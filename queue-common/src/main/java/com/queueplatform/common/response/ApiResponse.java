@@ -28,6 +28,7 @@ public class ApiResponse<T> {
         return new ApiResponse<Void>(null, false, LocalDateTime.now(), ErrorResponse.of(errorCode));
     }
 
+
     @Getter
     static class ErrorResponse {
         private final String code;
