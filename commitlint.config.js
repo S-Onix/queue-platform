@@ -11,5 +11,6 @@ module.exports = {
             'style',     // 코드 스타일
         ]],
         'subject-max-length': [2, 'always', 72],
+        'subject-case': [0],  // ← 추가 (0 = 비활성화)
     },
 };
