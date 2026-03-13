@@ -1,0 +1,8 @@
+dependencies {
+    implementation project(':queue-domain')
+    implementation project(':queue-infrastructure')
+    implementation project(':queue-common')
+
+    compileOnly "org.projectlombok:lombok:${lombokVersion}"
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+}

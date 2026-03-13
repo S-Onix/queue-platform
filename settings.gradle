@@ -1,0 +1,15 @@
+pluginManagement {
+    plugins {
+        id 'org.jetbrains.kotlin.jvm' version '2.3.0'
+    }
+}
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+rootProject.name = 'queue-platform'
+
+include 'queue-common'
+include 'queue-domain'
+include 'queue-infrastructure'
+include 'queue-api'
+include 'queue-batch'

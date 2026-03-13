@@ -1,0 +1,16 @@
+plugins {
+    id 'org.jetbrains.kotlin.jvm'
+}
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter'
+
+    compileOnly "org.projectlombok:lombok:${lombokVersion}"
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8"
+}
+repositories {
+    mavenCentral()
+}
+kotlin {
+    jvmToolchain(21)
+}
