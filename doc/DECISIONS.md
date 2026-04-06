@@ -15,7 +15,7 @@
 | 항목 | 내용 |
 |------|------|
 | API 서버 | Spring WebFlux + R2DBC 유지 |
-| Batch 서버 | Spring MVC (JPA 검토 가능) |
+| xxxxxxxxxx flowchart LR    subgraph GLOBAL["글로벌 순번 (Bulk)"]        SEQ["global-seq:{t}:{q}        INBYN 500 → 1~500 블록 채번"]    end​    subgraph SLICES["슬라이스    slice = (seq-1) % sliceCount (라운드로빈)"]        S0["queue:{t}:{q}:0        seq 1,4,7,10..."]        S1["queue:{t}:{q}:1        seq 2,5,8,11..."]        S2["queue:{t}:{q}:2        seq 3,6,9,12..."]    end​    subgraph RANK["전체 순위 계산 (내 seq=5)"]        R["ZCOUNT slice:0 0~4 = 1        ZCOUNT slice:1 0~4 = 2        ZCOUNT slice:2 0~4 = 1        합산 + 1 = 5등"]    end​    subgraph DEQUEUE["Admit Dequeue (N명)"]        D["슬라이스별 ZRANGE WITHSCORES        Lua 내부 score 정렬        상위 N명 선택        ZREM multi-member"]    end​    SEQ --> S0    SEQ --> S1    SEQ --> S2    S0 --> R    S1 --> R    S2 --> R    S0 --> D    S1 --> D    S2 --> Dmermaid#mermaidChart251{font-family:sans-serif;font-size:16px;fill:#333;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mermaidChart251 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mermaidChart251 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mermaidChart251 .error-icon{fill:#552222;}#mermaidChart251 .error-text{fill:#552222;stroke:#552222;}#mermaidChart251 .edge-thickness-normal{stroke-width:1px;}#mermaidChart251 .edge-thickness-thick{stroke-width:3.5px;}#mermaidChart251 .edge-pattern-solid{stroke-dasharray:0;}#mermaidChart251 .edge-thickness-invisible{stroke-width:0;fill:none;}#mermaidChart251 .edge-pattern-dashed{stroke-dasharray:3;}#mermaidChart251 .edge-pattern-dotted{stroke-dasharray:2;}#mermaidChart251 .marker{fill:#333333;stroke:#333333;}#mermaidChart251 .marker.cross{stroke:#333333;}#mermaidChart251 svg{font-family:sans-serif;font-size:16px;}#mermaidChart251 p{margin:0;}#mermaidChart251 .label{font-family:sans-serif;color:#333;}#mermaidChart251 .cluster-label text{fill:#333;}#mermaidChart251 .cluster-label span{color:#333;}#mermaidChart251 .cluster-label span p{background-color:transparent;}#mermaidChart251 .label text,#mermaidChart251 span{fill:#333;color:#333;}#mermaidChart251 .node rect,#mermaidChart251 .node circle,#mermaidChart251 .node ellipse,#mermaidChart251 .node polygon,#mermaidChart251 .node path{fill:#ECECFF;stroke:#9370DB;stroke-width:1px;}#mermaidChart251 .rough-node .label text,#mermaidChart251 .node .label text,#mermaidChart251 .image-shape .label,#mermaidChart251 .icon-shape .label{text-anchor:middle;}#mermaidChart251 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mermaidChart251 .rough-node .label,#mermaidChart251 .node .label,#mermaidChart251 .image-shape .label,#mermaidChart251 .icon-shape .label{text-align:center;}#mermaidChart251 .node.clickable{cursor:pointer;}#mermaidChart251 .root .anchor path{fill:#333333!important;stroke-width:0;stroke:#333333;}#mermaidChart251 .arrowheadPath{fill:#333333;}#mermaidChart251 .edgePath .path{stroke:#333333;stroke-width:2.0px;}#mermaidChart251 .flowchart-link{stroke:#333333;fill:none;}#mermaidChart251 .edgeLabel{background-color:rgba(232,232,232, 0.8);text-align:center;}#mermaidChart251 .edgeLabel p{background-color:rgba(232,232,232, 0.8);}#mermaidChart251 .edgeLabel rect{opacity:0.5;background-color:rgba(232,232,232, 0.8);fill:rgba(232,232,232, 0.8);}#mermaidChart251 .labelBkg{background-color:rgba(232, 232, 232, 0.5);}#mermaidChart251 .cluster rect{fill:#ffffde;stroke:#aaaa33;stroke-width:1px;}#mermaidChart251 .cluster text{fill:#333;}#mermaidChart251 .cluster span{color:#333;}#mermaidChart251 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:sans-serif;font-size:12px;background:hsl(80, 100%, 96.2745098039%);border:1px solid #aaaa33;border-radius:2px;pointer-events:none;z-index:100;}#mermaidChart251 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#333;}#mermaidChart251 rect.text{fill:none;stroke-width:0;}#mermaidChart251 .icon-shape,#mermaidChart251 .image-shape{background-color:rgba(232,232,232, 0.8);text-align:center;}#mermaidChart251 .icon-shape p,#mermaidChart251 .image-shape p{background-color:rgba(232,232,232, 0.8);padding:2px;}#mermaidChart251 .icon-shape rect,#mermaidChart251 .image-shape rect{opacity:0.5;background-color:rgba(232,232,232, 0.8);fill:rgba(232,232,232, 0.8);}#mermaidChart251 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mermaidChart251 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mermaidChart251 :root{--mermaid-alt-font-family:sans-serif;}Admit Dequeue (N명)전체 순위 계산 (내 seq=5)슬라이스slice = (seq-1) % sliceCount (라운드로빈)글로벌 순번 (Bulk)global-seq:{t}:{q}INBYN 500 → 1~500 블록 채번queue:{t}:{q}:0seq 1,4,7,10...queue:{t}:{q}:1seq 2,5,8,11...queue:{t}:{q}:2seq 3,6,9,12...ZCOUNT slice:0 0Unsupported markdown: del4 = 2ZCOUNT slice:2 0~4 = 1합산 + 1 = 5등슬라이스별 ZRANGE WITHSCORESLua 내부 score 정렬상위 N명 선택ZREM multi-member | Spring MVC (JPA 검토 가능) |
 | 이유 | Polling 10,000명 → 2,000 rps. Event loop non-blocking이 핵심 어필 포인트 |
 
 ### Virtual Thread 전환 시 문제
@@ -428,111 +428,415 @@ Tenant가 판단하고 Platform에 Admit 호출:
 
 ---
 
-## 12. token-status Redis Key 설계
+## 12. Admit 방식 전면 변경
 
-### 결정
-`token-status:{tokenId}` String key를 별도로 관리.
+### 기존 방식
+```
+유저 rank=1 → 유저가 Tenant에 "ready" 알림
+Tenant → Platform POST /tokens/:token/admit (1명씩)
+→ COMPLETED
+```
 
-### 이유
+### 변경 방식
+```
+Tenant → Platform POST /queues/:queueId/admit { count: N }
+Platform → 앞 N명 입장 토큰(admitToken) 발급 (TTL 30초)
+유저 → Polling으로 admitToken 수신
+유저 → Tenant에 admitToken 전달
+Tenant → Platform POST /admit-tokens/:admitToken/verify
+→ COMPLETED
+```
 
-Hash에 status 필드를 포함시키는 방식 대신 별도 String key를 선택한 이유:
+### 변경 이유
+```
+기존: 유저가 직접 "나 1등이에요" 알림 → 1명씩 처리
+변경: Tenant가 처리 가능한 인원만큼 Pull → N명 한번에
 
-| 항목 | Hash 방식 | String 별도 key |
-|------|----------|----------------|
-| 조회 | HGETALL (전체 읽기) | GET 한 번 |
-| 메모리 | 더 사용 | 적음 |
-| TTL 관리 | Hash 전체에 단일 TTL | 상태별 독립 TTL 가능 |
-| rank 저장 | Hash에 저장 시 전체 업데이트 필요 | ZRANK로 실시간 계산 |
-
-rank는 누군가 빠질 때마다 변경되는 값. Hash에 rank를 저장하면 뒤에 있는 모든 토큰을 업데이트해야 함. 대기자 1,000명이면 1명 빠질 때 1,000번 업데이트 발생 → ZRANK 실시간 계산이 현실적.
-
-### TTL 전략
-
-| 상태 | TTL | 이유 |
-|------|-----|------|
-| `WAITING` | waitingTtl | 대기 만료 시간과 동일하게 |
-| `CAN_ENTER` | inactiveTtl | 비활동 감지 기준과 동일하게 |
-| `COMPLETED` / `CANCELLED` / `EXPIRED` | 300s | 클라이언트 마지막 폴링 대응 |
+Backpressure 패턴 적용:
+  Publisher  = 대기열
+  Subscriber = Tenant (request(N) = admit { count: N })
+  → Tenant가 소화 가능한 만큼만 요청 → 과부하 방지
+```
 
 ---
 
-## 13. CAN_ENTER 상태 설계
+## 13. 입장 토큰(admitToken) 설계
 
-### 결정
-Token 상태에 `CAN_ENTER` 추가. rank 1 도달 시 전이. 클라이언트에는 `isFirst: true`로만 노출.
-
-### 이유
+### TTL = 30초
 
 ```
-rank 1 도달을 클라이언트에 알리는 방법 두 가지:
+근거:
+  Polling 주기(5초) + 네트워크(1~2초) + 유저 행동(3~5초) + 여유 ≈ 20초
+  → 30초 (여유분 포함)
 
-방법 A: 상태값 직접 노출
-  status: "CAN_ENTER" → 클라이언트가 상태값으로 판단
-  → 내부 상태값 변경 시 클라이언트 코드도 수정 필요
-  → Tenant마다 상태값 해석이 달라질 수 있음
-
-방법 B: isFirst 플래그 + 상태값 숨김 (채택)
-  CAN_ENTER → isFirst: true 변환 (PollingResponseDto)
-  → 내부 상태값 변경이 클라이언트에 영향 없음
-  → 클라이언트는 isFirst 하나만 보면 됨
-  → breaking change 방지
+최대 1000명 기준:
+  Tenant가 1000명 발급 → 각 유저에게 전달 → 30초 안에 verify
+  → 충분한 시간
 ```
 
-### 클라이언트 응답 매핑
+### 만료 시 우선순위 유지
 
-| 내부 상태 | isFirst | message (한국어) |
-|----------|---------|----------------|
-| `WAITING` | false | "대기 중입니다. 현재 {rank}번째입니다." |
-| `CAN_ENTER` | true | "입장 가능합니다." |
-| `COMPLETED` | false | "입장이 완료됐습니다." |
-| `CANCELLED` | false | "대기열이 취소됐습니다." |
-| `EXPIRED` | false | "대기 시간이 초과됐습니다." |
+```
+admitToken TTL 30초 초과
+  → WAITING 복귀
+  → seq(Sorted Set score) 그대로 유지
+  → 다음 admit 호출 시 앞순서면 재발급
 
-### 에러 케이스 처리
+이유:
+  유저 귀책 아닌 네트워크 지연으로 만료 가능
+  순위 박탈은 UX상 불합리
+  우선순위 유지 → 자연스러운 재시도
+```
 
-| 상황 | 처리 |
-|------|------|
-| CAN_ENTER 상태에서 inactiveTtl 초과 | Batch가 EXPIRED 처리 + 다음 1등 CAN_ENTER 전이 |
-| CAN_ENTER 상태에서 유저 이탈 | CANCELLED 처리 + 다음 1등 CAN_ENTER 전이 |
-| Lua Script 중 장애 | DB 우선 저장 → Batch 싱크 스케줄러 5분 내 복구 |
+### Redis Key
+```
+admit-token:{admitToken}  String  TTL 30s
+  value: tokenId
+  → verify 시 조회 → tokenId 매핑
+```
 
 ---
 
-## 14. Batch 스케줄러 2개 분리
+## 14. admit 요청 순서 보장 — Redis List 큐잉
 
-### 결정
-만료 처리(30초)와 Redis 싱크(5분)를 별도 스케줄러로 분리.
+### 문제
+```
+Tenant가 "100명" 처리 중에 "1000명" 추가 요청
+→ 순서 보장 필요
+→ 이전 완료 후 다음 처리 필요
+```
 
-### 이유
+### 해결: Redis List + BLPOP 워커
 
 ```
-단일 Batch로 합치면:
-  만료 처리 + Redis 불일치 복구를 30초마다 전부 실행
-  → DB 전체 스캔이 30초마다 발생 → 부하
+Tenant 요청 → RPUSH admit-request-queue:{tenantId}:{queueId}
+워커 → BLPOP (완료 후 다음 꺼냄)
+→ 이전 요청 완료 후 다음 요청 처리 보장
+```
+
+### 멀티 서버 환경
+```
+서버 A, B 둘 다 BLPOP 대기
+→ Redis BLPOP은 하나의 서버에만 전달
+→ 자동으로 단일 처리 보장
+→ 별도 락 불필요
+```
+
+---
+
+## 15. Token 상태 추가 — ADMIT_ISSUED
+
+### 변경
+```
+기존: WAITING → COMPLETED
+변경: WAITING → ADMIT_ISSUED → COMPLETED
+              → WAITING (admitToken 만료 시, 순위 유지)
+```
+
+### expiredReason 추가
+```
+기존: WAITING_TTL / INACTIVE_TTL
+추가: ADMIT_TOKEN_TTL (ADMIT_ISSUED 상태에서 30초 초과)
+```
+
+### 면접 포인트
+> "admitToken 만료 시 EXPIRED가 아닌 WAITING으로 복귀하는 이유는
+> 네트워크 지연 등 유저 귀책이 아닌 사유로 만료될 수 있기 때문입니다.
+> seq를 유지함으로써 우선순위를 보존하고
+> 다음 admit 호출 시 자동으로 재발급됩니다."
+
+---
+
+## 16. 대용량 처리 — DB
+
+### INSERT (Enqueue)
+```
+묶음 크기: 100건
+재시도: 3회 (backoff 100ms → 최대 1초)
+최종 실패: Redis List insert-retry-queue 보관 → Batch 재처리
+
+병목 확인 방법:
+  SHOW PROCESSLIST
+  SHOW STATUS LIKE 'Threads_connected'
+  Prometheus: r2dbc_pool_pending_connections
+
+Bulk INSERT:
+  INSERT INTO tokens VALUES (tok1,...),(tok2,...),...(tok100,...)
+  → DB 왕복 횟수 1/100로 감소
+```
+
+### SELECT (Polling) — Read/Write 분리
+```
+10만명 × 5초 간격 = 20,000 rps → DB 한계 초과
+
+해결:
+  Read Replica → Polling SELECT
+  Master       → INSERT/UPDATE
+
+token Redis 캐싱:
+  SET token-info:{tokenId} {status, queueId} EX 5
+  상태 변경 시 즉시 갱신 (TTL 기다리지 않음)
+  → DB QPS ≈ 0 (캐시 히트 시)
+
+캐시 TTL = 5초
+  근거: Polling 주기 = 5초 → 다음 Polling에서 최신 반영
+```
+
+### UPDATE (Admit / Batch)
+```
+청크 크기: 100건
+청크 간 대기: 10ms (서비스 쿼리에 DB 양보)
+순서: 순차 처리 (concurrency=1)
+
+Batch UPDATE:
+  Flux.fromIterable(tokenIds)
+      .buffer(100)
+      .delayElements(Duration.ofMillis(10))
+      .flatMap(chunk -> bulkUpdate(chunk), 1)
+```
+
+---
+
+## 17. 대용량 처리 — Redis
+
+### Enqueue Bulk — 500건 묶음
+```
+Adaptive Batching:
+  대기 요청 < 100건  → 즉시 처리
+  100~500건          → 100건 묶음
+  > 500건            → 500건 묶음
+
+Lua Script:
+  INCRBY N → seq 블록 한번에 채번
+  슬라이스별 ZADD multi-member → ZADD 횟수 = 슬라이스 수로 고정
+
+문제 및 해결:
+  INCRBY + ZADD 실패 → Lua 원자적 → 전체 실패 → 구멍 없음
+  멀티 서버 INCRBY 충돌 → INCRBY 원자 연산 → 겹치지 않음
+  Lua 블로킹 → Adaptive batching으로 크기 조절
+```
+
+### Batch 주기
+```
+10초 (변경: 30초 → 10초)
+  5초 vs 10초:
+    5초:  불일치 확률 낮음, Batch 부하 높음
+    10초: 불일치 소폭 증가, Batch 부하 낮음
+  admit 추가 추출 3회로 보완
+```
+
+### Hot Key (global-seq)
+```
+결정: 허용 범위
+
+근거:
+  Redis INCR 처리량 ≈ 100,000 ops/s
+  500건 묶음 → INCRBY 400/s → 한계의 0.4%
+  10만건 동시 → INCRBY 200/s → 여전히 한계 이하
+
+대규모 확장 시:
+  슬라이스별 독립 seq 도입 검토
+  단, FIFO 보장 약화 트레이드오프
+```
+
+---
+
+## 18. 대용량 처리 — 로직
+
+### 멱등성 — Redis idempotency key
+```
+Java Queue 방식 기각:
+  멀티 서버에서 각자 독립 Queue → 전체 순서 보장 불가
+  서버 다운 시 Queue 소멸 → 유실
+
+채택: Redis idempotency key
+  SET admit-idem:{requestId} {result} EX 300 NX
+  → 이미 처리된 requestId → 저장된 결과 반환
+  → 멀티 서버 보장
+  → 서버 재시작 후에도 Redis에 남아있음
+```
+
+### 비동기 INSERT 유실
+```
+3회 재시도 (backoff)
+최종 실패 → Redis List insert-retry-queue 보관
+Batch 서버가 주기적으로 재처리
+```
+
+### ADMIT_ISSUED → WAITING 복귀 (seq 복원)
+```
+문제:
+  admitToken TTL 30초 초과 → WAITING 복귀
+  Redis ZADD 시 원래 seq(score) 필요
+  → seq가 DB에 없으면 복원 불가
+
+해결:
+  tokens 테이블에 seq 컬럼 추가 ✅
+  Enqueue 시 INCRBY로 받은 seq → DB 저장
+
+복구 흐름:
+  Batch: EXISTS admit-token:{tokenId} = 0 감지
+  DB SELECT tokens WHERE status = 'ADMIT_ISSUED' AND seq > 0
+  → seq 조회
+  → Redis ZADD queue:{t}:{q}:{slice} {seq} {tokenId}
+  → DB UPDATE status = 'WAITING'
+```
+
+---
+
+## 19. 대용량 처리 — 병렬 처리
+
+### Batch 병렬화
+```
+큐별 독립 처리
+동시 처리 큐 수: 10개 (워커 풀 제한)
+큐별 타임아웃: 8초 (10초 주기 내 완료)
+
+문제 및 해결:
+  워커 수 폭발 → 동시 처리 10개로 제한
+  특정 큐 지연 → 8초 타임아웃으로 스킵
+  DB 부하 집중 → 청크 간 10ms 대기 유지
+
+Flux.fromIterable(queues)
+    .flatMap(queue ->
+        processQueue(queue)
+            .timeout(Duration.ofSeconds(8))
+            .onErrorResume(e -> Mono.empty()),
+        10  // 동시 처리 큐 수
+    )
+```
+
+### admit 워커 병렬화
+```
+단위: Queue (slice 아님)
+  Queue = Tenant가 생성한 대기열
+  Slice = Queue 내부 분산 구조
+
+큐별 독립 워커:
+  admit-request-queue:{tenantId}:{queueA} → 워커1
+  admit-request-queue:{tenantId}:{queueB} → 워커2
+  → 다른 큐의 admit 병렬 처리 ✅
+  → 같은 큐 내에서는 순차 보장 ✅
+
+워커 풀: 10개
+  큐 100개 → 10개 워커가 라운드로빈 처리
+```
+
+### Enqueue 병렬 처리
+```
+concurrency: 50
+  근거:
+    Redis 싱글스레드 → 동시 처리 수 늘려도 효과 없음
+    50개 × Lua 2ms = 100ms 내 처리 → 충분
+    500건 이상은 불필요한 메모리 낭비
+
+Flux.fromIterable(requests)
+    .buffer(500)
+    .flatMap(batch -> processBulkEnqueue(batch), 50)
+```
+
+---
+
+## 20. 메모리 압박 해결
+
+```
+즉시 적용:
+  inactiveTtl 기본값: 1800s → 300s
+    5분 무응답 = 사실상 이탈
+    Polling 5초 간격 활성 유저는 영향 없음
+
+  Batch 주기: 30초 → 10초
+    EXPIRED 토큰 메모리 점유 최소화
+    admit 불일치 확률 감소
+
+  Redis maxmemory: 4GB
+  maxmemory-policy: noeviction
+  Prometheus 모니터링: redis_memory_used_bytes 80% 알림
+
+대규모:
+  Redis Cluster (포트폴리오 범위 초과 — 면접 언급용)
+  "queueId 기준 샤딩으로 수평 확장"
+```
+
+---
+
+## 21. 이탈(CANCELLED) 정책
+
+```
+이탈 허용 상태:
+  WAITING      → CANCELLED ✅
+  ADMIT_ISSUED → 409 QE_006_INVALID_STATUS ❌
+
+이유:
+  ADMIT_ISSUED = 이미 입장 토큰 발급
+  → Tenant가 슬롯 할당한 상태
+  → 유저 실수까지 Platform이 책임 안 함
+
+ADMIT_ISSUED에서 이탈하려면:
+  admitToken TTL 30초 대기
+  → WAITING 자동 복귀
+  → DELETE /tokens/:token → CANCELLED
+
+재접속:
+  CANCELLED 후 DEL queue-user 역인덱스
+  → 같은 userId로 재Enqueue 가능
+  → 새 seq 배정 (맨 뒤)
+  → 우선순위 복구 없음 (자발적 이탈 귀책)
+```
+
+---
+
+## 22. verify / complete 분리
+
+### 결정
+```
+기존: verify → COMPLETED + ZREM (한번에)
+
+변경:
+  verify  → 유효성 확인만 (상태 변경 없음, ADMIT_ISSUED 유지)
+  complete → Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM
+```
+
+### 이유
+```
+Tenant 입장에서:
+  verify만으로 COMPLETED 처리되면
+  → Tenant가 입장 처리 전에 대기열에서 이미 제거됨
+  → 입장 실패 시 복구 불가
 
 분리하면:
-  TokenExpiryJob (30초): Redis 기준 만료 감지 → 빠름
-  RedisSyncJob   (5분):  DB 기준 불일치 복구 → 주기 길어도 OK
-  → 역할과 주기를 각각 최적화
+  verify → 유효성 확인 (입장 가능 여부만 판단)
+  Tenant → 유저 실제 입장 처리
+  complete → 입장 완료 확정 후 ZREM
+
+  Tenant가 ZREM 타이밍을 직접 제어
+  → 입장 실패 시 admitToken이 아직 유효 → 재시도 가능
 ```
 
-### 처리 순서 원칙
-
-두 스케줄러 모두 동일한 원칙 적용:
-
+### complete 처리 순서
 ```
-DB 먼저 → Redis 나중
-Redis 실패 시 → RedisSyncJob이 5분 내 복구
-DB가 Source of Truth
+① admitToken 유효성 재확인
+② DB status = COMPLETED (먼저 — 원자성 전략)
+③ Redis ZREM + DEL admit-token + DEL token-info (나중)
+④ avgWaitingTime 갱신
+
+DB 먼저 이유:
+  잔류(Redis에 남음) > 유실(DB 미반영)
+  잔류 → Batch 10초 내 정리
+  유실 → 복구 불가
 ```
 
-### 다국어 메시지 관리
+### 새 API
+```
+POST /api/v1/tokens/:token/complete
+  Body: { admitToken: "at_xxx" }
+  → COMPLETED + ZREM + avgWaitingTime 갱신
+  ← { status: COMPLETED, completedAt }
+```
 
-### 결정
-`messages.properties`로 상태별 메시지를 관리. Accept-Language 헤더 기반 자동 Locale 감지.
-
-### 이유
-- 내부 상태값을 노출하지 않으므로 클라이언트가 판단할 텍스트가 필요
-- Tenant마다 언어가 다를 수 있음
-- 언어 추가 시 파일만 추가하면 됨 → 코드 변경 없음
-- Spring MessageSource가 Accept-Language 헤더 기반 Locale 자동 감지
+### 면접 포인트
+> "verify와 complete를 분리한 이유는
+> Tenant가 입장 완료를 명시적으로 통보하게 함으로써
+> ZREM 타이밍을 Tenant가 제어할 수 있도록 하기 위해서입니다.
+> verify만으로 ZREM하면 입장 실패 시 복구가 불가능하지만
+> complete 분리 시 admitToken이 유효한 동안 재시도가 가능합니다."

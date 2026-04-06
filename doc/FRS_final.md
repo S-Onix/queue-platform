@@ -1,6 +1,6 @@
 # 📄 Queue Platform — 기능 정의서 (FRS)
 
-> 버전: v1.5 | 상태: 확정 | 대상: 실제 구현 범위
+> 버전: v1.6 | 상태: 확정 | 대상: 실제 구현 범위
 
 ---
 
@@ -26,34 +26,33 @@ Tenant    → 슬롯 관리 + 입장 제어
 | Tenant | 플랫폼을 사용하는 B2B 고객사 |
 | Queue | Tenant가 생성하는 대기열 단위 |
 | Token | 대기열 참여 단위. 순번은 Redis Sorted Set 전담. 메타데이터는 DB 저장 |
+| 대기토큰 | Enqueue 시 발급. 유저가 Polling에 사용 |
+| 입장토큰 (admitToken) | admit 시 발급. TTL 30초. 유저가 Tenant에 전달 |
 | Enqueue | Tenant 서버가 유저 대신 Platform에 대기열 등록 요청 |
 | Polling | 유저가 Platform에 직접 순위 확인 요청 |
-| isFirst | rank = 1 도달 여부. 클라이언트가 입장 가능 여부를 판단하는 플래그 |
-| CAN_ENTER | 내부 Token 상태값. rank 1 도달 시 전이. 클라이언트에 직접 노출 안 함 |
-| Admit | Tenant 서버가 슬롯 여유 확인 후 Platform에 입장 허용 요청 |
+| admit | Tenant 서버가 슬롯 여유 생길 때 Platform에 N명 입장 토큰 요청 (Backpressure Pull) |
+| verify | Tenant가 유저로부터 받은 admitToken 유효성 확인 (상태 변경 없음) |
+| complete | Tenant가 유저 입장 완료 후 Platform에 통보 → COMPLETED + ZREM |
 | maxCapacity | 대기열 최대 인원 (Tenant 슬롯 수와 무관) |
 | waitingTtl | 대기 중 절대 만료 시간 (기본 7200s) |
-| inactiveTtl | 마지막 Polling 이후 비활동 만료 시간 (기본 1800s) |
+| inactiveTtl | 마지막 Polling 이후 비활동 만료 시간 (기본 300s) |
 | sliceCount | Platform 자동 계산. ceil(maxCapacity ÷ 100,000) |
 | global-seq | 슬라이스 간 FIFO 보장을 위한 전체 순번 |
+| seq | 토큰별 global-seq 값. ADMIT_ISSUED→WAITING 복귀 시 score 복원에 사용 |
 | avgWaitingTime | 평균 대기 시간 (issuedAt ~ completedAt). ETA 계산에 사용 |
 
 ### Token 저장 구조
 
 ```
 DB tokens 테이블:
-  tokenId, userId, queueId, status, issuedAt, completedAt ...
+  tokenId, userId, queueId, seq, status, issuedAt, completedAt
   → 메타데이터 원본. Redis 장애 시 복구 기준
+  → seq: ADMIT_ISSUED→WAITING 복귀 시 Sorted Set score 복원에 사용
 
 Redis Sorted Set:
   Key: queue:{tenantId}:{queueId}:{sliceNumber}
   member: tokenId, score: global-seq
   → 순번 관리 전담. FIFO 보장
-
-Redis String:
-  Key: token-status:{tokenId}
-  Value: WAITING / CAN_ENTER / COMPLETED / CANCELLED / EXPIRED
-  → 폴링 응답 상태 캐시. rank 1 도달 시 CAN_ENTER로 전이
 ```
 
 ---
@@ -61,30 +60,45 @@ Redis String:
 ## 2. 전체 흐름
 
 ```
-① Tenant → Platform: Enqueue
+① Tenant → Platform: Queue 생성
+   POST /queues { name, maxCapacity, waitingTtl, inactiveTtl }
+   ← { queueId }
+
+② 유저 서비스 접속 → Tenant 슬롯 확인
+   여유 있음 → 바로 입장
+   여유 없음 → Enqueue 결정
+
+③ Tenant → Platform: Enqueue
    POST /queues/:queueId/tokens { userId }
-   ← { token, rank, isFirst: false, message, estimatedWaitSeconds }
-   Tenant → 유저: token 전달
+   ← { token, globalRank, estimatedWaitSeconds }
+   Tenant → 유저: 대기토큰 + Polling URL 전달
 
-② 유저 → Platform: Polling (직접, 5초 간격)
+④ 유저 → Platform: Polling (직접, 5초 간격)
    GET /queues/:queueId/tokens/:token
-   ← { rank, isFirst: false, message: "대기 중입니다. 현재 N번째입니다." }
+   ← { globalRank, estimatedWaitSeconds, ready: false }
 
-③ rank = 1 도달 → CAN_ENTER 전이
+⑤ Tenant → Platform: admit (슬롯 여유 생길 때마다, Backpressure Pull)
+   POST /queues/:queueId/admit { count: N }
+   ← { admitTokens: [ { userId, admitToken }, ... ] }
+   Platform: 앞 N명 → ADMIT_ISSUED + admitToken 발급 (TTL 30초)
+
+⑥ 유저 Polling 응답에 admitToken 포함 (ADMIT_ISSUED 상태일 때)
    GET /queues/:queueId/tokens/:token
-   ← { rank: 1, isFirst: true, message: "입장 가능합니다." }
-   유저 → Tenant: "나 ready야"
+   ← { globalRank: 1, ready: true, admitToken: "at_xxx" }
+   유저 → Tenant: admitToken 전달
 
-④ Tenant: 슬롯 여유 확인
-   여유 없음 → 유저에게 "대기" (10초 후 재시도)
-   여유 있음 → GET /tokens/:token/status 먼저 확인
-     ← { rank: 1, isFirst: true }  → Admit 호출
-     ← { rank: 2, isFirst: false } → 이미 만료됨. 스킵
-     → POST /tokens/:token/admit
-     ← { status: "COMPLETED", completedAt }
-   Tenant → 유저: 입장 허용
+⑦ Tenant → Platform: verify (유효성 확인만. 상태 변경 없음)
+   POST /admit-tokens/:admitToken/verify
+   ← { valid: true, userId }
 
-(종료 별도 없음. Admit = COMPLETED)
+⑧ Tenant: 유효한 유저 입장 허용
+
+⑨ Tenant → Platform: complete (입장 완료 통보)
+   POST /tokens/:token/complete { admitToken: "at_xxx" }
+   Platform: COMPLETED + ZREM + avgWaitingTime 갱신
+   ← { status: COMPLETED, completedAt }
+
+(admitToken TTL 30초 초과 시 → WAITING 복귀. seq 유지. 우선순위 보존)
 ```
 
 ---
@@ -96,9 +110,8 @@ Redis String:
 | Tenant 관리 | 회원가입 / 로그인 / JWT 인증 / 비밀번호 재설정 | ✅ |
 | API Key 관리 | 발급 / 검증 / Revoke / Rate limit | ✅ |
 | Queue 관리 | 생성 / 수정 / 조회 / 정지 / 재개 / 삭제 | ✅ |
-| Token Lifecycle | Enqueue / Polling / Status / Admit / Dequeue | ✅ |
-| TTL / Batch | 만료 처리 / Redis 싱크 / 과금 스냅샷 | ✅ |
-| 다국어 메시지 | messages.properties 기반 한/영/일 지원 | ✅ |
+| Token Lifecycle | Enqueue / Polling / admit / verify / complete / 이탈 | ✅ |
+| TTL / Batch | 만료 처리 / 과금 스냅샷 / INSERT 재처리 | ✅ |
 
 ---
 
@@ -108,11 +121,12 @@ Redis String:
 
 | Method | Path | 인증 | 호출 주체 | 설명 |
 |--------|------|------|----------|------|
-| `POST` | `/api/v1/queues/:queueId/tokens` | X-API-Key | Tenant 서버 | Enqueue |
+| `POST` | `/api/v1/queues/:queueId/tokens` | X-API-Key | Tenant 서버 | Enqueue → 대기토큰 발급 |
 | `GET` | `/api/v1/queues/:queueId/tokens/:token` | token | 유저 직접 | Polling |
-| `GET` | `/api/v1/tokens/:token/status` | X-API-Key | Tenant 서버 | 토큰 상태 확인 |
-| `POST` | `/api/v1/tokens/:token/admit` | X-API-Key | Tenant 서버 | Admit → COMPLETED |
-| `DELETE` | `/api/v1/queues/:queueId/tokens/:token` | X-API-Key | Tenant 서버 | 이탈 → CANCELLED |
+| `POST` | `/api/v1/queues/:queueId/admit` | X-API-Key | Tenant 서버 | N명 입장토큰 발급 → ADMIT_ISSUED |
+| `POST` | `/api/v1/admit-tokens/:admitToken/verify` | X-API-Key | Tenant 서버 | 입장토큰 유효성 확인 (상태 변경 없음) |
+| `POST` | `/api/v1/tokens/:token/complete` | X-API-Key | Tenant 서버 | 입장 완료 통보 → COMPLETED + ZREM |
+| `DELETE` | `/api/v1/queues/:queueId/tokens/:token` | X-API-Key | Tenant 서버 | 이탈 → CANCELLED (WAITING만) |
 
 ### 4.2 관리 API
 
@@ -142,9 +156,10 @@ Redis String:
 | name | String | ✅ | - | 큐 이름 (Tenant 내 유일) |
 | maxCapacity | Int | ✅ | - | 대기열 최대 인원 |
 | waitingTtl | Int(초) | ❌ | 7200 | 대기 중 절대 만료 시간 |
-| inactiveTtl | Int(초) | ❌ | 1800 | 비활동 만료 시간 |
+| inactiveTtl | Int(초) | ❌ | 300 | 비활동 만료 시간 |
 
 > `sliceCount = ceil(maxCapacity ÷ 100,000)` Platform 자동 계산
+> maxCapacity ≤ 100,000 → sliceCount = 1
 
 ### Queue 상태
 
@@ -163,29 +178,20 @@ Redis String:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING : POST /tokens
-    WAITING --> CAN_ENTER : rank 1 도달
-    CAN_ENTER --> COMPLETED : POST /admit
-    WAITING --> COMPLETED : POST /admit
-    WAITING --> CANCELLED : DELETE /token
-    WAITING --> EXPIRED : Batch
-    CAN_ENTER --> CANCELLED : DELETE /token
-    CAN_ENTER --> EXPIRED : Batch
+    [*] --> WAITING : POST /tokens (ZADD NX)
+    WAITING --> ADMIT_ISSUED : POST /admit\nPlatform이 입장토큰 발급 (TTL 30초)
+    ADMIT_ISSUED --> COMPLETED : POST /tokens/:token/complete\nTenant 입장 완료 통보\nDB COMPLETED + Redis ZREM
+    ADMIT_ISSUED --> WAITING : admitToken TTL 30초 초과\nBatch 감지 → WAITING 복귀\nseq 유지 (우선순위 보존)
+    WAITING --> CANCELLED : DELETE /token\n유저 자발적 이탈 (WAITING만 허용)
+    WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과
     COMPLETED --> [*]
     CANCELLED --> [*]
     EXPIRED --> [*]
 ```
 
-| 상태 | 내부 의미 | 클라이언트 응답 |
-|------|----------|----------------|
-| `WAITING` | 대기 중 | `isFirst: false` |
-| `CAN_ENTER` | rank 1 도달. 입장 가능 | `isFirst: true` |
-| `COMPLETED` | 입장 완료 | `isFirst: false` |
-| `CANCELLED` | 유저 자발적 이탈 | `isFirst: false` |
-| `EXPIRED` | TTL 초과 만료 | `isFirst: false` |
-
-> ADMITTED 상태 없음. Admit 즉시 COMPLETED 처리.
-> CAN_ENTER는 내부 상태값. 클라이언트에게 직접 노출 안 함.
+> verify: ADMIT_ISSUED 상태 유지 (상태 변경 없음). 유효성 확인만.
+> complete: COMPLETED + ZREM. Tenant가 입장 완료 후 명시적 통보.
+> ADMIT_ISSUED에서 이탈 시도 → 409 (admitToken TTL 후 WAITING 복귀 후 이탈 가능)
 
 ### 6.2 Enqueue
 
@@ -202,20 +208,19 @@ Body: { userId: string }
    GET queue-user:{t}:{q}:{userId} → 있으면 기존 토큰 반환 (멱등)
 5. 전체 용량 체크
    모든 슬라이스 ZCARD 합산 ≥ totalCapacity → 429
-6. Lua Script 원자 실행
-   ① INCR global-seq:{t}:{q} → seq
-   ② sliceNumber = seq % sliceCount
-   ③ ZADD queue:{t}:{q}:{slice} NX {seq} {tokenId}
-   ④ SET token-status:{tokenId} WAITING EX waitingTtl
-7. 비동기: INCR billing-count, SET queue-user 역인덱스, DB INSERT
+6. Bulk Lua Script 원자 실행 (500건 묶음 / Adaptive Batching)
+   ① INCRBY global-seq:{t}:{q} N → startSeq~endSeq 블록 채번
+   ② 슬라이스별 ZADD multi-member NX (라운드로빈)
+      slice = (seq-1) % sliceCount
+7. DB INSERT (Reactor 비동기 백그라운드 — 100건 Bulk / 3회 재시도)
+8. 비동기: INCR billing-count, SET queue-user 역인덱스
 
 Response 200:
 {
   "token": "tok_Kx9mZ3",
-  "rank": 42,
-  "isFirst": false,
-  "message": "대기 중입니다. 현재 42번째입니다.",
+  "globalRank": 42,
   "estimatedWaitSeconds": 300,
+  "status": "WAITING",
   "issuedAt": "2026-03-19T10:00:00Z"
 }
 ```
@@ -227,92 +232,162 @@ GET /api/v1/queues/:queueId/tokens/:token
 호출 주체: 유저 직접 (token으로 인증. API Key 불필요)
 
 처리 흐름:
-1. token 유효성 확인 (DB 조회)
-2. GET token-status:{tokenId} → 현재 상태 조회
-3. 전체 순위 계산 (Lua Script)
+1. token 유효성 확인
+   Redis GET token-info:{tokenId} (캐시 TTL 5초)
+   → 미스 시 DB SELECT → 캐시 저장
+   → status 확인 (WAITING / ADMIT_ISSUED만 유효)
+2. 전체 순위 계산 (Lua Script)
    ZSCORE → mySeq
    모든 슬라이스 ZCOUNT 0~(mySeq-1) 합산
-   rank = 합산 + 1
-4. SET token-last-active:{tokenId} EX inactiveTtl
-5. HGET queue-stats:{t}:{q} avgWaitingTime → ETA 계산
-6. Accept-Language 헤더 기반 다국어 메시지 조회
+   globalRank = 합산 + 1
+3. SET token-last-active:{tokenId} EX inactiveTtl
+4. HGET queue-stats:{t}:{q} avgWaitingTime → ETA 계산
+5. admitToken 확인 (status = ADMIT_ISSUED 일 때)
+   Redis GET admit-token:{tokenId} → 응답에 포함
 
-Response 200:
+Response 200 (WAITING):
 {
   "token": "tok_Kx9mZ3",
-  "rank": 1,
-  "isFirst": true,
-  "message": "입장 가능합니다.",
-  "estimatedWaitSeconds": 0
+  "globalRank": 42,
+  "estimatedWaitSeconds": 300,
+  "status": "WAITING",
+  "ready": false,
+  "admitToken": null
 }
 
-isFirst = true (내부 상태 CAN_ENTER):
-  유저 → Tenant: "나 ready야" 알림
-
-isFirst 변환 규칙:
-  CAN_ENTER → isFirst: true  (내부 상태값 클라이언트 노출 안 함)
-  그 외      → isFirst: false
-```
-
-### 6.4 Status 조회
-
-```
-GET /api/v1/tokens/:token/status
-호출 주체: Tenant 서버 (X-API-Key 인증)
-용도: Admit 전 상태 사전 확인
-
-Response 200:
+Response 200 (ADMIT_ISSUED):
 {
   "token": "tok_Kx9mZ3",
-  "rank": 1,
-  "isFirst": true,
-  "message": "입장 가능합니다."
+  "globalRank": 1,
+  "estimatedWaitSeconds": 0,
+  "status": "ADMIT_ISSUED",
+  "ready": true,
+  "admitToken": "at_abc123"
 }
-
-isFirst: true  → Admit 호출 가능
-isFirst: false → 아직 맨 앞 아님 또는 이미 만료
 ```
 
-### 6.5 Admit → COMPLETED
+### 6.4 Admit → ADMIT_ISSUED
 
 ```
-POST /api/v1/tokens/:token/admit
+POST /api/v1/queues/:queueId/admit
 호출 주체: Tenant 서버 (X-API-Key 인증)
+          슬롯 여유 생길 때마다 호출 (Backpressure Pull 방식)
+Body: { count: N, requestId: "req_abc" }  최대 1000명
+
+[Backpressure 패턴]
+  Publisher  = 대기열 (유저 토큰)
+  Subscriber = Tenant (처리 가능한 만큼만 request(N))
+  → Tenant가 소화 가능한 인원만 Pull → 과부하 방지
+
+[순서 보장]
+  Tenant 요청 → Redis List RPUSH (순서대로 적재)
+  Platform 워커 → BLPOP (완료 후 다음 처리)
+  워커 단위: Queue 단위 / 워커 풀 10개
+  멱등성: Redis admit-idem:{requestId} EX 300
 
 처리 흐름:
-1. 토큰 상태 확인 (WAITING 또는 CAN_ENTER + globalRank = 1만 허용)
-   조건 미충족 → 409 QE_008_NOT_READY
-2. DB status = COMPLETED ← 먼저 (원자성 전략)
-3. Redis ZREM             ← 나중
-4. Lua Script: 다음 1등 조회 → CAN_ENTER 전이
-5. completedAt = now 기록
-6. avgWaitingTime 갱신
-   HINCRBYFLOAT waitingTimeSum, HINCRBY waitingTimeCount, HSET avgWaitingTime
-
-원자성:
-  DB 성공 + ZREM 실패 → Batch 싱크 스케줄러 5분 내 복구
+1. 멱등성 확인 (admit-idem:{requestId} 존재 시 기존 결과 반환)
+2. Redis List에 요청 적재 (순서 보장)
+3. 워커가 BLPOP으로 순서대로 꺼냄
+4. Lua Script 원자 실행
+   각 슬라이스 ZRANGE WITHSCORES → 후보 수집
+   Lua 내부 score 정렬 → 상위 N명 선택
+   슬라이스별 ZREM multi-member
+5. DB에서 WAITING 상태 확인 + 필터링
+   불일치 토큰 즉시 ZREM 정리
+   부족 시 최대 3회 추가 추출
+6. admitToken 생성
+   SET admit-token:{tokenId} {admitToken} EX 30
+7. DB UPDATE status = ADMIT_ISSUED (100건씩 / 10ms 대기)
+   SET token-info:{tokenId} 캐시 즉시 갱신
 
 Response 200:
 {
-  "token": "tok_Kx9mZ3",
+  "admitTokens": [
+    { "userId": "user1", "admitToken": "at_abc123" },
+    { "userId": "user2", "admitToken": "at_xyz789" }
+  ]
+}
+
+admitToken TTL: 30초
+만료 시: WAITING 복귀 (seq 유지 → 우선순위 보존)
+         DB seq 컬럼으로 Redis ZADD score 복원
+```
+
+### 6.5 Verify (유효성 확인만 — 상태 변경 없음)
+
+```
+POST /api/v1/admit-tokens/:admitToken/verify
+호출 주체: Tenant 서버 (X-API-Key 인증)
+용도: 유저로부터 받은 admitToken 유효성 확인
+
+처리 흐름:
+1. Redis GET admit-token:{admitToken} → tokenId 조회
+   없으면 → 404 TK_002_INVALID_ADMIT_TOKEN (만료 or 무효)
+2. DB token 상태 확인 (ADMIT_ISSUED)
+   아니면 → 409 QE_006_INVALID_STATUS
+3. 상태 변경 없음 — 조회만
+
+Response 200:
+{
+  "valid": true,
+  "userId": "user1",
+  "tokenId": "tok_Kx9mZ3"
+}
+```
+
+### 6.6 Complete → COMPLETED
+
+```
+POST /api/v1/tokens/:token/complete
+호출 주체: Tenant 서버 (X-API-Key 인증)
+용도: 유저 입장 완료 후 Platform에 통보 → 대기열에서 제거
+
+처리 흐름:
+1. API Key 검증
+2. Redis GET admit-token:{tokenId} → admitToken 유효 확인
+   없으면 → 404 TK_002_INVALID_ADMIT_TOKEN
+3. DB token 상태 확인 (ADMIT_ISSUED)
+   아니면 → 409 QE_006_INVALID_STATUS
+4. DB status = COMPLETED (먼저 — 원자성 전략)
+   completed_at = now()
+5. Redis ZREM (나중)
+   DEL admit-token:{admitToken}
+   DEL token-info:{tokenId} 캐시
+6. avgWaitingTime 갱신
+   waitingSeconds = now - issuedAt
+   HINCRBYFLOAT waitingTimeSum {waitingSeconds}
+   HINCRBY waitingTimeCount 1
+   HSET avgWaitingTime {sum ÷ count}
+
+원자성:
+  DB 성공 + ZREM 실패 → Batch 10초 내 감지 후 ZREM 재실행 (멱등)
+
+Response 200:
+{
   "status": "COMPLETED",
   "completedAt": "2026-03-19T10:05:00Z"
 }
 ```
 
-### 6.6 이탈 → CANCELLED
+### 6.7 이탈 → CANCELLED
 
 ```
 DELETE /api/v1/queues/:queueId/tokens/:token
 호출 주체: Tenant 서버 (X-API-Key 인증)
+용도: 유저가 대기 포기 시
 
-조건: WAITING 또는 CAN_ENTER 상태만 허용
-처리:
-  DB status = CANCELLED + cancelledAt 기록 (먼저)
-  Redis ZREM (나중)
-  CAN_ENTER 상태였으면 → 다음 1등 CAN_ENTER 전이
-  DEL token-status:{tokenId}
-  DEL queue-user:{t}:{q}:{userId} 역인덱스
+조건: WAITING 상태만 허용
+      ADMIT_ISSUED → 409 QE_006_INVALID_STATUS
+      (admitToken TTL 30초 후 WAITING 복귀 후 이탈 가능)
+
+처리: Redis ZREM + DB status = CANCELLED + cancelledAt
+      DEL queue-user:{t}:{q}:{userId} 역인덱스
+      DEL token-info:{tokenId} 캐시
+
+재접속:
+  역인덱스 제거 → 같은 userId 재Enqueue 가능
+  새 seq 배정 (맨 뒤) — 우선순위 복구 없음 (자발적 이탈 귀책)
 
 Response 200:
 {
@@ -325,24 +400,36 @@ Response 200:
 
 ## 7. TTL 정책
 
-### Dual TTL (WAITING / CAN_ENTER 토큰)
+### WAITING 토큰 TTL
 
 | TTL | 기본값 | 기준 | Batch 감지 방법 |
-|-----|--------|------|-----------------| 
+|-----|--------|------|-----------------|
 | waitingTtl | 7200s | 등록 시각 | `ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms)` |
-| inactiveTtl | 1800s | 마지막 Polling | `EXISTS token-last-active:{tokenId}` = 0 |
+| inactiveTtl | 300s | 마지막 Polling | `EXISTS token-last-active:{tokenId}` = 0 |
 
-둘 중 먼저 도달하는 것으로 EXPIRED 처리.
+### ADMIT_ISSUED 토큰 TTL
 
-> `CAN_ENTER` 상태도 동일한 TTL 정책 적용.
-> CAN_ENTER 만료 시 Batch가 다음 1등 토큰에 CAN_ENTER 전이.
+| TTL | 값 | 기준 | 만료 시 처리 |
+|-----|-----|------|------------|
+| admitTokenTtl | 30s | 입장토큰 발급 시각 | WAITING 복귀 (seq 유지) |
+
+```
+admitToken TTL 30초 근거:
+  Polling 주기(5초) + 네트워크(1~2초) + 유저 행동(3~5초) + 여유 ≈ 20초
+  → 30초 (여유분 포함, 최대 1000명 기준)
+
+만료 시 우선순위 유지:
+  DB tokens.seq 기준으로 Redis ZADD score 복원
+  다음 admit 호출 시 앞순서면 재발급
+```
 
 ### expiredReason
 
-| 값 | 원인 |
-|----|------|
-| `WAITING_TTL` | waitingTtl 초과 |
-| `INACTIVE_TTL` | Polling 없어 비활동 |
+| 값 | 원인 | 대상 상태 |
+|----|------|----------|
+| `WAITING_TTL` | waitingTtl 초과 | WAITING |
+| `INACTIVE_TTL` | Polling 없어 비활동 | WAITING |
+| `ADMIT_TOKEN_TTL` | 입장토큰 미사용 만료 → WAITING 복귀 (EXPIRED 아님) | ADMIT_ISSUED |
 
 ---
 
@@ -350,72 +437,43 @@ Response 200:
 
 | Key 패턴 | 자료구조 | TTL | 역할 |
 |----------|----------|-----|------|
-| `queue:{t}:{q}:{slice}` | Sorted Set | 없음 | 슬라이스별 대기열. score=global-seq |
-| `global-seq:{t}:{q}` | String | 없음 | 글로벌 순번 채번. INCR 원자 실행 |
-| `queue-meta:{t}:{q}` | Hash | 없음 | sliceCount, totalCapacity 등 |
-| `queue-stats:{t}:{q}` | Hash | 없음 | avgWaitingTime, waitingTimeSum, waitingTimeCount |
-| `queue-user:{t}:{q}:{userId}` | String | waitingTtl | userId → tokenId 역인덱스. 멱등 O(1) |
-| `token-last-active:{tokenId}` | String | inactiveTtl | 비활동 TTL 감지. Polling 호출마다 갱신 |
-| `token-status:{tokenId}` | String | WAITING: waitingTtl / 종료 후 5분 | 토큰 상태 캐시. CAN_ENTER 전이 포함 |
-| `apikey-cache:{sha256}` | String | 60s | API Key 인증 캐시. DB QPS ≈ 0 |
-| `billing-count:{t}:{yyyyMM}` | String | 월말+7일 | Enqueue 과금 카운터 |
-
-### token-status TTL 전략
-
-| 상태 | TTL |
-|------|-----|
-| `WAITING` | waitingTtl (대기 만료 시간과 동일) |
-| `CAN_ENTER` | inactiveTtl (비활동 감지 기준과 동일) |
-| `COMPLETED` / `CANCELLED` / `EXPIRED` | 300s (클라이언트 마지막 폴링 대응) |
-
-### queue-stats Hash 필드
-
-```
-avgWaitingTime   → issuedAt ~ completedAt 평균 대기 시간 (초)
-waitingTimeSum   → 누적 대기 시간 합계. HINCRBYFLOAT
-waitingTimeCount → 누적 Admit 건수. HINCRBY
-
-갱신 시점: Admit(COMPLETED) 시
-```
-
-### 다국어 메시지 (messages.properties)
-
-```properties
-# messages.properties (기본 한국어)
-queue.status.waiting=대기 중입니다. 현재 {0}번째입니다.
-queue.status.can_enter=입장 가능합니다.
-queue.status.completed=입장이 완료됐습니다.
-queue.status.cancelled=대기열이 취소됐습니다.
-queue.status.expired=대기 시간이 초과됐습니다.
-
-# messages_en.properties
-queue.status.waiting=You are currently in position {0}.
-queue.status.can_enter=You can now enter.
-queue.status.completed=Entry completed.
-queue.status.cancelled=Queue cancelled.
-queue.status.expired=Queue time has expired.
-
-# messages_ja.properties
-queue.status.waiting=現在{0}番目です。
-queue.status.can_enter=入場可能です。
-queue.status.completed=入場が完了しました。
-queue.status.cancelled=キューがキャンセルされました。
-queue.status.expired=待機時間が超過しました。
-```
+| `queue:{tenantId}:{queueId}:{sliceNumber}` | Sorted Set | 없음 | 슬라이스별 대기열. score=global-seq |
+| `global-seq:{tenantId}:{queueId}` | String | 없음 | 글로벌 순번 채번. INCRBY 원자 실행 |
+| `queue-meta:{tenantId}:{queueId}` | Hash | 없음 | sliceCount, totalCapacity 등 |
+| `queue-stats:{tenantId}:{queueId}` | Hash | 없음 | avgWaitingTime, waitingTimeSum, waitingTimeCount |
+| `queue-user:{tenantId}:{queueId}:{userId}` | String | waitingTtl | userId → tokenId 역인덱스. 멱등 O(1) |
+| `token-last-active:{tokenId}` | String | inactiveTtl(300s) | 비활동 TTL 감지. Polling 호출마다 갱신 |
+| `token-info:{tokenId}` | String | 5s | Polling 캐시. DB QPS ≈ 0. 상태 변경 시 즉시 갱신 |
+| `admit-token:{tokenId}` | String | 30s | 입장토큰. verify/complete 시 조회 |
+| `admit-request-queue:{tenantId}:{queueId}` | List | 없음 | admit 요청 순서 보장. RPUSH/BLPOP |
+| `admit-idem:{requestId}` | String | 300s | admit 중복 요청 멱등성 |
+| `apikey-cache:{sha256Hash}` | String | 60s | API Key 인증 캐시. DB QPS ≈ 0 |
+| `billing-count:{tenantId}:{yyyyMM}` | String | 월말+7일 | Enqueue 과금 카운터. AOF 영속성 적용 |
 
 ---
 
 ## 9. 동시성 제어
 
-### Enqueue Lua Script
+### Enqueue Bulk Lua Script
 
 ```lua
-local seq = redis.call('INCR', KEYS[1])
-local slice = tonumber(seq) % tonumber(ARGV[1])
-local key = KEYS[2] .. ':' .. slice
-redis.call('ZADD', key, 'NX', seq, ARGV[2])
-redis.call('SET', 'token-status:' .. ARGV[2], 'WAITING', 'EX', ARGV[3])
-return seq
+-- INCRBY N → seq 블록 채번 + 슬라이스별 ZADD multi-member
+local count = #ARGV - 1
+local endSeq = redis.call('INCRBY', KEYS[1], count)
+local startSeq = endSeq - count + 1
+local sliceBatch = {}
+for i = 0, tonumber(ARGV[1])-1 do sliceBatch[i] = {} end
+for i = 2, #ARGV do
+    local seq = startSeq + (i-2)
+    local slice = (seq-1) % tonumber(ARGV[1])
+    table.insert(sliceBatch[slice], seq)
+    table.insert(sliceBatch[slice], ARGV[i])
+end
+for slice = 0, tonumber(ARGV[1])-1 do
+    if #sliceBatch[slice] > 0 then
+        redis.call('ZADD', KEYS[2]..':'..slice, 'NX', unpack(sliceBatch[slice]))
+    end
+end
 ```
 
 ### 전체 순위 계산 Lua Script
@@ -430,40 +488,30 @@ end
 return total + 1
 ```
 
-### CAN_ENTER 전이 Lua Script
-
-```lua
--- 누군가 빠질 때 원자적으로 다음 1등 CAN_ENTER 전이
-redis.call('ZREM', KEYS[1], ARGV[1])
-redis.call('SET', 'token-status:' .. ARGV[1], ARGV[2], 'EX', 300)
-local next = redis.call('ZRANGE', KEYS[1], 0, 0)
-if #next > 0 then
-    redis.call('SET', 'token-status:' .. next[1], 'CAN_ENTER', 'EX', 300)
-end
-return next
-```
-
 ### 동시성 문제별 해결
 
 | 문제 | 해결 |
 |------|------|
 | 중복 Enqueue | queue-user 역인덱스 + ZADD NX |
 | 용량 초과 경쟁 | Lua Script 원자 실행 |
-| 동시 Admit | DB 먼저 + ZREM 나중. Batch 싱크 자동 복구 |
-| CAN_ENTER 누락 | Lua Script 내 ZREM + ZRANGE 원자 처리 |
-| 동시 Dequeue | ZREM 단일 명령 원자적. 0 반환 시 스킵 |
+| 대량 Enqueue 병목 | INCRBY + ZADD multi-member (500건 Adaptive) |
+| admit 순서 보장 | Redis List RPUSH/BLPOP (Queue 단위 워커 풀 10개) |
+| admit 중복 요청 | Redis idempotency key (admit-idem:{requestId} EX 300) |
+| Dequeue WAITING 불일치 | DB 상태 확인 후 필터링 + 최대 3회 추가 추출 |
+| complete 동시성 | DB UPDATE WHERE status='ADMIT_ISSUED' (1번만 성공) |
+| ZREM 실패 | DB COMPLETED 먼저 → Batch 10초 내 ZREM 재실행 (멱등) |
 
 ---
 
 ## 10. ETA 계산
 
 ```
-estimatedWaitSeconds = rank × avgWaitingTime
+estimatedWaitSeconds = globalRank × avgWaitingTime
 
 avgWaitingTime = waitingTimeSum ÷ waitingTimeCount
                = 누적(issuedAt ~ completedAt) ÷ 누적 건수
 
-갱신: Admit(COMPLETED) 시 Redis에서 실시간 계산
+갱신: complete(COMPLETED) 시 Redis에서 실시간 계산
 초기값 없음: estimatedWaitSeconds = null
 ```
 
@@ -474,13 +522,13 @@ avgWaitingTime = waitingTimeSum ÷ waitingTimeCount
 | 코드 | HTTP | 상황 |
 |------|------|------|
 | `AK_001_UNAUTHORIZED` | 401 | API Key 무효 또는 REVOKED |
-| `TK_001_INVALID_TOKEN` | 401 | token 무효 (Polling 인증 실패) |
+| `TK_001_INVALID_TOKEN` | 401 | 대기토큰 무효 (Polling 인증 실패) |
+| `TK_002_INVALID_ADMIT_TOKEN` | 404 | 입장토큰 무효 또는 만료 |
 | `RL_001_KEY_LIMIT` | 429 | per-key 100rps 초과 |
 | `QM_001_NOT_FOUND` | 404 | 큐 없음 |
 | `QM_004_NOT_ACTIVE` | 503 | 큐 PAUSED / DRAINING |
 | `QE_001_CAPACITY_EXCEEDED` | 429 | maxCapacity 초과 |
 | `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 |
-| `QE_008_NOT_READY` | 409 | Admit 시 globalRank ≠ 1 |
 | `CM_001_INVALID_PARAM` | 400 | 파라미터 오류 |
 | `CM_003_INTERNAL_ERROR` | 500 | 서버 내부 오류 |
 | `CM_004_SERVICE_UNAVAILABLE` | 503 | Redis 장애 |
@@ -489,46 +537,37 @@ avgWaitingTime = waitingTimeSum ÷ waitingTimeCount
 
 ## 12. Batch 처리
 
-| Job | 주기 | 기준 | 처리 |
-|-----|------|------|------|
-| `TokenExpiryJob` | 30초 | Redis | WAITING/CAN_ENTER 토큰 TTL 만료 → EXPIRED |
-| `RedisSyncJob` | 5분 | DB | Redis 불일치 토큰 정합성 복구 |
-| `BillingSnapshotJob` | 1시간 | Redis | billing-count → DB 저장 |
+| Job | 주기 | 처리 |
+|-----|------|------|
+| `TokenExpiryJob` | 10초 | WAITING/ADMIT_ISSUED 토큰 TTL 만료 감지 |
+| `BillingSnapshotJob` | 1시간 | Redis billing-count → DB 저장 |
+| `InsertRetryJob` | 30초 | insert-retry-queue 재처리 |
 
-### TokenExpiryJob (30초)
+### TokenExpiryJob
 
 ```
-Redis 기준으로 만료 토큰 처리
+처리 대상: 큐별 병렬 처리 (동시 10개 / 타임아웃 8초)
 
-1. SCAN으로 모든 활성 큐 조회
-2. ZRANGEBYSCORE로 waitingTtl 초과 토큰 조회 → WAITING_TTL
-3. EXISTS token-last-active 없는 토큰 조회   → INACTIVE_TTL
-4. 각 토큰마다:
-   ① DB EXPIRED 업데이트 (먼저)
-   ② Redis ZREM + DEL token-status (나중)
-   ③ CAN_ENTER 상태였으면 → 다음 1등 CAN_ENTER 전이
+1. waitingTtl 체크 (WAITING 토큰)
+   ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms)
+   → expiredReason: WAITING_TTL
+   → DB UPDATE 100건씩 / 10ms 대기 → Redis ZREM
+
+2. inactiveTtl 체크 (WAITING 토큰)
+   EXISTS token-last-active:{tokenId} = 0
+   → expiredReason: INACTIVE_TTL
+
+3. ADMIT_TOKEN_TTL 체크 (ADMIT_ISSUED 토큰)
+   EXISTS admit-token:{tokenId} = 0
+   → WAITING 복귀 (EXPIRED 아님)
+   → DB SELECT seq WHERE status = 'ADMIT_ISSUED'
+   → Redis ZADD queue:{t}:{q}:{slice} {seq} {tokenId}
+   → DB UPDATE status = 'WAITING'
+   → DEL token-info:{tokenId} 캐시 갱신
 
 멱등 설계:
-  WHERE status IN ('WAITING', 'CAN_ENTER') 필터
-  → 이미 종료 상태면 조회 안 됨
-```
-
-### RedisSyncJob (5분)
-
-```
-DB 기준으로 Redis 불일치 복구
-
-1. DB에서 최근 5분간 상태 변경된 토큰 조회
-   (COMPLETED / CANCELLED / EXPIRED)
-2. 각 토큰마다:
-   GET token-status:{tokenId} 와 DB 상태 비교
-   → 일치: 패스
-   → 불일치:
-       ZREM (Sorted Set 잔류 시)
-       SET token-status 올바른 값으로 덮어쓰기
-3. CAN_ENTER가 날아간 케이스:
-   ZRANGE 0 0으로 다음 1등 조회
-   CAN_ENTER 전이 + DB 업데이트
+  WHERE status = 'WAITING' or 'ADMIT_ISSUED' 필터
+  → 이미 종료 상태면 조회 안 됨 → 중복 처리 없음
 ```
 
 ---
@@ -541,15 +580,31 @@ DB 기준으로 Redis 불일치 복구
 |-----|----------|----------|----------|
 | Enqueue | < 100ms | 200 rps | 10,000명 5분 집중 유입 |
 | Polling | < 50ms | 2,000 rps | 10,000명 ÷ 5초 간격 |
-| Admit | < 100ms | 10 rps | throughput 기준 |
+| admit | < 100ms | 10 rps | throughput 기준 |
+
+### 대용량 처리 설정값
+
+| 항목 | 값 |
+|------|-----|
+| Enqueue Bulk 묶음 | 500건 (Adaptive) |
+| Enqueue concurrency | 50 |
+| INSERT 묶음 | 100건 / 3회 재시도 |
+| SELECT 캐시 TTL | 5초 (변경 시 즉시 갱신) |
+| UPDATE 청크 | 100건 / 10ms 대기 |
+| Batch 주기 | 10초 |
+| Batch 동시 큐 | 10개 / 8초 타임아웃 |
+| admit 워커 | Queue 단위 / 풀 10개 |
+| Redis maxmemory | 4GB / noeviction |
 
 ### 안정성
 
 | 장애 | 영향 | 대응 |
 |------|------|------|
 | Redis 전체 다운 | Enqueue/Polling 중단 | Circuit Breaker → 503 |
-| Batch 중단 | TTL 만료 지연, Redis 싱크 지연 | 재기동 후 멱등 재실행 |
-| MySQL 다운 | Enqueue/Admit 중단 | Circuit Breaker → 503 |
+| Batch 중단 | TTL 만료 지연 | 재기동 후 멱등 재실행 |
+| MySQL 다운 | Enqueue/complete 중단 | Circuit Breaker → 503 |
+| INSERT 실패 | token DB 미저장 | insert-retry-queue → InsertRetryJob |
+| ZREM 실패 | Redis 잔류 (최대 10초) | Batch 자동 정리 |
 
 ### Blocking 방지
 
@@ -557,6 +612,7 @@ DB 기준으로 Redis 불일치 복구
 ReactiveRedisTemplate → Redis Non-Blocking
 R2DBC               → DB Non-Blocking
 BCrypt              → Schedulers.boundedElastic() 격리
+DB INSERT           → Reactor 비동기 백그라운드
 ```
 
 ---
@@ -564,8 +620,8 @@ BCrypt              → Schedulers.boundedElastic() 격리
 ## 🔥 핵심 원칙
 
 > Platform은 **순서만 관리**한다.
-> 입장 여부는 **Tenant 서버가 결정**한다.
+> 입장 여부는 **Tenant 서버가 결정**한다. (Backpressure Pull 방식)
 > 유저는 **Platform에 직접 Polling**한다.
-> Admit = COMPLETED. **Platform은 세션을 모른다.**
+> verify = 유효성 확인만. complete = COMPLETED + ZREM.
 > DB 먼저, ZREM 나중 — **잔류가 유실보다 안전**하다.
-> CAN_ENTER는 **내부 상태**. 클라이언트에게는 **isFirst 플래그**로만 노출.
+> seq를 DB에 저장 — **ADMIT_ISSUED 복귀 시 순위 복원 가능**하다.

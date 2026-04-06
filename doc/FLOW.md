@@ -1,6 +1,6 @@
 # 🔄 Queue Platform — 상세 흐름도
 
-> FRS v1.5 기준
+> FRS v1.6 기준
 
 ---
 
@@ -8,7 +8,7 @@
 
 ```mermaid
 flowchart TD
-    START(["POST /tokens
+    START(["POST /queues/:queueId/tokens
     Tenant 서버 호출
     { userId }"])
     --> AK["① API Key 검증
@@ -28,19 +28,17 @@ flowchart TD
 
     CAP -->|"≥ totalCapacity"| E429(["429
     QE_001_CAPACITY_EXCEEDED"])
-    CAP -->|"여유 있음"| LUA["⑥ Lua Script 원자 실행
-    INCR global-seq → seq
-    slice = seq % sliceCount
-    ZADD queue:{t}:{q}:{slice} NX {seq}
-    SET token-status:{tokenId} WAITING EX waitingTtl"]
+    CAP -->|"여유 있음"| LUA["⑥ Bulk Lua Script 원자 실행
+    INBYN global-seq N → startSeq~endSeq
+    슬라이스별 ZADD multi-member NX
+    slice = (seq-1) % sliceCount"]
 
     LUA --> OK(["200 OK
-    { token, rank, isFirst: false,
-      message, estimatedWaitSeconds }"])
-    OK --> ASYNC["⑦ 비동기
+    { token, globalRank, estimatedWaitSeconds }"])
+    OK --> ASYNC["⑦ 비동기 (Reactor 백그라운드)
+    DB INSERT 100건 Bulk / 3회 재시도
     INCR billing-count
-    SET queue-user 역인덱스
-    DB tokens INSERT"]
+    SET queue-user 역인덱스"]
 
     AK -->|"무효"| E401(["401 AK_001_UNAUTHORIZED"])
     RL -->|"초과"| E429B(["429 RL_001_KEY_LIMIT"])
@@ -53,110 +51,118 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    POLL(["GET /tokens/{token}
-    유저가 직접 호출
+    POLL(["GET /queues/:queueId/tokens/:token
+    유저가 직접 호출 (5초 간격)
     token으로 인증"])
     --> TK["① token 유효성 확인
-    DB 조회"]
+    Redis GET token-info:{tokenId} (캐시 5초)
+    미스 시 DB 조회 → 캐시 저장"]
 
     TK -->|"무효/만료"| E401(["401 TK_001_INVALID_TOKEN"])
-    TK -->|"유효"| STATUS["② GET token-status:{tokenId}
-    Redis 상태 조회"]
-
-    STATUS --> RANK["③ 전체 순위 계산
+    TK -->|"유효 (WAITING)"| RANK["② 전체 순위 계산
     Lua Script
     ZSCORE → mySeq
     모든 슬라이스 ZCOUNT 합산
-    rank = 합산 + 1"]
+    globalRank = 합산 + 1"]
 
-    RANK --> LA["④ SET token-last-active
+    RANK --> LA["③ SET token-last-active
     EX inactiveTtl 리셋"]
-    --> ETA["⑤ HGET queue-stats avgWaitingTime
-    estimatedWaitSeconds = rank × avgWaitingTime"]
-    --> MSG["⑥ QueueMessageSource
-    상태별 다국어 메시지 조회
-    Accept-Language 헤더 기반"]
+    --> ETA["④ HGET queue-stats avgWaitingTime
+    estimatedWaitSeconds = globalRank × avgWaitingTime"]
     --> RESP(["200 OK
-    { rank, isFirst, message,
-      estimatedWaitSeconds }"])
+    { globalRank, estimatedWaitSeconds
+    ready: false, admitToken: null }"])
+    RESP -->|"계속 대기"| POLL
 
-    RESP -->|"isFirst: false"| POLL
-    RESP -->|"isFirst: true"| NOTIFY["유저 → Tenant
-    나 ready야"]
-```
-
-> `token-status:{tokenId}` 가 `CAN_ENTER`이면 `isFirst: true` 반환.
-> 클라이언트에게 상태값(CAN_ENTER)은 직접 노출하지 않음.
-
----
-
-## CAN_ENTER 전이 흐름
-
-```mermaid
-flowchart TD
-    TRIGGER["누군가 대기열에서 빠짐
-    COMPLETED / CANCELLED / EXPIRED"]
-    --> LUA["Lua Script 원자 실행
-    ZREM queue:{t}:{q}:{slice} {tokenId}
-    SET token-status:{tokenId} {newStatus} EX 300"]
-    --> NEXT["ZRANGE queue:{t}:{q}:{slice} 0 0
-    다음 1등 tokenId 조회"]
-
-    NEXT -->|"없음"| DONE(["대기열 비어있음
-    종료"])
-    NEXT -->|"있음"| CE["SET token-status:{nextTokenId} CAN_ENTER EX 300
-    DB status = CAN_ENTER 업데이트"]
-    --> POLLING["다음 Polling 시
-    isFirst: true 반환
-    message: 입장 가능합니다."]
+    TK -->|"유효 (ADMIT_ISSUED)"| AT["⑤ Redis GET admit-token:{tokenId}
+    admitToken 조회"]
+    --> ARESP(["200 OK
+    { globalRank: 1, ready: true
+    admitToken: at_xxx }"])
+    --> USER["유저 → Tenant
+    admitToken 전달"]
 ```
 
 ---
 
-## Status 확인 → Admit
+## Admit → Verify → Complete
 
 ```mermaid
 flowchart TD
-    NOTIFY["유저 → Tenant
-    ready 알림"]
-    --> SLOT{"Tenant
-    슬롯 여유?"}
+    SLOT(["Tenant
+    슬롯 여유 생김"])
+    --> ADMIT["POST /queues/:queueId/admit
+    { count: N, requestId }
+    Tenant → Platform"]
 
-    SLOT -->|"없음"| WAIT["유저에게 대기 안내
-    10초 후 재시도"]
-    WAIT --> NOTIFY
+    ADMIT --> IDEM{"admit-idem:{requestId}
+    존재?"}
+    IDEM -->|"있음 (중복)"| CACHED(["200 OK
+    기존 결과 반환"])
+    IDEM -->|"없음"| QUEUE["Redis List RPUSH
+    admit-request-queue:{t}:{q}
+    순서 보장 적재"]
 
-    SLOT -->|"있음"| STATUS["GET /tokens/{token}/status
+    QUEUE --> WORKER["Queue 단위 워커 (풀 10개)
+    BLPOP — 이전 완료 후 꺼냄"]
+    --> LUA["Lua Script
+    슬라이스별 ZRANGE WITHSCORES
+    Lua 내부 score 정렬
+    상위 N명 선택
+    ZREM multi-member"]
+    --> FILTER["DB WAITING 상태 확인
+    불일치 즉시 ZREM
+    부족 시 최대 3회 추가 추출"]
+    --> TOKEN["admitToken 발급
+    SET admit-token:{tokenId} EX 30
+    DB UPDATE ADMIT_ISSUED (100건씩)
+    SET token-info 캐시 갱신"]
+    --> ARESP(["200 OK
+    { admitTokens: [{userId, admitToken}...] }"])
+
+    ARESP --> POLL["유저 다음 Polling 시
+    admitToken 수신"]
+    --> USER["유저 → Tenant
+    admitToken 전달"]
+    --> VERIFY["POST /admit-tokens/:admitToken/verify
     Tenant → Platform
-    Admit 전 상태 확인"]
+    유효성 확인만 (상태 변경 없음)"]
 
-    STATUS --> CHECK{"isFirst: true?"}
-    CHECK -->|"false 또는 EXPIRED"| SKIP["스킵
-    다음 슬롯 날 때 재시도"]
-    CHECK -->|"true"| ADMIT
+    VERIFY --> VK{"admitToken
+    유효?"}
+    VK -->|"만료 or 무효"| E404(["404 TK_002_INVALID_ADMIT_TOKEN"])
+    VK -->|"유효"| VRESP(["200 OK
+    { valid: true, userId }"])
 
-    ADMIT(["POST /tokens/{token}/admit
-    Tenant → Platform"])
-    --> V1["① WAITING 또는 CAN_ENTER 확인
-    + globalRank = 1 확인"]
-    V1 -->|"아님"| E409(["409 QE_008_NOT_READY"])
-    V1 -->|"확인"| DB["② DB status = COMPLETED
-    먼저 (원자성 전략)"]
-    --> ZREM["③ Redis ZREM
-    나중"]
-    --> CE["④ Lua Script
-    다음 1등 CAN_ENTER 전이"]
-    --> ETA_UPDATE["⑤ avgWaitingTime 갱신
-    HINCRBYFLOAT waitingTimeSum
-    HINCRBY waitingTimeCount
-    HSET avgWaitingTime"]
-    --> AOK(["200 OK
+    VRESP --> ALLOW["Tenant → 유저 입장 허용"]
+    --> COMPLETE["POST /tokens/:token/complete
+    { admitToken }
+    Tenant → Platform
+    입장 완료 통보"]
+
+    COMPLETE --> CK{"ADMIT_ISSUED
+    상태?"}
+    CK -->|"아님"| E409(["409 QE_006_INVALID_STATUS"])
+    CK -->|"확인"| DB["DB status = COMPLETED
+    ← 먼저 (원자성 전략)"]
+    --> ZREM["Redis ZREM
+    DEL admit-token
+    DEL token-info 캐시
+    ← 나중"]
+    --> AVG["avgWaitingTime 갱신
+    waitingSeconds = now - issuedAt"]
+    --> COK(["200 OK
     { status: COMPLETED, completedAt }"])
-    --> ALLOW["Tenant → 유저
-    입장 허용"]
 
-    DB -->|"ZREM 실패 시"| FIX["Batch 싱크 스케줄러
-    5분 내 Redis 정합성 복구"]
+    DB -->|"ZREM 실패 시"| FIX["Batch 10초 내
+    ZREM 재실행 (멱등)"]
+
+    TOKEN -->|"admitToken TTL 30초 초과
+    Batch 감지"| BACK["WAITING 복귀
+    DB SELECT seq
+    Redis ZADD {seq} {tokenId}
+    DB UPDATE WAITING
+    DEL token-info 캐시"]
 ```
 
 ---
@@ -165,92 +171,69 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    DQ(["DELETE /tokens/{token}
+    DQ(["DELETE /queues/:queueId/tokens/:token
     Tenant 서버 호출
     유저 대기 포기"])
-    --> CHK["WAITING 또는 CAN_ENTER 상태 확인"]
+    --> CHK["상태 확인"]
 
-    CHK -->|"아님"| E409(["409 QE_006_INVALID_STATUS"])
-    CHK -->|"확인"| DB["DB status = CANCELLED
+    CHK -->|"ADMIT_ISSUED"| E409A(["409 QE_006_INVALID_STATUS
+    입장토큰 발급 후 이탈 불가
+    admitToken TTL 30초 후
+    WAITING 복귀 후 이탈 가능"])
+    CHK -->|"WAITING 아님
+    (COMPLETED/EXPIRED/CANCELLED)"| E409B(["409 QE_006_INVALID_STATUS"])
+    CHK -->|"WAITING"| ZREM["Redis ZREM
+    뒤 순위 자동 당겨짐"]
+    --> DB["DB status = CANCELLED
     cancelledAt 기록"]
-    --> ZREM["Redis ZREM"]
-    --> CE["CAN_ENTER 상태였으면
-    다음 1등 CAN_ENTER 전이"]
     --> DEL["DEL queue-user 역인덱스
-    DEL token-status:{tokenId}
-    같은 userId 재Enqueue 가능"]
+    DEL token-info 캐시
+    같은 userId 재Enqueue 가능 (맨 뒤)"]
     --> OK(["200 OK
     { status: CANCELLED, cancelledAt }"])
 ```
 
 ---
 
-## TTL 만료 Batch
-
-### 스케줄러 1: 만료 처리 (30초 주기)
+## TTL 만료 Batch (10초 주기)
 
 ```mermaid
 flowchart TD
     JOB(["TokenExpiryJob
-    30초 주기"])
-    --> ALIST["SCAN으로 활성 큐 목록 조회
-    ACTIVE · PAUSED · DRAINING"]
+    10초 주기"])
+    --> ALIST["활성 큐 목록 조회
+    ACTIVE · PAUSED · DRAINING
+    큐별 병렬 처리 (동시 10개 / 8초 타임아웃)"]
 
-    ALIST --> W1 & W2
+    ALIST --> W1 & W2 & W3
 
-    W1["waitingTtl 체크
+    W1["waitingTtl 체크 (WAITING)
     ZRANGEBYSCORE
     0 ~ now_ms - waitingTtl_ms"]
-    W2["inactiveTtl 체크
+    W2["inactiveTtl 체크 (WAITING)
     EXISTS token-last-active
     = 0 이면 비활동"]
+    W3["admitToken TTL 체크 (ADMIT_ISSUED)
+    EXISTS admit-token:{tokenId}
+    = 0 이면 만료"]
 
-    W1 -->|"WAITING_TTL"| EXP
+    W1 -->|"WAITING_TTL"| EXP["DB UPDATE EXPIRED
+    expiredReason 기록
+    Redis ZREM
+    DEL token-info 캐시
+    100건씩 / 10ms 대기"]
     W2 -->|"INACTIVE_TTL"| EXP
 
-    EXP["① DB status = EXPIRED
-    expiredReason 기록 (먼저)
-    ② Redis ZREM (나중)
-    ③ DEL token-status:{tokenId}"]
-    --> CE["CAN_ENTER 상태였으면
-    다음 1등 CAN_ENTER 전이
-    DB + Redis 모두 업데이트"]
-    --> DONE(["완료
-    멱등: WAITING / CAN_ENTER 상태만 처리"])
+    W3 -->|"ADMIT_TOKEN_TTL"| BACK["WAITING 복귀
+    DB SELECT seq
+    Redis ZADD {seq} {tokenId}
+    DB UPDATE WAITING
+    DEL token-info 캐시"]
+
+    EXP --> DONE(["완료
+    멱등: 상태 필터로 중복 처리 없음"])
+    BACK --> DONE
 ```
-
-### 스케줄러 2: Redis 싱크 (5분 주기)
-
-```mermaid
-flowchart TD
-    SYNC(["RedisSyncJob
-    5분 주기"])
-    --> DBQUERY["DB에서 최근 5분간
-    상태 변경된 토큰 조회
-    (COMPLETED / CANCELLED / EXPIRED)"]
-
-    DBQUERY --> EACH["각 토큰마다
-    GET token-status:{tokenId} 조회"]
-
-    EACH --> CMP{"DB 상태와
-    Redis 상태 일치?"}
-
-    CMP -->|"일치"| PASS["패스"]
-    CMP -->|"불일치"| FIX["Redis 정합성 복구
-    ZREM (잔류 시)
-    SET token-status 올바른 값으로 덮어쓰기"]
-
-    FIX --> CECHECK{"CAN_ENTER가
-    날아간 케이스?"}
-    CECHECK -->|"아님"| DONE(["완료"])
-    CECHECK -->|"맞음"| CE["ZRANGE 0 0
-    다음 1등 조회
-    CAN_ENTER 전이"]
-    CE --> DONE
-```
-
-> DB가 Source of Truth. Redis 오류 발생 시 DB 기준으로 복구.
-> 처리 순서: DB 먼저 → Redis 나중. Redis 실패 시 싱크 스케줄러가 5분 내 복구.
 
 ---
 
@@ -258,12 +241,13 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph GLOBAL["글로벌 순번"]
+    subgraph GLOBAL["글로벌 순번 (Bulk)"]
         SEQ["global-seq:{t}:{q}
-        INCR → 1,2,3,4,5,6..."]
+        INBYN 500 → 1~500 블록 채번"]
     end
 
-    subgraph SLICES["슬라이스"]
+    subgraph SLICES["슬라이스
+    slice = (seq-1) % sliceCount (라운드로빈)"]
         S0["queue:{t}:{q}:0
         seq 1,4,7,10..."]
         S1["queue:{t}:{q}:1
@@ -279,10 +263,20 @@ flowchart LR
         합산 + 1 = 5등"]
     end
 
+    subgraph DEQUEUE["Admit Dequeue (N명)"]
+        D["슬라이스별 ZRANGE WITHSCORES
+        Lua 내부 score 정렬
+        상위 N명 선택
+        ZREM multi-member"]
+    end
+
     SEQ --> S0
     SEQ --> S1
     SEQ --> S2
     S0 --> R
     S1 --> R
     S2 --> R
+    S0 --> D
+    S1 --> D
+    S2 --> D
 ```

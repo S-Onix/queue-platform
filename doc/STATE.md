@@ -1,6 +1,6 @@
 # 📊 Queue Platform — 상태 흐름도
 
-> FRS v1.5 기준
+> FRS v1.6 기준
 
 ---
 
@@ -8,63 +8,47 @@
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING : POST /tokens
-    WAITING --> CAN_ENTER : rank 1 도달
-    CAN_ENTER --> COMPLETED : POST /admit
-    WAITING --> CANCELLED : DELETE /token
-    WAITING --> EXPIRED : Batch 30초
-    CAN_ENTER --> CANCELLED : DELETE /token
+    [*] --> WAITING : POST /tokens<br/>Enqueue (Tenant 서버)<br/>ZADD NX, score=global-seq
+
+    WAITING --> ADMIT_ISSUED : POST /admit<br/>Tenant 서버 — N명 입장토큰 발급<br/>admitToken TTL 30초
+
+    ADMIT_ISSUED --> COMPLETED : POST /tokens/{token}/complete<br/>Tenant 서버 — 입장 완료 통보<br/>DB COMPLETED + Redis ZREM
+
+    ADMIT_ISSUED --> WAITING : admitToken TTL 30초 초과<br/>Batch 10초 주기 감지<br/>WAITING 복귀 (EXPIRED 아님)<br/>seq 유지 → 우선순위 보존
+
+    WAITING --> CANCELLED : DELETE /token<br/>유저 자발적 이탈<br/>WAITING만 허용<br/>ZREM + cancelledAt
+
+    WAITING --> EXPIRED : Batch 10초 주기<br/>waitingTtl / inactiveTtl 초과
+
     COMPLETED --> [*]
     CANCELLED --> [*]
     EXPIRED --> [*]
 ```
 
-### 상태별 의미
-
-| 상태 | 내부 의미 | 클라이언트 응답 |
-|------|----------|----------------|
-| `WAITING` | 대기 중 | `isFirst: false` |
-| `CAN_ENTER` | rank 1 도달. 입장 가능 | `isFirst: true` |
-| `COMPLETED` | 입장 완료 | `isFirst: false` |
-| `CANCELLED` | 유저 자발적 이탈 | `isFirst: false` |
-| `EXPIRED` | TTL 초과 만료 | `isFirst: false` |
-
-> `CAN_ENTER`는 내부 상태값. 클라이언트에게는 `isFirst: true`로만 노출.
-> 클라이언트는 상태값(status)이 아닌 `isFirst` 플래그로 입장 가능 여부를 판단.
-
 ### 핵심 설계 결정
 
 | 항목 | 내용 |
 |------|------|
-| ADMITTED 상태 | **없음** — Admit 즉시 COMPLETED |
-| CAN_ENTER 전이 시점 | rank 1 도달 시 Lua Script 내에서 원자적으로 SET |
+| ADMIT_ISSUED | 입장토큰 발급됨. 유저가 Polling으로 admitToken 수신 대기 |
+| verify | ADMIT_ISSUED 상태 유지. 유효성 확인만. 상태 변경 없음 |
+| complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
+| admitToken 만료 | WAITING 복귀 (EXPIRED 아님). seq DB 저장값으로 순위 복원 |
+| 이탈 허용 | WAITING만. ADMIT_ISSUED → 409 (유저 귀책) |
 | 세션 관리 | Tenant 책임. Platform 관여 안 함 |
-| Admit 순서 | DB 먼저 → ZREM 나중 (잔류가 유실보다 안전) |
-| 복구 | Batch 싱크 스케줄러가 5분 내 Redis 정합성 복구 |
-
-### CAN_ENTER 전이 Lua Script
-
-```lua
--- 누군가 대기열에서 빠질 때 (COMPLETED / CANCELLED / EXPIRED 전이 시)
-redis.call('ZREM', queueKey, tokenId)
-redis.call('SET', 'token-status:' .. tokenId, 'COMPLETED', 'EX', 300)
-
--- 다음 1등 확인 후 CAN_ENTER 전이
-local next = redis.call('ZRANGE', queueKey, 0, 0)
-if #next > 0 then
-    redis.call('SET', 'token-status:' .. next[1], 'CAN_ENTER', 'EX', 300)
-end
-```
+| complete 순서 | DB 먼저 → ZREM 나중 (잔류가 유실보다 안전) |
+| 복구 | Batch 10초 내 ZREM 재실행 (멱등) |
+| seq 저장 | DB tokens.seq 컬럼 — ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
 
 ### expiredReason
 
-| 값 | 원인 | Batch 감지 방법 |
-|----|------|----------------|
-| `WAITING_TTL` | waitingTtl(기본 7200s) 초과 | `ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms)` |
-| `INACTIVE_TTL` | 마지막 Polling 후 inactiveTtl(기본 1800s) 초과 | `EXISTS token-last-active:{tokenId}` = 0 |
+| 값 | 원인 | 대상 상태 | Batch 감지 방법 |
+|----|------|----------|----------------|
+| `WAITING_TTL` | waitingTtl(기본 7200s) 초과 | WAITING | `ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms)` |
+| `INACTIVE_TTL` | 마지막 Polling 후 inactiveTtl(기본 300s) 초과 | WAITING | `EXISTS token-last-active:{tokenId}` = 0 |
+| `ADMIT_TOKEN_TTL` | 입장토큰 30초 초과 미사용 → WAITING 복귀 (EXPIRED 아님) | ADMIT_ISSUED | `EXISTS admit-token:{tokenId}` = 0 |
 
-> `CAN_ENTER` 상태에서 만료된 경우도 동일하게 `INACTIVE_TTL` 처리.
-> Batch가 다음 1등에게 `CAN_ENTER` 전이 후 DB도 업데이트.
+> ADMIT_TOKEN_TTL은 EXPIRED 처리가 아닌 WAITING 복귀
+> DB tokens.seq 기준으로 Redis ZADD score 복원 → 우선순위 유지
 
 ---
 
@@ -72,15 +56,15 @@ end
 
 ```mermaid
 stateDiagram-v2
-    [*] --> ACTIVE : POST /queues
+    [*] --> ACTIVE : POST /queues<br/>대기열 생성
 
-    ACTIVE --> PAUSED : POST /pause
+    ACTIVE --> PAUSED : POST /pause<br/>신규 Enqueue 차단<br/>기존 대기자 유지
     PAUSED --> ACTIVE : POST /resume
 
-    ACTIVE --> DRAINING : DELETE /queues
+    ACTIVE --> DRAINING : DELETE /queues<br/>잔여 토큰 순차 만료
     PAUSED --> DRAINING : DELETE /queues
 
-    DRAINING --> DELETED : Batch DrainJob
+    DRAINING --> DELETED : Batch DrainJob<br/>잔여 토큰 = 0 확인 후
 
     DELETED --> [*]
 ```
@@ -100,18 +84,19 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> ACTIVE : POST /api-keys
-    ACTIVE --> REVOKED : DELETE /api-keys/{id}
+    [*] --> ACTIVE : POST /api-keys<br/>SHA-256 해시 저장<br/>Redis 캐시 TTL 60s
+
+    ACTIVE --> REVOKED : DELETE /api-keys/{id}<br/>즉시 + Redis 캐시 DEL
 
     state ACTIVE {
-        [*] --> normal
-        normal : SHA-256 해시 저장
-        normal : Redis 캐시 TTL 60s
+        [*] --> 정상운영
+        정상운영 : SHA-256 해시 저장
+        정상운영 : Redis 캐시 TTL 60s
     }
 
     state REVOKED {
-        [*] --> invalid
-        invalid : Redis 캐시 DEL
-        invalid : 이후 401 반환
+        [*] --> 즉시무효화
+        즉시무효화 : Redis 캐시 DEL
+        즉시무효화 : 이후 401 반환
     }
 ```
