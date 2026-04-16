@@ -1,6 +1,7 @@
 dependencies {
     implementation project(':queue-common')
 
-    compileOnly "org.projectlombok:lombok:${lombokVersion}"
+    // 순수 Java — Spring 의존 없음
+    compileOnly      "org.projectlombok:lombok:${lombokVersion}"
     annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
 }

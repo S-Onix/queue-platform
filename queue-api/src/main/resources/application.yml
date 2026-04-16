@@ -1,71 +1,35 @@
 spring:
+  application:
+    name: queue-api
+
+  # Java 21 Virtual Thread 활성화 (Spring Boot 3.2+)
   threads:
     virtual:
-      enabled: true   # Virtual Thread 활성화
+      enabled: true
 
-  datasource:
-    master:
-      url: jdbc:mysql://localhost:3306/queue_platform?serverTimezone=UTC
-      driver-class-name: com.mysql.cj.jdbc.Driver
-      username: ${DB_MASTER_USER:root}
-      password: ${DB_MASTER_PASS:password}
-    replica:
-      url: jdbc:mysql://localhost:3307/queue_platform?serverTimezone=UTC
-      driver-class-name: com.mysql.cj.jdbc.Driver
-      username: ${DB_REPLICA_USER:root}
-      password: ${DB_REPLICA_PASS:password}
-    hikari:
-      maximum-pool-size: 50
-      minimum-idle: 10
-      connection-timeout: 3000
-
-  jpa:
-    hibernate:
-      ddl-auto: validate
-    properties:
-      hibernate:
-        dialect: org.hibernate.dialect.MySQLDialect
-        format_sql: true
-    open-in-view: false
-
-  data:
-    redis:
-      sentinel:
-        master: mymaster
-        nodes:
-          - localhost:26379
-          - localhost:26380
-          - localhost:26381
-      password: ${REDIS_PASSWORD:}
-      lettuce:
-        pool:
-          max-active: 50
-          max-idle: 20
-          min-idle: 5
-
-  kafka:
-    bootstrap-servers: localhost:9092
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.apache.kafka.common.serialization.StringSerializer
-      acks: all
-    consumer:
-      group-id: queue-api
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      auto-offset-reset: earliest
-      enable-auto-commit: false
-    listener:
-      type: batch
-      ack-mode: MANUAL_IMMEDIATE
-
-jwt:
-  secret: ${JWT_SECRET:local-dev-secret-key-must-be-long-enough}
-  access-expiry-ms: 900000      # 15분
-  refresh-expiry-ms: 604800000  # 7일
+  # Sprint 1: 인프라 autoconfiguration 비활성화
+  # Sprint 2(JPA), Sprint 4(Redis), Sprint 7(Kafka) 진행 시 해당 라인 제거
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
 
 server:
   port: 8080
-  tomcat:
-    threads:
-      max: 200
+
+# Actuator (Sprint 1: health check만)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    com.sonix.queue: DEBUG

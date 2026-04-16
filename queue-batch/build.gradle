@@ -1,8 +1,16 @@
+apply plugin: 'org.springframework.boot'
+
 dependencies {
     implementation project(':queue-domain')
     implementation project(':queue-infrastructure')
     implementation project(':queue-common')
 
-    compileOnly "org.projectlombok:lombok:${lombokVersion}"
+    // Spring MVC (Batch도 내장 Tomcat)
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+
+    // Kafka Consumer
+    implementation 'org.springframework.kafka:spring-kafka'
+
+    compileOnly      "org.projectlombok:lombok:${lombokVersion}"
     annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
 }
