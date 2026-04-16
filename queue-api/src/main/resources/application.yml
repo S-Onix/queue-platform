@@ -1,0 +1,71 @@
+spring:
+  threads:
+    virtual:
+      enabled: true   # Virtual Thread 활성화
+
+  datasource:
+    master:
+      url: jdbc:mysql://localhost:3306/queue_platform?serverTimezone=UTC
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      username: ${DB_MASTER_USER:root}
+      password: ${DB_MASTER_PASS:password}
+    replica:
+      url: jdbc:mysql://localhost:3307/queue_platform?serverTimezone=UTC
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      username: ${DB_REPLICA_USER:root}
+      password: ${DB_REPLICA_PASS:password}
+    hikari:
+      maximum-pool-size: 50
+      minimum-idle: 10
+      connection-timeout: 3000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+    open-in-view: false
+
+  data:
+    redis:
+      sentinel:
+        master: mymaster
+        nodes:
+          - localhost:26379
+          - localhost:26380
+          - localhost:26381
+      password: ${REDIS_PASSWORD:}
+      lettuce:
+        pool:
+          max-active: 50
+          max-idle: 20
+          min-idle: 5
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+    consumer:
+      group-id: queue-api
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    listener:
+      type: batch
+      ack-mode: MANUAL_IMMEDIATE
+
+jwt:
+  secret: ${JWT_SECRET:local-dev-secret-key-must-be-long-enough}
+  access-expiry-ms: 900000      # 15분
+  refresh-expiry-ms: 604800000  # 7일
+
+server:
+  port: 8080
+  tomcat:
+    threads:
+      max: 200
