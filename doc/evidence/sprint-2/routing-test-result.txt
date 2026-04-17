@@ -1,0 +1,15 @@
+=== Sprint 2 R/W Routing Test Result ===
+Date: 2026-04-17
+Command: ./gradlew :queue-infrastructure:test --tests "*RoutingDataSourceTest"
+
+[Test 1] Write -> Master Routing
+>>> Routing to [master]
+Result: PASSED
+
+[Test 2] Read -> Replica Routing  
+>>> Routing to [replica]
+HikariPool-2 - Start completed.
+Result: PASSED
+
+BUILD SUCCESSFUL
+2 tests passed, 0 failed
