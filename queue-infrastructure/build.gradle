@@ -12,6 +12,16 @@ dependencies {
     // Kafka
     implementation 'org.springframework.kafka:spring-kafka'
 
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+
     compileOnly      "org.projectlombok:lombok:${lombokVersion}"
     annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        showStandardStreams = true   // System.out + 로그 출력
+        events "passed", "failed"
+    }
 }
