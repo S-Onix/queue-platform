@@ -1,0 +1,30 @@
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+
+  datasource:
+    master:
+      jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      username: queueapp
+      password: queueapp1234
+      maximum-pool-size: 10
+    replica:
+      jdbc-url: jdbc:mysql://127.0.0.1:3307/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      username: queueapp
+      password: queueapp1234
+      maximum-pool-size: 30
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+
+logging:
+  level:
+    com.sonix.queue: DEBUG
