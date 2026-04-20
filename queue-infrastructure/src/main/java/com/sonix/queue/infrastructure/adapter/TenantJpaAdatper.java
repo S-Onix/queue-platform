@@ -1,18 +1,19 @@
-package com.sonix.queue.infrastructure.repository;
+package com.sonix.queue.infrastructure.adapter;
 
 import com.sonix.queue.domain.tenant.Tenant;
 import com.sonix.queue.domain.tenant.TenantRepository;
 import com.sonix.queue.infrastructure.entity.TenantEntity;
+import com.sonix.queue.infrastructure.repository.TenantJpaRepository;
 import org.springframework.stereotype.Repository;
 
 import java.util.Optional;
 
 @Repository
-public class TenantRepositoryImpl implements TenantRepository {
+public class TenantJpaAdatper implements TenantRepository {
 
     private final TenantJpaRepository tenantJpaRepository;
 
-    public TenantRepositoryImpl(TenantJpaRepository tenantJpaRepository) {
+    public TenantJpaAdatper(TenantJpaRepository tenantJpaRepository) {
         this.tenantJpaRepository = tenantJpaRepository;
     }
 
