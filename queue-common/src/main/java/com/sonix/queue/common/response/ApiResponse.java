@@ -1,6 +1,6 @@
-package com.queueplatform.common.response;
+package com.sonix.queue.common.response;
 
-import com.queueplatform.common.exception.ErrorCode;
+import com.sonix.queue.common.exception.ErrorCode;
 import lombok.Getter;
 
 import java.time.LocalDateTime;

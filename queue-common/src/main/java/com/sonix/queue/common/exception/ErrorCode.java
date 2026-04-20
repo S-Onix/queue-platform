@@ -1,4 +1,4 @@
-package com.queueplatform.common.exception;
+package com.sonix.queue.common.exception;
 
 public enum ErrorCode {
 

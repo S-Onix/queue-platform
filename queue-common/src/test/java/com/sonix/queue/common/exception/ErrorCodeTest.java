@@ -1,4 +1,4 @@
-package com.queueplatform.common.exception;
+package com.sonix.queue.common.exception;
 
 import static org.assertj.core.api.Assertions.*;
 import org.junit.jupiter.api.Test;

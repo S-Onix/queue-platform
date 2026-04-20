@@ -1,6 +1,6 @@
-package com.queueplatform.common.response;
+package com.sonix.queue.common.response;
 
-import com.queueplatform.common.exception.ErrorCode;
+import com.sonix.queue.common.exception.ErrorCode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
