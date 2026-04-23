@@ -1,3 +1,18 @@
+### 로그인 → 토큰 발급
+POST http://localhost:8080/api/v1/tenants/login
+Content-Type: application/json
+
+{"email":"test2@email.com","password":"1234"}
+
+### 토큰 없이 API Key 발급 → 401 기대
+POST http://localhost:8080/api/v1/tenants/me/api-keys?tenantId=1
+Content-Type: application/json
+
+### 토큰 있이 API Key 발급 → 200 기대 (accessToken을 아래에 붙여넣기)
+POST http://localhost:8080/api/v1/tenants/me/api-keys?tenantId=1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc2OTMzNjM0LCJleHAiOjE3NzY5MzQ1MzR9.eqA6Ba0Bo2MLe_wX06LcV77SQ37PLrY8pxdkVuBge1s38fxVLxjurxGSSo6RyMvB
+
 ### 로그인 - 잘못된 비밀번호
 POST http://localhost:8080/api/v1/tenants/login
 Content-Type: application/json
@@ -28,6 +43,7 @@ Content-Type: application/json
 
 {"email":"test2@email.com","password":"1234","name":"test2"}
 
-### API Key 발급
-POST http://localhost:8080/api/v1/tenants/me/api-keys?tenantId=1
+### API Key 발급 (JWT 인증)
+POST http://localhost:8080/api/v1/tenants/me/api-keys
 Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc2OTMzNjM0LCJleHAiOjE3NzY5MzQ1MzR9.eqA6Ba0Bo2MLe_wX06LcV77SQ37PLrY8pxdkVuBge1s38fxVLxjurxGSSo6RyMvB

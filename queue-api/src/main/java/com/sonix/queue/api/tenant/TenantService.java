@@ -1,5 +1,6 @@
 package com.sonix.queue.api.com.sonix.queue.api.tenant;
 
+import com.sonix.queue.api.com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.com.sonix.queue.api.tenant.dto.LoginRequest;
 import com.sonix.queue.api.com.sonix.queue.api.tenant.dto.LoginResponse;
 import com.sonix.queue.api.com.sonix.queue.api.tenant.dto.SignupRequest;
@@ -18,10 +19,12 @@ import java.util.Optional;
 public class TenantService {
     private final TenantRepository tenantRepository;
     private final PasswordHasher passwordHasher;
+    private final JwtProvider jwtProvider;
 
-    public TenantService(TenantRepository tenantRepository, PasswordHasher passwordHasher) {
+    public TenantService(TenantRepository tenantRepository, PasswordHasher passwordHasher, JwtProvider jwtProvider) {
         this.tenantRepository = tenantRepository;
         this.passwordHasher = passwordHasher;
+        this.jwtProvider = jwtProvider;
     }
 
     @Transactional
@@ -46,6 +49,9 @@ public class TenantService {
             throw new BusinessException(ErrorCode.INVALID_PASSWORD);
         }
 
-        return LoginResponse.from(tenant);
+        String accessToken = jwtProvider.generateAccessToken(tenant.getId(), tenant.getTenantId());
+        String refreshToken = jwtProvider.generateRefreshToken(tenant.getId());
+
+        return LoginResponse.of(accessToken, refreshToken);
     }
 }
