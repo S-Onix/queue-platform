@@ -12,6 +12,8 @@ dependencies {
     // Kafka
     implementation 'org.springframework.kafka:spring-kafka'
 
+    implementation 'org.springframework.security:spring-security-crypto'
+
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 
     compileOnly      "org.projectlombok:lombok:${lombokVersion}"
