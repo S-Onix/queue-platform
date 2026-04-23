@@ -1,4 +1,4 @@
-package com.sonix.queue.api.com.sonix.queue.api.dev;
+package com.sonix.queue.api.dev;
 
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;

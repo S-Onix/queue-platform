@@ -1,6 +1,6 @@
-package com.sonix.queue.api.com.sonix.queue.api.apikey;
+package com.sonix.queue.api.apikey;
 
-import com.sonix.queue.api.com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
+import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
 import com.sonix.queue.common.util.RawKeyGenerator;
 import com.sonix.queue.domain.apikey.ApiKey;
 import com.sonix.queue.domain.apikey.ApiKeyHasher;

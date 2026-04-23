@@ -1,4 +1,4 @@
-package com.sonix.queue.api.com.sonix.queue.api.apikey.dto;
+package com.sonix.queue.api.apikey.dto;
 
 import lombok.Getter;
 

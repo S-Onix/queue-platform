@@ -1,7 +1,9 @@
-package com.sonix.queue.api.com.sonix.queue.api.apikey;
+package com.sonix.queue.api.apikey;
 
-import com.sonix.queue.api.com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
+import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
+import com.sonix.queue.api.security.TenantAuth;
 import com.sonix.queue.common.response.ApiResponse;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -15,8 +17,8 @@ public class ApiKeyController {
     }
 
     @PostMapping("/api/v1/tenants/me/api-keys")
-    public ApiResponse<ApiKeyIssueResponse> issue(@RequestParam Long tenantId){
-        ApiKeyIssueResponse response = apiKeyService.issueApiKey(tenantId);
+    public ApiResponse<ApiKeyIssueResponse> issue(@AuthenticationPrincipal TenantAuth tenantAuth){
+        ApiKeyIssueResponse response = apiKeyService.issueApiKey(tenantAuth.getId());
         return ApiResponse.ok(response);
     }
 

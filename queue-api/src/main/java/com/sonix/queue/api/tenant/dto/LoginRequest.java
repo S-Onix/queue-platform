@@ -1,4 +1,4 @@
-package com.sonix.queue.api.com.sonix.queue.api.tenant.dto;
+package com.sonix.queue.api.tenant.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import lombok.Getter;

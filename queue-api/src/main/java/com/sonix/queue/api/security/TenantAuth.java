@@ -1,4 +1,4 @@
-package com.sonix.queue.api.com.sonix.queue.api.security;
+package com.sonix.queue.api.security;
 
 import lombok.Getter;
 

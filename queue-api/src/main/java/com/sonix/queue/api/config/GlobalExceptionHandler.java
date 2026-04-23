@@ -1,4 +1,4 @@
-package com.sonix.queue.api.com.sonix.queue.api.config;
+package com.sonix.queue.api.config;
 
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;

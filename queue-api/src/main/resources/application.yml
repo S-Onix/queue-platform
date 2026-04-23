@@ -52,3 +52,9 @@ management:
 logging:
   level:
     com.sonix.queue: DEBUG
+
+# JWT 관련 내용 추가
+jwt:
+  secret: queue-platform-secret-key-must-be-at-least-32-characters-long
+  access-token-expiry: 900000   # 15분
+  refresh-token-expiry: 604800000 # 7일

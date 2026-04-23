@@ -1,9 +1,9 @@
-package com.sonix.queue.api.com.sonix.queue.api.tenant;
+package com.sonix.queue.api.tenant;
 
-import com.sonix.queue.api.com.sonix.queue.api.tenant.dto.LoginRequest;
-import com.sonix.queue.api.com.sonix.queue.api.tenant.dto.LoginResponse;
-import com.sonix.queue.api.com.sonix.queue.api.tenant.dto.SignupRequest;
-import com.sonix.queue.api.com.sonix.queue.api.tenant.dto.TenantResponse;
+import com.sonix.queue.api.tenant.dto.LoginRequest;
+import com.sonix.queue.api.tenant.dto.LoginResponse;
+import com.sonix.queue.api.tenant.dto.SignupRequest;
+import com.sonix.queue.api.tenant.dto.TenantResponse;
 import com.sonix.queue.common.response.ApiResponse;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.PostMapping;

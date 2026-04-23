@@ -1,4 +1,4 @@
-package com.sonix.queue.api.com.sonix.queue.api.tenant.dto;
+package com.sonix.queue.api.tenant.dto;
 
 import com.sonix.queue.domain.tenant.Tenant;
 import lombok.Getter;
