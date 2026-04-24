@@ -1,3 +1,55 @@
+### Queue 생성
+POST http://localhost:8080/api/v1/queues
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDE0MzQzLCJleHAiOjE3NzcwMTUyNDN9.LVj6wswtdzlPE4YGX8ytO5alU748k0iLsVLBVBxcodRVPA_AvgfIWAbkRZIDhU88
+
+{"name":"이벤트 대기열","maxCapacity":100000}
+
+### Queue 조회
+GET http://localhost:8080/api/v1/queues/q_1c7a6cfa
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDE0MzQzLCJleHAiOjE3NzcwMTUyNDN9.LVj6wswtdzlPE4YGX8ytO5alU748k0iLsVLBVBxcodRVPA_AvgfIWAbkRZIDhU88
+
+### Queue 이름 변경
+PATCH http://localhost:8080/api/v1/queues/q_1c7a6cfa
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDE0MzQzLCJleHAiOjE3NzcwMTUyNDN9.LVj6wswtdzlPE4YGX8ytO5alU748k0iLsVLBVBxcodRVPA_AvgfIWAbkRZIDhU88
+
+{"name":"변경된 대기열"}
+
+### Queue 정지
+POST http://localhost:8080/api/v1/queues/q_1c7a6cfa/pause
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDE0MzQzLCJleHAiOjE3NzcwMTUyNDN9.LVj6wswtdzlPE4YGX8ytO5alU748k0iLsVLBVBxcodRVPA_AvgfIWAbkRZIDhU88
+
+### Queue 재개
+POST http://localhost:8080/api/v1/queues/q_1c7a6cfa/resume
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDE0MzQzLCJleHAiOjE3NzcwMTUyNDN9.LVj6wswtdzlPE4YGX8ytO5alU748k0iLsVLBVBxcodRVPA_AvgfIWAbkRZIDhU88
+
+### Queue 삭제 (PAUSED 상태에서만 가능)
+DELETE http://localhost:8080/api/v1/queues/q_1c7a6cfa
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDE0MzQzLCJleHAiOjE3NzcwMTUyNDN9.LVj6wswtdzlPE4YGX8ytO5alU748k0iLsVLBVBxcodRVPA_AvgfIWAbkRZIDhU88
+
+### Token Refresh
+POST http://localhost:8080/api/v1/tenants/refresh
+Content-Type: application/json
+
+{"token":"eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwiaWF0IjoxNzc3MDA5MTg0LCJleHAiOjE3Nzc2MTM5ODR9.N9wMpWJzeAWCu_432fo3UpyAbC0RtUR3-rqddxgqrvWZaDuo8ulw8yYtkGjbVR2h"}
+
+### 로그인 → accessToken 복사
+POST http://localhost:8080/api/v1/tenants/login
+Content-Type: application/json
+
+{"email":"test2@email.com","password":"1234"}
+
+### API Key 발급 → apiKeyId 복사
+POST http://localhost:8080/api/v1/tenants/me/api-keys
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDA5MTg0LCJleHAiOjE3NzcwMTAwODR9.CfPJAKY2BKBNiCJtZ-qRh9_JeDIfd5bQHgko7gFb0zm7oz1Rwzb8uqu6W8L0bdzl
+
+### API Key Revoke
+DELETE http://localhost:8080/api/v1/tenants/me/api-keys/ak_c12720e9
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiIzIiwidGVuYW50SWQiOiJ0XzU1Y2NkMjM4IiwiaWF0IjoxNzc3MDA5MTg0LCJleHAiOjE3NzcwMTAwODR9.CfPJAKY2BKBNiCJtZ-qRh9_JeDIfd5bQHgko7gFb0zm7oz1Rwzb8uqu6W8L0bdzl
+
 ### 로그인 → 토큰 발급
 POST http://localhost:8080/api/v1/tenants/login
 Content-Type: application/json
