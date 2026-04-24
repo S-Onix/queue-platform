@@ -47,6 +47,18 @@ public class Queue {
                 , inactiveTtl != null ? inactiveTtl : 300);
     }
 
+    public void update(String name) {
+        if (this.status == QueueStatus.DELETED) {
+            throw new IllegalStateException("삭제된 대기열은 수정할 수 없습니다");
+        }
+
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("이름은 필수입니다");
+        }
+        this.name = name;
+
+    }
+
 
     public boolean isEnqueueable(){
         /*
@@ -101,8 +113,8 @@ public class Queue {
     }
 
     public void delete(){
-        if(this.status != QueueStatus.DRAINING && this.status != QueueStatus.PAUSED) {
-            throw new IllegalStateException("The queue is not DRAINING or PAUSED");
+        if(this.status != QueueStatus.PAUSED) {
+            throw new IllegalStateException("The queue is not PAUSED");
         }
         this.status = QueueStatus.DELETED;
         this.deletedAt = LocalDateTime.now();
