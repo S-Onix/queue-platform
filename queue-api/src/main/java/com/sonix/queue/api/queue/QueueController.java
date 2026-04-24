@@ -10,10 +10,10 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
-public class QueueContorller {
+public class QueueController {
     private final QueueService queueService;
 
-    public QueueContorller(QueueService queueService) {
+    public QueueController(QueueService queueService) {
         this.queueService = queueService;
     }
 
