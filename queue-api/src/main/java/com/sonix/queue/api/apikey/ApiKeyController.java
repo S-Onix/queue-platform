@@ -4,9 +4,7 @@ import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
 import com.sonix.queue.api.security.TenantAuth;
 import com.sonix.queue.common.response.ApiResponse;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 @RestController
 public class ApiKeyController {
@@ -20,6 +18,14 @@ public class ApiKeyController {
     public ApiResponse<ApiKeyIssueResponse> issue(@AuthenticationPrincipal TenantAuth tenantAuth){
         ApiKeyIssueResponse response = apiKeyService.issueApiKey(tenantAuth.getId());
         return ApiResponse.ok(response);
+    }
+
+    @DeleteMapping("/api/v1/tenants/me/api-keys/{apiKeyId}")
+    public ApiResponse<Void> revoke(
+            @AuthenticationPrincipal TenantAuth tenantAuth
+            , @PathVariable String apiKeyId) {
+        apiKeyService.revokeApiKey(tenantAuth.getId(), apiKeyId);
+        return ApiResponse.ok(null);
     }
 
 }

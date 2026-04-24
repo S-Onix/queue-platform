@@ -1,6 +1,8 @@
 package com.sonix.queue.api.apikey;
 
 import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
+import com.sonix.queue.common.exception.BusinessException;
+import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.common.util.RawKeyGenerator;
 import com.sonix.queue.domain.apikey.ApiKey;
 import com.sonix.queue.domain.apikey.ApiKeyHasher;
@@ -29,4 +31,19 @@ public class ApiKeyService {
         // 5. ApiKeyIssueResponse.of(apiKeyId, rawKey) 반환
         return ApiKeyIssueResponse.of(apiKey.getApiKeyId(), rawKey);
     }
+
+    @Transactional
+    public void revokeApiKey(Long tenantId, String apiKeyId) {
+        ApiKey apiKey = apiKeyRepository.findByApiKeyId(apiKeyId)
+                .orElseThrow(() -> new BusinessException(ErrorCode.API_KEY_NOT_FOUND));
+
+        if(!tenantId.equals(apiKey.getTenantId())) {
+            throw new BusinessException(ErrorCode.API_KEY_NOT_OWNED);
+        }
+
+        apiKey.revoke();
+        apiKeyRepository.save(apiKey);
+    }
+
+
 }

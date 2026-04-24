@@ -25,6 +25,7 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth.requestMatchers(
                         "/api/v1/tenants/login"
                         ,"/api/v1/tenants/signup"
+                        , "/api/v1/tenants/refresh"
                         , "/actuator/**"
                 ).permitAll()
                 .anyRequest().authenticated()

@@ -1,9 +1,6 @@
 package com.sonix.queue.api.tenant;
 
-import com.sonix.queue.api.tenant.dto.LoginRequest;
-import com.sonix.queue.api.tenant.dto.LoginResponse;
-import com.sonix.queue.api.tenant.dto.SignupRequest;
-import com.sonix.queue.api.tenant.dto.TenantResponse;
+import com.sonix.queue.api.tenant.dto.*;
 import com.sonix.queue.common.response.ApiResponse;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -26,5 +23,10 @@ public class TenantController {
     @PostMapping("/api/v1/tenants/login")
     public ApiResponse<LoginResponse> login(@RequestBody @Valid LoginRequest request){
         return ApiResponse.ok(tenantService.login(request));
+    }
+
+    @PostMapping("/api/v1/tenants/refresh")
+    public ApiResponse<RefreshResponse> refresh(@RequestBody @Valid RefreshRequest request){
+        return ApiResponse.ok(tenantService.refresh(request));
     }
 }
