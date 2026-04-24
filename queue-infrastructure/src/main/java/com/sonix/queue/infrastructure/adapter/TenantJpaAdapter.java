@@ -9,11 +9,11 @@ import org.springframework.stereotype.Repository;
 import java.util.Optional;
 
 @Repository
-public class TenantJpaAdatper implements TenantRepository {
+public class TenantJpaAdapter implements TenantRepository {
 
     private final TenantJpaRepository tenantJpaRepository;
 
-    public TenantJpaAdatper(TenantJpaRepository tenantJpaRepository) {
+    public TenantJpaAdapter(TenantJpaRepository tenantJpaRepository) {
         this.tenantJpaRepository = tenantJpaRepository;
     }
 

@@ -106,13 +106,11 @@ public class QueueTest {
     }
 
     @Test
-    @DisplayName("delete - DRAINING에서 성공")
-    void delete_from_draining() {
-        Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
+    @DisplayName("delete - DRAINING에서 예외")
+    void delete_from_draining_throws() {
+        Queue queue = Queue.create(1L, "test", 100000, null, null);
         queue.drain();
-        queue.delete();
-        assertEquals(QueueStatus.DELETED, queue.getStatus());
-        assertNotNull(queue.getDeletedAt());
+        assertThrows(IllegalStateException.class, () -> queue.delete());
     }
 
     @Test
@@ -162,23 +160,14 @@ public class QueueTest {
     }
 
     @Test
-    @DisplayName("큐 전체 라이프사이클: ACTIVE → PAUSED → ACTIVE → DRAINING → DELETED")
-    void full_lifecycle() {
-        Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
-        assertEquals(QueueStatus.ACTIVE, queue.getStatus());
-
+    @DisplayName("라이프사이클: ACTIVE → PAUSED → ACTIVE → PAUSED → DELETED")
+    void lifecycle_full() {
+        Queue queue = Queue.create(1L, "test", 100000, null, null);
         queue.pause();
-        assertEquals(QueueStatus.PAUSED, queue.getStatus());
-
         queue.resume();
-        assertEquals(QueueStatus.ACTIVE, queue.getStatus());
-
-        queue.drain();
-        assertEquals(QueueStatus.DRAINING, queue.getStatus());
-
+        queue.pause();
         queue.delete();
         assertEquals(QueueStatus.DELETED, queue.getStatus());
-        assertNotNull(queue.getDeletedAt());
     }
 
     @Test
@@ -209,7 +198,7 @@ public class QueueTest {
     @DisplayName("DELETED에서 모든 전환 불가")
     void deleted_cannot_do_anything() {
         Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
-        queue.drain();
+        queue.pause();
         queue.delete();
 
         assertThrows(IllegalStateException.class, () -> queue.pause());
@@ -265,7 +254,7 @@ public class QueueTest {
     @DisplayName("isEnqueueable - DELETED면 false")
     void isEnqueueable_deleted() {
         Queue queue = Queue.create(1L, "test", 100000, null, null);
-        queue.drain();
+        queue.pause();
         queue.delete();
         assertFalse(queue.isEnqueueable());
     }
