@@ -1,6 +1,6 @@
 # 🔄 Queue Platform — 상세 흐름도
 
-> FRS v1.10 기준
+> FRS v1.9 기준
 
 ---
 
@@ -224,11 +224,11 @@ flowchart LR
 
 ---
 
-## 클라이언트 Polling 구조 (JS SDK + REST 직접 호출)
+## 클라이언트 Polling 구조 (JS SDK)
 
 ```mermaid
 flowchart TD
-    TENANT["Tenant 서버\n(REST 직접 호출)\nPOST /tokens → 대기토큰 발급\ntoken, queueId → 유저에게 전달"]
+    TENANT["Tenant 서버\n(Java SDK)\nenqueue() → 대기토큰 발급\ntoken, queueId → 유저에게 전달"]
     --> CLIENT["브라우저 (JS SDK)\nqueue.startPolling()"]
 
     CLIENT --> POLL["JS SDK 내부\npoll() 실행"]
@@ -242,14 +242,14 @@ flowchart TD
 
     READY -->|"true"| CB["onReady 콜백\nadmitToken 수신"]
     --> SEND["유저 → Tenant 서버: admitToken 전달"]
-    --> TENANTCALL["Tenant 서버 (REST 직접 호출)\n① POST /verify 즉시 호출\n② valid 확인\n③ Tenant 내부 처리 (세션 등)\n④ POST /complete (3회 재시도)"]
+    --> JAVA["Tenant 서버 (Java SDK)\nadmitAndVerify()\n① verify 즉시 호출\n② valid 확인\n③ Tenant 내부 처리\n④ complete 3회 자동 재시도"]
 ```
 
 > **역할 분리**
 > nextPollAfterSec 계산: Platform 책임
 > setTimeout / 탭 비활성화 처리: JS SDK 책임
 > UI 업데이트: 클라이언트(Tenant) 책임
-> verify 순서 강제 / complete 재시도: Tenant 서버 구현 책임 (OpenAPI 가이드)
+> verify 순서 강제 / complete 재시도: Java SDK 책임
 
 ---
 
@@ -263,7 +263,7 @@ flowchart TD
 | Platform (JS SDK) | 대기 중 | 2~30초마다 반복 | Polling (가장 빈번) |
 
 > Polling이 가장 빈번한 통신인데 JS SDK가 Platform과 직접 처리.
-> Tenant 서버는 진입/입장/이탈 3번만 관여 (REST 직접 호출).
+> Tenant 서버는 진입/입장/이탈 3번만 관여.
 > 이것이 "유저가 Platform에 직접 Polling" 원칙의 실제 구현.
 
 ---

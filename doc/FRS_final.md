@@ -2,7 +2,7 @@
 
 > 버전: v1.10 | 상태: 확정 | 대상: 실제 구현 범위
 >
-> v1.10 변경 이력: Java SDK 제거 → Tenant 서버 통합은 REST API + OpenAPI 명세로 전환. JS SDK는 유지.
+> v1.10 변경사항: Java SDK 제거 (REST API 명세로 대체), tenants.status 컬럼 추가, Queue update 전략 확정 (name만 변경 허용)
 
 ---
 
@@ -19,7 +19,6 @@ Platform  → 순서(순번)만 관리
 Tenant    → 슬롯 관리 + 입장 제어
 유저      → Platform에 직접 Polling
 세션 관리 → Tenant 책임 (Platform 관여 안 함)
-통합 방식 → REST API 직접 호출 (언어 중립) + JS SDK (브라우저)
 ```
 
 ### 핵심 개념
@@ -119,7 +118,7 @@ Redis Sorted Set:
 | TTL / Batch | 만료 처리 / 파티션 운영 / 통계 집계 | ✅ |
 | Kafka | Enqueue 버퍼 / 상태 변경 이벤트 | ✅ |
 | Billing | 과금 집계 (Kafka Consumer) | ✅ |
-| 외부 통합 | REST API + OpenAPI 3.0 명세 (Tenant 서버) / JS SDK (브라우저) | ✅ |
+| SDK | Java SDK / JS SDK | ✅ |
 
 ---
 
@@ -287,7 +286,7 @@ POST /api/v1/admit-tokens/:admitToken/verify
 Response: { "valid": true, "userId": "user1" }
 ```
 
-**[중요] verify 호출 순서 (Tenant 서버가 반드시 준수)**
+**[중요] verify 호출 순서 (Java SDK admitAndVerify()가 강제)**
 
 ```
 올바른 순서:
@@ -300,10 +299,7 @@ Response: { "valid": true, "userId": "user1" }
   ① Tenant 내부 처리 (30초 소요)
   ② verify 호출 → TTL 60초 초과 → 404 발생 위험
 
-구현 가이드:
-  SDK 없이 REST 직접 호출 방식이므로 Tenant 구현자가 순서를 보장해야 함
-  OpenAPI 명세에 이 순서를 "Workflow" 섹션으로 명시
-  Swagger UI에서 시각적으로 확인 가능
+Java SDK admitAndVerify()를 사용하면 이 순서를 코드 레벨에서 강제
 ```
 
 ### 6.6 Complete → COMPLETED
@@ -472,97 +468,89 @@ DELETE /api/v1/queues/:queueId/tokens/:token
 
 ---
 
-## 12. 외부 통합 설계 (SDK 전략)
+## 12. SDK 설계
 
-### 12.1 통합 방식 결정
-
-Queue Platform의 Tenant는 B2B 고객사로 **서버 스택 언어가 다양하다**. 단일 언어 SDK 제공은 차별적 지원 문제가 발생하므로 다음과 같이 결정한다.
-
-| 대상 | 통합 방식 | 이유 |
-|------|----------|------|
-| Tenant 서버 (enqueue/admit/verify/complete/cancel) | **REST API + OpenAPI 3.0 명세** | 언어 중립. 모든 언어 동등 지원 |
-| 브라우저 (유저 Polling) | **JS SDK** | 탭 비활성화·네트워크 offline 등 클라이언트 특화 문제 해결 |
-
-### 12.2 REST API 직접 호출 (Tenant 서버용)
-
-#### 제공 자료
+### SDK 제공 목적
 
 ```
-1. OpenAPI 3.0 명세 (Springdoc 자동 생성)
-   - /v3/api-docs (JSON)
-   - /swagger-ui.html (인터랙티브 테스트)
+Tenant가 직접 구현해야 하는 것들:
+  HTTP 클라이언트, SHA-256 해싱, 재시도 로직
+  에러 코드 파싱, requestId 생성
+  verify 호출 순서 강제 (내부 처리 전 먼저 호출)
+  complete 재시도 (TTL 내 보장)
+  Polling 타이밍 관리, 탭 비활성화 처리
 
-2. Postman Collection
-   - queue-platform.postman_collection.json
-
-3. Workflow 문서 (6.5의 verify 순서 등)
-   - OpenAPI의 description + example에 명시
-   - Swagger UI에서 시각적으로 확인 가능
+SDK로 추상화:
+  Platform 정책 변경 시 SDK 업데이트만
+  Tenant 코드 변경 최소화
+  실수 방지 → 순서/재시도 SDK가 강제
 ```
 
-#### Tenant 구현 가이드라인
+### Java SDK (Tenant 서버용)
 
-Tenant 서버가 REST 직접 호출 시 준수해야 할 규칙:
+| 클래스 | 역할 |
+|--------|------|
+| `QueueClient` | enqueue, admit, verify, complete, cancel API 호출 래퍼 |
+| `BulkVerifier` | admitToken N개를 동시 최대 100개로 병렬 verify |
+| `RetryPolicy` | Exponential Backoff. 404/409 구분 처리 |
+| `ApiKeyManager` | SHA-256 해싱 자동. Key Rotation 지원 |
 
-**A. verify 호출 순서**
-```
-1. admit 응답의 admitToken 획득
-2. Tenant 내부 처리(세션 생성 등) 전에 먼저 verify 호출
-3. valid=true 확인 후 내부 처리
-4. 내부 처리 완료 후 complete 호출
+```java
+QueueClient client = QueueClient.builder()
+    .baseUrl("https://api.queue-platform.com")
+    .apiKey(System.getenv("QUEUE_API_KEY"))
+    .build();
 
-이유: 내부 처리 후 verify 호출 시 TTL 60초 초과 위험
+// Enqueue → 202 Accepted
+EnqueueResult result = client.enqueue(queueId, userId);
+
+// admit + 병렬 verify + complete 한번에
+// verify를 내부 처리 전에 먼저 호출 → SDK가 순서 강제
+client.admitAndVerify(queueId, 1000)
+    .concurrency(100)       // 동시 verify 수 (기본값 100)
+    .timeout(50_000)        // 50초 타임아웃
+    .onSuccess((userId, token, admitToken) -> {
+        sessionService.createSession(userId); // Tenant 내부 처리
+        client.complete(token, admitToken);   // 3회 자동 재시도
+    })
+    .onExpired(userId -> log.warn("만료: {}", userId))
+    .execute();
 ```
 
-**B. complete 재시도**
-```
-admitToken TTL 60초 내에 complete 호출 보장
-네트워크 오류 시 3회 재시도 (100ms → 500ms → 1500ms backoff)
-재시도 금지:
-  404 TK_002_INVALID_ADMIT_TOKEN (이미 만료/처리됨)
-  409 QE_006_INVALID_STATUS (상태 불일치)
-```
+**BulkVerifier concurrency 기준:**
 
-**C. 동시 verify 수 가이드 (BulkVerifier 패턴)**
 ```
-admit count 1,000 기준 → 동시 verify 100개 권장
+기본값: concurrency = 100
 
 계산식:
-  concurrency = admit_count × verify_time_ms / (ttl_ms × 안전마진 0.5)
-  예: 1,000명, TTL 60초, verify 100ms
-  = 1,000 × 100 / (60,000 × 0.5) ≈ 3.3 → 최소 4 → 안전하게 100
+  = admit count × 처리시간(ms) ÷ (TTL(ms) × 안전마진 0.5)
+  예시: 1,000명, TTL 60초, 처리 100ms
+  = 1,000 × 100 ÷ (60,000 × 0.5) ≈ 3.3 → 최소 4 → 안전하게 100
 
-Platform per-key 100 rps 초과 시 429 → backoff 필요
+Platform Rate Limit: per-key 100 rps → 100 초과 시 429 주의
 ```
 
-**D. API Key 보안**
-```
-X-API-Key 헤더 전송 (HTTPS 필수)
-환경변수 저장 (코드에 하드코딩 금지)
-발급 시 1회만 표시 → 재발급은 Revoke 후 신규 발급
-```
-
-### 12.3 JS SDK (브라우저용)
-
-브라우저 Polling은 다음과 같은 **클라이언트 특화 문제**가 있어 SDK로 제공:
+**SDK가 강제하는 순서:**
 
 ```
-- nextPollAfterSec 타이밍 (setTimeout 관리)
-- 탭 비활성화 → Polling 자동 중단 (배터리/서버 부하)
-- 네트워크 offline → 재연결 시 즉시 재개
-- 상태 머신 추적 (IDLE → WAITING → READY → COMPLETED/EXPIRED)
+admitAndVerify():
+  1. verify 즉시 호출 (내부 처리 전)
+  2. valid 확인
+  3. onSuccess 콜백 (Tenant 내부 처리)
+  4. complete 자동 호출 (3회 backoff 재시도)
+
+이유:
+  verify를 내부 처리 후 호출하면 TTL 초과 위험
+  Tenant가 직접 구현하면 순서 실수 가능
+  SDK가 올바른 순서를 코드 레벨에서 강제
 ```
 
-#### 핵심 컴포넌트
+### JS SDK (브라우저용)
 
-| 컴포넌트 | 역할 |
-|----------|------|
+| 클래스 | 역할 |
+|--------|------|
 | `PollingManager` | nextPollAfterSec 타이밍 자동 적용. setTimeout 관리 |
 | `StateManager` | IDLE → WAITING → READY → COMPLETED → EXPIRED 전환 |
-| `VisibilityHandler` | visibilitychange 이벤트 자동 감지. 탭 비활성화 시 중단 |
-| `NetworkHandler` | offline/online 이벤트 자동 처리 |
-
-#### 사용법
 
 ```javascript
 const queue = QueueSDK.init({
@@ -578,10 +566,10 @@ queue.startPolling({
         // Platform이 계산해서 내려줌 → SDK가 setTimeout에 세팅
     },
     onReady: ({ admitToken }) => {
-        sendToTenantServer(admitToken);
+        sendToTenantServer(admitToken); // Tenant 서버에 전달
     },
     onExpired: () => {
-        showExpiredMessage();
+        showExpiredMessage(); // 재Enqueue 안내
     }
 });
 
@@ -590,28 +578,43 @@ queue.startPolling({
 // 네트워크 offline/online 이벤트 자동 처리
 ```
 
-### 12.4 클라이언트 전체 흐름
+**JS SDK가 해결하는 것:**
+
+```
+nextPollAfterSec 타이밍:
+  Platform이 globalRank 기준으로 계산해서 내려줌
+  SDK가 setTimeout에 자동 세팅
+  → Tenant가 Polling 간격 직접 관리 불필요
+
+탭 비활성화 처리:
+  visibilitychange 이벤트 자동 감지
+  비활성화 → Polling 중단 (서버 부하 절약)
+  복귀 → 즉시 재개
+
+과도한 Polling 방지:
+  SDK가 nextPollAfterSec 준수 → 서버 과부하 방지
+```
+
+### 클라이언트 전체 흐름
 
 ```
 1. 유저 → Tenant 서버: 서비스 접속 (슬롯 여유 확인)
-2. Tenant 서버 → Platform (REST 직접 호출): POST /tokens
+2. Tenant 서버 → Platform (Java SDK): enqueue()
 3. Tenant 서버 → 유저: token, queueId 전달
 4. 유저 (JS SDK): queue.startPolling() 시작
 5. JS SDK → Platform 직접: GET /tokens/:token (nextPollAfterSec 자동)
 6. JS SDK → onReady 콜백: admitToken 수신
 7. 유저 → Tenant 서버: admitToken 전달
-8. Tenant 서버 → Platform (REST 직접 호출):
-   verify 즉시 → 내부 처리 → complete (3회 재시도)
+8. Tenant 서버 (Java SDK): admitAndVerify() → verify 즉시 → 내부 처리 → complete
 ```
 
-### 12.5 프로젝트 구조
+### 프로젝트 구조
 
 | 레포 | 모듈 수 | 배포 | 역할 |
 |------|--------|------|------|
 | `queue-platform` | 5개 | Docker | 플랫폼 본체 (API, Batch, Domain, Infra, Common) |
+| `queue-platform-sdk-java` | 3개 | Maven Central | Tenant 서버용 (sdk-core, sdk-http, sdk-bulk) |
 | `queue-platform-sdk-js` | 1개 | npm + CDN | 브라우저용 (PollingManager, StateManager) |
-
-> v1.9 → v1.10 변경: `queue-platform-sdk-java` 레포 삭제. Tenant 서버는 REST + OpenAPI 명세로 통합.
 
 ---
 
@@ -683,5 +686,3 @@ BCrypt → 별도 스케줄러 격리 불필요
 > DB 먼저, ZREM 나중 — **잔류가 유실보다 안전**하다.
 > seq를 DB에 저장 — **ADMIT_ISSUED 복귀 시 순위 복원 가능**하다.
 > Kafka At-Least-Once — **DB INSERT는 반드시 보장**된다.
-> Tenant 서버 통합은 **REST + OpenAPI** — 언어 중립.
-> 브라우저 Polling은 **JS SDK** — 탭 비활성화/네트워크 복구 특화.

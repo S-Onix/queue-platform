@@ -1,8 +1,6 @@
 # Queue Platform — 설계 결정 문서
 
-> FRS v1.10 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
->
-> v1.10 변경: §28, §35 SDK 전략 개정. §45 "Java SDK 제거 — 언어 중립 REST 전략" 신규 ADR 추가.
+> FRS v1.9 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
 
 ---
 
@@ -1245,35 +1243,20 @@ TokenExpiryJob이 여러 서버에서 동시 실행되면?
 
 ---
 
-## 28. SDK 전략 — REST API + OpenAPI (Tenant) / JS SDK (브라우저)
+## 28. SDK 제공 계획
 
-### 초기 결정 (v1.9까지)
+### SDK가 필요한 이유
 ```
-Java SDK + JS SDK 이중 제공
-Java SDK: Tenant 서버가 verify 순서, complete 재시도를 자동으로
-JS SDK:   브라우저 Polling, 탭 비활성화 자동 처리
+Tenant가 직접 구현해야 하는 것들:
+  HTTP 클라이언트 설정
+  X-API-Key SHA-256 해싱
+  재시도 로직 (verify 순서 강제, complete 재시도)
+  nextPollAfterSec 타이밍 관리, 탭 비활성화 처리
+
+→ Tenant마다 직접 구현 → 실수 가능성 높음
+→ Platform 정책 변경 시 모든 Tenant가 수정
+→ SDK가 정책을 코드 레벨에서 강제
 ```
-
-### 변경 (v1.10) — Java SDK 제거
-```
-Tenant 서버 언어 다양성 (Java/Node/Python/Go/PHP/Ruby 등)
-→ Java SDK만 제공하면 차별적 지원 문제
-→ 언어별 SDK 전체 제공은 유지보수 비용 과다 (CVE 대응, 버전 관리)
-→ OpenAPI 3.0 명세 + REST 직접 호출이 보편적 통합 방식
-
-JS SDK는 유지:
-  브라우저는 탭 비활성화/네트워크 offline 등 클라이언트 특화 문제
-  Polling 빈도 관리(nextPollAfterSec 자동) → UX 핵심
-```
-
-### 최종 통합 방식
-
-| 대상 | 방식 | 제공 자료 |
-|------|------|----------|
-| Tenant 서버 | REST API 직접 호출 | OpenAPI 3.0 명세 (Springdoc) + Workflow 문서 + Postman Collection |
-| 브라우저 | JS SDK | npm + CDN 배포 (`queue-platform-sdk-js`) |
-
-> 상세 ADR은 §45 참조 ("Java SDK 제거 — 언어 중립 REST 전략")
 
 ---
 
@@ -1626,28 +1609,20 @@ TTL 30초 → 60초:
 
 ---
 
-## 35. SDK 설계 (v1.10 — JS SDK만 제공)
+## 35. SDK 설계
 
-### Tenant 서버 통합 — REST API + OpenAPI
-
-v1.9까지 있던 Java SDK는 제거되었다. Tenant 서버는 REST API를 직접 호출한다.
+### Java SDK 핵심 기능
 
 ```
-제공 자료:
-  1. OpenAPI 3.0 명세 (Springdoc 자동 생성)
-     - /v3/api-docs (JSON) · /swagger-ui.html
-  2. Workflow 문서 (verify 순서, complete 재시도 가이드)
-     - OpenAPI description에 명시 → Swagger UI로 시각화
-  3. Postman Collection
+QueueClient.admitAndVerify(queueId, count):
+  verify를 내부 처리 전에 먼저 호출 → SDK가 순서 강제
+  BulkVerifier: admitToken N개 동시 최대 100개 병렬 처리
+  onSuccess: verify 완료 후 Tenant 내부 처리 콜백
+  complete 자동 호출 (3회 backoff 재시도)
 
-Tenant가 직접 구현해야 하는 부분:
-  - verify 호출 순서 (내부 처리 전에 먼저)
-  - complete 재시도 (3회, backoff 100/500/1500ms)
-  - 동시 verify 제한 (기본 100, per-key 100 rps 고려)
-  - API Key 환경변수 관리
-
-→ OpenAPI 명세의 description에 각 규칙을 Workflow로 명시
-→ Swagger UI에서 시각적으로 유도
+QueueClient.complete(token, admitToken):
+  3회 자동 재시도 (100ms → 500ms → 1500ms backoff)
+  admitToken TTL(60초) 내 완료 보장 설계
 ```
 
 ### JS SDK 핵심 기능
@@ -1660,21 +1635,12 @@ QueueSDK.init() + startPolling():
   네트워크 offline/online 자동 처리
 ```
 
-| 컴포넌트 | 역할 |
-|----------|------|
-| `PollingManager` | nextPollAfterSec 자동 적용 / setTimeout 관리 |
-| `StateManager` | IDLE → WAITING → READY → COMPLETED → EXPIRED |
-| `VisibilityHandler` | visibilitychange 자동 감지 |
-| `NetworkHandler` | offline/online 자동 처리 |
-
 ### 면접 포인트
-> "Tenant 서버는 언어 제약이 없는 B2B 통합 대상이므로
-> 단일 언어 SDK 대신 OpenAPI 명세 기반 REST 직접 호출 전략을 선택했습니다.
-> verify 순서 강제와 complete 재시도 같은 규칙은 OpenAPI의 Workflow로 문서화하고
-> Swagger UI로 시각화해 모든 언어의 Tenant가 동등하게 참고할 수 있도록 했습니다.
-> 반면 브라우저는 탭 비활성화/네트워크 offline 같은 공통 문제가 명확해서
-> JS SDK로 제공합니다. 이를 통해 SDK 유지보수 비용을 최소화하면서도
-> 브라우저 UX는 손해 보지 않는 균형을 맞췄습니다."
+> "Java SDK의 admitAndVerify()가 verify 호출 순서를 코드 레벨에서 강제합니다.
+> verify를 내부 처리 전에 먼저 호출하지 않으면 TTL 초과 위험이 있는데
+> SDK가 이 순서를 보장합니다.
+> JS SDK는 nextPollAfterSec 타이밍을 자동 적용하고
+> 탭 비활성화 시 Polling을 자동 중단해 서버 부하를 줄입니다."
 
 ---
 
@@ -2335,96 +2301,182 @@ queues → queue_daily_stats FK도 미적용:
 
 ---
 
-## 45. Java SDK 제거 — 언어 중립 REST 전략 (v1.10)
+## 45. Sprint 1 — Gradle 멀티모듈 + Virtual Thread 전략
 
-### 배경
+### 결정
 
-v1.9까지 Queue Platform은 Tenant 서버용 **Java SDK**와 브라우저용 **JS SDK** 두 종류를 제공할 계획이었다. 그러나 Tenant 서버는 **언어 제약이 없는 B2B 통합 대상**이다 — 고객사가 어떤 언어로 서버를 운영할지 Platform이 통제할 수 없다.
+| 항목 | 결정 |
+|------|------|
+| 모듈 구조 | 5개 (queue-api, queue-batch, queue-common, queue-domain, queue-infrastructure) |
+| 실행 방식 | Spring MVC + Tomcat + Virtual Thread (WebFlux 대신) |
+| 인프라 비활성화 | autoconfigure.exclude로 DataSource/Redis/Kafka 단계적 활성화 |
 
-```
-Tenant 서버 스택은 본질적으로 언어 다양성을 전제
-→ 단일 언어 SDK만 제공하면 해당 언어 외 Tenant는 차별적 지원
-→ 결국 상당수 Tenant가 REST 직접 호출 방식으로 통합
-→ 단일 언어 SDK의 존재 의의 약화
-```
+### 근거
+- 헥사고날 아키텍처 물리적 분리: domain은 순수 Java, infrastructure는 Spring 의존
+- autoconfigure.exclude: Sprint별 인프라 도입 시점에 해당 라인만 제거 → 빌드 에러 방지
+- Java SDK 제거 → REST + OpenAPI 전략 전환 (Tenant 언어가 다양해 SDK 커스터마이징 비현실적)
 
-### 고려한 대안
+---
 
-| 대안 | 장점 | 단점 | 채택 여부 |
-|------|------|------|----------|
-| **A. 모든 언어 SDK 제공** | 완벽한 지원 | 언어별 CVE 대응·버전 관리 비용 선형 증가, 1인 포트폴리오 스코프 초과 | ❌ |
-| **B. Java SDK만 제공** | Java Tenant 편의 | 다른 언어 차별 → 공평성 훼손 | ❌ |
-| **C. REST + OpenAPI만 제공** | 언어 중립·유지보수 비용 최소 | Tenant가 verify 순서/재시도 직접 구현 | ✅ |
-| **D. gRPC** | 언어 중립 + 스키마 | 브라우저 지원 애매·도입 비용 | ❌ |
+## 46. Sprint 2 — LazyConnectionDataSourceProxy 필수 적용
 
-### 결정: 대안 C (REST + OpenAPI)
+### 문제
+Spring의 기본 동작: @Transactional 시작 → getConnection() → readOnly 설정 순서.
+커넥션 획득 시점에 readOnly 여부를 아직 모르므로 determineCurrentLookupKey()가 항상 "master" 반환.
 
-```
-Tenant 서버 통합 방식:
-  1. OpenAPI 3.0 명세 (Springdoc 자동 생성)
-     - /v3/api-docs (JSON)
-     - /swagger-ui.html (인터랙티브 테스트)
-  2. Workflow 문서 (verify 순서, complete 재시도, 동시성 가이드)
-     - OpenAPI description + Swagger UI에 명시
-  3. Postman Collection
-
-JS SDK는 유지:
-  브라우저는 탭 비활성화/네트워크 offline이 공통 문제
-  Polling 빈도 자동 관리가 UX 핵심
-  한 언어만 유지보수 → 비용 감당 가능
-```
-
-### 트레이드오프
-
-| 항목 | Java SDK 있을 때 | REST + OpenAPI |
-|------|-----------------|----------------|
-| Tenant 진입 장벽 | Java만 낮음 | 모든 언어 균등하게 낮음 |
-| verify 순서 강제 | SDK 코드 레벨 | 문서(OpenAPI description) 레벨 |
-| complete 재시도 | SDK 자동 | Tenant 직접 구현 |
-| 버그/CVE 대응 | SDK 배포 필요 | Platform만 수정 → 자동 반영 |
-| Platform 정책 변경 시 | SDK 업데이트 배포 | 명세/문서 업데이트 |
-| 유지보수 비용 | 고 (언어 종속) | 저 (OpenAPI는 Springdoc 자동 생성) |
-
-### Tenant 부담 경감 방안
-
-Java SDK가 자동 처리하던 책임을 Tenant가 구현하되, **명확한 가이드로 부담을 최소화**한다.
+### 결정: LazyConnectionDataSourceProxy 적용
+커넥션 획득을 실제 SQL 실행 시점까지 지연 → readOnly 판단 후 올바른 DataSource 선택.
 
 ```
-A. verify 순서 강제
-   OpenAPI spec의 description에 "Workflow: verify → process → complete" 명시
-   Swagger UI에서 시각적으로 확인 가능
-
-B. complete 재시도
-   README/Workflow 문서에 "3회 retry, backoff 100/500/1500ms" 권장 패턴 명시
-   재시도 금지 조건(404/409) 문서화
-
-C. 동시 verify 수 가이드
-   계산 공식 문서화: concurrency = admit_count × verify_ms / (ttl_ms × 0.5)
-   "admit 1,000 기준 동시 100 권장" 구체 수치 제시
-
-D. API Key 보안
-   "환경변수 저장, 하드코딩 금지, HTTPS 필수" 체크리스트
+Bean 구성: masterDS → replicaDS → routingDS → LazyProxy (@Primary)
 ```
 
-### 면접 답변
+### 근거
+- LazyProxy 없이는 R/W 분리가 동작하지 않음 (실증 확인)
+- DataSourceAutoConfiguration exclude 유지 (커스텀 DataSource 4개 직접 생성)
+- HibernateJpaAutoConfiguration 활성화 (@Primary DataSource를 자동 사용)
 
-> "초기엔 Java SDK를 제공해 verify 순서를 SDK 레벨에서 강제하려 했습니다.
-> 하지만 Tenant 서버는 언어 제약이 없는 B2B 통합 대상이고
-> Platform이 Tenant의 언어 선택을 통제할 수 없는 구조입니다.
-> 단일 언어 SDK만 제공하면 해당 언어 외 Tenant는 차별적 지원이 되고
-> 언어 전체 SDK는 1인 프로젝트 유지보수 한계를 넘어서므로
-> OpenAPI 3.0 명세와 Workflow 문서로
-> 모든 언어의 Tenant가 균등하게 통합할 수 있도록 전략을 변경했습니다.
-> verify 순서 같은 규칙은 OpenAPI의 Workflow description에 명시하고
-> Swagger UI로 시각화해 문서 레벨에서 유도합니다.
-> 반면 브라우저는 탭 비활성화/네트워크 offline이 공통 문제이므로
-> JS SDK는 유지해 UX를 보장했습니다."
+---
 
-### 추후 확장 가능성
+## 47. Sprint 2 — JpaConfig를 infrastructure 모듈에 배치
+
+### 결정
+@EnableJpaRepositories + @EntityScan을 queue-infrastructure의 JpaConfig.java에 배치.
+
+### 근거
+- queue-api에 spring-boot-starter-data-jpa 의존성 추가 불필요 (헥사고날 원칙)
+- JPA는 infrastructure의 관심사
+- scanBasePackages="com.sonix.queue"가 infrastructure의 JpaConfig를 자동 스캔
+
+---
+
+## 48. Sprint 2 — schema.sql 수동 관리 (ddl-auto 미동작 대응)
+
+### 문제
+LazyConnectionDataSourceProxy 환경에서 Hibernate ddl-auto=update가 테이블을 생성하지 않음.
+커넥션 획득이 지연되어 DDL 실행이 스킵되는 알려진 이슈.
+
+### 결정: schema.sql 수동 실행
+- ddl-auto=update 유지하되, 실제 테이블 생성은 schema.sql로 수동 관리
+- Sprint 4 이후 스키마 안정화 시 Flyway 도입 예정
+
+---
+
+## 49. Sprint 3 — Adapter 네이밍 xxxRepositoryImpl → xxxJpaAdapter
+
+### 결정
+TenantRepositoryImpl → TenantJpaAdapter로 네이밍 변경.
+
+### 근거
+- "Impl"은 "단순 구현체"처럼 보여 헥사고날의 Adapter 역할이 안 느껴짐
+- "JpaAdapter"는 "JPA를 사용하는 어댑터"라는 역할이 명확
+- 인프라 교체 시 네이밍이 자연스러움: TenantJpaAdapter → TenantMyBatisAdapter → TenantMongoAdapter
+
+---
+
+## 50. Sprint 3 — Tenant status 확장 (FRS에 없는 필드)
+
+### 결정
+FRS의 tenants 테이블에 status 컬럼이 없지만, ACTIVE(0)/DEACTIVATED(1) 상태를 추가.
+
+### 근거
+- 실무에서 Tenant 비활성화 없는 SaaS는 거의 없음 (계정 정지/탈퇴 처리)
+- schema.sql에 `status TINYINT NOT NULL DEFAULT 0` 추가
+- 면접에서 "FRS에 없던 건데 왜 추가했나?" → "계정 관리에 필수라 확장했습니다"
+
+---
+
+## 51. Sprint 3 — Queue update 전략 (name만 변경 허용)
+
+### 문제
+운영 중 Queue의 maxCapacity/TTL 변경 시:
+- maxCapacity 변경 → sliceCount 변경 → Redis 슬라이스 파티셔닝 정합성 붕괴
+- TTL 변경 → 기존 토큰과의 소급 적용 문제
+
+### 결정
+- name만 in-place 변경 허용 (Redis Key에 미사용, 안전)
+- maxCapacity/TTL 변경 필요 시: Pause → Delete → 재생성 (Drain+재생성 패턴)
+
+### 근거
+데이터 정합성 > 설정 편의성
+
+---
+
+## 52. Sprint 3 — Queue delete는 PAUSED 상태에서만 허용
+
+### 결정
+기존 DRAINING/PAUSED 둘 다 허용 → PAUSED에서만 허용으로 변경.
+
+### 근거
+- ACTIVE에서 삭제하면 대기자가 즉시 소실
+- 정지(PAUSED) → 대기자 처리 → 삭제 흐름을 강제
+- DRAINING 상태 처리는 Sprint 5 이후 Redis 레벨에서 처리
+
+---
+
+## 53. Sprint 4 — PasswordHasher Port/Adapter 분리 (BCrypt)
+
+### 결정
+BCrypt를 domain에 직접 두지 않고 Port(domain) + Adapter(infrastructure)로 분리.
+
+### 근거
+- BCryptPasswordEncoder는 Spring Security 의존 → domain에 둘 수 없음
+- ApiKeyHasher(SHA-256)는 java.security.MessageDigest(순수 Java) → domain OK
+- 같은 "해싱"이지만 의존성 차이로 배치가 다름
 
 ```
-수요가 검증되면 언어별 오픈소스 SDK를 커뮤니티 프로젝트로 분리:
-  queue-platform-sdk-java, -python, -go 등
-  Platform 본체와 분리 → 유지보수 책임 분산
-  OpenAPI spec 기반 자동 생성(openapi-generator) 활용 가능
+domain:         PasswordHasher (interface)    ← Port
+infrastructure: BcryptPasswordHasher          ← Adapter (Spring Security 의존)
+
+domain:         ApiKeyHasher (class)          ← 순수 Java, domain 직접 배치
+```
+
+---
+
+## 54. Sprint 4 — JWT를 api 계층에 배치 (domain 아님)
+
+### 결정
+JwtProvider, JwtAuthenticationFilter, SecurityConfig 전부 queue-api에 배치.
+
+### 근거
+- JWT는 "HTTP API 인증"이지 "비즈니스 규칙"이 아님
+- Tenant 도메인 입장에서 JWT를 알 필요 없음 (create, deactivate에 JWT 불필요)
+- infrastructure도 아님 — "외부 시스템 접근"이 아니라 "들어오는 요청 인증"
+
+```
+domain:         JWT 관련 코드 없음 ✅
+infrastructure: JWT 관련 코드 없음 ✅
+api:            JWT 전부 여기 ✅
+```
+
+---
+
+## 55. Sprint 4 — API Key prefix "sk_live_" (Stripe 관례)
+
+### 결정
+API Key 원본 형식: "sk_live_" + SecureRandom 16byte hex (총 40자)
+
+### 근거
+- Stripe의 API Key 네이밍 컨벤션 참고 (업계 표준)
+- sk = Secret Key
+- rawKey는 발급 시 1회만 반환, DB에는 SHA-256 해시만 저장
+- Platform도 원본을 모름 → 분실 시 Revoke 후 재발급
+
+---
+
+## 56. Sprint 4 — GlobalExceptionHandler를 api 모듈에 배치
+
+### 결정
+@RestControllerAdvice를 queue-api에 배치. queue-common이 아님.
+
+### 근거
+- GlobalExceptionHandler는 "예외 → HTTP 응답 변환" 역할
+- HTTP는 API 계층 전용 관심사
+- queue-batch는 같은 예외를 다른 방식으로 처리 (로그/재시도)
+- 예외 정의(ErrorCode, BusinessException)는 common, 처리 방식은 각 모듈에서 결정
+
+```
+queue-common: BusinessException, ErrorCode   ← 예외 정의 (공유)
+queue-api:    GlobalExceptionHandler          ← HTTP 응답 변환
+queue-batch:  BatchExceptionHandler           ← 로그/재시도 (Sprint 9)
 ```

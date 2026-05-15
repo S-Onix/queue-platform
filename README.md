@@ -21,8 +21,7 @@
 - **admitToken 만료 시 WAITING 복귀** — seq 유지로 우선순위 보존
 - **Kafka 버퍼** — Enqueue 202 즉시 응답 + DB INSERT 비동기
 - **Virtual Thread** — Spring MVC + JPA blocking I/O를 OS Thread 고갈 없이 처리
-- **REST API + OpenAPI 명세** — Tenant 서버는 언어 무관 HTTP 직접 호출
-- **JS SDK** — 브라우저 Polling 자동 관리 (탭 비활성화 처리, nextPollAfterSec 적응)
+- **SDK 제공** — JS SDK (nextPollAfterSec 적용) + REST API 명세
 
 ---
 
@@ -86,14 +85,6 @@ Redis Lua 처리 → 202 즉시 응답
 Kafka enqueue-events → DB INSERT (At-Least-Once)
 → Enqueue p99 50ms 이하 달성
 → redis_sync_needed: Redis 다운 중 INSERT 토큰 추적
-```
-
-### 7. 언어 중립 REST API (Java SDK 미제공)
-```
-Tenant 서버 언어 다양성 → JS만 브라우저용 SDK로 제공
-Tenant 서버는 OpenAPI 명세 기반 REST 직접 호출
-→ 어떤 언어든 HTTP 클라이언트로 동일하게 통합
-→ SDK 유지보수 비용 제거 (CVE 대응, 버전 관리)
 ```
 
 ---
@@ -272,64 +263,36 @@ Failover: 5~10초 | Circuit Breaker → 503
 
 ---
 
-## 🔧 Tenant 통합 — REST API + JS SDK
+## 🔧 SDK + API
 
-Queue Platform은 **Tenant 서버용 언어별 SDK를 제공하지 않습니다**. 대신 **OpenAPI 명세 기반 REST API를 직접 호출**합니다. 브라우저 Polling만 **JS SDK**로 제공해 탭 비활성화·네트워크 복구 등 클라이언트 특화 문제를 해결합니다.
+### REST API (Tenant 서버용)
 
-### 왜 Java SDK를 제공하지 않는가
-
-```
-Tenant 서버는 언어 다양성이 전제
-→ 특정 언어 SDK만 제공하면 다른 언어 사용자는 차별적 지원
-→ 언어별 SDK 전체 제공은 유지보수 비용(CVE 대응, 버전 관리)이 큼
-→ OpenAPI 명세 + REST 직접 호출이 보편적 통합 방식
-```
-
-### REST API + OpenAPI (Tenant 서버용)
-
-Tenant 서버는 OpenAPI 3.0 명세 기반으로 REST API를 직접 호출합니다. 엔드포인트/스키마와 규칙은 Swagger UI에서 확인할 수 있습니다.
+> Java SDK 제거 — Tenant 서버 언어가 다양해 SDK 커스터마이징이 비현실적.
+> REST API 명세 (OpenAPI 3.0) 제공으로 대체.
 
 ```
-제공 자료:
-  - /v3/api-docs (OpenAPI 3.0 JSON)
-  - /swagger-ui.html (인터랙티브 테스트)
-  - Postman Collection
-  - Workflow 문서 (verify 순서, complete 재시도 등)
+관리 API (JWT 인증):
+  POST   /api/v1/tenants/signup          → 회원가입
+  POST   /api/v1/tenants/login           → 로그인 (JWT 발급)
+  POST   /api/v1/tenants/refresh         → 토큰 갱신
+  POST   /api/v1/tenants/me/api-keys     → API Key 발급
+  DELETE /api/v1/tenants/me/api-keys/:id → API Key 폐기
+  POST   /api/v1/queues                  → 대기열 생성
+  GET    /api/v1/queues/:queueId         → 대기열 조회
+  PATCH  /api/v1/queues/:queueId         → 대기열 이름 변경
+  POST   /api/v1/queues/:queueId/pause   → 대기열 정지
+  POST   /api/v1/queues/:queueId/resume  → 대기열 재개
+  DELETE /api/v1/queues/:queueId         → 대기열 삭제
+
+Queue Engine API (API Key 인증, Sprint 6~7):
+  POST   /api/v1/queues/:queueId/tokens  → Enqueue (202)
+  GET    /api/v1/tokens/:tokenId         → Polling
+  POST   /api/v1/queues/:queueId/admit   → Admit
+  POST   /api/v1/tokens/:tokenId/verify  → Verify
+  POST   /api/v1/tokens/:tokenId/complete → Complete
 ```
-
-### Tenant 구현 가이드라인
-
-Tenant가 REST 직접 호출 시 준수해야 할 규칙:
-
-```
-1. verify 호출 순서
-   ① admit 응답의 admitToken 획득
-   ② Tenant 내부 처리(세션 생성 등) 전에 먼저 verify 호출
-   ③ valid=true 확인 후 내부 처리
-   ④ 내부 처리 완료 후 complete 호출
-   → 내부 처리 후 verify 호출 시 TTL 60초 초과 위험
-
-2. complete 재시도
-   admitToken TTL 60초 내에 complete 호출 보장
-   네트워크 오류 시 3회 재시도 권장 (100ms → 500ms → 1500ms backoff)
-   404/409는 재시도 금지 (이미 처리됨 or 상태 불일치)
-
-3. 동시 verify 수 가이드
-   admit count 1,000 기준 → 동시 verify 100개 권장
-   계산식: concurrency = admit_count × verify_time_ms / (ttl_ms × 0.5)
-   Platform per-key 100 rps 초과 시 429 → backoff 필요
-
-4. API Key 보안
-   X-API-Key 헤더 전송 (HTTPS 필수)
-   환경변수 저장 (코드 하드코딩 금지)
-   발급 시 1회만 표시 → 재발급은 Revoke 후 신규 발급
-```
-
-> 상세 명세는 [OpenAPI 문서](https://api.queue-platform.com/swagger-ui.html) 참조 (Sprint 5 이후 제공 예정)
 
 ### JS SDK (브라우저용)
-
-브라우저 Polling은 **탭 비활성화 / 네트워크 offline / nextPollAfterSec 자동 적용** 등 클라이언트 특화 이슈가 많아 SDK로 제공합니다.
 
 ```javascript
 const queue = QueueSDK.init({
@@ -352,23 +315,16 @@ queue.startPolling({
 // 네트워크 offline/online 자동 처리
 ```
 
-| 기능 | 역할 |
-|------|------|
-| `PollingManager` | nextPollAfterSec 타이밍 자동 적용. setTimeout 관리 |
-| `StateManager` | IDLE → WAITING → READY → COMPLETED → EXPIRED 전환 |
-| `VisibilityHandler` | visibilitychange 이벤트 자동 감지. 탭 비활성화 시 중단 |
-| `NetworkHandler` | offline/online 이벤트 자동 처리 |
-
 ### 클라이언트 전체 흐름
 
 ```
-유저 → Tenant 서버         : 서비스 접속
-Tenant 서버 (REST 호출)    : POST /tokens → 대기토큰 발급
-Tenant → 유저              : token, queueId 전달
-유저 (JS SDK)              : startPolling() → Platform 직접 Polling
-JS SDK → onReady           : admitToken 수신
-유저 → Tenant 서버         : admitToken 전달
-Tenant 서버 (REST 호출)    : verify → 내부처리 → complete (3회 재시도)
+유저 → Tenant 서버      : 서비스 접속
+Tenant (REST API)       : POST /tokens → 대기토큰 발급
+Tenant → 유저           : token, queueId 전달
+유저 (JS SDK)           : startPolling() → Platform 직접 Polling
+JS SDK → onReady        : admitToken 수신
+유저 → Tenant 서버      : admitToken 전달
+Tenant (REST API)       : POST /verify → POST /complete
 ```
 
 ---
@@ -405,8 +361,6 @@ Tenant 서버 (REST 호출)    : verify → 내부처리 → complete (3회 재�
 | MySQL R/W 분리 | SELECT 2,000 rps 분산 | Replica lag | token-info 캐시로 lag 최소화 |
 | tokens 파티셔닝 | 월별 DROP 빠른 정리 | PK에 파티션 키 | Partition Pruning 효과 |
 | RedisKeyFactory | 컴파일 타임 검사 | - | Enum: 가변인수 타입 안전성 없음 |
-| **Java SDK 미제공** | **언어 중립. 유지보수 비용 제거** | **Tenant가 HTTP 직접 구현** | **Tenant 서버 언어 다양성 전제** |
-| **JS SDK 유지** | **브라우저 특화 문제 해결** | **한 언어 SDK 유지 부담** | **탭 비활성화/네트워크 복구는 공통** |
 
 ---
 
@@ -424,57 +378,6 @@ Tenant 서버 (REST 호출)    : verify → 내부처리 → complete (3회 재�
 | DB | MySQL 8.0 | Range 파티셔닝 + Replica |
 | Architecture | Hexagonal + DDD | 도메인 단위 테스트 |
 | Build | Gradle 멀티모듈 5개 | 의존성 명확 분리 |
-| API Spec | OpenAPI 3.0 (Springdoc) | 언어 중립 Tenant 통합 |
-| Client SDK | JS SDK (npm + CDN) | 브라우저 Polling 특화 |
-
----
-
-## 🏃 빌드 및 실행
-
-### 요구 사항
-
-- JDK 21
-- Gradle 8.5+ (Wrapper 포함)
-- Docker Desktop (Sprint 2+ 인프라 구동용)
-
-### 빌드
-
-```bash
-./gradlew build
-```
-
-### 실행
-
-```bash
-# API 서버 (포트 8080)
-./gradlew :queue-api:bootRun
-
-# Batch 서버 (포트 8081)
-./gradlew :queue-batch:bootRun
-```
-
-### Health Check
-
-```bash
-curl http://localhost:8080/actuator/health
-# {"status":"UP"}
-```
-
-### Sprint 진행 단계
-
-| Sprint | 범위 | 상태 |
-|--------|------|------|
-| 1 | 멀티모듈 스켈레톤 + MVC+Virtual Thread + Actuator | ✅ 완료 |
-| 2 | JPA + MySQL R/W 분리 + DataSourceConfig | 🔜 |
-| 3 | 도메인 모델 + 포트 정의 (Rich Domain) | 🔜 |
-| 4 | Redis 어댑터 + Lua Script + Sentinel | 🔜 |
-| 5 | API 레이어 + Enqueue/Polling + OpenAPI | 🔜 |
-| 6 | Admit → Verify → Complete 토큰 흐름 | 🔜 |
-| 7 | Kafka (Enqueue 버퍼 + 상태 이벤트) | 🔜 |
-| 8 | Batch 모듈 (TokenExpiryJob, RedisSyncJob) | 🔜 |
-
-**Sprint 1 → Sprint N 활성화 전략:**
-`application.yml`의 `spring.autoconfigure.exclude`에서 해당 AutoConfiguration을 제거하는 방식으로 단계적으로 활성화합니다. 상세는 [DECISIONS.md §45](docs/DECISIONS.md) 참조.
 
 ---
 
@@ -482,10 +385,29 @@ curl http://localhost:8080/actuator/health
 
 | 문서 | 설명 |
 |------|------|
-| [FRS v1.9](docs/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
+| [FRS v1.10](docs/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
 | [STATE](docs/STATE.md) | Token · Queue · ApiKey 상태 머신 |
 | [FLOW](docs/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
-| [DECISIONS](docs/DECISIONS.md) | 설계 결정 + 근거 + 면접 포인트 |
+| [DECISIONS](docs/DECISIONS.md) | 56개 설계 결정 + 근거 + 면접 포인트 |
+| [ROADMAP](docs/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
+
+---
+
+## 📊 프로젝트 진행 현황
+
+```
+✅ Sprint 1:  멀티모듈 스켈레톤 + Virtual Thread
+✅ Sprint 2:  JPA + MySQL Master/Replica R/W 분리
+✅ Sprint 3:  관리 도메인 (Tenant + ApiKey + Queue) 헥사고날 구현
+✅ Sprint 4:  JWT 인증 + 관리 API 12개 + Service/Controller 테스트
+⬜ Sprint 5:  Redis + Lua Script + Sentinel + Rate Limit
+⬜ Sprint 6:  Token 도메인 + Queue Engine API
+⬜ Sprint 7:  Admit → Verify → Complete
+⬜ Sprint 8:  Kafka KRaft 연동
+⬜ Sprint 9:  Batch 모듈
+⬜ Sprint 10: 통합 테스트 + k6 + Grafana + JS SDK + OpenAPI
+⬜ Sprint 11: Docker + AWS 배포 + 대용량 실측
+```
 
 ---
 
