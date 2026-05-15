@@ -1,4 +1,4 @@
-package com.sonix.queue.common.response;
+package com.sonix.queue.api.common.response;
 
 import com.sonix.queue.common.exception.ErrorCode;
 import lombok.Getter;

@@ -2,7 +2,7 @@ package com.sonix.queue.api.config;
 
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
-import com.sonix.queue.common.response.ApiResponse;
+import com.sonix.queue.api.common.response.ApiResponse;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;

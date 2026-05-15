@@ -40,7 +40,7 @@ Auth: JWT (Access 15분 + Refresh 7일) + Spring Security
 
 ```
 queue-platform/
-├── queue-common/          # ErrorCode, IdGenerator, ApiResponse 등 공통 유틸
+├── queue-common/          # ErrorCode, BusinessException, IdGenerator 등 공통 유틸
 ├── queue-domain/          # Rich Domain Model + Port 인터페이스 (Spring 의존성 없음!)
 ├── queue-infrastructure/  # JPA Adapter, Redis Adapter, Kafka Adapter
 ├── queue-api/             # REST Controller + Security + JWT
@@ -165,7 +165,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 
 ### Sprint 4 빈틈 (Sprint 5에서 보강 예정)
 - **Refresh Token 저장 로직 미구현**: queue-domain/auth 디렉토리에 RefreshToken 도메인, Repository Port, JpaAdapter 추가 필요
-- **ApiResponse 위치**: queue-common에 있으나 queue-api로 이동 검토 중 (Batch가 사용 안 함)
+- ~~**ApiResponse 위치**: queue-common에 있으나 queue-api로 이동 검토 중~~ → Sprint 5 진입 시 `com.sonix.queue.api.common.response`로 이동 완료 (Batch가 사용 안 함)
 
 ### Sprint 5에서 함께 구현할 것
 - Refresh Token 도메인 모델 + DB 저장 + Redis 캐시

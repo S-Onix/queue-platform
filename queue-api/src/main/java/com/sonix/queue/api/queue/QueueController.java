@@ -4,7 +4,7 @@ import com.sonix.queue.api.queue.dto.QueueCreateRequest;
 import com.sonix.queue.api.queue.dto.QueueResponse;
 import com.sonix.queue.api.queue.dto.QueueUpdateRequest;
 import com.sonix.queue.api.security.TenantAuth;
-import com.sonix.queue.common.response.ApiResponse;
+import com.sonix.queue.api.common.response.ApiResponse;
 import jakarta.validation.Valid;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;

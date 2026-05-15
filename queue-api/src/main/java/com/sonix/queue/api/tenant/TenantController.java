@@ -1,7 +1,7 @@
 package com.sonix.queue.api.tenant;
 
 import com.sonix.queue.api.tenant.dto.*;
-import com.sonix.queue.common.response.ApiResponse;
+import com.sonix.queue.api.common.response.ApiResponse;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;

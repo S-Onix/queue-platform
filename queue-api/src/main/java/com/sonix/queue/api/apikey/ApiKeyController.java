@@ -2,7 +2,7 @@ package com.sonix.queue.api.apikey;
 
 import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
 import com.sonix.queue.api.security.TenantAuth;
-import com.sonix.queue.common.response.ApiResponse;
+import com.sonix.queue.api.common.response.ApiResponse;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 

@@ -418,7 +418,7 @@ queue-common을 각 모듈에서 직접 선언하는 이유:
   implementation은 컴파일 타임 전파 안 됨
   api(project(":queue-common"))으로 전파할 수 있지만
   명시적 직접 선언이 의존성 추적에 더 명확함
-  ErrorCode, ApiResponse 등 어느 모듈에서나 직접 사용
+  ErrorCode, BusinessException, IdGenerator 등 어느 모듈에서나 직접 사용
 ```
 
 ---

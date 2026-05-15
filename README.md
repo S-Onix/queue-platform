@@ -137,7 +137,7 @@ flowchart LR
         infra["queue-infrastructure\nRedisKeyFactory\nJPA Repository\nKafka Producer"]
     end
 
-    common["queue-common\nErrorCode · IdGenerator\nApiResponse · QueueException"]
+    common["queue-common\nErrorCode · BusinessException\nIdGenerator · RawKeyGenerator"]
 
     api --> domain & infra & common
     batch --> domain & infra & common
