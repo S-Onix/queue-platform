@@ -1,0 +1,29 @@
+dependencies {
+    implementation project(':queue-domain')
+    implementation project(':queue-common')
+
+    // JPA + MySQL
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    runtimeOnly    'com.mysql:mysql-connector-j'
+
+    // Redis
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+
+    // Kafka
+    implementation 'org.springframework.kafka:spring-kafka'
+
+    implementation 'org.springframework.security:spring-security-crypto'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+
+    compileOnly      "org.projectlombok:lombok:${lombokVersion}"
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        showStandardStreams = true   // System.out + 로그 출력
+        events "passed", "failed"
+    }
+}
