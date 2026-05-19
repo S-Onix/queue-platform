@@ -96,7 +96,7 @@ class TenantServiceTest {
         when(tenantRepository.findByEmail("test@email.com")).thenReturn(Optional.of(tenant));
         when(passwordHasher.matches("1234", "hashed_pw")).thenReturn(true);
         when(jwtProvider.generateAccessToken(1L, "t_test1234")).thenReturn("mock-access");
-        when(jwtProvider.generateRefreshToken(1L)).thenReturn("mock-refresh");
+        when(jwtProvider.generateRefreshToken(1L, "t_test1234")).thenReturn("mock-refresh");
 
         LoginResponse response = tenantService.login(request);
 

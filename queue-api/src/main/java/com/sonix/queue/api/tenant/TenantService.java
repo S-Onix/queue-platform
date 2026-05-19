@@ -4,6 +4,7 @@ import com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.tenant.dto.*;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
+import com.sonix.queue.domain.auth.RefreshToken;
 import com.sonix.queue.domain.tenant.PasswordHasher;
 import com.sonix.queue.domain.tenant.Tenant;
 import com.sonix.queue.domain.tenant.TenantRepository;
@@ -36,7 +37,7 @@ public class TenantService {
         return TenantResponse.from(saved);
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public LoginResponse login(LoginRequest request) {
         Tenant tenant = tenantRepository.findByEmail(request.getEmail())
                 .orElseThrow(() -> new BusinessException(ErrorCode.TENANT_NOT_FOUND));
@@ -46,26 +47,34 @@ public class TenantService {
         }
 
         String accessToken = jwtProvider.generateAccessToken(tenant.getId(), tenant.getTenantId());
-        String refreshToken = jwtProvider.generateRefreshToken(tenant.getId());
+        String refreshToken = jwtProvider.generateRefreshToken(tenant.getId(), tenant.getTenantId());
 
         return LoginResponse.of(accessToken, refreshToken);
     }
 
-    @Transactional(readOnly = true)
+    @Transactional
     public RefreshResponse refresh(RefreshRequest request) {
-        String token = request.getToken();
-        // 1. refreshToken 검증 → 실패 시 예외
-        if(!jwtProvider.validateToken(token)) {
+        String refreshToken = request.getToken();
+
+        // 1. JWT 검증 + type=REFRESH 강제 (Access Token 차단)
+        Claims claims;
+        try {
+            claims = jwtProvider.parseAndValidateRefresh(refreshToken);
+        } catch (Exception e) {
             throw new BusinessException(ErrorCode.INVALID_TOKEN);
         }
+
         // 2. Claims에서 id 추출
-        Long id = Long.parseLong(jwtProvider.getClaims(token).getSubject());
-        // 3. tenantRepository.findById(id) → 존재 확인
-        Tenant tenant = tenantRepository.findById(id).orElseThrow(() -> new BusinessException(ErrorCode.TENANT_NOT_FOUND));
-        // 4. 새 accessToken 생성 (tenantId 필요하니까 Tenant 조회)
+        Long id = Long.parseLong(claims.getSubject());
+
+        // 3. Tenant 존재 확인
+        Tenant tenant = tenantRepository.findById(id)
+                .orElseThrow(() -> new BusinessException(ErrorCode.TENANT_NOT_FOUND));
+
+        // 4. 새 토큰 발급
         String accessToken = jwtProvider.generateAccessToken(tenant.getId(), tenant.getTenantId());
-        String refreshToken = jwtProvider.generateRefreshToken(tenant.getId());
-        // 5. RefreshResponse 반환
-        return RefreshResponse.of(accessToken, refreshToken);
+        String newRefreshToken = jwtProvider.generateRefreshToken(tenant.getId(), tenant.getTenantId());
+
+        return RefreshResponse.of(accessToken, newRefreshToken);
     }
 }
