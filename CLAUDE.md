@@ -189,6 +189,28 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 
 ---
 
+---
+
+## Claude Code 점검 가이드
+
+새 클래스 작성 후 다음 항목들로 점검 요청:
+
+### 헥사고날 점검
+- 모듈 위치 (queue-domain은 Spring 의존성 없는지)
+- Port-Adapter 관계 명확한지
+
+### Spring/JPA 점검
+- 어노테이션 적절성
+- 메서드명 규칙 (Spring Data JPA)
+- @Query JPQL 문법
+
+### 컨벤션 일치
+- 기존 코드와 스타일 일관성
+- 패키지 위치 패턴 일치
+- 네이밍 일관성
+
+---
+
 ## 진행 중인 작업 / 알려진 이슈
 
 ### Sprint 4 빈틈 (Sprint 5에서 보강 예정)

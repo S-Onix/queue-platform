@@ -239,3 +239,29 @@ WHERE queue_id = 'q_xyz'
   AND issued_at >= '2026-04-01'
   AND issued_at <  '2026-05-01';
 -- partitions: p2026_04 ← Pruning 성공 확인
+
+
+-- ================================================================
+-- refresh_tokens (Sprint 5 추가)
+--
+-- Token Rotation + 재사용 감지를 위한 Refresh Token 저장
+-- 원본 토큰은 SHA-256 hash로 저장 (DB 유출 방어)
+-- revoked_at으로 soft delete (감사 추적용)
+-- ================================================================
+
+CREATE TABLE refresh_tokens (
+                                id          BIGINT       NOT NULL AUTO_INCREMENT,
+                                tenant_id   BIGINT       NOT NULL,
+                                token_hash  CHAR(64)     NOT NULL,           -- SHA-256 hex
+                                issued_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                                expires_at  DATETIME(3)  NOT NULL,
+                                revoked_at  DATETIME(3)  NULL,                -- soft delete
+
+                                PRIMARY KEY (id),
+                                UNIQUE KEY uq_refresh_tokens_token_hash (token_hash),
+                                INDEX idx_refresh_tokens_tenant_active  (tenant_id, revoked_at),
+                                INDEX idx_refresh_tokens_expires        (expires_at),
+
+                                CONSTRAINT fk_refresh_tokens_tenant
+                                    FOREIGN KEY (tenant_id) REFERENCES tenants (id)
+);

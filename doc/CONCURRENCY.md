@@ -1,0 +1,524 @@
+# 동시성 제어 (Concurrency Control)
+
+> Queue Platform의 동시성 제어 전략과 `@DistributedLock` 사용 가이드.  
+> CLAUDE.md "동시성 제어" 섹션의 상세 문서.
+
+---
+
+## 1. 확장성 전제
+
+본 프로젝트의 API 서버는 다음을 만족하도록 설계한다.
+
+- **수평 확장 (Horizontal Scaling)**: 인스턴스 N개를 추가하는 것만으로 처리량 증가
+- **수직 확장 (Vertical Scaling)**: 인스턴스 spec 증가로 처리량 증가
+- **Stateless**: 어떤 요청도 특정 인스턴스에 묶이지 않음
+
+### 이 전제가 의미하는 것
+
+| 항목 | 허용 | 금지 |
+|------|------|------|
+| 세션 저장 | Redis, JWT(stateless) | JVM 메모리, HttpSession |
+| 동시성 제어 | DB, Redis, Kafka | `synchronized`, `ReentrantLock` (락 대용) |
+| 캐시 | Redis | JVM 로컬 캐시 (읽기 전용 정적 데이터 제외) |
+| 스케줄러 | Leader election 필수 | `@Scheduled` 단독 사용 |
+| ID 생성 | DB AUTO_INCREMENT, Snowflake | JVM 카운터 |
+| 파일 저장 | S3 등 오브젝트 스토리지 | 로컬 디스크 |
+
+### 단일 JVM 도구의 허용 범위
+
+`synchronized`, `ReentrantLock`, `ConcurrentHashMap` 자체를 금지하는 건 아니다.  
+**"동시성 제어 목적의 락 대용"**으로 쓰는 것만 금지한다.
+
+```java
+// ✅ OK — JVM 내부 자료구조 보호
+private final ConcurrentHashMap<String, ScriptDigest> scriptCache = new ConcurrentHashMap<>();
+
+// ❌ Not OK — 분산 환경에서 동시성 제어 시도
+private static final Object createQueueLock = new Object();
+public synchronized Queue createQueue(...) { ... }  // 인스턴스 #2가 무력화
+```
+
+---
+
+## 2. 동시성 문제 의사결정 트리
+
+동시성 문제가 보이면 **위에서부터 차례로** 검토한다. 위 단계로 해결되면 아래 단계는 도입하지 않는다.
+
+### 1단계: DB 제약조건
+
+`UNIQUE`, `FK`, `CHECK` 제약으로 풀 수 있는가?
+
+```sql
+-- 동일 tenant 내 queueName 중복 방지
+ALTER TABLE queue ADD CONSTRAINT uk_tenant_queue_name UNIQUE (tenant_id, queue_name);
+```
+
+```java
+try {
+    queueRepository.save(queue);
+} catch (DataIntegrityViolationException e) {
+    throw new QueueAlreadyExistsException(tenantId, queueName);
+}
+```
+
+**장점**: 락 없음, 가장 단순, DB가 자연스럽게 직렬화  
+**언제 한계**: 단일 row 제약으로 표현 불가능한 규칙 (예: "tenant당 queue 최대 5개")
+
+### 2단계: Redis 단일 키 원자 연산
+
+`SETNX`, `INCR`, `ZADD NX`, Lua Script로 풀 수 있는가?
+
+```lua
+-- 예: enqueue (Sorted Set에 추가, 중복 방지)
+local exists = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if exists then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+return 1
+```
+
+**장점**: Redis 단일 스레드 모델 → Lua 안의 명령은 모두 원자적, 처리량 매우 높음  
+**언제 한계**: DB 트랜잭션과 결합된 검증이 필요할 때
+
+### 3단계: Kafka partition 순서 보장
+
+같은 entity의 이벤트가 같은 partition으로 가도록 key를 설정한다.
+
+```java
+kafkaTemplate.send("enqueue-events", queueId.toString(), event);
+//                                    ↑ partition key
+```
+
+같은 queueId의 이벤트는 같은 partition → 같은 consumer thread → 순서 보장.
+
+**장점**: 비동기 흐름 안에서 동시성 자연 해결  
+**언제 한계**: 동기 응답이 필요한 경우
+
+### 4단계: DB 비관적 락
+
+`SELECT ... FOR UPDATE`로 row를 잠근다.
+
+```java
+@Transactional
+public Queue createQueue(Long tenantId, CreateQueueCommand cmd) {
+    Tenant tenant = tenantRepository.findByIdForUpdate(tenantId).orElseThrow();
+    long count = queueRepository.countByTenantId(tenantId);
+    if (count >= tenant.getPlan().maxQueues()) {
+        throw new QuotaExceededException();
+    }
+    return queueRepository.save(Queue.create(tenantId, cmd));
+}
+```
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("SELECT t FROM Tenant t WHERE t.id = :id")
+Optional<Tenant> findByIdForUpdate(@Param("id") Long id);
+```
+
+**장점**:
+- DB만 있으면 됨, 추가 인프라 불필요
+- 트랜잭션 커밋/롤백과 락 해제가 자동 결합
+- API 서버 장애 시 DB 커넥션 종료 → 락 자동 해제
+
+**언제 한계**:
+- 트랜잭션이 길어지면 락 점유 시간 증가 → 처리량 저하
+- DB row가 없는 자원(외부 시스템, 추상 작업)은 보호 불가
+- DB 부하 집중
+
+**적용 기준**: 짧은 트랜잭션, DB row만 보호하면 충분한 경우
+
+### 5단계: 분산 락 (`@DistributedLock`)
+
+위 1~4로 해결 안 될 때만 도입한다.
+
+**적용 기준**:
+- 외부 시스템(Redis, Kafka, 외부 API) 호출 포함 → 트랜잭션 안에 두기 부적절
+- 보호 대상이 DB row가 아닌 추상적 작업 (예: "캐시 갱신 단일 실행")
+- 여러 도메인 entity에 걸친 검증 (단일 row 락으로 불충분)
+
+---
+
+## 3. 비관적 락 vs 분산 락 비교
+
+| 항목 | 비관적 락 | 분산 락 |
+|------|---------|--------|
+| **락 저장소** | DB (보호 대상과 동일) | 외부 시스템 (Redis 등) |
+| **락 단위** | DB row (PK 기반) | 임의의 문자열 키 |
+| **트랜잭션 결합** | 강결합 (커밋/롤백으로 해제) | 분리 (수동 해제 또는 TTL) |
+| **장애 시 해제** | DB 커넥션 종료 → 자동 해제 | TTL 만료까지 점유 |
+| **인프라 의존성** | DB만 있으면 됨 | Redis 추가 필요 |
+| **성능 부하** | DB에 집중 | DB와 분리 |
+| **외부 자원 보호** | 불가 (DB row만) | 가능 (DB+Redis+Kafka) |
+| **fencing** | 트랜잭션이 자연스럽게 보장 | 별도 메커니즘 필요 |
+
+### 비유
+
+**비관적 락 = 도서관 책에 자물쇠**: 책 자체에 직접. 책 외 자원은 보호 못 함.  
+**분산 락 = 도서관 입구에 자물쇠**: 입구 통과 후 도서관 내부는 자유롭게.
+
+### Queue Platform 적용 매트릭스
+
+| 시나리오 | 권장 방식 | 이유 |
+|---------|---------|------|
+| createQueue (quota 검증) | 비관적 락 | DB만 건드림, 짧은 트랜잭션 |
+| Queue 생성 + Redis/Kafka 초기화 | 분산 락 | 외부 시스템 포함 |
+| ApiKey rotate | 분산 락 | 캐시 무효화 등 외부 영향 |
+| 일별 통계 집계 (스케줄러) | ShedLock | leader election 성격 |
+| enqueue (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
+| admit (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
+| 파티션 DROP | 분산 락 | 관리 작업, 단일 실행 보장 |
+
+---
+
+## 4. `@DistributedLock` 사양
+
+### 4.1 모듈 배치
+
+- **`queue-common`**: `@DistributedLock` 어노테이션 정의 (pure Java, Redisson 의존성 없음)
+- **`queue-infrastructure`**: `DistributedLockAspect` 구현 (Redisson 의존)
+- 도메인/애플리케이션 레이어는 어노테이션만 import
+
+### 4.2 어노테이션 정의 (queue-common)
+
+```java
+package com.sonix.queue.common.lock;
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DistributedLock {
+    /** SpEL 표현식. 메서드 파라미터 참조 가능 (예: "#tenantId") */
+    String key();
+    
+    /** 락 획득 대기 시간 (기본 3초) */
+    long waitTime() default 3L;
+    
+    /** 락 보유 시간 (기본 10초). Redisson watchdog 미사용 전제 */
+    long leaseTime() default 10L;
+    
+    /** 시간 단위 */
+    TimeUnit timeUnit() default TimeUnit.SECONDS;
+}
+```
+
+### 4.3 Aspect 구현 (queue-infrastructure)
+
+```java
+package com.sonix.queue.infrastructure.lock;
+
+@Aspect
+@Component
+@RequiredArgsConstructor
+@Order(Ordered.HIGHEST_PRECEDENCE)  // ★ @Transactional보다 바깥
+public class DistributedLockAspect {
+    private final RedissonClient redissonClient;
+    private final SpelExpressionParser parser = new SpelExpressionParser();
+    
+    @Around("@annotation(distributedLock)")
+    public Object lock(ProceedingJoinPoint pjp, DistributedLock distributedLock) throws Throwable {
+        String key = parseKey(pjp, distributedLock.key());
+        RLock lock = redissonClient.getLock(key);
+        
+        boolean acquired = false;
+        try {
+            acquired = lock.tryLock(
+                distributedLock.waitTime(),
+                distributedLock.leaseTime(),
+                distributedLock.timeUnit()
+            );
+            if (!acquired) {
+                throw new BusinessException(ErrorCode.LOCK_ACQUISITION_FAILED, key);
+            }
+            return pjp.proceed();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException(ErrorCode.LOCK_INTERRUPTED, e);
+        } finally {
+            if (acquired && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+    
+    private String parseKey(ProceedingJoinPoint pjp, String expression) {
+        MethodSignature sig = (MethodSignature) pjp.getSignature();
+        String[] paramNames = sig.getParameterNames();
+        Object[] args = pjp.getArgs();
+        StandardEvaluationContext ctx = new StandardEvaluationContext();
+        for (int i = 0; i < paramNames.length; i++) {
+            ctx.setVariable(paramNames[i], args[i]);
+        }
+        return parser.parseExpression(expression).getValue(ctx, String.class);
+    }
+}
+```
+
+### 4.4 키 명명 규칙
+
+**형식**: `lock:{domain}:{identifier}:{action}`
+
+예시:
+- `lock:tenant:{tenantId}:queue-create`
+- `lock:tenant:{tenantId}:apikey-rotate`
+- `lock:queue:{queueId}:partition-drop`
+- `lock:tenant:{tenantId}:plan-change`
+
+**규칙**:
+- Tenant 단위 이하로 좁힘 (전역 락 금지)
+- 다른 tenant 작업이 서로 영향 주지 않도록 격리
+- 콜론 구분, 소문자 + 하이픈
+
+### 4.5 타이밍 파라미터 기본값
+
+| 파라미터 | 기본값 | 가이드 |
+|---------|-------|--------|
+| `waitTime` | 3초 | UX와 빠른 실패의 균형. 0이면 fail-fast |
+| `leaseTime` | 10초 | 트랜잭션 최대 예상 시간의 2~3배 |
+| `timeUnit` | SECONDS | 명시적으로 표기 |
+
+**외부 시스템 호출 포함 시**: leaseTime은 호출 timeout의 2배 이상으로 설정.
+
+### 4.6 트랜잭션과의 순서 (★중요)
+
+**락은 반드시 `@Transactional`보다 바깥에 있어야 한다.**
+
+#### 잘못된 순서가 만드는 문제
+
+```
+잘못된 순서:
+1. 트랜잭션 시작
+2. 락 획득
+3. INSERT
+4. 락 해제   ← 이 시점에 다음 요청 진입
+5. 트랜잭션 커밋  ← INSERT가 아직 다른 트랜잭션에서 안 보임
+
+→ 다음 요청이 락을 잡았을 때 이전 INSERT를 못 봐서 중복 생성
+```
+
+#### 보장하는 방법 2가지
+
+**방법 1**: Aspect에 `@Order(Ordered.HIGHEST_PRECEDENCE)` 명시 (위 코드 참고)
+
+**방법 2**: 락 메서드와 트랜잭션 메서드를 별도 빈으로 분리
+
+```java
+@Service
+@RequiredArgsConstructor
+public class QueueCreationService {
+    private final QueueTransactionalService txService;
+    
+    @DistributedLock(key = "'lock:tenant:' + #tenantId + ':queue-create'")
+    public Queue createQueue(Long tenantId, CreateQueueCommand cmd) {
+        return txService.doCreate(tenantId, cmd);  // 별도 빈 호출
+    }
+}
+
+@Service
+public class QueueTransactionalService {
+    @Transactional
+    public Queue doCreate(Long tenantId, CreateQueueCommand cmd) { ... }
+}
+```
+
+방법 2가 더 명시적이고 안전하다. AOP 순서 디버깅 비용 없음.
+
+### 4.7 부수 작업 처리
+
+Redis 초기화, Kafka 발행, 외부 API 호출 등은 **트랜잭션 커밋 이후**에 실행.
+
+```java
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void onQueueCreated(QueueCreatedEvent event) {
+    redisQueueInitializer.initialize(event.queueId());
+    kafkaProducer.publish(event);
+}
+```
+
+이유:
+- 트랜잭션 안에서 외부 호출 → 락 점유 시간 증가
+- 외부 호출 실패 시 트랜잭션 롤백 복잡 (Redis는 트랜잭션 못 따라옴)
+- 커밋 후 실행이면 "DB는 확실히 반영됨"이 보장됨
+
+---
+
+## 5. Do / Don't
+
+### ✅ Do
+
+```java
+// 비관적 락 사용 (DB만 건드리는 경우)
+@Transactional
+public Queue createQueue(Long tenantId, CreateQueueCommand cmd) {
+    Tenant tenant = tenantRepository.findByIdForUpdate(tenantId).orElseThrow();
+    // ...
+}
+
+// 분산 락 + 트랜잭션 분리 (외부 시스템 포함)
+@DistributedLock(key = "'lock:tenant:' + #tenantId + ':queue-create'")
+public Queue createQueue(Long tenantId, CreateQueueCommand cmd) {
+    Queue q = queueTxService.doCreate(tenantId, cmd);
+    // 트랜잭션 커밋 후 외부 호출 (이벤트 리스너로 분리 권장)
+    return q;
+}
+
+// 핫패스는 Lua Script로 락 회피
+public EnqueueResult enqueue(...) {
+    return redisAdapter.executeLua(ENQUEUE_SCRIPT, keys, args);
+}
+```
+
+### ❌ Don't
+
+```java
+// 단일 JVM 락으로 분산 환경 동시성 제어 시도
+private static final Object lock = new Object();
+public Queue createQueue(...) {
+    synchronized (lock) { ... }  // 다른 인스턴스가 무력화
+}
+
+// 트랜잭션 안에서 분산 락 (순서 역전)
+@Transactional
+@DistributedLock(key = "...")
+public Queue createQueue(...) { ... }
+
+// 전역 락
+@DistributedLock(key = "'lock:queue-create-global'")  // 모든 tenant 직렬화
+
+// 트랜잭션 안에서 외부 호출
+@Transactional
+public Queue createQueue(...) {
+    Queue q = queueRepository.save(...);
+    kafkaTemplate.send(...);  // 락 점유 시간 늘어남, 롤백 문제
+    return q;
+}
+```
+
+---
+
+## 6. 함정 모음
+
+### 6.1 TTL 만료 vs 작업 미완료
+
+```
+1. API #1이 락 획득 (TTL 10초)
+2. API #1 작업이 12초 걸림 → TTL 먼저 만료
+3. API #2가 락 획득 (TTL 만료된 키 다시 SETNX 성공)
+4. API #1과 #2가 동시에 작업 → 보호 실패
+```
+
+**완화책**:
+- leaseTime을 충분히 길게
+- Redisson watchdog 사용 (leaseTime=-1 또는 미지정 시 자동 갱신)
+- fencing token 패턴 (외부 시스템 호출 시 단조 증가 토큰 검증)
+
+### 6.2 GC pause
+
+```
+1. API #1 락 획득
+2. API #1에서 STW GC 15초 발생
+3. 그 사이 락 TTL 만료, API #2가 락 획득
+4. API #1 GC 종료, 자기가 락 가졌다고 착각하며 작업 계속
+```
+
+**완화책**: 짧은 임계영역, fencing token.
+
+### 6.3 락 해제 누락
+
+```java
+RLock lock = redissonClient.getLock(key);
+lock.lock();
+doWork();   // 예외 발생
+lock.unlock();  // 실행 안 됨 → leaseTime까지 다른 요청 대기
+```
+
+**완화책**: try-finally, `lock.isHeldByCurrentThread()` 체크 후 unlock.
+
+### 6.4 다른 트랜잭션의 락 해제 시도
+
+```java
+// API #1이 락 획득 (TTL 만료됨)
+// API #2가 같은 키로 락 획득
+// API #1이 finally에서 unlock() → API #2의 락 해제됨
+```
+
+**완화책**: Redisson은 내부적으로 ownerId 체크. 직접 Lua로 구현 시에도 ownerId 검증 필수.
+
+```lua
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+```
+
+---
+
+## 7. 테스트 전략
+
+### 7.1 단위 테스트
+
+Aspect 자체보다, **락이 걸린 메서드에 동시 호출 시 직렬화되는가**를 검증.
+
+```java
+@SpringBootTest
+class QueueCreationConcurrencyTest {
+    
+    @Autowired QueueCreationService service;
+    
+    @Test
+    void 동일_tenant_동시_createQueue_정확히_quota만큼만_생성() throws Exception {
+        Long tenantId = createTenantWithPlan(maxQueues = 3);
+        int threads = 10;
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch end = new CountDownLatch(threads);
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger failure = new AtomicInteger();
+        
+        ExecutorService es = Executors.newFixedThreadPool(threads);
+        for (int i = 0; i < threads; i++) {
+            int idx = i;
+            es.submit(() -> {
+                try {
+                    start.await();
+                    service.createQueue(tenantId, new CreateQueueCommand("q" + idx));
+                    success.incrementAndGet();
+                } catch (QuotaExceededException e) {
+                    failure.incrementAndGet();
+                } catch (Exception ignored) {
+                } finally {
+                    end.countDown();
+                }
+            });
+        }
+        
+        start.countDown();
+        end.await();
+        
+        assertThat(success.get()).isEqualTo(3);
+        assertThat(failure.get()).isEqualTo(7);
+    }
+}
+```
+
+### 7.2 통합 테스트
+
+여러 API 인스턴스를 띄우고 실제 분산 환경 시뮬레이션:
+- TestContainers로 Redis 띄우기
+- 같은 Redisson 클라이언트 설정으로 2개 컨텍스트 기동
+- 양쪽에서 동시 요청
+
+---
+
+## 8. 관련 결정 (DECISIONS.md)
+
+- DEC-XX: 동시성 제어 우선순위 정책
+- DEC-XX: Queue 생성 동시성 처리 방식 (비관적 락 + UNIQUE 제약)
+- DEC-XX: `@DistributedLock` 도입 및 모듈 배치
+
+---
+
+## 9. 참조
+
+- CLAUDE.md "동시성 제어" 섹션
+- Martin Kleppmann, "How to do distributed locking"
+- Redis Documentation, "Distributed Locks with Redis"
+- Redisson Wiki, "Distributed locks and synchronizers"
