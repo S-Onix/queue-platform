@@ -1,0 +1,54 @@
+# ============================================================================
+# Dev (Staging) 환경 — 개발/스테이징 서버
+#
+# - DB: 개발 서버 DB (환경변수)
+# - JWT: 환경변수 (Vault 또는 Secret Manager)
+# - 로그: INFO 레벨
+# - JPA: ddl-auto=validate (스키마 변경 차단, 검증만)
+# ============================================================================
+
+spring:
+  datasource:
+    master:
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST:localhost}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      username: ${DB_USERNAME:queueapp}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 20
+    replica:
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST:localhost}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      username: ${DB_USERNAME:queueapp}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 20
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: false
+
+logging:
+  level:
+    root: INFO
+    com.sonix.queue: DEBUG
+    org.hibernate.SQL: DEBUG
+    
+# Actuator (dev — health, info, metrics 추가)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+
+# JWT — Dev (환경변수, default 없음)
+jwt:
+  active-kid: ${JWT_ACTIVE_KID}
+  keys:
+    - kid: ${JWT_ACTIVE_KID}
+      secret: ${JWT_SECRET_CURRENT}
+    - kid: ${JWT_PREVIOUS_KID:}
+      secret: ${JWT_SECRET_PREVIOUS:}
