@@ -5,6 +5,7 @@ import com.sonix.queue.api.tenant.dto.*;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.auth.RefreshToken;
+import com.sonix.queue.domain.auth.RefreshTokenRepository;
 import com.sonix.queue.domain.tenant.PasswordHasher;
 import com.sonix.queue.domain.tenant.Tenant;
 import com.sonix.queue.domain.tenant.TenantRepository;
@@ -12,16 +13,28 @@ import io.jsonwebtoken.Claims;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
+
 @Service
 public class TenantService {
+
+    private static final Duration REFRESH_TTL = Duration.ofDays(7);
+
     private final TenantRepository tenantRepository;
+    private final RefreshTokenRepository refreshTokenRepository;
     private final PasswordHasher passwordHasher;
     private final JwtProvider jwtProvider;
+    private final TokenRevocationService tokenRevocationService;
 
-    public TenantService(TenantRepository tenantRepository, PasswordHasher passwordHasher, JwtProvider jwtProvider) {
+    public TenantService(TenantRepository tenantRepository, PasswordHasher passwordHasher,
+                         JwtProvider jwtProvider, RefreshTokenRepository refreshTokenRepository,
+                         TokenRevocationService tokenRevocationService) {
         this.tenantRepository = tenantRepository;
         this.passwordHasher = passwordHasher;
         this.jwtProvider = jwtProvider;
+        this.refreshTokenRepository = refreshTokenRepository;
+        this.tokenRevocationService = tokenRevocationService;
     }
 
     @Transactional
@@ -49,6 +62,14 @@ public class TenantService {
         String accessToken = jwtProvider.generateAccessToken(tenant.getId(), tenant.getTenantId());
         String refreshToken = jwtProvider.generateRefreshToken(tenant.getId(), tenant.getTenantId());
 
+        RefreshToken refreshTokenDomain = RefreshToken.create(
+                refreshToken,
+                tenant.getId(),
+                REFRESH_TTL
+        );
+
+        refreshTokenRepository.save(refreshTokenDomain);
+
         return LoginResponse.of(accessToken, refreshToken);
     }
 
@@ -71,10 +92,47 @@ public class TenantService {
         Tenant tenant = tenantRepository.findById(id)
                 .orElseThrow(() -> new BusinessException(ErrorCode.TENANT_NOT_FOUND));
 
-        // 4. 새 토큰 발급
+        // 4. DB에서 Refresh Token 조회 (재사용 감지)
+        String hash = RefreshToken.sha256(refreshToken);
+        RefreshToken stored = refreshTokenRepository.findByTokenHash(hash)
+                .orElseThrow(() -> {
+                    // 토큰이 DB에 없으면 재사용 공격 의심 (별도의 Service를 호출하여 Transaction을 분리함 Exception으로 인한 Rollback을 대비)
+                   tokenRevocationService.revokeAllForTenant(tenant.getId());
+                   return new BusinessException(ErrorCode.INVALID_TOKEN);
+                });
+
+        // 5. 사용 가능 여부 확인
+        if (!stored.isUsable()) {
+            // 폐기 여부 확인
+            if(stored.isRevoked()){
+                // 폐기된 토큰 재사용 = 도난 당한 것 -> 해당 tenant의 모든 토큰 폐기
+                tokenRevocationService.revokeAllForTenant(tenant.getId());
+            }
+            throw new BusinessException(ErrorCode.INVALID_TOKEN);
+        }
+
+        // 6. 이전 토큰 폐기
+        refreshTokenRepository.revokeByTokenHash(hash, LocalDateTime.now());
+
+        // 7. 새 토큰 발급
         String accessToken = jwtProvider.generateAccessToken(tenant.getId(), tenant.getTenantId());
         String newRefreshToken = jwtProvider.generateRefreshToken(tenant.getId(), tenant.getTenantId());
 
+        // 8. 새 Refresh Token DB 저장
+        RefreshToken refreshTokenDomain = RefreshToken.create(
+                newRefreshToken,
+                tenant.getId(),
+                REFRESH_TTL
+        );
+
+        refreshTokenRepository.save(refreshTokenDomain);
+
         return RefreshResponse.of(accessToken, newRefreshToken);
+    }
+
+    @Transactional
+    public void logout(String refreshToken) {
+        String hash = RefreshToken.sha256(refreshToken);
+        refreshTokenRepository.revokeByTokenHash(hash, LocalDateTime.now());
     }
 }

@@ -13,7 +13,7 @@ public interface RefreshTokenJpaRepository extends JpaRepository<RefreshTokenEnt
 
     Optional<RefreshTokenEntity> findByTokenHash(String tokenHash);
 
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("UPDATE RefreshTokenEntity r " +
             "SET r.revokedAt = :revokedAt " +
             "WHERE r.tenantId = :tenantId " +
@@ -21,24 +21,14 @@ public interface RefreshTokenJpaRepository extends JpaRepository<RefreshTokenEnt
     int revokeAllByTenantId(@Param("tenantId") Long tenantId,
                             @Param("revokedAt") LocalDateTime revokedAt);
 
-    @Modifying
-    int deleteByExpiresAtBefore(LocalDateTime before);
+    @Modifying(clearAutomatically = true)
+    @Query("DELETE FROM RefreshTokenEntity r WHERE r.expiresAt < :before")
+    int deleteByExpiresAtBefore(@Param("before") LocalDateTime before);
 
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("UPDATE RefreshTokenEntity r " +
             "SET r.revokedAt = :revokedAt " +
             "WHERE r.tokenHash = :tokenHash AND r.revokedAt IS NULL")
     int revokeByTokenHash(@Param("tokenHash") String tokenHash,
                           @Param("revokedAt") LocalDateTime revokedAt);
-
-    @Query("SELECT r FROM RefreshTokenEntity r " +
-            "WHERE r.tokenHash = :tokenHash " +
-            "  AND r.revokedAt IS NULL " +
-            "  AND r.expiresAt > :now")
-    Optional<RefreshTokenEntity> findActiveByTokenHash(
-            @Param("tokenHash") String tokenHash,
-            @Param("now") LocalDateTime now);
-
-
-
 }
