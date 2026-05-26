@@ -1,7 +1,8 @@
 spring:
   application:
     name: queue-api
-
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
   # Java 21 Virtual Thread 활성화 (Spring Boot 3.2+)
   threads:
     virtual:
@@ -11,33 +12,12 @@ spring:
   # Sprint 2(JPA), Sprint 4(Redis), Sprint 7(Kafka) 진행 시 해당 라인 제거
   autoconfigure:
     exclude:
-      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
       - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
-
-  datasource:
-    master:
-      jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
-      username: queueapp
-      password: queueapp1234
-      maximum-pool-size: 10
-    replica:
-      jdbc-url: jdbc:mysql://127.0.0.1:3307/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
-      username: queueapp
-      password: queueapp1234
-      maximum-pool-size: 30
-    jpa:
-      hibernate:
-        ddl-auto: update
-      show-sql: true
-      properties:
-        hibernate:
-          dialect: org.hibernate.dialect.MySQLDialect
-          format_sql: true
-
+      -
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
 
 # Actuator (Sprint 1: health check만)
 management:
@@ -45,16 +25,8 @@ management:
     web:
       exposure:
         include: health,info
-  endpoint:
-    health:
-      show-details: when-authorized
 
-logging:
-  level:
-    com.sonix.queue: DEBUG
-
-# JWT 관련 내용 추가
+# JWT 관련 내용 추가 (Duration 표기: 15m, 7d, 30s 등)
 jwt:
-  secret: queue-platform-secret-key-must-be-at-least-32-characters-long
-  access-token-expiry: 900000   # 15분
-  refresh-token-expiry: 604800000 # 7일
+  access-token-expiry: 15m
+  refresh-token-expiry: 7d
