@@ -26,7 +26,7 @@ management:
       exposure:
         include: health,info
 
-# JWT 관련 내용 추가
+# JWT 관련 내용 추가 (Duration 표기: 15m, 7d, 30s 등)
 jwt:
-  access-token-expiry: 900000   # 15분
-  refresh-token-expiry: 604800000 # 7일
+  access-token-expiry: 15m
+  refresh-token-expiry: 7d

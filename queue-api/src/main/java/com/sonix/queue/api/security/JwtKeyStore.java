@@ -47,7 +47,7 @@ public class JwtKeyStore {
 
     public void setKeys(List<KeyConfig> keys) {
         this.keys = keys;
-        this.keyMap.clear();
+        this.keyMap.clear(); // 캐시에 값이 남아 있을 수 있기 떄문에
 
         if(keys == null) {
             return;

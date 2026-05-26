@@ -1,5 +1,6 @@
 package com.sonix.queue.api.tenant;
 
+import com.sonix.queue.api.security.JwtProperties;
 import com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.tenant.dto.*;
 import com.sonix.queue.common.exception.BusinessException;
@@ -13,26 +14,26 @@ import io.jsonwebtoken.Claims;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 
 @Service
 public class TenantService {
 
-    private static final Duration REFRESH_TTL = Duration.ofDays(7);
-
     private final TenantRepository tenantRepository;
     private final RefreshTokenRepository refreshTokenRepository;
     private final PasswordHasher passwordHasher;
     private final JwtProvider jwtProvider;
+    private final JwtProperties jwtProperties;
     private final TokenRevocationService tokenRevocationService;
 
     public TenantService(TenantRepository tenantRepository, PasswordHasher passwordHasher,
-                         JwtProvider jwtProvider, RefreshTokenRepository refreshTokenRepository,
+                         JwtProvider jwtProvider, JwtProperties jwtProperties,
+                         RefreshTokenRepository refreshTokenRepository,
                          TokenRevocationService tokenRevocationService) {
         this.tenantRepository = tenantRepository;
         this.passwordHasher = passwordHasher;
         this.jwtProvider = jwtProvider;
+        this.jwtProperties = jwtProperties;
         this.refreshTokenRepository = refreshTokenRepository;
         this.tokenRevocationService = tokenRevocationService;
     }
@@ -65,7 +66,7 @@ public class TenantService {
         RefreshToken refreshTokenDomain = RefreshToken.create(
                 refreshToken,
                 tenant.getId(),
-                REFRESH_TTL
+                jwtProperties.refreshTokenExpiry()
         );
 
         refreshTokenRepository.save(refreshTokenDomain);
@@ -122,7 +123,7 @@ public class TenantService {
         RefreshToken refreshTokenDomain = RefreshToken.create(
                 newRefreshToken,
                 tenant.getId(),
-                REFRESH_TTL
+                jwtProperties.refreshTokenExpiry()
         );
 
         refreshTokenRepository.save(refreshTokenDomain);

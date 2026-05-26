@@ -6,16 +6,12 @@ import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
-import jakarta.annotation.PostConstruct;
 import lombok.extern.log4j.Log4j2;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.time.LocalDateTime;
 import java.util.Base64;
 import java.util.Date;
 
@@ -23,7 +19,7 @@ import java.util.Date;
 /**
  * JWT 발급/검증 + Key Rotation 지원
  *
- * Phase A 보안 강화:
+ * 보안 강화:
  *   - type 클레임으로 ACCESS/REFRESH 구분 강제
  *   - parseAndValidateAccess / parseAndValidateRefresh 분리
  *
@@ -36,13 +32,8 @@ import java.util.Date;
 @Log4j2
 public class JwtProvider {
 
-    @Value("${jwt.access-token-expiry}")
-    private Long accessTokenExpiry;
-
-    @Value("${jwt.refresh-token-expiry}")
-    private Long refreshTokenExpiry;
-
     private final JwtKeyStore keyStore;
+    private final JwtProperties jwtProperties;
 
     private static final String CLAIM_TYPE = "type";
     public static final String CLAIM_TENANT_ID = "tenantId";
@@ -51,8 +42,9 @@ public class JwtProvider {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    public JwtProvider(JwtKeyStore keyStore) {
+    public JwtProvider(JwtKeyStore keyStore, JwtProperties jwtProperties) {
         this.keyStore = keyStore;
+        this.jwtProperties = jwtProperties;
     }
 
     public String generateAccessToken(Long id, String tenantId) {
@@ -66,7 +58,7 @@ public class JwtProvider {
                 .claim(CLAIM_TENANT_ID, tenantId)
                 .claim(CLAIM_TYPE, TYPE_ACCESS)
                 .issuedAt(Date.from(now))
-                .expiration(Date.from(now.plusMillis(accessTokenExpiry)))
+                .expiration(Date.from(now.plus(jwtProperties.accessTokenExpiry())))
                 .signWith(keyStore.getActiveKey())
                 .compact();
     }
@@ -79,10 +71,10 @@ public class JwtProvider {
                     .keyId(keyStore.getActiveKid())
                     .and()
                 .subject(id.toString())
-                . claim("tenantId", tenantId)
+                .claim(CLAIM_TENANT_ID, tenantId)
                 .claim(CLAIM_TYPE, TYPE_REFRESH)
                 .issuedAt(Date.from(now))
-                .expiration(Date.from(now.plusMillis(refreshTokenExpiry)))
+                .expiration(Date.from(now.plus(jwtProperties.refreshTokenExpiry())))
                 .signWith(keyStore.getActiveKey())
                 .compact();
     }
@@ -142,7 +134,7 @@ public class JwtProvider {
 
     /**
      * JWT 형식
-     * header.payload.signature >> 첫번째 header를 추출해야함
+     *  >> header.payload.signature >> 첫번째 header를 추출해야함
      * generateAccessToken / generateRefreshToken 에서 header에 kid 설정함
      * */
     private String extractKid(String token) {
