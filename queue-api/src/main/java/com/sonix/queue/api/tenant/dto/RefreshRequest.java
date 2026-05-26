@@ -9,4 +9,10 @@ import lombok.Setter;
 public class RefreshRequest {
     @NotBlank
     String token;
+
+    public RefreshRequest() {}
+
+    public RefreshRequest(String token) {
+        this.token = token;
+    }
 }

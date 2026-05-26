@@ -1,0 +1,56 @@
+# ============================================================================
+# Production 환경 — 운영 서버
+#
+# - DB: 운영 DB (환경변수 필수, SSL 강제)
+# - JWT: 환경변수 (Vault/Secret Manager에서 주입)
+# - 로그: WARN 레벨 (성능 + 보안)
+# - JPA: ddl-auto=validate (스키마 변경 절대 금지)
+# - Actuator: 최소 노출 (보안)
+# ============================================================================
+
+spring:
+  datasource:
+    master:
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&serverTimezone=Asia/Seoul
+      username: ${DB_USERNAME}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 50
+    replica:
+      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&serverTimezone=Asia/Seoul
+      username: ${DB_USERNAME}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 50
+
+  jpa:
+    hibernate:
+      ddl-auto: validate            # ⭐ 운영 절대 금지: update, create, create-drop
+    show-sql: false                 # 운영 SQL 로그 차단 (성능 + 보안)
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: false
+
+logging:
+  level:
+    root: WARN
+    com.sonix.queue: INFO
+    org.hibernate.SQL: WARN
+
+# Actuator (운영 — 최소 노출)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      show-details: never           # 운영: 헬스 상세 정보 숨김
+
+# JWT — Production (모두 환경변수 필수)
+jwt:
+  active-kid: ${JWT_ACTIVE_KID}
+  keys:
+    - kid: ${JWT_ACTIVE_KID}
+      secret: ${JWT_SECRET_CURRENT}
+    - kid: ${JWT_PREVIOUS_KID:}
+      secret: ${JWT_SECRET_PREVIOUS:}

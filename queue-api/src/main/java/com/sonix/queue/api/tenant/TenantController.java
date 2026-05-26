@@ -29,4 +29,10 @@ public class TenantController {
     public ApiResponse<RefreshResponse> refresh(@RequestBody @Valid RefreshRequest request){
         return ApiResponse.ok(tenantService.refresh(request));
     }
+
+    @PostMapping("/api/v1/tenants/logout")
+    public ApiResponse<Void> logout(@RequestBody @Valid RefreshRequest request){
+        tenantService.logout(request.getToken());
+        return ApiResponse.ok(null);
+    }
 }

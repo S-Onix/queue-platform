@@ -2480,3 +2480,190 @@ queue-common: BusinessException, ErrorCode   ← 예외 정의 (공유)
 queue-api:    GlobalExceptionHandler          ← HTTP 응답 변환
 queue-batch:  BatchExceptionHandler           ← 로그/재시도 (Sprint 9)
 ```
+
+## 57. 동시성 제어 우선순위 정책
+
+**Status**: Accepted  
+**Date**: 2026-05  
+**Context**: Sprint 5 진입 시점, Redis Sentinel 도입과 함께 동시성 제어 전반 정책화 필요
+
+### Decision
+
+동시성 문제가 발생하는 경우, 다음 우선순위로 도구를 선택한다.
+
+1. DB 제약조건 (UNIQUE, FK, CHECK)
+2. Redis 단일 키 원자 연산 (`SETNX`, `INCR`, Lua Script)
+3. Kafka partition 순서 보장
+4. DB 비관적 락 (`SELECT ... FOR UPDATE`) — 짧은 트랜잭션 한정
+5. 분산 락 (`@DistributedLock`, Redisson 기반) — 위로 안 될 때만
+
+상위 단계로 해결되면 하위 단계는 도입하지 않는다.
+
+### Rationale
+
+- **단순성 우선**: DB 제약은 추가 코드 없이 충돌 방지. 락 메커니즘은 최후 수단.
+- **인프라 의존성 최소화**: 분산 락은 Redis 의존성과 fencing 문제를 도입하므로 비용 큼.
+- **핫패스 보호**: enqueue/admit은 처리량이 핵심. 락 회피 가능한 Lua Script 방식으로 설계.
+- **콜드패스 안전성**: createQueue 등 관리성 API는 충돌 빈도 낮음 → DB 비관적 락으로 충분.
+
+### Consequences
+
+**긍정**
+- 도구 선택 기준이 명확 → 코드 리뷰 시 일관성
+- Redis 장애 시 대부분의 핵심 흐름이 영향 받지 않음 (DB 제약 + Kafka)
+- 신규 기능 도입 시 "분산 락 우선 도입" 같은 안일한 판단 차단
+
+**부정**
+- 1~3단계 도구 선택을 위한 도메인 이해 필요 (학습 곡선)
+- 외부 시스템 결합 작업은 4~5단계로 fall back → 별도 검토 필요
+
+### Related
+
+- DEC-XX (Queue 생성 동시성), DEC-XX (`@DistributedLock` 도입)
+- `docs/CONCURRENCY.md` §2
+
+### Interview Point
+
+> "동시성 제어는 항상 최소한의 도구로 풀어야 합니다. DB 제약, Redis 원자 연산, Kafka 순서 보장으로 풀 수 있다면 락은 안 쓰는 게 좋습니다. 분산 락은 fencing token, TTL 만료, GC pause 같은 함정이 많아 신중하게 적용해야 합니다."
+
+---
+
+## 58. Queue 생성 동시성 처리 방식
+
+**Status**: Accepted  
+**Date**: 2026-05  
+**Context**: 동일 tenant로 동시 `POST /queues` 요청 시 (1) queueName 중복 (2) tenant quota 초과 두 가지 동시성 문제 발생 가능
+
+### Decision
+
+`createQueue`는 **DB 비관적 락 + UNIQUE 제약 조합**으로 처리한다. 분산 락은 도입하지 않는다.
+
+```java
+@Transactional
+public Queue createQueue(Long tenantId, CreateQueueCommand cmd) {
+    Tenant tenant = tenantRepository.findByIdForUpdate(tenantId).orElseThrow();
+    long count = queueRepository.countByTenantId(tenantId);
+    if (count >= tenant.getPlan().maxQueues()) {
+        throw new QuotaExceededException(tenantId);
+    }
+    try {
+        return queueRepository.save(Queue.create(tenantId, cmd));
+    } catch (DataIntegrityViolationException e) {
+        throw new QueueAlreadyExistsException(tenantId, cmd.queueName());
+    }
+}
+```
+
+- `findByIdForUpdate`: `SELECT ... FOR UPDATE`로 tenant row 잠금 (quota 검증 직렬화)
+- `UNIQUE(tenant_id, queue_name)`: queueName 중복 자동 차단
+- Redis/Kafka 초기화는 `@TransactionalEventListener(AFTER_COMMIT)`으로 분리
+
+### Rationale
+
+**왜 분산 락이 아닌가**:
+- createQueue는 관리성 API → 요청 빈도 낮음 (충돌 거의 없음)
+- 트랜잭션이 짧음 (count + insert) → 락 점유 시간 무시 가능
+- DB row만 보호 대상 → 분산 락의 "여러 시스템 보호" 장점 불필요
+- Redis 분산 락 도입 시 fencing/TTL 문제 추가 → 비용 대비 효익 낮음
+
+**왜 비관적 락 + UNIQUE 조합인가**:
+- quota 검증은 `count → check → insert` 사이 TOCTOU 윈도우 존재 → row 락 필요
+- queueName 중복은 단일 row UNIQUE로 해결 → 락 범위 좁히기
+
+### Consequences
+
+**긍정**
+- 추가 인프라 의존성 없음 (DB만 사용)
+- API 서버 장애 시 DB 커넥션 종료로 락 자동 해제 → 안전
+- 트랜잭션과 락 해제가 자연 결합 → 누락 위험 없음
+
+**부정**
+- Tenant row가 createQueue, createApiKey 등 여러 작업의 잠금 대상이 될 수 있음 → 핫스팟화 가능성 (현재 빈도 낮아 무시)
+- 외부 시스템 호출이 추가되면 트랜잭션 안에 둘 수 없음 → 후속 검토 필요
+
+### Alternatives Considered
+
+| 대안 | 기각 사유 |
+|------|---------|
+| Redis `@DistributedLock` | 인프라 의존성 추가, fencing 문제, 빈도 대비 과설계 |
+| 낙관적 락 (`@Version`) | quota 검증 실패 시 재시도 복잡, count 쿼리와 결합 안 됨 |
+| Application 레벨 idempotency key | 좋은 보조 수단이나 동시성 자체는 못 풀음 |
+
+### Related
+
+- DEC-XX (동시성 제어 우선순위 정책)
+- `docs/CONCURRENCY.md` §2.4, §3
+
+### Interview Point
+
+> "createQueue 같은 관리성 API는 요청 빈도가 낮고 트랜잭션이 짧아서 비관적 락의 단점이 거의 드러나지 않습니다. 반면 Redis 분산 락은 TTL 만료, fencing 같은 문제가 추가됩니다. 그래서 DB 비관적 락으로 quota 검증을 직렬화하고, queueName 중복은 UNIQUE 제약으로 처리했습니다. Redis 초기화 같은 외부 작업은 `@TransactionalEventListener(AFTER_COMMIT)`으로 분리해서 트랜잭션 안에서 외부 호출을 하지 않도록 했습니다."
+
+---
+
+## 59. `@DistributedLock` 도입 및 모듈 배치
+
+**Status**: Accepted  
+**Date**: 2026-05  
+**Context**: 일부 작업(외부 시스템 호출 포함, 추상 자원 보호)은 비관적 락으로 풀 수 없음. 사내 분산 락 어노테이션 필요.
+
+### Decision
+
+Redisson 기반 `@DistributedLock` 어노테이션을 사내에서 정의해 사용한다.
+
+**모듈 배치**:
+- `queue-common`: `@DistributedLock` 어노테이션 (pure Java, Redisson 의존성 없음)
+- `queue-infrastructure`: `DistributedLockAspect` 구현 (Redisson 의존)
+
+**적용 규칙**:
+- Key 형식: `lock:{domain}:{id}:{action}` (예: `lock:tenant:{tenantId}:queue-create`)
+- 전역 락 금지, 항상 tenant/queue 단위 이하로 좁힘
+- 락은 반드시 `@Transactional`보다 바깥 (`@Order(HIGHEST_PRECEDENCE)`)
+- 부수 작업은 `@TransactionalEventListener(AFTER_COMMIT)`로 분리
+
+**기본 파라미터**: `waitTime=3s`, `leaseTime=10s`
+
+### Rationale
+
+**왜 표준 어노테이션이 아닌가**:
+- Java/Spring 표준에는 분산 락 어노테이션 없음 (`@Transactional`은 트랜잭션 한정, Spring Data JPA `@Lock`은 단일 DB 한정)
+- ShedLock의 `@SchedulerLock`은 스케줄러 전용
+- 따라서 사내 정의가 사실상 표준 패턴
+
+**왜 모듈 분리인가**:
+- 헥사고날 원칙: 도메인/애플리케이션은 인프라(Redisson)에 의존하지 않아야 함
+- 어노테이션은 인터페이스 → `queue-common`이 적절
+- Aspect는 Redisson 구현 → `queue-infrastructure`
+
+**왜 `@Order(HIGHEST_PRECEDENCE)`인가**:
+- `@Transactional`과 `@DistributedLock`이 같은 메서드에 붙으면 AOP 실행 순서가 동시성에 영향
+- 락이 트랜잭션보다 안쪽이면 락 해제 후 커밋 전에 다음 요청 진입 → 중복 생성
+- 명시적 Order로 락이 바깥임을 보장
+
+### Consequences
+
+**긍정**
+- 외부 시스템 호출 포함 작업의 동시성 보호 가능
+- 헥사고날 원칙 유지 (도메인이 Redisson을 모름)
+- AOP로 비즈니스 코드와 락 로직 분리
+
+**부정**
+- Redisson 의존성 추가
+- TTL 만료, GC pause, fencing 등 분산 락 함정 학습 필요
+- AOP 순서 디버깅 비용 (Order 명시로 완화)
+
+### Anti-patterns to Avoid
+
+- `synchronized`, `ReentrantLock`을 락 대용으로 사용 (단일 JVM 한정)
+- 트랜잭션 안에 분산 락 (`@Transactional` 메서드 안에서 `@DistributedLock` 메서드 호출)
+- 전역 락 (`lock:queue-create-global`처럼 tenant 무관)
+- 트랜잭션 안에서 외부 시스템 호출 (Kafka 발행, Redis 초기화 등)
+
+### Related
+
+- DEC-XX (동시성 제어 우선순위 정책)
+- DEC-XX (Queue 생성 동시성)
+- `docs/CONCURRENCY.md` §4
+
+### Interview Point
+
+> "분산 락은 표준 어노테이션이 없어서 Redisson을 AOP로 감싸 `@DistributedLock`을 직접 정의했습니다. 헥사고날 원칙을 지키기 위해 어노테이션은 queue-common, Aspect는 queue-infrastructure에 두었습니다. 가장 큰 함정은 `@Transactional`과의 순서로, 락이 트랜잭션보다 안쪽이면 락 해제 후 커밋 전에 다음 요청이 들어와 보호가 깨집니다. `@Order(HIGHEST_PRECEDENCE)`로 락이 트랜잭션보다 바깥임을 명시했고, 더 안전하게는 락 메서드와 트랜잭션 메서드를 별도 빈으로 분리하는 패턴도 권장합니다."

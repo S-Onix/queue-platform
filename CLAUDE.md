@@ -16,6 +16,7 @@
 3. Backpressure Pull (Tenant가 admit으로 받을 수 있는 만큼만)
 4. admitToken TTL 만료 → WAITING 복귀 (seq 기반 우선순위 보존)
 5. Spring MVC + Virtual Thread (JPA blocking I/O를 OS Thread 고갈 없이)
+6. **API 서버는 N대로 수평/수직 확장 가능 (Stateless 전제)**
 
 ---
 
@@ -40,9 +41,9 @@ Auth: JWT (Access 15분 + Refresh 7일) + Spring Security
 
 ```
 queue-platform/
-├── queue-common/          # ErrorCode, BusinessException, IdGenerator 등 공통 유틸
+├── queue-common/          # ErrorCode, BusinessException, IdGenerator, AOP 어노테이션
 ├── queue-domain/          # Rich Domain Model + Port 인터페이스 (Spring 의존성 없음!)
-├── queue-infrastructure/  # JPA Adapter, Redis Adapter, Kafka Adapter
+├── queue-infrastructure/  # JPA Adapter, Redis Adapter, Kafka Adapter, AOP Aspect 구현
 ├── queue-api/             # REST Controller + Security + JWT
 └── queue-batch/           # @Scheduled + Spring Kafka Consumer
 ```
@@ -97,6 +98,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - ❌ `queue-domain`에서 JPA Entity 사용 금지 (Domain Model만)
 - ✅ Port는 `queue-domain` 인터페이스, Adapter는 `queue-infrastructure`
 - ✅ JPA Entity는 `toDomain()`, `fromDomain()` 팩토리 메서드로 변환
+- ✅ AOP 어노테이션은 `queue-common` (인터페이스만), Aspect 구현은 `queue-infrastructure`
 
 ### 도메인 모델 (Rich)
 - 비즈니스 메서드는 도메인 객체 안에 (예: `Token.expire()`, `Queue.pause()`)
@@ -114,13 +116,33 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - 필드 주입 금지
 - Setter 주입 금지
 
+### 동시성 제어
+- **단일 JVM 한정 도구 금지** (동시성 제어 목적):
+   - ❌ `synchronized`, `ReentrantLock`을 락 대용으로 사용
+   - ❌ `ConcurrentHashMap`을 분산 상태 저장 용도로 사용
+   - ❌ `static` 필드에 상태 저장
+- **동시성 문제 발생 시 우선순위 (위에서부터 시도)**:
+   1. DB 제약조건 (UNIQUE, FK, CHECK)
+   2. Redis 단일 키 원자 연산 (`SETNX`, `INCR`, Lua Script)
+   3. Kafka partition 순서 보장 (같은 key는 같은 partition)
+   4. DB 비관적 락 (`SELECT ... FOR UPDATE`) — 짧은 트랜잭션 한정
+   5. `@DistributedLock` (Redisson 기반) — 위로 안 될 때만
+- **`@DistributedLock` 사용 시**:
+   - Key 형식: `lock:{domain}:{id}:{action}` (예: `lock:tenant:{tenantId}:queue-create`)
+   - 전역 락 금지, 항상 tenant/queue 단위 이하로 좁힘
+   - 락은 **반드시 `@Transactional`보다 바깥** (Aspect `@Order(HIGHEST_PRECEDENCE)`)
+   - 부수 작업(Redis 초기화, Kafka 발행)은 `@TransactionalEventListener(AFTER_COMMIT)`
+- **스케줄러**: `@Scheduled` 단독 금지, leader election 필요 (ShedLock 또는 분산 락)
+- **세션/상태**: 메모리 저장 금지, Redis 또는 stateless JWT
+- 상세: `docs/CONCURRENCY.md`
+
 ### 트랜잭션
 - `@Transactional`은 Service 계층에만
 - 읽기 전용은 `@Transactional(readOnly = true)` → Replica 자동 라우팅
 - Domain Model에 트랜잭션 노출 금지
 
 ### Git
-- 브랜치: `feat/sprint-N-범위` (예: `feat/sprint-5-redis-sentinel`)
+- 브랜치: `feat/범위` (예: `feat/redis-sentinel`)
 - 커밋: Conventional Commits (한국어 제목 OK, subject-case rule disabled)
 - feature → dev → master (PR 기반)
 
@@ -129,35 +151,63 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 ## 핵심 설계 결정 (자주 잊지 말 것)
 
 1. **WebFlux X, Spring MVC + Virtual Thread O**
-    - JPA + ThreadLocal + Reactor scheduler 충돌 회피
-    - `spring.threads.virtual.enabled=true` 한 줄로 적용
+   - JPA + ThreadLocal + Reactor scheduler 충돌 회피
+   - `spring.threads.virtual.enabled=true` 한 줄로 적용
 
 2. **R2DBC 폐기, JPA 채택**
-    - JPA blocking I/O는 Virtual Thread가 OS Thread 점유 없이 처리
+   - JPA blocking I/O는 Virtual Thread가 OS Thread 점유 없이 처리
 
 3. **admitToken TTL 60s + DB Fallback**
-    - Redis 만료 시 DB에서 admit_token 컬럼으로 복구
-    - WAITING 복귀 시 seq 컬럼으로 score 복원 (EXPIRED 아님)
+   - Redis 만료 시 DB에서 admit_token 컬럼으로 복구
+   - WAITING 복귀 시 seq 컬럼으로 score 복원 (EXPIRED 아님)
 
 4. **Status는 TINYINT (0~4)**
-    - VARCHAR 대비 저장공간·비교 성능 최적화
-    - 0=WAITING, 1=ADMIT_ISSUED, 2=COMPLETED, 3=CANCELLED, 4=EXPIRED
+   - VARCHAR 대비 저장공간·비교 성능 최적화
+   - 0=WAITING, 1=ADMIT_ISSUED, 2=COMPLETED, 3=CANCELLED, 4=EXPIRED
 
 5. **Kafka 비동기 처리**
-    - Enqueue: Redis Lua → 202 응답 → Kafka → DB INSERT (At-Least-Once)
-    - 상태 변경: Kafka token-status-changed 이벤트
+   - Enqueue: Redis Lua → 202 응답 → Kafka → DB INSERT (At-Least-Once)
+   - 상태 변경: Kafka token-status-changed 이벤트
 
 6. **tokens 파티셔닝 (Range, 월별)**
-    - `YEAR(issued_at) * 100 + MONTH(issued_at)`
-    - 파티션 1달 유예 DROP (월말 걸친 토큰 과금 누락 방지)
+   - `YEAR(issued_at) * 100 + MONTH(issued_at)`
+   - 파티션 1달 유예 DROP (월말 걸친 토큰 과금 누락 방지)
 
 7. **RedisKeyFactory: static 메서드 방식**
-    - Enum 아님 (가변인수 타입 안전성 위해)
+   - Enum 아님 (가변인수 타입 안전성 위해)
 
 8. **JWT 분리**
-    - Access (15분, type=ACCESS, stateless)
-    - Refresh (7일, type=REFRESH, DB 저장 + Redis 캐시)
-    - Token Rotation + 재사용 감지
+   - Access (15분, type=ACCESS, stateless)
+   - Refresh (7일, type=REFRESH, DB 저장 + Redis 캐시)
+   - Token Rotation + 재사용 감지
+
+9. **동시성 제어 우선순위: DB 제약 > Redis 원자연산 > Kafka 순서 > DB 비관적 락 > 분산 락**
+   - 핫패스(enqueue/admit): Redis Lua Script로 락 회피
+   - 콜드패스(createQueue 등 관리성): DB 비관적 락 또는 `@DistributedLock`
+   - 표준 분산 락 어노테이션은 없음 → 사내 `@DistributedLock` (Redisson + AOP)
+   - 어노테이션은 `queue-common`, Aspect는 `queue-infrastructure`
+
+---
+
+---
+
+## Claude Code 점검 가이드
+
+새 클래스 작성 후 다음 항목들로 점검 요청:
+
+### 헥사고날 점검
+- 모듈 위치 (queue-domain은 Spring 의존성 없는지)
+- Port-Adapter 관계 명확한지
+
+### Spring/JPA 점검
+- 어노테이션 적절성
+- 메서드명 규칙 (Spring Data JPA)
+- @Query JPQL 문법
+
+### 컨벤션 일치
+- 기존 코드와 스타일 일관성
+- 패키지 위치 패턴 일치
+- 네이밍 일관성
 
 ---
 
@@ -186,6 +236,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - 테스트 누락
 - 트랜잭션 경계
 - Spring 의존성이 queue-domain에 들어갔는지
+- **단일 JVM 한정 동시성 도구가 분산 환경 가정을 깨지는 않는지**
 
 ### 학습 가이드 모드
 - 본인이 어떤 개념을 학습 중이면 (예: Lua Script, Redis Sentinel)
@@ -228,14 +279,15 @@ mysql -u root -p -P 3307  # Replica
 
 | 문서 | 내용 |
 |------|------|
-| `docs/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
-| `docs/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
-| `docs/DECISIONS.md` | 56+ 설계 결정 + 근거 + 면접 포인트 |
-| `docs/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |
-| `docs/STATE.md` | Token, Queue, ApiKey 상태 머신 |
-| `docs/schema.sql` | MySQL DDL + 파티션 운영 쿼리 |
-| `docs/sprint-5/REDIS_SENTINEL.md` | Sprint 5 Phase 1 학습 노트 (Sentinel) |
-| `docs/sprint-5/LUA_SCRIPTS.md` | Sprint 5 Phase 2 학습 노트 (Lua 3종) |
+| `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
+| `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
+| `doc/DECISIONS.md` | 56+ 설계 결정 + 근거 + 면접 포인트 |
+| `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |
+| `doc/STATE.md` | Token, Queue, ApiKey 상태 머신 |
+| `doc/schema.sql` | MySQL DDL + 파티션 운영 쿼리 |
+| `doc/CONCURRENCY.md` | 동시성 제어 전략, `@DistributedLock` 사용법, 확장성 전제 |
+| `doc/sprint-5/REDIS_SENTINEL.md` | Sprint 5 Phase 1 학습 노트 (Sentinel) |
+| `doc/sprint-5/LUA_SCRIPTS.md` | Sprint 5 Phase 2 학습 노트 (Lua 3종) |
 
 ---
 
@@ -244,6 +296,5 @@ mysql -u root -p -P 3307  # Replica
 1. **현재 Sprint 상태 확인**: 위 "Sprint 진행 현황" 섹션 참고
 2. **관련 문서 읽기**: 작업 영역에 따라 `docs/` 참조
 3. **헥사고날 위반 가능성 자가 진단**: 새 클래스가 어느 모듈에 속하는지 명확히
-4. **테스트 먼저 또는 동시**: TDD 강제 아니지만, 테스트 누락 금지
-
-
+4. **확장성 자가 진단**: 단일 JVM 가정에 기댄 코드가 아닌지 (특히 동시성/상태)
+5. **테스트 먼저 또는 동시**: TDD 강제 아니지만, 테스트 누락 금지
