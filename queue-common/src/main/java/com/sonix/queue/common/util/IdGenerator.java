@@ -1,9 +1,14 @@
 package com.sonix.queue.common.util;
 
+import com.github.f4b6a3.uuid.UuidCreator;
+
 import java.util.UUID;
 
 public class IdGenerator {
+    private IdGenerator() {}
+
     public static String generate(String prefix) {
-        return prefix + UUID.randomUUID().toString().substring(0,8);
+        UUID uuid = UuidCreator.getTimeOrderedEpoch();
+        return prefix + uuid;
     }
 }
