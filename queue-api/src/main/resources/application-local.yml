@@ -39,6 +39,10 @@ management:
   endpoint:
     health:
       show-details: always
+  endpoints:
+    web:
+      exposure:
+        include: '*'
 # JWT — 로컬 (Rotation 미리 테스트 가능)
 jwt:
   active-kid: key-local-01

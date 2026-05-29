@@ -24,7 +24,29 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+
+  # Prometheus 메트릭 — 자동 활성화
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  # JVM, HTTP 메트릭 활성화 (기본 enabled)
+  metrics:
+    enable:
+      jvm: true
+      process: true
+      system: true
+      http: true
+      hikaricp: true                              # DB Pool (HikariCP)
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true                # p50/p95/p99 자동
+      percentiles:
+        http.server.requests: 0.5, 0.95, 0.99    # 명시적
 
 # JWT 관련 내용 추가 (Duration 표기: 15m, 7d, 30s 등)
 jwt:
