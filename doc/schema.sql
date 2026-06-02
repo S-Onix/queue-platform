@@ -10,11 +10,12 @@
 --   billing: tokens 원본 직접 집계 → billing_snapshots UPSERT
 --   avgWaitingTime: complete 시 직접 Redis HINCRBYFLOAT
 -- [v1.10] tenants.status 추가 (ACTIVE=0, DEACTIVATED=1)
+-- [v1.11] tenant_id, api_key_id, queue_id 크기를 36에서 50으로 변경 (prefix + UUIDv7 의 길이가 총 38임)
 -- ================================================================
 
 CREATE TABLE tenants (
     id            BIGINT       NOT NULL AUTO_INCREMENT,
-    tenant_id     VARCHAR(36)  NOT NULL,
+    tenant_id     VARCHAR(50)  NOT NULL,
     email         VARCHAR(255) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     name          VARCHAR(100) NOT NULL,
@@ -29,7 +30,7 @@ CREATE TABLE tenants (
 
 CREATE TABLE api_keys (
     id          BIGINT      NOT NULL AUTO_INCREMENT,
-    api_key_id  VARCHAR(36) NOT NULL,
+    api_key_id  VARCHAR(50) NOT NULL,
     tenant_id   BIGINT      NOT NULL,
     key_hash    VARCHAR(64) NOT NULL,
     status      TINYINT     NOT NULL DEFAULT 0,
@@ -48,7 +49,7 @@ CREATE TABLE api_keys (
 
 CREATE TABLE queues (
     id           BIGINT       NOT NULL AUTO_INCREMENT,
-    queue_id     VARCHAR(36)  NOT NULL,
+    queue_id     VARCHAR(50)  NOT NULL,
     tenant_id    BIGINT       NOT NULL,
     name         VARCHAR(100) NOT NULL,
     max_capacity INT          NOT NULL,
@@ -91,14 +92,14 @@ CREATE TABLE queues (
 -- ----------------------------------------------------------------
 CREATE TABLE tokens (
     id                BIGINT       NOT NULL AUTO_INCREMENT,
-    token_id          VARCHAR(36)  NOT NULL,
-    queue_id          VARCHAR(36)  NOT NULL,
+    token_id          VARCHAR(50)  NOT NULL,
+    queue_id          VARCHAR(50)  NOT NULL,
     tenant_id         BIGINT       NOT NULL,
     user_id           VARCHAR(255) NOT NULL,
     seq               BIGINT       NOT NULL DEFAULT 0,
     status            TINYINT      NOT NULL DEFAULT 0,
     expired_reason    TINYINT      NULL,
-    admit_token       VARCHAR(36)  NULL,
+    admit_token       VARCHAR(50)  NULL,
     redis_sync_needed TINYINT      NOT NULL DEFAULT 0,
     issued_at         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     completed_at      DATETIME(3)  NULL,
@@ -135,9 +136,9 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
 
 CREATE TABLE admit_requests (
     id            BIGINT       NOT NULL AUTO_INCREMENT,
-    request_id    VARCHAR(36)  NOT NULL,
+    request_id    VARCHAR(50)  NOT NULL,
     tenant_id     BIGINT       NOT NULL,
-    queue_id      VARCHAR(36)  NOT NULL,
+    queue_id      VARCHAR(50)  NOT NULL,
     count         INT          NOT NULL,
     status        TINYINT      NOT NULL DEFAULT 0,
     created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -170,7 +171,7 @@ CREATE TABLE billing_snapshots (
 CREATE TABLE queue_daily_stats (
     id                BIGINT      NOT NULL AUTO_INCREMENT,
     tenant_id         BIGINT      NOT NULL,
-    queue_id          VARCHAR(36) NOT NULL,
+    queue_id          VARCHAR(50) NOT NULL,
     stat_date         DATE        NOT NULL,
     total_enqueued    INT         NOT NULL DEFAULT 0,
     total_completed   INT         NOT NULL DEFAULT 0,

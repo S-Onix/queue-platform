@@ -1,6 +1,7 @@
 dependencies {
     // 공통 유틸 — Spring 최소 의존
     implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'com.github.f4b6a3:uuid-creator:5.3.7'
 
     compileOnly      "org.projectlombok:lombok:${lombokVersion}"
     annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
