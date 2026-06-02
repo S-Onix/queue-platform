@@ -31,7 +31,7 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST, "/api/v1/tenants/refresh").permitAll()
 
                         // === Actuator 제한 ===
-                        .requestMatchers("/actuator/health", "/actuator/info").permitAll()
+                        .requestMatchers("/actuator/health", "/actuator/info", "/actuator/prometheus").permitAll()
                         .requestMatchers("/actuator/**").denyAll()    // 그 외 actuator 차단
 
                         // === 그 외 모두 인증 필요 ===
