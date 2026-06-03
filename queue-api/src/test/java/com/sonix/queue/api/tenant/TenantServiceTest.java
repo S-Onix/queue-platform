@@ -1,5 +1,6 @@
 package com.sonix.queue.api.tenant;
 
+import com.sonix.queue.api.security.JwtProperties;
 import com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.tenant.dto.*;
 import com.sonix.queue.common.exception.BusinessException;
@@ -16,7 +17,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -38,8 +38,12 @@ class TenantServiceTest {
     @Mock RefreshTokenRepository refreshTokenRepository;
     @Mock TokenRevocationService tokenRevocationService;
 
-    @InjectMocks
     TenantService tenantService;
+
+    private final JwtProperties jwtProperties = new JwtProperties(
+            Duration.ofMinutes(15),
+            Duration.ofDays(7)
+    );
 
     // 공통 데이터
     private static final Long TENANT_PK = 1L;
@@ -64,6 +68,16 @@ class TenantServiceTest {
                 "Test Tenant",
                 TenantStatus.ACTIVE,
                 LocalDateTime.now()
+        );
+
+        // TenantService 수동 구성 (JwtProperties는 record라 실제 인스턴스 주입)
+        tenantService = new TenantService(
+                tenantRepository,
+                passwordHasher,
+                jwtProvider,
+                jwtProperties,
+                refreshTokenRepository,
+                tokenRevocationService
         );
     }
 

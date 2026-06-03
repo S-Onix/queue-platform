@@ -7,8 +7,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
-import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -34,12 +34,14 @@ class JwtProviderTest {
         keyStore.setActiveKid(ACTIVE_KID);
         keyStore.setKeys(buildKeyConfigs());
 
-        // JwtProvider 생성
-        jwtProvider = new JwtProvider(keyStore);
+        // JwtProperties 직접 구성 (Spring 없이)
+        JwtProperties jwtProperties = new JwtProperties(
+                Duration.ofMinutes(15),
+                Duration.ofDays(7)
+        );
 
-        // @Value 필드 수동 주입 (Reflection)
-        ReflectionTestUtils.setField(jwtProvider, "accessTokenExpiry", 900_000L);     // 15분
-        ReflectionTestUtils.setField(jwtProvider, "refreshTokenExpiry", 604_800_000L); // 7일
+        // JwtProvider 생성
+        jwtProvider = new JwtProvider(keyStore, jwtProperties);
     }
 
     private List<JwtKeyStore.KeyConfig> buildKeyConfigs() {
