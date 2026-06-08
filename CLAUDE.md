@@ -110,6 +110,11 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - Service 단위 테스트 (Mockito)
 - Controller 통합 테스트 (MockMvc)
 - Repository는 Adapter 통합 테스트
+- **동시성 테스트의 스레드는 Virtual Thread 사용** (`Executors.newVirtualThreadPerTaskExecutor()`)
+   - 고정 크기 풀(`newFixedThreadPool(N)`)은 작업 수 > N이고 각 작업이 출발 신호(`start.await()`)에서
+     블록되면, N개만 점유되고 나머지는 큐에서 굶어 `ready.await()`가 0에 못 닿아 **교착**된다.
+   - 요청 1건당 가상 스레드 1개면 OS 스레드 고갈 없이 전부 동시에 출발 → 진짜 경쟁 상황 재현.
+   - 운영 코드도 Virtual Thread 전제(`spring.threads.virtual.enabled=true`)이므로 테스트도 동일 모델 유지.
 
 ### 의존성 주입
 - 생성자 주입 (Lombok `@RequiredArgsConstructor`)
