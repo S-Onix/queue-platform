@@ -16,5 +16,10 @@ spring:
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
       - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
 
+  data:
+    redis:
+      sentinel:
+        master: mymaster
+
 server:
   port: ${SERVER_PORT:8081}

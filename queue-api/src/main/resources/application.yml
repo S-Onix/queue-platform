@@ -15,7 +15,11 @@ spring:
       - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
       - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
-      -
+  data:
+    redis:
+      sentinel:
+        master: mymaster      # Sentinel Master 이름 (공통)
+
 server:
   port: ${SERVER_PORT:8080}
 
