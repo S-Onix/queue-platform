@@ -1,7 +1,10 @@
 package com.sonix.queue.infrastructure.config;
 
+import com.sonix.queue.domain.ratelimit.FixedWindowRateLimiter;
 import com.sonix.queue.domain.ratelimit.RateLimiter;
+import com.sonix.queue.infrastructure.ratelimit.RedisFixedWindowRateLimiter;
 import com.sonix.queue.infrastructure.ratelimit.RedisTokenBucketRateLimiter;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -59,15 +62,28 @@ public class RedisConfig {
         return loadScript("lua/token-bucket.lua", Long.class);
     }
 
+    @Bean
+    public RedisScript<Long> fixedWindowScript() {
+        return loadScript("lua/fixed-window.lua", Long.class);
+    }
+
 
     @Bean
     public RateLimiter rateLimiter(
             StringRedisTemplate redisTemplate,
-            RedisScript<Long> tokenBucketScript
+            @Qualifier("tokenBucketScript") RedisScript<Long> tokenBucketScript
     ) {
         return new RedisTokenBucketRateLimiter(
                 redisTemplate,
                 tokenBucketScript
         );
+    }
+
+    @Bean
+    public FixedWindowRateLimiter fixedWindowRateLimiter(
+            StringRedisTemplate redisTemplate,
+            @Qualifier("fixedWindowScript") RedisScript<Long> fixedWindowScript
+    ) {
+        return new RedisFixedWindowRateLimiter(redisTemplate, fixedWindowScript);
     }
 }
