@@ -74,21 +74,46 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 ⬜ Sprint 11: Docker + AWS 배포
 ```
 
-### Sprint 5 현재 상태 (2026-05)
-**Phase 1 완료**: Redis Sentinel 인프라 구성 (WSL2)
+### Sprint 5 현재 상태 (2026-06)
+
+**5-A 완료**: Redis Sentinel 인프라
 - Master 6379 + Slave 6380, 6381 + Sentinel 26379, 26380, 26381
 - Failover 실증 완료 (5~10초 내)
 - CONFIG REWRITE 자동 동작 확인
+- LettuceConnectionFactory + StringRedisTemplate
+- application*.yml Sentinel 연결 정보
 
-**Phase 2 진행 예정**: Spring Redis 통합
-- autoconfigure.exclude에서 Redis 제거
-- LettuceConnectionFactory + Sentinel 설정
+**5-B 완료**: 모니터링 시스템
+- Prometheus 3.0.1 + Grafana (WSL2 직접 설치)
+- /actuator/prometheus 노출
+- MONITORING_DESIGN.md 4개 카테고리
+
+**5-C 완료**: Rate Limiter (Token Bucket + Fixed Window)
+- 알고리즘 분리 적용 (DECISIONS §60, §61)
+    - Tenant SLA (인증 후) → Token Bucket (`rl:tenant:{id}`)
+    - 인증 전 (signup/login/refresh) → Fixed Window (`rl:{action}:ip:{ip}`)
+- RateLimiter / FixedWindowRateLimiter 도메인 포트
+- Redis Lua Script 2개 (token-bucket.lua, fixed-window.lua)
+- Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE, DECISIONS §62)
+- RateLimitFilter HTTP 통합 (JwtAuthFilter 후)
+- PublicEndpointRateLimit (SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분)
+- ErrorCode RL_001 (HTTP 429 + Retry-After 헤더)
+- 동시성 검증 (1,000 동시 요청 → 정확히 capacity개)
+
+**5-D 진행 예정**: Redis 캐시 적용
+- ApiKey Redis 캐시 (TTL 60s)
+- Refresh Token Redis 이중 저장 (Redis 우선 + DB fallback)
 - RedisKeyFactory (static 메서드)
-- Lua Script 3종 (Ranking, Enqueue Bulk, Admit Dequeue)
-- RedisPort (queue-domain) + RedisAdapter (queue-infrastructure)
 
-**Phase 3~5 예정**: API Key 캐시, Refresh Token Redis 이중 저장, Rate Limit
+**5-E 진행 예정**: Queue Engine Lua Scripts (Sprint 6 준비)
+- enqueue.lua (INCRBY global-seq + ZADD NX)
+- admit.lua (ZRANGE WITHSCORES + ZREM)
+- ranking.lua (ZSCORE + 슬라이스별 ZCOUNT)
 
+**5-F 진행 예정**: Sprint 5 마무리
+- DECISIONS.md 갱신
+- ROADMAP.md 갱신
+- doc/sprint-5/RATE_LIMITER.md 신규
 ---
 
 ## 코드 작성 규칙 (반드시 준수)
@@ -223,11 +248,12 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - ~~**ApiResponse 위치**: queue-common에 있으나 queue-api로 이동 검토 중~~ → Sprint 5 진입 시 `com.sonix.queue.api.common.response`로 이동 완료 (Batch가 사용 안 함)
 
 ### Sprint 5에서 함께 구현할 것
-- Refresh Token 도메인 모델 + DB 저장 + Redis 캐시
-- Lua Script 3종 (Ranking, Enqueue Bulk, Admit Dequeue 골격)
-- Rate Limit (per-key 100 rps)
-- API Key 캐시 (apikey-cache:{sha256}, TTL 60s)
-
+- ✅ Rate Limiter (Token Bucket + Fixed Window 분리 적용)
+- ✅ Tenant Plan 도입 (SaaS 등급)
+- ✅ HTTP Filter 통합 (429 + Retry-After)
+- ⬜ Refresh Token 도메인 모델 + DB 저장 + Redis 캐시 (5-D)
+- ⬜ Lua Script 3종 (Ranking, Enqueue Bulk, Admit Dequeue 골격) (5-E)
+- ⬜ API Key 캐시 (apikey-cache:{sha256}, TTL 60s) (5-D)
 ---
 
 ## Claude Code 사용 지침

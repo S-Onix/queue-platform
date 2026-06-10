@@ -1,6 +1,6 @@
 # 🗺 Queue Platform — Sprint Roadmap
 
-> 작성일: 2026-04-16 | Sprint 4 완료 후 최신화 (2026-04-25)
+> 작성일: 2026-04-16 | Sprint 5 진행 중 최신화 (2026-06-10)
 
 ---
 
@@ -33,9 +33,9 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 | Sprint | 인프라 | 가이드 |
 |:-:|------|:-:|
 | 2 | MySQL 8.0 × 2 (Master + Replica) | INFRA_SETUP §1 |
-| 5 | Redis Sentinel (M1 + S2 + Sen3) | INFRA_SETUP §2 |
+| 5 | Redis Sentinel (M1 + S2 + Sen3) + Prometheus + Grafana | INFRA_SETUP §2, §7 |
 | 8 | Kafka 3 브로커 (KRaft) | INFRA_SETUP §3 |
-| 10 | k6 + Prometheus + Grafana | INFRA_SETUP §4, §5 |
+| 10 | k6 + Prometheus + Grafana 통합 | INFRA_SETUP §4, §5 |
 | **11** | **Docker + AWS (EC2/RDS/ElastiCache/MSK Serverless)** | **AWS_LEARNING_PATH** |
 
 ### 진행 현황
@@ -45,7 +45,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ✅ Sprint 2   완료 (2026-04-22)
 ✅ Sprint 3   완료 (2026-04-23)
 ✅ Sprint 4   완료 (2026-04-24)
-⬜ Sprint 5   ← 다음
+🔄 Sprint 5   ← 진행 중 (5-A/5-B/5-C 완료, 5-D/5-E/5-F 남음)
 ⬜ Sprint 6
 ⬜ Sprint 7
 ⬜ Sprint 8
@@ -64,7 +64,7 @@ flowchart TD
     S2["Sprint 2<br/>JPA + R/W 분리"]
     S3["Sprint 3<br/>관리 도메인<br/>(Tenant + ApiKey + Queue)"]
     S4["Sprint 4<br/>인증 + 관리 API"]
-    S5["Sprint 5<br/>Redis + Lua"]
+    S5["Sprint 5<br/>Redis + Lua + Rate Limiter"]
     S6["Sprint 6<br/>Token 도메인 + Queue Engine API"]
     S7["Sprint 7<br/>Admit → Verify → Complete"]
     S8["Sprint 8<br/>Kafka 연동"]
@@ -78,10 +78,12 @@ flowchart TD
     AWS -.-> S11
 
     classDef done fill:#4caf50,color:#fff,stroke-width:0px
+    classDef inprogress fill:#ff9800,color:#fff,stroke-width:0px
     classDef todo fill:#e0e0e0,color:#333,stroke-width:0px
     classDef learn fill:#fff3e0,color:#333,stroke-width:1px
     class S1,S2,S3,S4 done
-    class S5,S6,S7,S8,S9,S10,S11 todo
+    class S5 inprogress
+    class S6,S7,S8,S9,S10,S11 todo
     class AWS learn
 ```
 
@@ -207,42 +209,146 @@ flowchart TD
 
 ---
 
-### ⬜ Sprint 5 — Redis 어댑터 + Lua Script + Sentinel
+### 🔄 Sprint 5 — Redis + Lua Script + Sentinel + Rate Limiter (진행 중)
 
-**예상 기간:** 2.5주 (Sentinel 3노드 설치 + Lua Script 구현 포함)
+**예상 기간:** 3주 (Sentinel + 모니터링 + Rate Limiter + 캐시 + Queue Lua)
 **카테고리:** MVP
+**진행률:** 약 50% (5-A/5-B/5-C 완료)
 
 **선행 인프라:** [INFRA_SETUP.md §2](INFRA_SETUP.md) — Redis Master(6379) + Slave(6380, 6381) + Sentinel(26379, 26380, 26381) WSL2 직접 설치
 
-**주요 산출물:**
-- WSL2에 Redis Sentinel 구성 (기존 Redis Master + Slave 2 + Sentinel 3)
-- `~/.bashrc` 자동 시작 스크립트
-- `RedisKeyFactory` (static 메서드 방식)
-- Enqueue Bulk Lua Script (INCRBY global-seq + ZADD multi-member NX)
-- Admit Dequeue Lua Script (ZRANGE WITHSCORES + ZREM + 재정렬)
-- Ranking Lua Script (ZSCORE + 슬라이스별 ZCOUNT 합산)
-- **API Key 캐시** Redis 적용 (Sprint 4의 DB 조회 구조에 Redis 캐시 레이어 추가, TTL 60s)
-- **JWT Refresh Token** Redis 이중 저장 적용 (Sprint 4의 DB 단일 구조를 Redis + DB로 확장)
-- **Rate Limit** Redis 카운터로 처음부터 구현 (per-key 100 rps, 슬라이딩 윈도우 또는 토큰 버킷)
+### 진행 현황
 
-**완료 기준 (DoD):**
-- [ ] Redis Sentinel 3노드 기동 확인 (`redis-cli -p 26379 sentinel master mymaster`)
-- [ ] `num-sentinels=3, num-slaves=2, quorum=2` 확인
-- [ ] Failover 시나리오 테스트 (Master 강제 종료 → Slave 승격 5~10초 내)
-- [ ] `autoconfigure.exclude`에서 `RedisAutoConfiguration`, `RedisRepositoriesAutoConfiguration` 제거
+| Phase | 내용 | 상태 |
+|-------|------|------|
+| 5-A | Redis Sentinel 인프라 | ✅ |
+| 5-B | 모니터링 시스템 (Prometheus + Grafana) | ✅ |
+| 5-C | Rate Limiter (Token Bucket + Fixed Window) | ✅ |
+| 5-D | Redis 캐시 (API Key + Refresh Token) | ⬜ |
+| 5-E | Queue Engine Lua Scripts (Sprint 6 준비) | ⬜ |
+| 5-F | Sprint 5 마무리 (문서 갱신) | 🔄 |
+
+### 5-A. Redis Sentinel 인프라 ✅
+
+- ✅ WSL2 Redis Sentinel 구성 (Master + Slave 2 + Sentinel 3)
+- ✅ `~/.bashrc` 자동 시작 스크립트
+- ✅ `RedisConfig` LettuceConnectionFactory + StringRedisTemplate
+- ✅ `application*.yml` Sentinel 연결 정보 (master + nodes)
+- ✅ Failover 실증 (Master 강제 종료 → Slave 승격 5~10초 내)
+- ✅ CONFIG REWRITE 자동 동작 확인
+
+### 5-B. 모니터링 시스템 ✅
+
+- ✅ Prometheus 3.0.1 + Grafana (WSL2 직접 설치)
+- ✅ `micrometer-registry-prometheus` 의존성
+- ✅ `/actuator/prometheus` 엔드포인트 노출
+- ✅ MONITORING_DESIGN.md (4개 카테고리: System / Application / Business / Infrastructure)
+- ✅ INFRA_SETUP.md §7 Prometheus + Grafana 섹션
+- ✅ 핵심 메트릭: `hikaricp_connections_pending`, `http_server_requests_seconds`, JVM/GC
+
+### 5-C. Rate Limiter ✅
+
+**알고리즘 분리 적용** (DECISIONS §60, §61):
+
+| 용도 | 알고리즘 | 키 패턴 | 인터페이스 |
+|------|---------|--------|-----------|
+| Tenant SLA (인증 후) | Token Bucket | `rl:tenant:{tenantId}` | `RateLimiter` |
+| 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip:{ip}` | `FixedWindowRateLimiter` |
+
+**구성:**
+- ✅ `RateLimiter` / `FixedWindowRateLimiter` 도메인 포트 (queue-domain)
+- ✅ `InMemoryTokenBucketRateLimiter` (학습/단일 JVM)
+- ✅ `RedisTokenBucketRateLimiter` (운영, Lua 원자 실행)
+- ✅ `RedisFixedWindowRateLimiter` (운영, INCR + EXPIRE 원자 실행)
+- ✅ `token-bucket.lua` (HMGET → 회복 계산 → HMSET + EXPIRE)
+- ✅ `fixed-window.lua` (시간 윈도우별 키 분리 + 자동 만료)
+- ✅ Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE, DECISIONS §62)
+- ✅ `RateLimitFilter` HTTP 통합 (JwtAuthFilter 후 실행, addFilterAfter)
+- ✅ `PublicEndpointRateLimit` (SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분)
+- ✅ ErrorCode RL_001_KEY_LIMIT (HTTP 429 + Retry-After 헤더)
+- ✅ 동시성 검증 (1,000 동시 요청 → 정확히 capacity개만 통과, Lua 원자성)
+- ✅ 수동 검증 (signup 6회 → 6번째부터 429 응답)
+
+### 5-D. Redis 캐시 적용 ⬜
+
+- ⬜ ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
+- ⬜ 캐시 히트율 로그
+- ⬜ Refresh Token Redis 이중 저장 (Redis 우선 + DB fallback)
+- ⬜ `RedisKeyFactory` (static 메서드 방식)
+- ⬜ Tenant 정보 Redis 캐시 (Rate Limiter에서 사용)
+
+### 5-E. Queue Engine Lua Scripts ⬜ (Sprint 6 준비)
+
+- ⬜ `enqueue.lua` (INCRBY global-seq + ZADD multi-member NX)
+- ⬜ `admit.lua` (ZRANGE WITHSCORES + ZREM + 재정렬)
+- ⬜ `ranking.lua` (ZSCORE + 슬라이스별 ZCOUNT 합산)
+- ⬜ 슬라이스 라운드로빈 분배 (`slice = (seq-1) % sliceCount`)
+- ⬜ Lua Script 동시성 검증 (1,000 동시 Enqueue → 순번 중복 0)
+
+### 5-F. Sprint 5 마무리 🔄
+
+- 🔄 DECISIONS.md 갱신 (Rate Limiter 결정 사항 #60~#65)
+- 🔄 ROADMAP.md Sprint 5 진행 반영
+- ⬜ `doc/sprint-5/RATE_LIMITER.md` 신규 작성
+- ⬜ FRS_final.md Rate Limiter 명세 갱신
+- ⬜ FLOW.md Filter 흐름도 추가
+- ⬜ CLAUDE.md 진행 상황 반영
+- ⬜ KPT 회고 (선택)
+
+### 완료 기준 (DoD)
+
+**5-A (완료) — Redis Sentinel 인프라**
+- [x] Redis Sentinel 3노드 기동 확인 (`redis-cli -p 26379 sentinel master mymaster`)
+- [x] `num-sentinels=3, num-slaves=2, quorum=2` 확인
+- [x] Failover 시나리오 테스트 (Master 강제 종료 → Slave 승격 5~10초 내)
+- [x] `autoconfigure.exclude`에서 `RedisAutoConfiguration`, `RedisRepositoriesAutoConfiguration` 제거
+- [x] Redis 장애 시 Circuit Breaker → 503 응답 (LettuceConnectionFactory가 자동 처리)
+
+**5-B (완료) — 모니터링**
+- [x] Prometheus + Grafana 기동
+- [x] `/actuator/prometheus` 노출
+- [x] 모니터링 4개 카테고리 설계 완료
+- [x] HikariCP, JVM, HTTP 메트릭 수집 확인
+
+**5-C (완료) — Rate Limiter**
+- [x] Rate Limiter 알고리즘 분리 (Token Bucket + Fixed Window)
+- [x] Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE)
+- [x] RateLimitFilter HTTP 통합 (JwtAuthenticationFilter 후 실행)
+- [x] 동시 1,000 요청 → 정확히 capacity개만 통과 (Lua 원자성)
+- [x] HTTP 429 + Retry-After 응답 표준 준수
+- [x] signup 6회 → 6번째 429 수동 검증 완료
+- [x] InMemoryTokenBucketRateLimiter 단위 테스트
+- [x] RedisTokenBucketRateLimiter 통합 테스트
+
+**5-D (예정) — Redis 캐시**
+- [ ] API Key 캐시 히트율 로그로 확인 (60s TTL)
+- [ ] Refresh Token Redis 조회 우선 → DB fallback 동작 검증
+- [ ] RedisKeyFactory 단위 테스트 (키 포맷 검증)
+
+**5-E (예정) — Queue Engine Lua**
 - [ ] Lua Script 원자성 통합 테스트 (동시 1,000 Enqueue → 순번 중복 없음)
 - [ ] 슬라이스 라운드로빈 분배 확인 (`slice = (seq-1) % sliceCount`)
-- [ ] Redis 장애 시 Circuit Breaker → 503 응답
-- [ ] RedisKeyFactory 단위 테스트 (키 포맷 검증)
-- [ ] **Rate Limit per-key 100 rps 초과 시 429 응답** (Redis 카운터 기반)
-- [ ] **API Key 캐시 히트율 로그로 확인** (60s TTL 적용)
-- [ ] **Refresh Token Redis 조회 우선 → DB fallback 동작 검증**
+- [ ] Ranking Lua Script 정확성 검증
 
-**참조 문서:** DECISIONS §5 (Redis 장애 복구), §17 (대용량 처리 - Redis), §30 (Redis Sentinel)
+**참조 문서:**
+- DECISIONS §5 (Redis 장애 복구), §17 (대용량 처리), §30 (Redis Sentinel)
+- DECISIONS §60-§65 (Rate Limiter 결정 사항)
+- `doc/sprint-5/RATE_LIMITER.md` (신규)
+- `doc/sprint-5/REDIS_SENTINEL.md`
+- `doc/sprint-5/LUA_SCRIPTS.md`
 
-**Sprint 핵심 차별 포인트:** Lua Script 원자성 + Sentinel Failover 실증
+**Sprint 핵심 차별 포인트:**
+- Lua Script 원자성 + Sentinel Failover 실증
+- **Token Bucket + Fixed Window 알고리즘 분리** (책임/의도 명확)
+- **Tenant Plan 기반 동적 SLA 한도 적용** (SaaS 비즈니스 모델 매핑)
+- **인증 전 보안 한도** (Brute Force/회원가입 남용 방지)
+- 슬라이스 파티셔닝
 
-**실증 증거 수집:** Failover 로그 + Lua Script 동시성 테스트 결과
+**실증 증거 수집:**
+- Failover 로그 + Lua Script 동시성 테스트 결과
+- Rate Limiter 1,000 동시 요청 정확성 검증
+- signup 429 응답 수동 검증
+- Token Bucket burst 허용 + 회복 시나리오
 
 ---
 
@@ -389,7 +495,7 @@ flowchart TD
 **예상 기간:** 3주
 **카테고리:** 부하 / 운영
 
-**선행 인프라:** [INFRA_SETUP.md §4](INFRA_SETUP.md) — k6 설치 / [§5 (신규)](INFRA_SETUP.md) — Prometheus + Grafana 설치
+**선행 인프라:** [INFRA_SETUP.md §4](INFRA_SETUP.md) — k6 설치 / [§7](INFRA_SETUP.md) — Prometheus + Grafana (Sprint 5에서 이미 구축)
 
 **주요 산출물:**
 
@@ -403,16 +509,13 @@ flowchart TD
 - 시나리오 1: Enqueue 200 rps 지속
 - 시나리오 2: **Polling 2,000 rps 지속 → p99 < 50ms 검증 (포트폴리오 핵심)**
 - 시나리오 3: Enqueue 10,000 rps 급증 (Kafka 버퍼 효과 검증)
+- 시나리오 4: Rate Limit 한도 초과 시나리오 (Tenant Plan별 burst 동작)
 - p50/p95/p99 레이턴시, 에러율, Throughput 측정
 
-**C. Grafana 모니터링 구축**
-- WSL2에 Prometheus + Grafana 설치
-- Queue Platform 측에 `micrometer-registry-prometheus` 의존성 추가 (Sprint 2 이후 점진 확장)
-- `/actuator/prometheus` 엔드포인트 노출
-- Grafana 대시보드 구성:
-  - JVM 메트릭 (GC, Heap, Thread)
-  - HTTP 요청 (p99 레이턴시, RPS, 에러율)
-  - HikariCP 커넥션 풀 상태
+**C. Grafana 대시보드 확장** (Sprint 5에서 기초 구축)
+- 추가 대시보드:
+  - Rate Limiter 한도 도달 통계 (Tenant 단위)
+  - Polling 응답 시간 p50/p95/p99
   - Kafka Consumer lag
   - Redis 커맨드 레이턴시
   - Virtual Thread 수
@@ -426,6 +529,7 @@ flowchart TD
 
 **E. JS SDK 구현** (별도 레포 `queue-platform-sdk-js`)
 - `PollingManager` (nextPollAfterSec 자동 적용, setTimeout 관리)
+- `RetryHandler` (429 응답 시 Retry-After 헤더 활용)
 - `StateManager` (IDLE → WAITING → READY → COMPLETED → EXPIRED)
 - `VisibilityHandler` (visibilitychange → Polling 중단/재개)
 - `NetworkHandler` (offline/online 자동 처리)
@@ -444,11 +548,11 @@ flowchart TD
 
 **완료 기준 (DoD):**
 - [ ] k6 설치 확인 (`k6 version`)
-- [ ] Prometheus + Grafana 기동 확인
 - [ ] 통합 테스트 실행 시간 < 10분
 - [ ] k6 시나리오 2 (Polling 2,000 rps) 성공 → **p99 < 50ms 증거 스크린샷 확보** ⭐
 - [ ] k6 시나리오 3 (Enqueue 10,000 rps 급증) → Kafka 버퍼 효과로 p99 < 100ms
-- [ ] **Grafana 대시보드 6개 완성** (JVM / HTTP / HikariCP / Kafka lag / Redis / Virtual Thread)
+- [ ] k6 시나리오 4 (Rate Limit 한도 초과) → 429 정상 응답 + Retry-After 검증
+- [ ] **Grafana 대시보드 6개 완성** (JVM / HTTP / HikariCP / Kafka lag / Redis / Rate Limiter)
 - [ ] **k6 실측 중 Grafana 실시간 모니터링 스크린샷 확보** ⭐
 - [ ] Swagger UI 접근 가능 + 모든 API 응답 예시 포함
 - [ ] **JS SDK 데모 HTML로 대기열 참여 → Polling → admitToken 수신 E2E 시나리오 동작**
@@ -457,7 +561,7 @@ flowchart TD
 
 **Sprint 핵심 차별 포인트:** 2,000 rps 실측 + Grafana 대시보드 + JS SDK 데모 = 면접 시 가장 강력한 증거 세트
 
-**실증 증거 수집:** 
+**실증 증거 수집:**
 - k6 리포트 HTML
 - Grafana 대시보드 스크린샷 (부하 전/중/후)
 - OpenAPI Swagger UI 캡처
@@ -465,7 +569,7 @@ flowchart TD
 
 ---
 
-### ⬜ Sprint 11 — Docker화 + AWS 배포 + 대용량 실측 (신규)
+### ⬜ Sprint 11 — Docker화 + AWS 배포 + 대용량 실측
 
 **예상 기간:** 3주
 **카테고리:** 배포 / 운영
@@ -507,6 +611,7 @@ flowchart TD
 **E. AWS 환경 k6 부하 실측**
 - Polling 2,000 rps 지속 → p99 확인 (AWS 네트워크 레이턴시 감안)
 - Enqueue 10,000 rps 급증 (MSK Serverless 버퍼 효과 검증)
+- Rate Limit Tenant Plan 한도 실측 (PRO 10,000 RPS burst 검증)
 - **로컬 vs AWS 비교 리포트** (레이턴시, 비용, 가용성)
 
 **F. CloudWatch 모니터링**
@@ -594,7 +699,7 @@ ECR, CloudWatch, 기타        : ~$10
 | 1 | Virtual Thread 실증 (isVirtual=true) + autoconfigure.exclude 단계적 활성화 전략 |
 | 2 | ReplicationRoutingDataSource + @Transactional(readOnly) 자동 라우팅 (GTID 복제 기반) |
 | 4 | Refresh Token 버전 기반 재사용 감지 + Rotation |
-| 5 | Lua Script 원자성 + Sentinel Failover 실증 + 슬라이스 파티셔닝 + Rate Limit |
+| **5** | **Lua Script 원자성 + Sentinel Failover 실증 + Rate Limiter 알고리즘 분리 + Tenant Plan 동적 SLA** ⭐ |
 | 6 | nextPollAfterSec 적응형 간격 (서버 부하 최적화) |
 | **7** | **admitToken TTL 만료 → WAITING 복귀 (seq 기반 우선순위 보존)** ⭐ |
 | 8 | Kafka KRaft + At-Least-Once + 동기→비동기 리팩토링 경험 |
@@ -604,17 +709,40 @@ ECR, CloudWatch, 기타        : ~$10
 
 ---
 
+## 우선순위 가이드
+
+### 즉시 (이번 주)
+- 5-D-1: ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
+- 5-D-2: 캐시 히트율 로그
+- 5-D-3: Refresh Token Redis 이중 저장
+- 5-D-4: RedisKeyFactory (static 메서드)
+
+### 단기 (1-2주)
+- 5-E-1: enqueue.lua (INCRBY + ZADD multi-member NX)
+- 5-E-2: admit.lua (ZRANGE + ZREM)
+- 5-E-3: ranking.lua (ZSCORE + 슬라이스별 ZCOUNT)
+- 5-F: Sprint 5 마무리 (문서 갱신 완료, 회고 작성)
+
+### 중기 (다음 Sprint)
+- Sprint 6: Token 도메인 + Queue Engine API (Enqueue / Polling)
+
+---
+
 ## 참조 문서
 
 - [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis/Kafka/k6/Prometheus/Grafana)
 - [AWS_LEARNING_PATH.md](AWS_LEARNING_PATH.md) — Sprint 11 대비 AWS 병렬 학습 경로
 - [FRS v1.10](FRS_final.md) — 기능 정의
-- [DECISIONS](DECISIONS.md) — 45개 설계 결정
+- [DECISIONS](DECISIONS.md) — 65개+ 설계 결정
 - [FLOW](FLOW.md) — 상세 흐름도
 - [STATE](STATE.md) — 상태 머신
+- [CONCURRENCY](CONCURRENCY.md) — 동시성 제어
+- [sprint-5/RATE_LIMITER.md](sprint-5/RATE_LIMITER.md) — Rate Limiter 설계 통합 문서 (신규)
+- [sprint-5/REDIS_SENTINEL.md](sprint-5/REDIS_SENTINEL.md) — Redis Sentinel 학습 노트
+- [sprint-5/LUA_SCRIPTS.md](sprint-5/LUA_SCRIPTS.md) — Lua Script 학습 노트
 
 ---
 
 <p align="center">
-  <sub>Sprint 1 완료 · 2026-04-16 · 다음 목표: Sprint 2 (JPA + R/W 분리) · 병렬 학습: AWS_LEARNING_PATH</sub>
+  <sub>Sprint 4 완료 · 2026-04-24 · Sprint 5 진행 중 (2026-06-10) · 다음 목표: 5-D Redis 캐시 · 병렬 학습: AWS_LEARNING_PATH</sub>
 </p>

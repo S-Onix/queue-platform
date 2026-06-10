@@ -2667,3 +2667,385 @@ Redisson 기반 `@DistributedLock` 어노테이션을 사내에서 정의해 사
 ### Interview Point
 
 > "분산 락은 표준 어노테이션이 없어서 Redisson을 AOP로 감싸 `@DistributedLock`을 직접 정의했습니다. 헥사고날 원칙을 지키기 위해 어노테이션은 queue-common, Aspect는 queue-infrastructure에 두었습니다. 가장 큰 함정은 `@Transactional`과의 순서로, 락이 트랜잭션보다 안쪽이면 락 해제 후 커밋 전에 다음 요청이 들어와 보호가 깨집니다. `@Order(HIGHEST_PRECEDENCE)`로 락이 트랜잭션보다 바깥임을 명시했고, 더 안전하게는 락 메서드와 트랜잭션 메서드를 별도 빈으로 분리하는 패턴도 권장합니다."
+
+
+## 60. Sprint 5 — Rate Limiter 알고리즘 선택 (Token Bucket)
+
+**Status**: Accepted
+**Date**: 2026-06
+**Context**: 멀티 테넌시 환경에서 Tenant별 SLA 차등 한도 적용 필요. 5개 알고리즘 비교 후 선택.
+
+### Decision
+
+Tenant SLA 한도용 알고리즘으로 **Token Bucket**을 채택.
+
+| 알고리즘 | 정확성 | Burst | 메모리 | Queue Platform 적합도 |
+|---------|--------|-------|--------|---------------------|
+| Fixed Window | 낮음 | 시간 경계 | O(1) | △ (시간 경계 burst 문제) |
+| Sliding Window Log | 매우 높음 | 없음 | O(N) | ✗ (메모리 부담) |
+| Sliding Window Counter | 높음 | 작음 | O(1) | △ (burst 처리 부족) |
+| **Token Bucket** ⭐ | 높음 | 제어 가능 | O(1) | ✓ |
+| Leaky Bucket | 매우 높음 | 없음 | O(1) | ✗ (burst 거부) |
+
+### Rationale
+
+**Token Bucket 선택 이유**:
+- capacity (burst 허용량) + refillRatePerSecond (평균 처리량) 분리 제어
+- 콘서트 티켓팅 같은 burst 트래픽 흡수 (양동이 가득찬 상태 → 즉시 통과)
+- SaaS Plan과 자연스러운 매핑 (capacity = refillRate × 60)
+- O(1) 메모리 (Hash 필드 in-place 갱신)
+
+**다른 알고리즘 기각 사유**:
+- Fixed Window: 시간 경계 burst (12:59 + 13:00 = 한도의 2배 통과 가능)
+- Sliding Window Log: 요청마다 O(N) 메모리 → 대규모 트래픽에 부적합
+- Leaky Bucket: 일정 속도 강제, burst 거부 → SLA의 burst 허용과 충돌
+
+### Consequences
+
+**긍정**
+- Tenant Plan(FREE/STARTER/PRO/ENTERPRISE)별 capacity/refillRate 차등 가능
+- 콘서트 시작 시 폭증 흡수 (양동이 일시 비움 후 회복)
+- 단순 구현 (Redis Hash 2필드 + Lua Script)
+
+**부정**
+- 양동이 가득찬 상태가 항상 보장되지 않음 (장시간 미사용 후 큰 burst 가능)
+- → 운영 시 burst 도달 빈도 모니터링 필요
+
+### Interview Point
+
+> "Rate Limiter 알고리즘은 비즈니스 요구사항에 따라 다릅니다. Queue Platform은 콘서트 티켓팅 같은 burst 트래픽을 흡수해야 하므로 Token Bucket을 선택했습니다. capacity는 1분치 burst를 허용하도록 refillRate × 60으로 설정했고, 양동이 모델이 SaaS Plan과 자연스럽게 매핑됩니다. 단순 Fixed Window는 시간 경계 burst 문제가 있고, Sliding Window Log는 O(N) 메모리 부담이 있어서 부적합했습니다."
+
+### Related
+
+- §61 (알고리즘 분리), §62 (Tenant Plan 도입)
+- `doc/sprint-5/RATE_LIMITER.md`
+
+---
+
+## 61. Sprint 5 — Rate Limiter 알고리즘 분리 (Token Bucket + Fixed Window)
+
+**Status**: Accepted
+**Date**: 2026-06
+**Context**: 인증 후(Tenant SLA)와 인증 전(보안) 한도의 의도가 다름. 같은 알고리즘으로 처리 시 의미 모호.
+
+### Decision
+
+용도별로 다른 알고리즘 적용. 인터페이스도 분리.
+
+| 용도 | 알고리즘 | 인터페이스 |
+|------|---------|----------|
+| Tenant SLA (인증 후) | Token Bucket | `RateLimiter` |
+| 인증 전 보안 (signup/login/refresh) | Fixed Window | `FixedWindowRateLimiter` |
+
+### Rationale
+
+**왜 Token Bucket이 인증 전에 부적합한가**:
+- Token Bucket = burst 허용용 (capacity까지 즉시 통과)
+- 인증 전 endpoint는 정상 사용자가 분당 1-5회 → burst 불필요
+- burst 허용이 오히려 공격자에게 유리 (예: signup capacity 5 → 초기 5회 burst 가능)
+
+**왜 Fixed Window가 보안에 적합한가**:
+- "1분에 N회만 허용" 명확한 의미
+- Burst 불허 → 정상 사용자엔 영향 없음 (도달 X)
+- 한도 도달 = 비정상 신호 (공격/봇)
+- 시간 경계 burst 문제도 한도가 작아 영향 미미 (5/분이 잠시 10/2분이 되는 정도)
+
+**왜 인터페이스를 분리하는가**:
+- 다른 책임 (SLA vs 보안)
+- 다른 시그니처 (capacity + refillRate vs limit + windowSize)
+- 다른 호출 자리 (Filter에서 인증 후/전 분기)
+- 다형성 불필요 (같은 자리에서 교체 X)
+
+**인터페이스 분리해도 인터페이스의 가치 유지**:
+- 의존성 역전 (도메인이 Redis 모름) ✓
+- 테스트 용이성 (Mock 가능) ✓
+- 명세 (Contract) ✓
+- → 다형성만이 인터페이스의 유일한 가치가 아님
+
+### Consequences
+
+**긍정**
+- 의미 명확 (알고리즘 이름에서 의도 추론 가능)
+- 면접 답변 자산 (왜 분리했나)
+- 각자 최적화 가능
+
+**부정**
+- 클래스 수 증가 (도메인 포트 2개, 구현 2개)
+- 단순함은 약간 손해
+
+### Alternatives Considered
+
+| 대안 | 기각 사유 |
+|------|---------|
+| 단일 RateLimiter (Token Bucket 강제) | 인증 전 burst 허용이 보안 목적과 충돌 |
+| 단일 RateLimiter (어색한 매핑) | capacity = limit, refillRate 무시 → 의미 불명 |
+
+### Interview Point
+
+> "인증 후와 인증 전 한도는 의도가 다릅니다. Tenant SLA는 burst 처리(콘서트 티켓팅)가 핵심이라 Token Bucket을 썼고, 인증 전 보안 한도는 burst가 불필요해서 Fixed Window를 썼습니다. 한 인터페이스로 통합하려 했지만 시그니처가 달라 어색했고, 두 인터페이스로 분리해도 의존성 역전, 테스트 용이성, 명세라는 인터페이스의 다른 가치는 유지됩니다. 다형성만이 인터페이스의 유일한 가치는 아닙니다."
+
+### Related
+
+- §60 (Token Bucket 채택), §62 (Tenant Plan)
+- `doc/sprint-5/RATE_LIMITER.md`
+
+---
+
+## 62. Sprint 5 — Tenant Plan 도입 (SaaS 등급)
+
+**Status**: Accepted
+**Date**: 2026-06
+**Context**: Tenant별 동적 Rate Limit 한도 필요. SaaS Plan과 매핑.
+
+### Decision
+
+Tenant 도메인에 `Plan` enum 추가. 각 Plan이 Rate Limiter 파라미터 정의.
+
+```java
+public enum Plan {
+    FREE(100, 1.67),            // 분당 100 RPS
+    STARTER(1_000, 16.67),      // 분당 1,000 RPS
+    PRO(10_000, 166.67),        // 분당 10,000 RPS
+    ENTERPRISE(100_000, 1_666.67); // 분당 100,000 RPS
+
+    private final int capacity;
+    private final double refillRatePerSecond;
+}
+```
+
+**비율**: `capacity = refillRatePerSecond × 60` (1분치 burst 허용)
+
+**DB 저장**: `plan TINYINT NOT NULL DEFAULT 0` (TenantStatus 패턴과 동일)
+
+### Rationale
+
+**왜 capacity = refillRate × 60인가**:
+- 콘서트 티켓팅: 시작 1분 안에 매진 (현실 시나리오)
+- 1분 후 트래픽 안정화
+- 1분치 burst가 비즈니스와 맞음
+
+**왜 enum인가**:
+- Plan은 고정된 셋 (확장 가능하지만 동적 추가 X)
+- 코드에서 Plan.PRO처럼 명시적 사용
+- DB에는 ordinal 저장 (TINYINT)
+
+**왜 Tenant 도메인에 두는가**:
+- Plan은 비즈니스 개념 (SaaS 등급 = 약속)
+- Rate Limit은 그 약속의 한 구현
+- 도메인 객체로 자연스러움
+
+### Consequences
+
+**긍정**
+- Tenant별 SLA 차등 적용
+- Plan 변경 시 다음 요청부터 자동 반영
+- 비즈니스 모델과 자연스러운 매핑
+
+**부정**
+- Filter에서 매 요청 Tenant 조회 → DB 부담
+- → Sprint 5-D에서 Redis 캐시 도입 예정
+
+### Interview Point
+
+> "Tenant Plan은 SaaS 비즈니스 모델의 핵심입니다. Free 100 RPS, Pro 10,000 RPS 같은 약속을 Rate Limiter에 매핑했습니다. capacity = refillRate × 60으로 1분치 burst를 허용해서 콘서트 시작 같은 폭증을 처리합니다. Plan은 Tenant 도메인에 enum으로 두고, DB에는 TINYINT로 저장합니다. TenantStatus 패턴과 동일하게 ordinal 매핑이라 추가 컬럼 없이 확장 가능합니다."
+
+### Related
+
+- §60 (Token Bucket), §61 (알고리즘 분리)
+- `doc/sprint-5/RATE_LIMITER.md`
+
+---
+
+## 63. Sprint 5 — RateLimitFilter HTTP 통합
+
+**Status**: Accepted
+**Date**: 2026-06
+**Context**: Rate Limit을 HTTP Filter에 통합. Filter 체인 위치, Tenant 식별, 키 패턴 결정 필요.
+
+### Decision
+
+`RateLimitFilter`를 `JwtAuthenticationFilter` **뒤**에 등록.
+
+```java
+.addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+.addFilterAfter(rateLimitFilter, JwtAuthenticationFilter.class);
+```
+
+**키 패턴**:
+- 인증 후: `rl:tenant:{tenantId}` + Tenant Plan 한도 (Token Bucket)
+- 인증 전: `rl:{action}:ip:{ip}` + 고정 한도 (Fixed Window)
+    - `rl:signup:ip:127.0.0.1`
+    - `rl:login:ip:127.0.0.1`
+    - `rl:refresh:ip:127.0.0.1`
+
+**응답**:
+- 한도 초과 시 HTTP 429
+- `Retry-After` 헤더 (초 단위)
+- Body: `{ "error": "RL001", "message": "...", "retryAfter": 60 }`
+
+### Rationale
+
+**왜 JwtAuthenticationFilter 뒤인가**:
+- JWT 파싱이 먼저 → SecurityContext에 TenantAuth 저장
+- RateLimitFilter가 그 정보로 Tenant Plan 한도 적용
+- 순서 반대면 Tenant 식별 불가 → 모든 요청이 IP 기반 (의도 X)
+
+**왜 IP 기반 인증 전 한도인가**:
+- Tenant 식별 불가 (인증 안 됨)
+- IP가 유일한 식별자
+- X-Forwarded-For 헤더 우선 (Nginx 프록시 대응)
+
+**왜 NAT 공유 IP에도 한도 너무 엄격하지 않은가**:
+- 회사 100명 동시 가입 = 같은 IP
+- 한도 분당 5회 → 정상 사용자도 차단 가능
+- → 분당 5-10회는 정상 사용자에겐 충분 (하루 1-2회 가입)
+
+**왜 인증 필요 endpoint를 인증 없이 호출 시 Rate Limit 안 적용하는가**:
+- SecurityConfig가 401로 차단 → 시스템 자원 거의 안 씀
+- Filter에서 정확한 endpoint별 키 패턴 모호
+- 단순화 우선 (책임 분리: 인증/인가 vs Rate Limit)
+
+### Consequences
+
+**긍정**
+- 인증 후/전 모두 보호
+- Tenant Plan 차등 적용 가능
+- 표준 HTTP 패턴 (429 + Retry-After)
+
+**부정**
+- 매 요청 Tenant DB 조회 → 5-D에서 캐시
+- IP 기반은 NAT 공유 IP 한계
+- → 추가 보안 (CAPTCHA 등)은 Sprint 6+
+
+### Interview Point
+
+> "Rate Limit Filter는 JWT 인증 뒤에 배치합니다. JWT 파싱이 먼저 SecurityContext에 Tenant 정보를 저장하고, RateLimitFilter가 그 정보로 Plan 한도를 적용합니다. 인증 전 endpoint(signup/login/refresh)는 IP 기반 + Fixed Window로 Brute Force와 회원가입 남용을 방지합니다. X-Forwarded-For 헤더로 실제 IP를 추출하고, NAT 공유 IP 대비 한도를 너무 엄격하게 잡지 않습니다."
+
+### Related
+
+- §60 (Token Bucket), §61 (분리), §62 (Plan)
+- `doc/sprint-5/RATE_LIMITER.md`
+
+---
+
+## 64. Sprint 5 — Redis Lua Script Bean 등록 패턴
+
+**Status**: Accepted
+**Date**: 2026-06
+**Context**: Lua Script가 늘어날 예정 (Token Bucket, Fixed Window, Enqueue, Admit, Ranking 등). Bean 등록 전략 결정.
+
+### Decision
+
+**현재 단계 (Script 1-5개)**: Bean 개별 등록 + Helper 메서드.
+
+```java
+// Helper 메서드 (Bean 아님)
+private <T> RedisScript<T> loadScript(String path, Class<T> resultType) {
+    DefaultRedisScript<T> script = new DefaultRedisScript<>();
+    script.setLocation(new ClassPathResource(path));
+    script.setResultType(resultType);
+    return script;
+}
+
+@Bean
+public RedisScript<Long> tokenBucketScript() {
+    return loadScript("lua/token-bucket.lua", Long.class);
+}
+
+@Bean
+public RedisScript<Long> fixedWindowScript() {
+    return loadScript("lua/fixed-window.lua", Long.class);
+}
+```
+
+### Rationale
+
+**왜 일괄 로드(Map 패턴) 아닌가**:
+- Script 5개 미만이라 boilerplate 부담 적음
+- 타입 안전성 (Class<T> 파라미터)
+- Bean 명시적 → 가독성 ↑
+- Map 키 문자열 의존 → 런타임 확인 (컴파일 X)
+
+**왜 Helper 메서드인가**:
+- 3줄 boilerplate를 1줄로 줄임
+- @Bean 메서드는 여전히 명시적
+- 추가 쉬움 (한 줄)
+
+**확장 시점**:
+- Script 5-10개: 도메인별 Configuration 분리 (RedisRateLimitConfig, RedisQueueConfig)
+- Script 10+: 일괄 로드 (Map<String, RedisScript>) 검토
+
+### Consequences
+
+**긍정**
+- 단순 + 명시적
+- 학습 단계 적합
+- 면접 답변 깔끔
+
+**부정**
+- Script 늘어나면 RedisConfig 비대해짐
+- → 시점에 도메인별 분리
+
+### Interview Point
+
+> "Lua Script Bean 관리는 단계별 전략입니다. 현재 1-5개 단계는 개별 @Bean 등록 + Helper 메서드로 boilerplate를 줄였습니다. Script가 5-10개로 늘면 도메인별 Configuration 분리(RedisRateLimitConfig, RedisQueueConfig)를 검토하고, 10개 이상이면 일괄 로드 패턴을 고려합니다. 단순함과 가독성을 우선하되, 확장 시점의 패턴 변경 가능성을 열어둡니다."
+
+### Related
+
+- §60 (Token Bucket), §61 (분리)
+
+---
+
+## 65. Sprint 5 — 인증 전 Rate Limit 알고리즘 의도 (Burst 불허)
+
+**Status**: Accepted
+**Date**: 2026-06
+**Context**: 인증 전 endpoint(signup/login/refresh)의 한도 알고리즘 선택. Token Bucket vs Fixed Window 비교.
+
+### Decision
+
+인증 전 endpoint는 **Fixed Window** 사용. Token Bucket 안 씀.
+
+| 측면 | 인증 후 (Token Bucket) | 인증 전 (Fixed Window) |
+|------|-------------------|------------------|
+| 목적 | SLA + 비즈니스 | 보안 + 보호 |
+| Burst | 허용 (콘서트 티켓팅) | 불허 (정상 분당 1-5회) |
+| 한도 도달 | 영업 시그널 | 비정상 시그널 |
+| 정상 사용자 도달 | 가능 | 거의 X |
+
+### Rationale
+
+**왜 인증 전엔 burst 불필요한가**:
+- 정상 사용자: 회원가입 하루 1-2회, 로그인 5-10회, refresh 분당 1회
+- Token Bucket의 burst 5-10 → 정상 사용자에게 의미 없음
+- 오히려 공격자에게 도움 (초기 burst 5회 즉시 통과)
+
+**왜 Fixed Window 의도 명확한가**:
+- "1분에 N회" 명시적 한도
+- 도달 = 비정상 신호 (정상은 절대 도달 X)
+- 시간 경계 burst 영향 미미 (한도 작아서)
+
+**한도 결정 근거**:
+- SIGNUP 5/분: 정상 사용자는 하루 1-2회 → 5회는 충분
+- LOGIN 10/분: 비밀번호 오타 3-5회 + 여유 → 10회 적절
+- REFRESH 30/분: SDK 정상 15분마다 1회 → 30회는 매우 여유
+
+### Consequences
+
+**긍정**
+- 보안 신호 명확 (한도 도달 = 공격/봇 의심)
+- 정상 사용자엔 영향 X
+- 알고리즘 의도 명확
+
+**부정**
+- NAT 공유 IP 차단 가능 (회사 100명 동시 가입 시)
+- → CAPTCHA, 이메일 인증 등 보조 수단 (Sprint 6+)
+
+### Interview Point
+
+> "인증 전 endpoint의 Rate Limit은 의도가 다릅니다. Tenant SLA는 burst 처리가 핵심이지만, 인증 전 보안 한도는 burst가 오히려 공격자에게 유리합니다. 정상 사용자는 분당 1-5회 정도라 burst 불필요하고, 한도 도달 = 비정상 신호로 운영자가 알람 받을 수 있습니다. 한도 자체는 NAT 공유 IP 고려해 너무 엄격하지 않게 설정했습니다. SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분으로 정상 사용엔 절대 도달 안 합니다."
+
+### Related
+
+- §60 (Token Bucket), §61 (알고리즘 분리)
+- `doc/sprint-5/RATE_LIMITER.md`
