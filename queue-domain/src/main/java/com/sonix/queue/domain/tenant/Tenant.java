@@ -13,6 +13,7 @@ public class Tenant {
     private String passwordHash;
     private String name;
     private TenantStatus status;
+    private Plan plan;
     private LocalDateTime createdAt;
 
     /**
@@ -27,6 +28,7 @@ public class Tenant {
         this.passwordHash = passwordHash;
         this.name = name;
         this.status = TenantStatus.ACTIVE;
+        this.plan = Plan.FREE;
         this.createdAt = LocalDateTime.now();
         this.tenantId = IdGenerator.generate("t_");
     }
@@ -43,7 +45,8 @@ public class Tenant {
      * */
     public static Tenant reconstruct(Long id, String tenantId, String email,
                                      String passwordHash, String name,
-                                     TenantStatus status, LocalDateTime createdAt) {
+                                     TenantStatus status, Plan plan,
+                                     LocalDateTime createdAt) {
         Tenant tenant = new Tenant();
         tenant.id = id;
         tenant.tenantId = tenantId;
@@ -51,6 +54,7 @@ public class Tenant {
         tenant.passwordHash = passwordHash;
         tenant.name = name;
         tenant.status = status;
+        tenant.plan = plan;
         tenant.createdAt = createdAt;
         return tenant;
     }
@@ -70,6 +74,11 @@ public class Tenant {
         if(this.status == TenantStatus.DEACTIVATED)
             throw new IllegalStateException("이미 비활성화된 Tenant 입니다.");
         this.status = TenantStatus.DEACTIVATED;
+    }
+
+    public void changePlan(Plan newPlan) {
+        if (newPlan == null) throw new IllegalArgumentException("Plan은 필수값입니다.");
+        this.plan = newPlan;
     }
 
 }

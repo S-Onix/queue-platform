@@ -13,7 +13,8 @@ public enum ErrorCode {
     QUEUE_NOT_OWNED("Q002", "본인의 대기열이 아닙니다.", 403),
     DUPLICATE_QUEUE_NAME("Q003", "이미 존재하는 대기열 이름입니다.", 409),
     AK_001_UNAUTHORIZED("AK001", "인증이 필요합니다.", 401),
-    AK_002_FORBIDDEN("AK002", "권한이 없습니다.", 403)
+    AK_002_FORBIDDEN("AK002", "권한이 없습니다.", 403),
+    RL_001_KEY_LIMIT("RL001", "요청 한도를 초과했습니다.", 429)
     ;
 
     private final String code;

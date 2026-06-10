@@ -2,3 +2,10 @@ logging:
   level:
     root: WARN
     com.sonix.queue: INFO
+
+spring:
+  data:
+    redis:
+      sentinel:
+        nodes: ${REDIS_SENTINEL_NODES:redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379}
+        password: ${REDIS_PASSWORD:}

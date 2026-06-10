@@ -1,5 +1,6 @@
 package com.sonix.queue.infrastructure.entity;
 
+import com.sonix.queue.domain.tenant.Plan;
 import com.sonix.queue.domain.tenant.Tenant;
 import com.sonix.queue.domain.tenant.TenantStatus;
 import jakarta.persistence.*;
@@ -18,6 +19,7 @@ public class TenantEntity {
     String passwordHash;
     String name;
     int status;
+    int plan;
     LocalDateTime createdAt;
 
 
@@ -26,7 +28,8 @@ public class TenantEntity {
     public Tenant toDomain() {
         return Tenant.reconstruct(this.id,this.tenantId, this.email
                 , this.passwordHash, this.name
-                , TenantStatus.fromCode(status), this.createdAt
+                , TenantStatus.fromCode(status), Plan.fromCode(plan)
+                , this.createdAt
         );
     }
 
@@ -38,6 +41,7 @@ public class TenantEntity {
         entity.passwordHash = tenant.getPasswordHash();
         entity.name = tenant.getName();
         entity.status = tenant.getStatus().getStatusCode();
+        entity.plan = tenant.getPlan().getCode();
         entity.createdAt = tenant.getCreatedAt();
 
         return entity;
