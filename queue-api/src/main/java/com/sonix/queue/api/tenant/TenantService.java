@@ -39,7 +39,7 @@ public class TenantService {
     }
 
     @Transactional
-    public TenantResponse signup(SignupRequest request) {
+    public Tenant signup(SignupRequest request) {
         boolean isExist = tenantRepository.existsByEmail(request.getEmail());
         if (isExist) {
             throw new BusinessException(ErrorCode.DUPLICATE_EMAIL);
@@ -47,8 +47,8 @@ public class TenantService {
 
         String hash = passwordHasher.hash(request.getPassword());
         Tenant tenant = Tenant.create(request.getEmail(), hash, request.getName());
-        Tenant saved = tenantRepository.save(tenant);
-        return TenantResponse.from(saved);
+
+        return tenantRepository.save(tenant);
     }
 
     @Transactional
