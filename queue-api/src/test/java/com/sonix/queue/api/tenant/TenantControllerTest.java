@@ -2,10 +2,8 @@ package com.sonix.queue.api.tenant;
 
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
-import com.sonix.queue.api.tenant.dto.LoginRequest;
-import com.sonix.queue.api.tenant.dto.LoginResponse;
-import com.sonix.queue.api.tenant.dto.SignupRequest;
-import com.sonix.queue.api.tenant.dto.TenantResponse;
+import com.sonix.queue.api.security.RateLimitFilter;
+import com.sonix.queue.api.tenant.dto.*;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.tenant.Tenant;
@@ -40,12 +38,16 @@ class TenantControllerTest {
     @MockBean
     private JwtAuthenticationFilter jwtAuthenticationFilter;
 
+    @MockBean
+    private RateLimitFilter rateLimitFilter;
+
     @Test
     @DisplayName("POST /signup → 200")
     void signup_success() throws Exception {
         // given
-        TenantResponse response = TenantResponse.from(
-                Tenant.create("test@email.com", "hash", "테스트"));
+        Tenant tenant = Tenant.create("test@email.com", "hash", "테스트");
+
+        TenantResponse response = TenantResponse.from(tenant);
 
         when(tenantService.signup(any(SignupRequest.class))).thenReturn(response);
 
@@ -57,6 +59,7 @@ class TenantControllerTest {
                 )
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.email").value("test@email.com"))
+                .andExpect(jsonPath("$.data.name").value("테스트"))
                 .andExpect(jsonPath("$.success").value(true));
     }
 
