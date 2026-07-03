@@ -21,7 +21,7 @@ public class RedisApiKeyCache implements ApiKeyCache {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
 
-    private RedisApiKeyCache(StringRedisTemplate redisTemplate,
+    public RedisApiKeyCache(StringRedisTemplate redisTemplate,
                              ObjectMapper cacheObjectMapper) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = cacheObjectMapper;

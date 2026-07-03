@@ -48,7 +48,8 @@ public class TenantService {
         String hash = passwordHasher.hash(request.getPassword());
         Tenant tenant = Tenant.create(request.getEmail(), hash, request.getName());
 
-        return TenantResponse.from(tenant);
+        Tenant saved = tenantRepository.save(tenant);
+        return TenantResponse.from(saved);
     }
 
     @Transactional
