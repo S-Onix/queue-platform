@@ -1,6 +1,5 @@
 package com.sonix.queue.api.tenant;
 
-import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.security.RateLimitFilter;
@@ -33,8 +32,6 @@ class TenantControllerTest {
     @MockBean
     private TenantService tenantService;
 
-    @MockBean SignupFacade signupFacade;
-
     @MockBean
     private JwtProvider jwtProvider;              // ← 추가
 
@@ -50,11 +47,9 @@ class TenantControllerTest {
         // given
         Tenant tenant = Tenant.create("test@email.com", "hash", "테스트");
 
+        TenantResponse response = TenantResponse.from(tenant);
 
-        ApiKeyIssueResponse apiKey = ApiKeyIssueResponse.of("ak_test", "sk_test_rawkey");
-        SignupResponse response = SignupResponse.of(tenant, apiKey);
-
-        when(signupFacade.signup(any(SignupRequest.class))).thenReturn(response);
+        when(tenantService.signup(any(SignupRequest.class))).thenReturn(response);
 
         // when & then
         mockMvc.perform(
@@ -64,7 +59,7 @@ class TenantControllerTest {
                 )
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.email").value("test@email.com"))
-                .andExpect(jsonPath("$.data.apiKey.rawKey").value("sk_test_rawkey"))
+                .andExpect(jsonPath("$.data.name").value("테스트"))
                 .andExpect(jsonPath("$.success").value(true));
     }
 
@@ -72,7 +67,7 @@ class TenantControllerTest {
     @DisplayName("POST /signup 중복 이메일 → 409")
     void signup_duplicate_email() throws Exception {
         // given
-        when(signupFacade.signup(any(SignupRequest.class)))
+        when(tenantService.signup(any(SignupRequest.class)))
                 .thenThrow(new BusinessException(ErrorCode.DUPLICATE_EMAIL));
 
         // when & then
