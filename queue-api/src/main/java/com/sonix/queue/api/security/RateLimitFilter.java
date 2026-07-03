@@ -4,7 +4,9 @@ import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.ratelimit.FixedWindowRateLimiter;
 import com.sonix.queue.domain.ratelimit.RateLimiter;
 import com.sonix.queue.domain.tenant.Tenant;
+import com.sonix.queue.domain.tenant.TenantCache;
 import com.sonix.queue.domain.tenant.TenantRepository;
+import com.sonix.queue.infrastructure.ratelimit.RateLimitKeys;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -48,15 +50,18 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private final RateLimiter tokenBucketRateLimiter;
     private final FixedWindowRateLimiter fixedWindowRateLimiter;
     private final TenantRepository tenantRepository;
+    private final TenantCache tenantCache;
 
     public RateLimitFilter(
             RateLimiter tokenBucketRateLimiter,
             FixedWindowRateLimiter fixedWindowRateLimiter,
-            TenantRepository tenantRepository
+            TenantRepository tenantRepository,
+            TenantCache tenantCache
     ){
         this.tokenBucketRateLimiter = tokenBucketRateLimiter;
         this.fixedWindowRateLimiter = fixedWindowRateLimiter;
         this.tenantRepository = tenantRepository;
+        this.tenantCache = tenantCache;
     }
 
 
@@ -101,7 +106,8 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private boolean checkAuthenticatedRateLimit(
             TenantAuth tenantAuth, HttpServletResponse response) throws IOException {
 
-        Optional<Tenant> tenantOpt = tenantRepository.findByTenantId(tenantAuth.getTenantId());
+        //Optional<Tenant> tenantOpt = tenantRepository.findByTenantId(tenantAuth.getTenantId());
+        Optional<Tenant> tenantOpt = loadTenant(tenantAuth.getTenantId());
 
         if (tenantOpt.isEmpty()) {
             log.warn("Tenant not found for rate limit: tenantId={}", tenantAuth.getTenantId());
@@ -109,7 +115,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         }
 
         Tenant tenant = tenantOpt.get();
-        String key = "rl:tenant:" + tenant.getTenantId();
+        String key = RateLimitKeys.tenant(tenant.getTenantId());
         int capacity = tenant.getPlan().getCapacity();
         double refillRate = tenant.getPlan().getRefillRatePerSecond();
 
@@ -144,7 +150,8 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
         String ip = extractIp(request);
         String action = resolveActionName(path);
-        String key = "rl:" + action + ":ip:" + ip;
+        String key = RateLimitKeys.publicEndPoint(action, ip);
+
 
         boolean allowed = fixedWindowRateLimiter.tryAcquire(
                 key,
@@ -162,6 +169,19 @@ public class RateLimitFilter extends OncePerRequestFilter {
         }
 
         return true;
+    }
+
+    /**
+     * Cache Aside 패턴
+     * 캐시에 있으면 캐시 없으면 DB 조회
+     * */
+    private Optional<Tenant> loadTenant(String tenantId) {
+        return tenantCache.get(tenantId)
+                .or(() -> {
+                    Optional<Tenant> dbResult = tenantRepository.findByTenantId(tenantId);
+                    dbResult.ifPresent(tenantCache::put);
+                    return dbResult;
+                });
     }
 
     private PublicEndpointRateLimit resolvePublicEndpoint(String path) {

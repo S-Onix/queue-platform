@@ -3,6 +3,7 @@ package com.sonix.queue.api.apikey;
 import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
+import com.sonix.queue.api.security.RateLimitFilter;
 import com.sonix.queue.api.security.TenantAuth;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
@@ -40,6 +41,9 @@ class ApiKeyControllerTest {
 
     @MockBean
     private JwtAuthenticationFilter jwtAuthenticationFilter;
+
+    @MockBean
+    private RateLimitFilter rateLimitFilter;
 
     @BeforeEach
     void setUp() {

@@ -1,11 +1,10 @@
 package com.sonix.queue.api.tenant;
 
+import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
-import com.sonix.queue.api.tenant.dto.LoginRequest;
-import com.sonix.queue.api.tenant.dto.LoginResponse;
-import com.sonix.queue.api.tenant.dto.SignupRequest;
-import com.sonix.queue.api.tenant.dto.TenantResponse;
+import com.sonix.queue.api.security.RateLimitFilter;
+import com.sonix.queue.api.tenant.dto.*;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.tenant.Tenant;
@@ -34,20 +33,28 @@ class TenantControllerTest {
     @MockBean
     private TenantService tenantService;
 
+    @MockBean SignupFacade signupFacade;
+
     @MockBean
     private JwtProvider jwtProvider;              // ← 추가
 
     @MockBean
     private JwtAuthenticationFilter jwtAuthenticationFilter;
 
+    @MockBean
+    private RateLimitFilter rateLimitFilter;
+
     @Test
     @DisplayName("POST /signup → 200")
     void signup_success() throws Exception {
         // given
-        TenantResponse response = TenantResponse.from(
-                Tenant.create("test@email.com", "hash", "테스트"));
+        Tenant tenant = Tenant.create("test@email.com", "hash", "테스트");
 
-        when(tenantService.signup(any(SignupRequest.class))).thenReturn(response);
+
+        ApiKeyIssueResponse apiKey = ApiKeyIssueResponse.of("ak_test", "sk_test_rawkey");
+        SignupResponse response = SignupResponse.of(tenant, apiKey);
+
+        when(signupFacade.signup(any(SignupRequest.class))).thenReturn(response);
 
         // when & then
         mockMvc.perform(
@@ -57,6 +64,7 @@ class TenantControllerTest {
                 )
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.email").value("test@email.com"))
+                .andExpect(jsonPath("$.data.apiKey.rawKey").value("sk_test_rawkey"))
                 .andExpect(jsonPath("$.success").value(true));
     }
 
@@ -64,7 +72,7 @@ class TenantControllerTest {
     @DisplayName("POST /signup 중복 이메일 → 409")
     void signup_duplicate_email() throws Exception {
         // given
-        when(tenantService.signup(any(SignupRequest.class)))
+        when(signupFacade.signup(any(SignupRequest.class)))
                 .thenThrow(new BusinessException(ErrorCode.DUPLICATE_EMAIL));
 
         // when & then

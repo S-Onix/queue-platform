@@ -39,6 +39,8 @@ logging:
     com.sonix.queue: DEBUG
     org.hibernate.SQL: DEBUG
     org.hibernate.orm.jdbc.bind: TRACE
+    com.sonix.queue.infrastructure.cache: DEBUG
+    com.sonix.queue.api.security.RateLimitFilter: DEBUG
 
 management:
   endpoint:

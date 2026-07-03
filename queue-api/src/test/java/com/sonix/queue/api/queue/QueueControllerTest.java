@@ -5,6 +5,7 @@ import com.sonix.queue.api.queue.dto.QueueResponse;
 import com.sonix.queue.api.queue.dto.QueueUpdateRequest;
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
+import com.sonix.queue.api.security.RateLimitFilter;
 import com.sonix.queue.api.security.TenantAuth;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
@@ -45,6 +46,9 @@ class QueueControllerTest {
 
     @MockBean
     private JwtAuthenticationFilter jwtAuthenticationFilter;
+
+    @MockBean
+    private RateLimitFilter rateLimitFilter;
 
     private QueueResponse mockResponse() {
         Queue queue = Queue.create(1L, "이벤트 대기열", 100000, null, null);

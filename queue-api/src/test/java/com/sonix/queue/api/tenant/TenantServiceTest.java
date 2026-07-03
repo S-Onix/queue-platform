@@ -7,10 +7,7 @@ import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.auth.RefreshToken;
 import com.sonix.queue.domain.auth.RefreshTokenRepository;
-import com.sonix.queue.domain.tenant.PasswordHasher;
-import com.sonix.queue.domain.tenant.Tenant;
-import com.sonix.queue.domain.tenant.TenantRepository;
-import com.sonix.queue.domain.tenant.TenantStatus;
+import com.sonix.queue.domain.tenant.*;
 import io.jsonwebtoken.*;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -67,6 +64,7 @@ class TenantServiceTest {
                 PASSWORD_HASH,
                 "Test Tenant",
                 TenantStatus.ACTIVE,
+                Plan.FREE,
                 LocalDateTime.now()
         );
 

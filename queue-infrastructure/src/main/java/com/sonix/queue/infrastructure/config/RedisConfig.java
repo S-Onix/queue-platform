@@ -1,7 +1,12 @@
 package com.sonix.queue.infrastructure.config;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.sonix.queue.domain.ratelimit.FixedWindowRateLimiter;
 import com.sonix.queue.domain.ratelimit.RateLimiter;
+import com.sonix.queue.infrastructure.cache.mixin.CacheMixinRegistrar;
 import com.sonix.queue.infrastructure.ratelimit.RedisFixedWindowRateLimiter;
 import com.sonix.queue.infrastructure.ratelimit.RedisTokenBucketRateLimiter;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -85,5 +90,26 @@ public class RedisConfig {
             @Qualifier("fixedWindowScript") RedisScript<Long> fixedWindowScript
     ) {
         return new RedisFixedWindowRateLimiter(redisTemplate, fixedWindowScript);
+    }
+
+    /**
+     * 캐시 전용 ObjectMapper.
+     *
+     * <p>Tenant 등 도메인 객체의 JSON 직렬화/역직렬화 담당.
+     * Mixin을 통해 도메인 오염 없이 처리.
+     */
+    @Bean
+    public ObjectMapper cacheObjectMapper(){
+        ObjectMapper mapper = new ObjectMapper();
+
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+
+        //Mixin 일괄 등록 (추가될 시 CacheMixinRegisterar에 등록해야함)
+        CacheMixinRegistrar.registerAll(mapper);
+
+        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+        return mapper;
     }
 }
