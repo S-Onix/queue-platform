@@ -45,14 +45,17 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ✅ Sprint 2   완료 (2026-04-22)
 ✅ Sprint 3   완료 (2026-04-23)
 ✅ Sprint 4   완료 (2026-04-24)
-🔄 Sprint 5   ← 진행 중 (5-A/5-B/5-C 완료, 5-D/5-E/5-F 남음)
+🔄 Sprint 5   진행 중 (5-A/B/C/D 완료, 5-E 진입, 5-F 예정)
+🎯 Sprint 8 (Cluster 학습) 로컬 실습 완료 (2026-07-08, 병행 학습)
 ⬜ Sprint 6
 ⬜ Sprint 7
-⬜ Sprint 8
+⬜ Sprint 8   ← Cluster 프로덕션 도입 준비 (로컬 학습은 완료)
 ⬜ Sprint 9
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
 ```
+
+**주요 학습 자산 축적**: 총 88개 통찰 (Line Pay Plus 시니어 백엔드 지원 자산)
 
 ---
 
@@ -213,7 +216,7 @@ flowchart TD
 
 **예상 기간:** 3주 (Sentinel + 모니터링 + Rate Limiter + 캐시 + Queue Lua)
 **카테고리:** MVP
-**진행률:** 약 50% (5-A/5-B/5-C 완료)
+**진행률:** 약 75% (5-A/5-B/5-C/5-D 완료, 5-E 진입)
 
 **선행 인프라:** [INFRA_SETUP.md §2](INFRA_SETUP.md) — Redis Master(6379) + Slave(6380, 6381) + Sentinel(26379, 26380, 26381) WSL2 직접 설치
 
@@ -224,8 +227,8 @@ flowchart TD
 | 5-A | Redis Sentinel 인프라 | ✅ |
 | 5-B | 모니터링 시스템 (Prometheus + Grafana) | ✅ |
 | 5-C | Rate Limiter (Token Bucket + Fixed Window) | ✅ |
-| 5-D | Redis 캐시 (API Key + Refresh Token) | ⬜ |
-| 5-E | Queue Engine Lua Scripts (Sprint 6 준비) | ⬜ |
+| 5-D | Redis 캐시 (API Key + Refresh Token) | ✅ |
+| 5-E | Queue Engine Lua Scripts (Sprint 6 준비) | 🔄 |
 | 5-F | Sprint 5 마무리 (문서 갱신) | 🔄 |
 
 ### 5-A. Redis Sentinel 인프라 ✅
@@ -269,21 +272,37 @@ flowchart TD
 - ✅ 동시성 검증 (1,000 동시 요청 → 정확히 capacity개만 통과, Lua 원자성)
 - ✅ 수동 검증 (signup 6회 → 6번째부터 429 응답)
 
-### 5-D. Redis 캐시 적용 ⬜
+### 5-D. Redis 캐시 적용 ✅
 
-- ⬜ ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
-- ⬜ 캐시 히트율 로그
-- ⬜ Refresh Token Redis 이중 저장 (Redis 우선 + DB fallback)
-- ⬜ `RedisKeyFactory` (static 메서드 방식)
-- ⬜ Tenant 정보 Redis 캐시 (Rate Limiter에서 사용)
+- ✅ ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
+- ✅ 캐시 히트율 로그
+- ✅ `RedisKeyFactory` (static 메서드 방식)
+- ✅ Facade 도입 → Anti-pattern 인식 후 롤백 (중요 학습 자산)
+- ⬜ Refresh Token Redis 이중 저장 (5-E 이후 결정)
+- ⬜ Tenant 정보 Redis 캐시 (Rate Limiter 최적화)
 
-### 5-E. Queue Engine Lua Scripts ⬜ (Sprint 6 준비)
+### 5-E. Queue Engine Lua Scripts 🔄 (Sprint 6 준비)
 
-- ⬜ `enqueue.lua` (INCRBY global-seq + ZADD multi-member NX)
-- ⬜ `admit.lua` (ZRANGE WITHSCORES + ZREM + 재정렬)
-- ⬜ `ranking.lua` (ZSCORE + 슬라이스별 ZCOUNT 합산)
-- ⬜ 슬라이스 라운드로빈 분배 (`slice = (seq-1) % sliceCount`)
-- ⬜ Lua Script 동시성 검증 (1,000 동시 Enqueue → 순번 중복 0)
+**Phase A 완료** (2026-07-08):
+- ✅ `QueueEngine.java` Port 인터페이스 (queue-domain)
+- ✅ `EnqueueResult.java` Value Object (OK/EXISTS/FULL)
+
+**Phase B-F 진행 예정**:
+- 🔄 `enqueue.lua` (ZRANK 중복 방지 + ZADD + ZCARD Capacity)
+- 🔄 `enqueue_bulk.lua` (배치 처리 + Adaptive Batching)
+- 🔄 `SlidingWindowCounter` (Enqueue 부하 측정)
+- 🔄 `RedisQueueEngine` 하이브리드 (일반 Lua + Bulk 모드)
+- 🔄 `QueueService.enqueue` + `QueueController.enqueue`
+
+**8가지 확정 결정** (DECISIONS §66-69 참조):
+- D1: 자유 identifier (Tenant 제공)
+- D2: ZSet 하나 (`queue:{queueId}:waiting`)
+- D3: ZRANK + ZCARD
+- D4: Java + Lua 분리
+- D5: Lua ZRANK 중복 방지
+- D6: Lua ZCARD Capacity
+- D7: enqueue.lua + enqueue_bulk.lua
+- D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)
 
 ### 5-F. Sprint 5 마무리 🔄
 
@@ -690,6 +709,43 @@ ECR, CloudWatch, 기타        : ~$10
 
 ---
 
+## 아키텍처 진화 로드맵 (대규모 확장 준비)
+
+Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
+상세: `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (Phase 0-4 + 부록 A-I)
+
+### Cluster 학습 병행 (Sprint 5-D 이후 완료)
+
+**로컬 실습 완료** (2026-07-08):
+- Sentinel (Sprint 5-D 인프라) 유지
+- Cluster A (7001-7008): 4 Master + 4 Replica × 1GB
+- Cluster B (8001-8008): 4 Master + 4 Replica × 1GB
+- 총 22 Redis 프로세스
+- Failover 검증 완료
+- 완전 독립성 확인
+- 상세: `doc/INFRA_SETUP.md` §6.5
+
+### Phase별 인프라 진화
+
+| Phase | Sprint | 구성 | 처리량 | 대응 규모 |
+|-------|--------|------|--------|----------|
+| Phase 0 | 완료 | Sentinel + WAS 1대 | 40k ops/s | 1만 대기 |
+| Phase 1 | 5-E~7 | Sentinel + WAS 2-3대 | 40k ops/s | 10만 대기 |
+| Phase 2 | 8-10 | 3-Master Cluster | 120k ops/s | 100만 대기 |
+| Phase 3 | 11-14 | 5-7 Master + Kafka | 200k ops/s | 1000만 대기 |
+| Phase 4 | 15+ | 4x4x4GB 극대 분산 | 640k ops/s | 1억 대기 |
+
+### 주요 인프라 결정 (오늘 세션 반영)
+
+- **Sprint 10**: Sentinel → Cluster 전환 (§66)
+- **Sprint 12**: 이중 라우팅 (Cluster + Hash Tag) 도입 (§67)
+- **Sprint 15+**: Master 크기 최적화 → 4 GB (§68)
+- **Sprint 15+**: 4 Cluster × 4 Master 극대 분산 (§69)
+
+**통찰 축적**: 오늘 세션 통찰 55-88번 (34개 신규, 총 88개)
+
+---
+
 ## 포트폴리오 차별 포인트 요약
 
 면접 시 가장 임팩트 있게 설명할 수 있는 포인트들을 Sprint별로 정리:
@@ -712,37 +768,38 @@ ECR, CloudWatch, 기타        : ~$10
 ## 우선순위 가이드
 
 ### 즉시 (이번 주)
-- 5-D-1: ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
-- 5-D-2: 캐시 히트율 로그
-- 5-D-3: Refresh Token Redis 이중 저장
-- 5-D-4: RedisKeyFactory (static 메서드)
+- 5-E-A: QueueEngine Port + EnqueueResult ✅ 완료 (2026-07-08)
+- 5-E-B: enqueue.lua + enqueue_bulk.lua Bean 등록
+- 5-E-C: SlidingWindowCounter + PendingEnqueue + RedisQueueEngine 하이브리드
+- 5-E-D: QueueService.enqueue + QueueController.enqueue
 
 ### 단기 (1-2주)
-- 5-E-1: enqueue.lua (INCRBY + ZADD multi-member NX)
-- 5-E-2: admit.lua (ZRANGE + ZREM)
-- 5-E-3: ranking.lua (ZSCORE + 슬라이스별 ZCOUNT)
+- 5-E-E: 검증 (Lua Script 동시성 테스트, 1,000 동시 Enqueue → 순번 중복 0)
+- 5-E-F: 커밋 + PR merge
 - 5-F: Sprint 5 마무리 (문서 갱신 완료, 회고 작성)
 
 ### 중기 (다음 Sprint)
 - Sprint 6: Token 도메인 + Queue Engine API (Enqueue / Polling)
+- Sprint 8+: Cluster 프로덕션 도입 준비 (로컬 학습 완료)
 
 ---
 
 ## 참조 문서
 
-- [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis/Kafka/k6/Prometheus/Grafana)
+- [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis Sentinel/Cluster/Kafka/k6/Prometheus/Grafana)
 - [AWS_LEARNING_PATH.md](AWS_LEARNING_PATH.md) — Sprint 11 대비 AWS 병렬 학습 경로
 - [FRS v1.10](FRS_final.md) — 기능 정의
-- [DECISIONS](DECISIONS.md) — 65개+ 설계 결정
+- [DECISIONS](DECISIONS.md) — 69개+ 설계 결정 (§66-69 신규)
 - [FLOW](FLOW.md) — 상세 흐름도
 - [STATE](STATE.md) — 상태 머신
 - [CONCURRENCY](CONCURRENCY.md) — 동시성 제어
-- [sprint-5/RATE_LIMITER.md](sprint-5/RATE_LIMITER.md) — Rate Limiter 설계 통합 문서 (신규)
+- **[queue-domain/docs/ARCHITECTURE_ROADMAP.md](../queue-domain/docs/ARCHITECTURE_ROADMAP.md) — 아키텍처 진화 로드맵 (Phase 0-4 + 부록 A-I) ⭐ 신규**
+- [sprint-5/RATE_LIMITER.md](sprint-5/RATE_LIMITER.md) — Rate Limiter 설계 통합 문서
 - [sprint-5/REDIS_SENTINEL.md](sprint-5/REDIS_SENTINEL.md) — Redis Sentinel 학습 노트
 - [sprint-5/LUA_SCRIPTS.md](sprint-5/LUA_SCRIPTS.md) — Lua Script 학습 노트
 
 ---
 
 <p align="center">
-  <sub>Sprint 4 완료 · 2026-04-24 · Sprint 5 진행 중 (2026-06-10) · 다음 목표: 5-D Redis 캐시 · 병렬 학습: AWS_LEARNING_PATH</sub>
+  <sub>Sprint 5-D 완료 · 2026-07-08 · Sprint 5-E 진입 (Phase A 완료) · Cluster 로컬 학습 완료 · 다음 목표: 5-E Lua Scripts · 통찰 축적: 88개</sub>
 </p>

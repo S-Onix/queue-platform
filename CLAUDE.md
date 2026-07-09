@@ -1,7 +1,7 @@
 # Queue Platform — Project Context for Claude Code
 
 > 이 파일은 Claude Code가 세션 시작 시 자동으로 읽는 컨텍스트 파일입니다.
-> 자세한 내용은 `docs/` 폴더의 개별 문서를 참조하세요.
+> 자세한 내용은 `doc/` 폴더의 개별 문서를 참조하세요.
 
 ---
 
@@ -74,7 +74,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 ⬜ Sprint 11: Docker + AWS 배포
 ```
 
-### Sprint 5 현재 상태 (2026-06)
+### Sprint 5 현재 상태 (2026-07-08)
 
 **5-A 완료**: Redis Sentinel 인프라
 - Master 6379 + Slave 6380, 6381 + Sentinel 26379, 26380, 26381
@@ -100,20 +100,44 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - ErrorCode RL_001 (HTTP 429 + Retry-After 헤더)
 - 동시성 검증 (1,000 동시 요청 → 정확히 capacity개)
 
-**5-D 진행 예정**: Redis 캐시 적용
-- ApiKey Redis 캐시 (TTL 60s)
-- Refresh Token Redis 이중 저장 (Redis 우선 + DB fallback)
-- RedisKeyFactory (static 메서드)
+**5-D 완료** (2026-07-08): Redis 캐시 적용
+- ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
+- 캐시 히트율 로그
+- Facade 도입 → Anti-pattern 인식 후 롤백 (중요 학습 자산)
+- Step 1 롤백 완료, Step 2-5 캐시 인프라 완료
+- dev 브랜치 merge 완료
 
-**5-E 진행 예정**: Queue Engine Lua Scripts (Sprint 6 준비)
-- enqueue.lua (INCRBY global-seq + ZADD NX)
-- admit.lua (ZRANGE WITHSCORES + ZREM)
-- ranking.lua (ZSCORE + 슬라이스별 ZCOUNT)
+**5-E 진행 중** (Phase A 완료, 2026-07-08):
+- Phase A ✅: QueueEngine Port + EnqueueResult Value Object
+- Phase B 🔄: enqueue.lua + enqueue_bulk.lua + Bean 등록
+- Phase C ⬜: SlidingWindowCounter + PendingEnqueue + RedisQueueEngine 하이브리드
+- Phase D ⬜: QueueService.enqueue + QueueController.enqueue
+- Phase E ⬜: 검증 (1,000 동시 Enqueue 순번 중복 0)
+- Phase F ⬜: 커밋
+
+**5-E 8가지 확정 결정** (DECISIONS §66-69 참조):
+- D1: 자유 identifier (Tenant 제공)
+- D2: ZSet 하나 (`queue:{queueId}:waiting`)
+- D3: ZRANK + ZCARD
+- D4: Java + Lua 분리
+- D5: Lua ZRANK 중복 방지
+- D6: Lua ZCARD Capacity
+- D7: enqueue.lua + enqueue_bulk.lua
+- D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)
+
+**Cluster 로컬 학습 완료** (2026-07-08 - Sprint 8 병행):
+- Sentinel 유지 + Cluster A (7001-7008) + Cluster B (8001-8008)
+- 4 Master + 4 Replica × 1GB × 2 Cluster = 16 노드
+- Failover 실전 검증 완료
+- 완전 독립성 확인
+- 프로덕션 축소판 (Sprint 15+ 목표 4x4x4GB의 절반)
+- 상세: `doc/INFRA_SETUP.md` §6.5
 
 **5-F 진행 예정**: Sprint 5 마무리
-- DECISIONS.md 갱신
-- ROADMAP.md 갱신
-- doc/sprint-5/RATE_LIMITER.md 신규
+- DECISIONS.md 갱신 완료 (§66-69 신규)
+- ROADMAP.md 갱신 완료
+- CLAUDE.md 갱신 완료 (진행 상황 반영)
+- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` 신규 (2588 라인)
 ---
 
 ## 코드 작성 규칙 (반드시 준수)
@@ -164,7 +188,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
    - 부수 작업(Redis 초기화, Kafka 발행)은 `@TransactionalEventListener(AFTER_COMMIT)`
 - **스케줄러**: `@Scheduled` 단독 금지, leader election 필요 (ShedLock 또는 분산 락)
 - **세션/상태**: 메모리 저장 금지, Redis 또는 stateless JWT
-- 상세: `docs/CONCURRENCY.md`
+- 상세: `doc/CONCURRENCY.md`
 
 ### 트랜잭션
 - `@Transactional`은 Service 계층에만
@@ -243,17 +267,24 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 
 ## 진행 중인 작업 / 알려진 이슈
 
-### Sprint 4 빈틈 (Sprint 5에서 보강 예정)
-- **Refresh Token 저장 로직 미구현**: queue-domain/auth 디렉토리에 RefreshToken 도메인, Repository Port, JpaAdapter 추가 필요
+### Sprint 4 빈틈 (Sprint 5에서 보강 완료 / 진행 중)
+- **Refresh Token 저장 로직 미구현**: Sprint 5-D 이후 결정 (Redis 캐시 완료 후 Sprint 6 이전 검토)
 - ~~**ApiResponse 위치**: queue-common에 있으나 queue-api로 이동 검토 중~~ → Sprint 5 진입 시 `com.sonix.queue.api.common.response`로 이동 완료 (Batch가 사용 안 함)
 
 ### Sprint 5에서 함께 구현할 것
 - ✅ Rate Limiter (Token Bucket + Fixed Window 분리 적용)
 - ✅ Tenant Plan 도입 (SaaS 등급)
 - ✅ HTTP Filter 통합 (429 + Retry-After)
-- ⬜ Refresh Token 도메인 모델 + DB 저장 + Redis 캐시 (5-D)
-- ⬜ Lua Script 3종 (Ranking, Enqueue Bulk, Admit Dequeue 골격) (5-E)
-- ⬜ API Key 캐시 (apikey-cache:{sha256}, TTL 60s) (5-D)
+- ✅ API Key 캐시 (apikey-cache:{sha256}, TTL 60s) (5-D)
+- 🔄 Queue Engine Lua Scripts (enqueue.lua + enqueue_bulk.lua, 5-E)
+- ⬜ Refresh Token 도메인 모델 + DB 저장 + Redis 캐시 (5-E 이후)
+
+### Cluster 로컬 학습 완료 자산 (2026-07-08)
+- Sentinel + Cluster A + Cluster B 병행 실행 (WSL2)
+- 총 22 Redis 프로세스
+- Failover 실전 검증
+- 프로덕션 확장 시 자연스러운 upgrade path
+- 상세: `doc/INFRA_SETUP.md` §6.5
 ---
 
 ## Claude Code 사용 지침
@@ -292,6 +323,13 @@ redis_status   # 상태 확인
 redis_logs master         # Master 로그 실시간
 redis_logs sentinel-1     # Sentinel 로그 실시간
 
+# Redis Cluster A/B (Sprint 8+ 학습 환경, doc/INFRA_SETUP.md §6.5)
+sudo systemctl start redis-cluster-a-{1..8}    # Cluster A 8 노드 시작
+sudo systemctl start redis-cluster-b-{1..8}    # Cluster B 8 노드 시작
+redis-cli -c -p 7001 cluster info              # Cluster A 상태
+redis-cli -c -p 8001 cluster info              # Cluster B 상태
+redis-cli -c -p 7001 cluster nodes             # Cluster A 노드 목록
+
 # Gradle
 ./gradlew build
 ./gradlew :queue-api:bootRun
@@ -312,20 +350,23 @@ mysql -u root -p -P 3307  # Replica
 |------|------|
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
-| `doc/DECISIONS.md` | 56+ 설계 결정 + 근거 + 면접 포인트 |
+| `doc/DECISIONS.md` | 69+ 설계 결정 + 근거 + 면접 포인트 (§66-69 신규) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |
 | `doc/STATE.md` | Token, Queue, ApiKey 상태 머신 |
 | `doc/schema.sql` | MySQL DDL + 파티션 운영 쿼리 |
 | `doc/CONCURRENCY.md` | 동시성 제어 전략, `@DistributedLock` 사용법, 확장성 전제 |
+| `doc/INFRA_SETUP.md` | WSL2 인프라 설치 가이드 (Sentinel + Cluster 로컬 실습 포함, §6.5) |
+| `queue-domain/docs/ARCHITECTURE_ROADMAP.md` | ⭐ **아키텍처 진화 로드맵 (Phase 0-4 + 부록 A-I)** |
 | `doc/sprint-5/REDIS_SENTINEL.md` | Sprint 5 Phase 1 학습 노트 (Sentinel) |
 | `doc/sprint-5/LUA_SCRIPTS.md` | Sprint 5 Phase 2 학습 노트 (Lua 3종) |
+| `doc/sprint-5/RATE_LIMITER.md` | Rate Limiter 설계 통합 |
 
 ---
 
 ## 작업 시작 시 권장 프로세스
 
 1. **현재 Sprint 상태 확인**: 위 "Sprint 진행 현황" 섹션 참고
-2. **관련 문서 읽기**: 작업 영역에 따라 `docs/` 참조
+2. **관련 문서 읽기**: 작업 영역에 따라 `doc/` 참조
 3. **헥사고날 위반 가능성 자가 진단**: 새 클래스가 어느 모듈에 속하는지 명확히
 4. **확장성 자가 진단**: 단일 JVM 가정에 기댄 코드가 아닌지 (특히 동시성/상태)
 5. **테스트 먼저 또는 동시**: TDD 강제 아니지만, 테스트 누락 금지

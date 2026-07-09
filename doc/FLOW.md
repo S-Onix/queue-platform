@@ -1,63 +1,127 @@
 # 🔄 Queue Platform — 상세 흐름도
 
-> FRS v1.9 기준
+> **최종 업데이트**: 2026-07-08 (Sprint 5-D 완료, Sprint 5-E 진입, Cluster 학습 완료 반영)
+> **관련 문서**: DECISIONS.md §66-69, queue-domain/docs/ARCHITECTURE_ROADMAP.md, FRS v1.10
 
 ---
 
-## Enqueue
+## Enqueue (Sprint 5-E 하이브리드)
+
+Sprint 5-E에서 확정된 하이브리드 전략을 반영한 최신 흐름.
+
+**핵심**:
+- 평상시: 일반 Lua Script (즉시 처리, 1-3ms)
+- 피크 시: Bulk Lua Script (배치 처리, 10-30ms)
+- 임계값 1000 req/s로 자동 전환 (SlidingWindowCounter)
 
 ```mermaid
 flowchart TD
-    START(["POST /queues/:queueId/tokens\nTenant 서버 호출\n{ userId }"])
-    --> AK["① API Key 검증\nSHA-256 → Redis 캐시 60s\n미스 시 DB fallback"]
-    --> RL["② Rate limit 체크\nper-key 100rps"]
-    --> QS["③ 큐 상태 확인\nACTIVE만 허용"]
-    --> DUP["④ userId 중복 체크\nGET queue-user:{t}:{q}:{userId}"]
+    START(["POST /api/v1/queues/{queueId}/enqueue\nJWT 또는 ApiKey 인증\n{ identifier }"])
+    --> FILTER["① Filter Chain\nJwtAuthenticationFilter\nRateLimitFilter (초당 통제)"]
+    --> CTRL["② QueueController.enqueue()\nEnqueueRequest 파싱\nBean Validation"]
+    --> SERV["③ QueueService.enqueue()\nQueue 조회 (Cache first)\nTenant 소유권 검증\nQueue.isEnqueueable() 검증"]
+    --> ENG["④ QueueEngine.enqueue()\n(RedisQueueEngine 하이브리드)"]
+    --> COUNT["⑤ SlidingWindowCounter 확인\n현재 초당 요청 수 조회\n임계값 (1000 req/s) 비교"]
 
-    DUP -->|"이미 있음"| IDEM(["200 기존 토큰 반환\n멱등 처리"])
-    DUP -->|"없음"| CAP["⑤ 전체 용량 체크\n모든 슬라이스 ZCARD 합산\n(queue-count 제거 → ZCARD Pipeline)"]
+    COUNT -->|"< 1000 req/s"| NORMAL["⑥-A 일반 Lua Script 경로\n즉시 처리"]
+    COUNT -->|"≥ 1000 req/s"| BULK["⑥-B Bulk 모드\n배치 처리 대기"]
 
-    CAP -->|"≥ totalCapacity"| E429(["429\nQE_001_CAPACITY_EXCEEDED"])
-    CAP -->|"여유 있음"| LUA["⑥ Bulk Lua Script 원자 실행\nINCRBY global-seq N → startSeq~endSeq\n슬라이스별 ZADD multi-member NX\nslice = (seq-1) % sliceCount"]
+    NORMAL --> LUA["enqueue.lua 실행\n(Redis 원자 실행)\n1. ZRANK 확인 (중복?)\n2. ZCARD 확인 (Capacity?)\n3. ZADD (score=timestamp)\n4. ZRANK 재조회 (순번)"]
+    LUA --> OK1(["200 OK\n{ status: OK/EXISTS/FULL,\n  rank, total }\n소요: 1-3ms"])
 
-    LUA --> OK(["202 Accepted\n{ token, globalRank, estimatedWaitSeconds }\n즉시 응답 — DB INSERT는 Kafka 비동기 처리"])
+    BULK --> FUTURE["CompletableFuture 생성\nPendingEnqueue 생성\nBatchQueue.offer()\nfuture.get(1s) 대기"]
+    FUTURE --> SCHED["@Scheduled (fixedDelay=10ms)\nprocessBulk()\n최대 100개 배치 수집\nQueue별 그룹핑"]
+    SCHED --> BULKLUA["enqueue_bulk.lua 실행\n(Redis 원자 실행)\nfor 루프 numRequests:\n  ZRANK 확인\n  ZCARD 확인\n  ZADD (또는 skip)\n결과 array 반환"]
+    BULKLUA --> COMPLETE["각 future.complete(result)"]
+    COMPLETE --> OK2(["200 OK\n동일 응답 스키마\n소요: 10-30ms"])
 
-    OK --> KAFKA["⑦ Kafka enqueue-events topic produce\n{ tokenId, queueId, tenantId, userId, seq, issuedAt }"]
-    KAFKA --> CONSUMER["⑧ Kafka Consumer (Batch Server)\n1000건씩 Bulk INSERT → MySQL\nredis_sync_needed = 0 으로 초기화"]
-
-    OK --> SIDE["⑨ 동기 처리 (Redis)\nSET queue-user 역인덱스 EX waitingTtl"]
-
-    AK -->|"무효"| E401(["401 AK_001_UNAUTHORIZED"])
-    RL -->|"초과"| E429B(["429 RL_001_KEY_LIMIT"])
-    QS -->|"PAUSED/DRAINING"| E503(["503 QM_004_NOT_ACTIVE"])
+    FILTER -->|"인증 실패"| E401(["401 UNAUTHORIZED"])
+    FILTER -->|"Rate 초과"| E429(["429 RL_001 + Retry-After"])
+    SERV -->|"큐 없음"| E404(["404 QM_002 QUEUE_NOT_FOUND"])
+    SERV -->|"소유권 불일치"| E403(["403 QM_003 FORBIDDEN"])
+    SERV -->|"PAUSED/DRAINING"| E503(["503 QM_004 NOT_ACTIVE"])
 ```
 
-> **Redis 다운 중 Enqueue 발생 시**
-> Redis ZADD 실패 → `redis_sync_needed = 1`로 DB INSERT
-> Kafka Consumer가 DB 저장 후 RedisHealthChecker가 복구 감지
-> 복구 배치: `redis_sync_needed = 1` 토큰 → Sorted Set 재삽입
+### Enqueue 하이브리드 결정 근거
+
+**8가지 확정 결정** (DECISIONS §66-69, ARCHITECTURE_ROADMAP 부록 A):
+- D1: 자유 identifier (Tenant 제공, UUID/이메일/고객번호 등)
+- D2: ZSet 하나 (`queue:{queueId}:waiting`)
+- D3: ZRANK + ZCARD (별도 counter 없음)
+- D4: Java (부하 측정) + Lua (원자 처리) 분리
+- D5: Lua ZRANK 중복 방지
+- D6: Lua ZCARD Capacity 검증
+- D7: enqueue.lua + enqueue_bulk.lua 2개
+- D8: 임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s
+
+### Cluster 환경에서 (Sprint 10+ 반영)
+
+Sprint 10 이후 Redis Cluster 도입 시:
+- Lettuce가 `queue:{queueId}:waiting` key의 CRC16으로 자동 slot 계산
+- 해당 slot 담당 Master로 자동 라우팅
+- Lua Script 단일 key만 사용 → CROSSSLOT 이슈 없음
+- 이중 라우팅 (Sprint 12+): `queue:{shard_X}:{queueId}:waiting` 형식
+
+### Kafka 도입 후 (Sprint 11+ 계획)
+
+Sprint 11-12에서 Kafka 도입 시 흐름 변경:
+- Enqueue 완료 후 Kafka `enqueue-events` 토픽 발행
+- Consumer가 DB INSERT (Bulk, 1000건씩)
+- Redis 다운 시 `redis_sync_needed=1` DB INSERT
+- 복구 시 배치가 Sorted Set 재삽입
 
 ---
 
-## Polling (유저 → Platform 직접)
+## Polling (유저 → Platform 직접, Jitter 적용)
+
+Sprint 5-E 이후 Polling 부하 최적화:
+- **Jitter 적용** (JS SDK): 요청 시점 무작위 분산 (4-6초 랜덤)
+- **Caffeine 캐싱** (Sprint 9+): 서버 측 rank 조회 캐시 (TTL 1-2초)
+- **SSE 미도입** (본인 확정): Polling 방식 유지, 인프라 무변경
+
+### 부하 감소 효과
+
+일반 Polling vs Jitter Polling:
+- 100만명 × 5초 = 초당 200,000 요청 (평균 동일)
+- 일반 Polling: 스파이크 t=0, 5000, 10000ms (초당 500,000 피크)
+- Jitter Polling: 4000-6000ms 균등 분산 (초당 200,000 안정)
+- **피크 부하 40-50% 감소**
+
+Caffeine 캐싱 조합 시:
+- Rank 조회 80% 캐시 HIT (rank 변화 낮음)
+- Redis 실제 요청 20%로 감소
+- 초당 40,000 요청만 Redis 도달
 
 ```mermaid
 flowchart TD
-    POLL(["GET /queues/:queueId/tokens/:token\n유저가 직접 호출\ntoken으로 인증\n적응형 간격 (2~30초)"])
-    --> TK["① token 유효성 확인\nRedis GET token-info:{tokenId}\n캐시 TTL = nextPollAfterSec + 2s\n미스 시 DB 조회 → 캐시 저장"]
+    POLL(["GET /api/v1/queues/:queueId/rank/:identifier\n유저가 직접 호출\nJS SDK가 setTimeout으로 Jitter 적용\n(4-6초 랜덤 재요청)"])
+    --> AUTH["① 인증 확인\nJWT 또는 조회용 임시 토큰"]
+    --> CACHE["② Caffeine 로컬 캐시 확인\n(Sprint 9+ 도입)\nkey: rank:{queueId}:{identifier}\nTTL: 1-2s"]
 
-    TK -->|"무효/만료"| E401(["401 TK_001_INVALID_TOKEN"])
-    TK -->|"유효 (WAITING)"| RANK["② 전체 순위 계산\nLua Script\nZSCORE → mySeq\n모든 슬라이스 ZCOUNT 합산\nglobalRank = 합산 + 1"]
+    CACHE -->|"HIT (80%)"| RESPCACHE(["200 OK 즉시 반환\n소요: 0.0001ms"])
+    CACHE -->|"MISS (20%)"| RANK["③ Rank 조회 (Redis)\nZRANK queue:{queueId}:waiting {identifier}\nZCARD queue:{queueId}:waiting\n소요: 1-2ms"]
 
-    RANK --> LA["③ SET token-last-active\nEX inactiveTtl 리셋"]
-    --> ETA["④ HGET queue-stats avgWaitingTime\nestimatedWaitSeconds = globalRank × avgWaitingTime"]
-    --> INTERVAL["⑤ nextPollAfterSec 계산\nposition > 500 → 30s\nposition > 100 → 10s\nposition > 10  → 5s\nposition ≤ 10  → 2s"]
-    --> RESP(["200 OK\n{ globalRank, estimatedWaitSeconds\nnextPollAfterSec, ready: false, admitToken: null }"])
-    RESP -->|"클라이언트: setTimeout(poll, nextPollAfterSec * 1000)"| POLL
+    RANK -->|"없음"| E404(["404 QE_002 NOT_IN_QUEUE"])
+    RANK -->|"조회됨"| CACHESET["④ Caffeine에 저장\nTTL 1-2s"]
+    CACHESET --> ETA["⑤ ETA 계산\navgWaitingTime × rank"]
+    --> RESP(["200 OK\n{ rank, total, estimatedWaitSeconds }\nJS SDK가 다음 요청 시점\nsetTimeout(4000~6000ms)로 예약"])
 
-    TK -->|"유효 (ADMIT_ISSUED)"| AT["⑥ Redis GET admit-token-by-token:{tokenId}\nadmitToken 조회"]
-    --> ARESP(["200 OK\n{ globalRank: 1, ready: true\nadmitToken: at_xxx\nnextPollAfterSec: 2 }"])
-    --> USER["유저 → Tenant\nadmitToken 전달"]
+    RESP -.->|"클라이언트: setTimeout(jitter)"| POLL
+    RESPCACHE -.->|"동일 재요청"| POLL
+```
+
+### 미래 확장 - Rank Query 전용 서비스 (Sprint 9+)
+
+```mermaid
+flowchart LR
+    Client["Client (Polling)"]
+    --> Ctrl["QueueController.getRank()"]
+    --> Svc["QueueService.getRank()"]
+    --> Cache["CaffeineRankCache"]
+    Cache -->|"HIT (80-95%)"| Return1["즉시 반환 (0.0001ms)"]
+    Cache -->|"MISS (5-20%)"| Engine["RankQueryEngine (Redis 조회, 1-2ms)"]
+    Engine --> Cache2["Caffeine에 저장 (TTL 1s)"]
+    Cache2 --> Return2["반환 (1-2ms)"]
 ```
 
 ---
@@ -287,3 +351,135 @@ flowchart TD
 > **순서 보장**: global-seq INCRBY = Redis 싱글스레드 원자 연산
 > 서버 여러 대가 동시 호출해도 seq 절대 중복 없음
 > Tenant는 Load Balancer 주소만 알면 됨 (내부 서버 수 몰라도 됨)
+
+---
+
+## Cluster 라우팅 흐름 (Sprint 10+ 반영)
+
+Sprint 10 이후 Redis Cluster 도입 시의 Enqueue 라우팅 상세.
+
+### Sprint 10 - 단일 Cluster (자동 slot 분배)
+
+```mermaid
+flowchart TD
+    Client["Client (Enqueue 요청)"]
+    --> WAS["WAS (Spring MVC)"]
+    --> Lettuce["Lettuce Client"]
+
+    Lettuce --> CRC["① CRC16 계산\nkey: 'queue:{queueId}:waiting'\nslot = CRC16(key) % 16384"]
+
+    CRC --> Route["② Topology 조회\nslot → 담당 Master"]
+
+    Route --> M1["Master 1\nSlot 0-5460"]
+    Route --> M2["Master 2\nSlot 5461-10922"]
+    Route --> M3["Master 3\nSlot 10923-16383"]
+
+    M1 & M2 & M3 --> Lua["Lua Script 실행\n(각 Master 원자 실행)"]
+    Lua --> Return["결과 반환"]
+```
+
+**특징**:
+- Lettuce 자동 라우팅 (개발자 개입 X)
+- Queue별 다른 Master 자동 배치
+- 완전 격리 (다른 Master 영향 X)
+
+### Sprint 12+ - 이중 라우팅 (Cluster + Hash Tag)
+
+```mermaid
+flowchart TD
+    Client["Client (Queue 생성 요청)"]
+    --> Router1["Layer 1: Cluster Router\n(Application)"]
+
+    Router1 --> Analyze1["Tenant Tier 확인\n예상 규모 확인\nLeast Load 알고리즘"]
+
+    Analyze1 --> ClusterA["Cluster A\n(대다수 Tenant)"]
+    Analyze1 --> ClusterB["Cluster B\n(대형 Tenant)"]
+    Analyze1 --> ClusterC["Cluster C\n(VIP)"]
+
+    ClusterA & ClusterB & ClusterC --> Router2["Layer 2: Shard Router\n(각 Cluster 내부)"]
+
+    Router2 --> Analyze2["각 Master 부하 조회\nLeast Load 알고리즘\nShard 결정 (shard_X)"]
+
+    Analyze2 --> KeyGen["Redis Key 구성\n'queue:{shard_X}:{queueId}:waiting'"]
+
+    KeyGen --> Store["Queue 도메인 저장\nclusterName + shard 필드"]
+    Store --> Enqueue["이후 Enqueue 시\n저장된 정보로 정확한 Master 접근"]
+```
+
+**Layer 1 (Cluster) 결정 기준**:
+- Tenant Tier (VIP/Premium/일반)
+- 예상 규모 (500만+ 대기 → Cluster B)
+- 지역 (Multi-region)
+
+**Layer 2 (Master) 결정 기준**:
+- 부하 기반 (Least Load)
+- Hash Tag 문법 `{shard_X}`
+- Cluster 내 4-16 Master 중 선택
+
+---
+
+## Enqueue 순서 보장 제약 (Sprint 5-E 확정)
+
+**본인 확정 사항**: WAS에 enqueue되는 순서는 완전히 보장하지 않음
+
+### 이유
+
+여러 WAS에서 동시 요청 시:
+```
+Client A → WAS 1 → Redis (도착 t=100ms)
+Client B → WAS 2 → Redis (도착 t=90ms)
+
+Redis 저장 순서: B, A (도착 순)
+실제 요청 순서: A, B (사용자 관점)
+
+결과: Redis 도착 순서 = Enqueue 순서
+      사용자 요청 순서와 다를 수 있음
+```
+
+### 이 제약의 이점
+
+**분산 처리 가능**:
+- WAS 확장 자유 (Sticky Session 불필요)
+- 각 WAS 독립 처리
+- 병렬화 가능
+
+**부하 분산**:
+- 로드 밸런서 자유
+- 확장성 확보
+
+**성능 최적화**:
+- 각 WAS 로컬 처리
+- 대기 없음
+- 처리량 극대화
+
+**Kafka 도입 가능 (Sprint 11)**:
+- 완전 비동기 가능
+- 순서 보장 안 함 (대기열 UX 관점 무관)
+- 처리량 폭증
+
+### 실무 관행
+
+Ticketmaster, 인터파크 등:
+- 밀리초 단위 정확한 순서 X
+- 대략적 순서 제공 (사용자 인식 무관)
+- 대량 처리 우선
+
+**결론**: Redis 도착 순서 = Enqueue 순서만 보장, 사용자 요청 순서 ≠ Enqueue 순서 (제약 사항으로 명시)
+
+---
+
+## 부하 감소 요약 (오늘 세션 반영)
+
+| 단계 | Before | After | 감소 |
+|------|--------|-------|------|
+| Enqueue (평상시) | 개별 처리 3ms | 일반 Lua 1-3ms | 유지 |
+| Enqueue (피크) | 순차 실패/재시도 | Bulk Lua 10-30ms | 안정화 |
+| Polling (일반) | 스파이크 500k/s | Jitter 200k/s | -40~50% |
+| Polling (캐싱 후) | Redis 200k/s | Caffeine 80% + Redis 40k/s | -80% |
+
+**Sprint별 최적화 도입**:
+- Sprint 5-E: Enqueue 하이브리드 (완료)
+- Sprint 9: Rank Query + Caffeine 캐싱
+- Sprint 10: Cluster 도입 (부하 격리)
+- Sprint 11-12: Kafka (비동기 처리량 증가)
+- Sprint 12+: 이중 라우팅 (부하 균등)

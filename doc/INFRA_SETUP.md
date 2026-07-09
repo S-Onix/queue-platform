@@ -527,6 +527,404 @@ redis_start
 
 ---
 
+## 6.5. Redis Cluster (Sprint 8+ 학습 환경) ⭐
+
+> **작성일**: 2026-07-08 (Sprint 5-D 완료 후)
+> **목적**: Sentinel과 병행 실습 가능한 Redis Cluster 구축
+> **최종 목표**: Sprint 10 프로덕션 Cluster 도입 사전 학습
+
+### 6.5-1. Cluster 구성 개요
+
+Sentinel과 병행 실행하여 두 방식을 비교 학습하는 환경.
+
+```
+[Sentinel (Sprint 5-D 인프라, 유지)]
+- Master 6379
+- Replica 6380, 6381
+- Sentinel 26379, 26380, 26381
+- 총 6 프로세스
+
+[Cluster A (신규, 7001-7008)]
+- Master 7001, 7002, 7003, 7004
+- Replica 7005, 7006, 7007, 7008
+- 총 8 프로세스, 8 GB Master 저장
+
+[Cluster B (신규, 8001-8008)]
+- Master 8001, 8002, 8003, 8004
+- Replica 8005, 8006, 8007, 8008
+- 총 8 프로세스, 8 GB Master 저장
+
+[전체]
+- 22 Redis 프로세스
+- 프로덕션 최종 목표 (4 Cluster × 4 Master × 4GB)의 축소판
+```
+
+### 6.5-2. 각 Cluster 설정 파일 자동 생성
+
+Cluster A 구성 스크립트:
+
+```bash
+# Cluster A 구성 (7001-7008)
+cat << 'SCRIPT' > /tmp/setup-cluster-a.sh
+#!/bin/bash
+
+NODES=(7001 7002 7003 7004 7005 7006 7007 7008)
+CLUSTER_HOME=/home/sonix/redis-cluster-a
+
+mkdir -p $CLUSTER_HOME
+for port in "${NODES[@]}"; do
+    mkdir -p $CLUSTER_HOME/$port
+done
+
+for port in "${NODES[@]}"; do
+    cat > $CLUSTER_HOME/$port/redis.conf << EOF
+# Redis Cluster A Node - Port $port
+port $port
+bind 127.0.0.1
+protected-mode no
+
+# Cluster 설정
+cluster-enabled yes
+cluster-config-file nodes-$port.conf
+cluster-node-timeout 5000
+cluster-require-full-coverage yes
+
+# 영속성
+appendonly yes
+appendfilename "appendonly-$port.aof"
+
+# 데이터/로그 경로
+dir $CLUSTER_HOME/$port
+pidfile $CLUSTER_HOME/$port/redis.pid
+logfile $CLUSTER_HOME/$port/redis.log
+loglevel notice
+
+# 메모리 제한 (1GB - 로컬 실습)
+maxmemory 1gb
+maxmemory-policy noeviction
+EOF
+done
+
+echo "Cluster A 설정 완료"
+SCRIPT
+
+chmod +x /tmp/setup-cluster-a.sh
+/tmp/setup-cluster-a.sh
+```
+
+Cluster B 구성 스크립트 (동일한 패턴, 포트만 8001-8008):
+
+```bash
+# Cluster B 구성 (8001-8008)
+# 위 스크립트와 동일, NODES=(8001 8002 8003 8004 8005 8006 8007 8008)
+# CLUSTER_HOME=/home/sonix/redis-cluster-b
+```
+
+### 6.5-3. systemd 서비스 등록
+
+```bash
+# Cluster A systemd 서비스 등록
+cat << 'SCRIPT' > /tmp/create-cluster-a-services.sh
+#!/bin/bash
+
+NODES=(7001 7002 7003 7004 7005 7006 7007 7008)
+CLUSTER_HOME=/home/sonix/redis-cluster-a
+
+for i in "${!NODES[@]}"; do
+    port=${NODES[$i]}
+    index=$((i + 1))
+    
+    sudo tee /etc/systemd/system/redis-cluster-a-$index.service > /dev/null << EOF
+[Unit]
+Description=Redis Cluster-A Node-$index (Queue Platform, $port)
+After=network.target
+
+[Service]
+Type=simple
+User=sonix
+Group=sonix
+ExecStart=/usr/bin/redis-server $CLUSTER_HOME/$port/redis.conf
+ExecStop=/usr/bin/redis-cli -p $port shutdown
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+done
+
+sudo systemctl daemon-reload
+SCRIPT
+
+chmod +x /tmp/create-cluster-a-services.sh
+/tmp/create-cluster-a-services.sh
+```
+
+Cluster B 서비스도 동일 패턴 (`redis-cluster-b-N.service`).
+
+### 6.5-4. 노드 실행 및 Cluster 초기화
+
+```bash
+# Cluster A 실행
+for i in 1 2 3 4 5 6 7 8; do
+    sudo systemctl enable redis-cluster-a-$i
+    sudo systemctl start redis-cluster-a-$i
+done
+
+# 노드 상태 확인
+for port in 7001 7002 7003 7004 7005 7006 7007 7008; do
+    result=$(redis-cli -p $port ping 2>&1)
+    echo "Port $port: $result"
+done
+
+# Cluster A 초기화 (4 Master + 4 Replica)
+redis-cli --cluster create \
+  127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 \
+  127.0.0.1:7005 127.0.0.1:7006 127.0.0.1:7007 127.0.0.1:7008 \
+  --cluster-replicas 1
+# yes 입력
+```
+
+Cluster B도 동일 (포트 8001-8008).
+
+### 6.5-5. 초기 배치 결과
+
+Cluster A 초기화 후 Slot 배정:
+
+```
+Master 7001: Slot 0-4095
+Master 7002: Slot 4096-8191
+Master 7003: Slot 8192-12287
+Master 7004: Slot 12288-16383
+
+Replica 매칭 (자동):
+- 7005 → 7002의 Replica
+- 7006 → 7001의 Replica
+- 7007 → 7003의 Replica
+- 7008 → 7004의 Replica
+```
+
+Cluster B도 동일한 4096 slot 균등 분배.
+
+### 6.5-6. 검증 명령
+
+```bash
+# Cluster A 상태
+redis-cli -c -p 7001 cluster info
+# 기대: cluster_state:ok, cluster_size:4, cluster_known_nodes:8
+
+redis-cli -c -p 7001 cluster nodes
+
+# Cluster B 상태
+redis-cli -c -p 8001 cluster info
+redis-cli -c -p 8001 cluster nodes
+
+# 전체 프로세스 확인
+ps aux | grep -E "redis-server|redis-sentinel" | grep -v grep | wc -l
+# 기대: 22 (Sentinel 6 + Cluster A 8 + Cluster B 8)
+
+# 완전 독립성 검증
+redis-cli -c -p 7001 SET "queue:test_a:waiting" "cluster_a_data"
+redis-cli -c -p 8001 SET "queue:test_b:waiting" "cluster_b_data"
+
+# Cluster A에서 test_b 조회 (없어야 함 - 완전 격리)
+redis-cli -c -p 7001 GET "queue:test_b:waiting"
+
+# 정리
+redis-cli -c -p 7001 DEL "queue:test_a:waiting"
+redis-cli -c -p 8001 DEL "queue:test_b:waiting"
+```
+
+### 6.5-7. Failover 테스트
+
+Cluster A의 Master 하나 강제 종료:
+
+```bash
+# 현재 Master 확인
+redis-cli -c -p 7001 cluster nodes | grep master
+
+# Master 7001 강제 종료
+sudo systemctl stop redis-cluster-a-1
+
+# 10초 대기 (Cluster 감지 + Failover)
+sleep 10
+
+# Failover 결과 확인 - 7006(Replica)가 Master로 승격
+redis-cli -c -p 7002 cluster nodes
+
+# 원상 복구 (7001 재시작 시 Replica로 강등)
+sudo systemctl start redis-cluster-a-1
+```
+
+### 6.5-8. Hash Tag 실전 활용
+
+각 Master로 Queue를 명시적 배치:
+
+```bash
+# 각 shard tag의 slot 확인
+for tag in "shard_A1" "shard_A2" "shard_A3" "shard_A4"; do
+    slot=$(redis-cli -c -p 7001 cluster keyslot "queue:{$tag}:test:waiting")
+    
+    if [ $slot -le 4095 ]; then
+        master="Master 1 (7001)"
+    elif [ $slot -le 8191 ]; then
+        master="Master 2 (7002)"
+    elif [ $slot -le 12287 ]; then
+        master="Master 3 (7003)"
+    else
+        master="Master 4 (7004)"
+    fi
+    
+    echo "Tag $tag: slot=$slot → $master"
+done
+```
+
+Hash Tag로 특정 Master에 Queue 강제 배치:
+
+```bash
+# {shard_X} 문법으로 애플리케이션이 Master 선택 가능
+redis-cli -c -p 7001 SET "queue:{shard_A1}:q_bts_001:waiting" "user_1"
+redis-cli -c -p 7001 SET "queue:{shard_A2}:q_bts_002:waiting" "user_2"
+```
+
+### 6.5-9. Cluster 정리 명령
+
+```bash
+# 모든 Cluster A 노드 정지
+for i in 1 2 3 4 5 6 7 8; do
+    sudo systemctl stop redis-cluster-a-$i
+done
+
+# Cluster 데이터 초기화 (재구성 시)
+for port in 7001 7002 7003 7004 7005 7006 7007 7008; do
+    dir="/home/sonix/redis-cluster-a/$port"
+    rm -f $dir/nodes-$port.conf
+    rm -f $dir/appendonly-$port.aof
+    rm -f $dir/dump.rdb
+done
+
+# 재시작
+for i in 1 2 3 4 5 6 7 8; do
+    sudo systemctl start redis-cluster-a-$i
+done
+```
+
+### 6.5-10. 로컬 vs 프로덕션 매핑
+
+```
+[로컬 실습 (지금)]
+- 2 Cluster (A, B)
+- 각 4 Master + 4 Replica
+- 각 Master 1 GB
+- 총 저장: 8 GB (Master만)
+- 총 처리량 (이론): 320,000 ops/초
+
+[프로덕션 최종 목표 (Sprint 15+)]
+- 4 Cluster
+- 각 4 Master + 4 Replica
+- 각 Master 4 GB
+- 총 저장: 64 GB (Master만)
+- 총 처리량 (이론): 640,000 ops/초
+
+[확장 비율]
+- Cluster 수: 2배 (2 → 4)
+- Master 크기: 4배 (1GB → 4GB)
+- 총 처리량: 2배 (Master 수 2배)
+- 총 저장: 8배 (크기 4배 × Cluster 2배)
+```
+
+### 6.5-11. 아키텍처 결정 이유
+
+**왜 Master를 작게, 많이 두는가?**
+
+Redis는 Single Thread 특성으로 각 Master가 CPU 1개만 사용:
+
+```
+[성능 관점]
+- 각 Master: 최대 40,000 ops/초 (Single Thread 한계)
+- Master 크기가 커도 성능 X (CPU 낭비)
+- Master 수를 늘려야 처리량 선형 증가
+
+[본인 프로젝트 계산]
+- 3 Master: 120,000 ops/초
+- 5 Master: 200,000 ops/초
+- 8 Master (Cluster A+B): 320,000 ops/초 ⭐
+- 16 Master (프로덕션): 640,000 ops/초
+
+[관리 vs 성능]
+- Master 4개 (Cluster당): 관리 감당 가능
+- CPU 코어 4개 완전 활용
+- Failover 손실 25% (4개 중 1)
+```
+
+**왜 2 Cluster로 나누는가?**
+
+```
+[격리 관점]
+- Cluster 간 완전 격리 (통신 X)
+- 하나의 Cluster 부하가 다른 Cluster에 영향 없음
+- 애플리케이션 라우팅으로 Tenant/Queue별 배치
+
+[실습 가치]
+- 다중 Cluster 라우팅 학습
+- Cluster 간 격리 검증
+- 프로덕션 아키텍처 사전 검증
+```
+
+### 6.5-12. 이중 라우팅 아키텍처 (Sprint 12+)
+
+Cluster + Hash Tag 조합으로 완전한 제어:
+
+```
+[Layer 1 - Cluster Router (애플리케이션)]
+- Tenant Tier 기반
+- 예상 규모 기반
+- Least Load 알고리즘
+- Cluster A 또는 B 선택
+
+[Layer 2 - Hash Tag (Cluster 내)]
+- {shard_X} 문법
+- 부하 기반 Master 선택
+- Cluster 내 4 Master 중 하나 결정
+
+[최종 Key 예시]
+"queue:{shard_A2}:q_bts_002:waiting"
+- Cluster: A (Application 결정)
+- Master: 2 (shard_A2 Hash Tag)
+- Queue: q_bts_002
+```
+
+**Application 코드 흐름**:
+
+```java
+// Layer 1 - Cluster 선택
+Cluster targetCluster = clusterRouter.selectCluster(tenant, request);
+
+// Layer 2 - Master 선택 (Hash Tag)
+String shard = shardResolver.selectShard(targetCluster);
+
+// 최종 Key 구성
+String redisKey = String.format("queue:{%s}:%s:waiting", shard, queueId);
+
+// Lettuce가 {shard} 부분으로 slot 계산 → 자동 라우팅
+targetCluster.execute(enqueueScript, redisKey, ...);
+```
+
+### 6.5-13. 참고 - 실측 결과
+
+로컬 실습 완료 시 확인된 사항:
+
+| 항목 | 결과 |
+|------|------|
+| 총 Redis 프로세스 | 22개 (Sentinel 6 + Cluster A 8 + Cluster B 8) |
+| 총 포트 사용 | 41개 (Redis + Cluster Bus + Sentinel IPv6) |
+| 메모리 사용 | 약 900MB (각 프로세스 40-50MB) |
+| 디스크 여유 요구 | 최소 2GB (실제 사용 <500MB) |
+| Cluster 간 격리 | 완벽 (교차 접근 불가) |
+| Sentinel과 병행 | 무충돌 (서로 다른 포트 대역) |
+
+---
+
 ## 7. Prometheus + Grafana (모니터링 스택)
 
 WSL2에서 직접 실행. Spring Boot Actuator의 메트릭을 수집/시각화.
@@ -962,13 +1360,15 @@ IntelliJ Settings (Ctrl+Alt+S)
 
 ## 9. 포트 사용 요약
 
+### 기본 인프라
+
 | 포트 | 용도 |
 |------|------|
 | 3306 | MySQL Master |
 | 3307 | MySQL Replica |
-| 6379 | Redis Master |
-| 6380 | Redis Slave 1 |
-| 6381 | Redis Slave 2 |
+| 6379 | Redis Sentinel Master |
+| 6380 | Redis Sentinel Slave 1 |
+| 6381 | Redis Sentinel Slave 2 |
 | 26379 | Redis Sentinel 1 |
 | 26380 | Redis Sentinel 2 |
 | 26381 | Redis Sentinel 3 |
@@ -976,6 +1376,17 @@ IntelliJ Settings (Ctrl+Alt+S)
 | 3000 | Grafana |
 | 9092 | (Sprint 8+) Kafka Broker |
 | 8080 | queue-api Spring Boot |
+
+### Redis Cluster (Sprint 8+ 학습 환경)
+
+| 포트 대역 | 용도 |
+|-----------|------|
+| 7001-7004 | Cluster A Master (4개) |
+| 7005-7008 | Cluster A Replica (4개) |
+| 17001-17008 | Cluster A Bus (자동, Redis 포트 + 10000) |
+| 8001-8004 | Cluster B Master (4개) |
+| 8005-8008 | Cluster B Replica (4개) |
+| 18001-18008 | Cluster B Bus (자동) |
 
 향후 추가 (Phase 5 — 인프라 Exporter):
 
@@ -1323,14 +1734,63 @@ sudo cp /var/lib/grafana/grafana.db ~/backups/grafana_$(date +%Y%m%d).db
 
 ---
 
-## 15. 향후 추가 예정 (Sprint 8~11)
+## 15. 향후 추가 예정 (Sprint 8~15)
 
-### Sprint 8: Kafka KRaft
+### Sprint 8: Redis Cluster 학습 (완료 - 6.5 섹션 참조)
+
+로컬 실습 환경 완료:
+- Cluster A + B 병행 실행
+- Sentinel 유지
+- Failover 검증 완료
+
+### Sprint 10: Redis Cluster 프로덕션 도입
+
+```
+[프로덕션 최소 구성]
+- 3 Master + 3 Replica
+- 각 Master 8-16 GB
+- Multi-AZ 배치
+- AWS ElastiCache 또는 자체 관리
+
+[성능 목표]
+- 초당 120,000-200,000 ops
+- Failover 33% 손실
+- 관리 부담 낮음
+```
+
+### Sprint 11: Kafka KRaft
 
 ```bash
 # Kafka 3.5+ KRaft 모드 설치 (Zookeeper 없이)
 # 디렉토리: ~/queue-platform-infra/kafka/
 # 포트: 9092
+```
+
+### Sprint 12: Cluster 확장 + Hash Tag
+
+```
+[확장 구성]
+- 3 Master → 5-7 Master
+- Hash Tag 정책 도입
+- 부하 기반 Shard 선택 (Layer 2)
+- 이중 라우팅 시작
+```
+
+### Sprint 15+: 4x4x4GB 극대 분산
+
+```
+[최종 목표 구성]
+- 4 Cluster × 4 Master × 4 Replica
+- 각 Master 4 GB
+- 총 32 노드
+- 640,000 ops/초 처리 능력
+- 물리 서버 4대 (r6g.2xlarge)
+- Multi-AZ 배치
+- 이중 라우팅 완전 구현
+
+[비용]
+- $1,961-2,561/월 (EC2 자체 관리)
+- 1억 대기 처리 가능
 ```
 
 ### Phase 5 (모니터링 확장): 인프라 Exporter

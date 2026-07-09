@@ -3049,3 +3049,307 @@ public RedisScript<Long> fixedWindowScript() {
 
 - §60 (Token Bucket), §61 (알고리즘 분리)
 - `doc/sprint-5/RATE_LIMITER.md`
+
+---
+
+## 66. Sprint 8+ — Redis Cluster 도입 결정 (Sentinel → Cluster 확장)
+
+**Date**: 2026-07-08
+**Context**: Sprint 5-D 완료 후 대규모 확장 대비 검토. 현재 Sentinel은 데이터 총량 한계 (Master 1대 메모리), Master Single Thread 병목이 명확. Multi-tenant SaaS로 성장 시 Tenant 30+ 시점에 인프라 전환 필요.
+
+### Decision
+
+**Sprint 10에서 Sentinel → Redis Cluster 전환**
+
+단계적 도입:
+- **Sprint 5-E~7**: Sentinel 유지 (Master 8-16GB, WAS 확장)
+- **Sprint 8**: Cluster 로컬 학습 실습 (완료 - 2 Cluster × 4 Master × 1GB WSL)
+- **Sprint 10**: 프로덕션 Cluster 도입 (3 Master + 3 Replica × 8-16GB)
+- **Sprint 12**: Cluster 확장 (5-7 Master + Hash Tag)
+- **Sprint 15+**: 4 Cluster × 4 Master × 4GB (극대 분산 최종)
+
+### Rationale
+
+**Sentinel의 한계**:
+- Master 1대에 모든 데이터 저장 (총 저장 = Master 메모리)
+- Single Thread 특성 → 초당 40,000 ops 한계
+- Scale-Up만 가능 (메모리 증가), Scale-Out 불가
+
+**Cluster의 이점**:
+- 자동 샤딩 (16,384 slot)
+- 여러 Master 병렬 처리 → 처리량 선형 증가
+- Failover 손실 최소화 (Master 수 많을수록)
+- Multi-tenant 격리 (Master별 부하 분산)
+
+**단계적 접근 근거**:
+- 학습 우선 (Sprint 8 로컬 실습)
+- 안전한 전환 (Sentinel + Cluster 병행 실행)
+- Master 크기 결정 후 확장 (초기 8-16GB → 최종 4GB)
+
+**로컬 실습 완료 사항** (2026-07-08):
+- Sentinel (6379-6381, 26379-26381) 유지
+- Cluster A (7001-7008): 4 Master + 4 Replica × 1GB
+- Cluster B (8001-8008): 4 Master + 4 Replica × 1GB
+- 총 22 Redis 프로세스
+- Failover 검증 완료
+- Cluster 간 완전 독립성 확인
+
+### Consequences
+
+**긍정**:
+- 확장성 확보 (Tenant 100+ 대응)
+- Failover 손실 최소화 (16 Master 시 6.25%)
+- CPU 코어 완전 활용 (Master 수 = 활용 코어 수)
+- 실무 관행 준수 (Netflix, Twitter, Uber)
+
+**부정**:
+- 관리 복잡성 증가 (노드 수 6 → 32)
+- Cluster 통신 오버헤드
+- Multi-key 명령 제약 (Hash Tag 필요)
+- 자동화 필수 (Prometheus, Grafana)
+
+**중립**:
+- Lua Script 무변경 (단일 key 사용 - Queue Platform 특성)
+- Spring 코드 무변경 (application.yml 변경만)
+- Lettuce 자동 라우팅
+
+### Interview Point
+
+> "Queue Platform은 Sprint 5까지 Sentinel 기반이지만, Sprint 10에서 Cluster로 전환합니다. Sentinel은 데이터 총량이 Master 하나 메모리로 제한되고 Single Thread 병목이 있어 대규모 트래픽 처리에 한계가 있습니다. Cluster는 자동 샤딩으로 여러 Master가 병렬 처리하여 처리량이 선형 증가하고, Master별 부하 격리로 Multi-tenant 서비스에 적합합니다. Sprint 8에서 로컬 WSL에 Sentinel과 병행 실행하여 학습했습니다. 프로덕션 Cluster는 실제 운영 관행에 따라 Master 크기를 8-16GB로 시작해 부하 편차 관찰 후 확장할 계획입니다. Lua Script는 단일 key만 사용하므로 CROSSSLOT 이슈 없이 그대로 사용 가능합니다."
+
+### Related
+
+- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (Phase 2, 부록 C-E)
+- `doc/INFRA_SETUP.md` §6.5 (로컬 Cluster 실습 가이드)
+- §67 (이중 라우팅), §68 (Master 크기), §69 (극대 분산)
+
+---
+
+## 67. Sprint 12+ — 이중 라우팅 아키텍처 (Cluster + Hash Tag)
+
+**Date**: 2026-07-08
+**Context**: Cluster만으로는 자동 slot 분배에 의존해 부하 편차 제어 불가. 대형 Queue 하나가 특정 Master로 몰릴 때 다른 Master로 회피 불가. 애플리케이션의 세밀한 제어 필요.
+
+### Decision
+
+**Cluster Routing (Layer 1) + Hash Tag Master Routing (Layer 2) 동시 도입**
+
+**Layer 1 - Cluster 선택 (Application Router)**:
+- 여러 개의 독립 Cluster 운영
+- Tenant Tier 또는 예상 규모 기반 선택
+- Least Load 알고리즘
+
+**Layer 2 - Master 선택 (Hash Tag)**:
+- 선택한 Cluster 내 4-16 Master 중 결정
+- `{shard_X}` 문법으로 Master 지정
+- 부하 기반 Shard 결정
+
+**최종 Key 예시**: `queue:{shard_A2}:q_bts_002:waiting`
+- Cluster: A (Application이 결정)
+- Master: 2 (shard_A2로 slot 계산)
+- Queue: q_bts_002
+
+### Rationale
+
+**Cluster만으로 부족한 이유**:
+- CRC16 자동 분배는 무작위 (부하 편차 발생 가능)
+- 특정 Master 부하 시 다른 Master로 회피 불가
+- 대형 Tenant 격리 어려움
+
+**Hash Tag만으로 부족한 이유**:
+- 하나의 Cluster 내 제어만 가능
+- 다중 Cluster 간 라우팅 불가
+- 대형 Tenant 완전 격리 어려움
+
+**이중 라우팅의 이점**:
+- Layer 1: Cluster 간 격리 (SLA 차등, 지역 분산)
+- Layer 2: Master 간 부하 균등 (세밀한 제어)
+- 완전한 부하 관리
+
+**실무 관행**:
+- Netflix EVCache: Service Clusters + Sharding
+- Twitter: Region Clusters + Hash Sharding
+- Uber: Service Clusters + Geographic Sharding
+
+### Consequences
+
+**긍정**:
+- 완전한 부하 제어
+- Tenant Tier 격리 (SLA 차등)
+- 대형 Queue 완전 격리
+- 실무 표준 아키텍처
+
+**부정**:
+- 관리 복잡성 큼 (다중 Cluster + 라우팅 로직)
+- Queue → Cluster/Shard 매핑 DB 필요
+- 자동화 리소스 요구
+- 초기 도입 부담
+
+**중립**:
+- Queue 도메인에 `clusterName`, `shard` 필드 추가
+- 애플리케이션 부하 측정 로직 필요
+- Sprint 12 (Layer 2) → Sprint 15+ (Layer 1+2) 단계적
+
+### Interview Point
+
+> "Cluster 도입 후에도 자동 slot 분배만으로는 부하 편차와 대형 Tenant 격리에 한계가 있습니다. 이중 라우팅은 Layer 1에서 Application이 Cluster를 선택하고, Layer 2에서 Hash Tag로 Cluster 내 Master를 선택합니다. 최종 key는 `queue:{shard_A2}:q_bts_002:waiting` 형태로, `{shard_A2}` 부분만으로 slot 계산해 원하는 Master에 배치됩니다. Netflix EVCache, Twitter가 이 방식으로 대규모 트래픽 처리합니다. Queue Platform은 Sprint 12에 Hash Tag를 먼저 도입하고, Sprint 15+에 다중 Cluster를 완성해 대형 Tenant SLA 차등을 지원할 계획입니다."
+
+### Related
+
+- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (부록 F)
+- §66 (Cluster 도입), §69 (극대 분산)
+- `doc/INFRA_SETUP.md` §6.5-12 (이중 라우팅 실습)
+
+---
+
+## 68. Sprint 10+ — Master 크기 최적화 (Single Thread 병목 해결)
+
+**Date**: 2026-07-08
+**Context**: Redis Single Thread 특성으로 Master 크기가 커도 CPU 코어 1개만 사용. 실무에서 큰 Master 소수보다 작은 Master 다수가 효율적임을 확인.
+
+### Decision
+
+**Master 크기 4-16 GB로 유지, Master 수를 늘리는 방향으로 확장**
+
+단계별 결정:
+- **Sprint 10 초기**: 3 Master × 8-16 GB (관리 부담 최소)
+- **Sprint 12 확장**: 5-7 Master × 8-16 GB (부하 편차 발생 시)
+- **Sprint 15+ 최종**: 16 Master × 4 GB (극대 분산, 4 Cluster × 4 Master)
+
+### Rationale
+
+**Redis Single Thread 병목**:
+- 각 Redis 프로세스 = CPU 코어 1개만 사용
+- 초당 30,000-50,000 ops 한계 (Master 하나)
+- CPU 크기 무관 (16코어 CPU여도 1코어만)
+- Master 메모리 크기와 성능 무관
+
+**해결 원리 - Master 늘리기**:
+- Master 수 = CPU 코어 활용 수
+- 처리량 선형 증가
+- 5 Master: 200,000 ops/초
+- 10 Master: 400,000 ops/초
+- 16 Master: 640,000 ops/초
+
+**물리 서버 배치**:
+- 각 Master 별도 서버 = CPU 낭비 (Redis 1코어만 사용, 서버 16코어 존재)
+- 여러 Master 같은 서버 = CPU 완전 활용 (실무 권장)
+- r6g.2xlarge (8 vCPU, 64 GB)에 8 Redis 프로세스
+
+**실무 관행**:
+- Netflix EVCache: Master 10-50개, 각 8-16 GB
+- Twitter: Master 100+, 물리 서버당 여러 Master
+- LinkedIn: Master 100+, CPU 활용 극대화
+
+### Consequences
+
+**긍정**:
+- 처리량 대폭 증가 (선형)
+- CPU 활용도 극대화
+- Failover 시 손실 최소화 (16 Master 시 6.25%)
+- 비용 효율 (물리 서버 공유)
+
+**부정**:
+- Cluster 통신 오버헤드 증가
+- Failover 감지 시간 증가
+- Rebalancing 오래 걸림
+- 자동화 도구 필수
+
+**중립**:
+- Sweet Spot: Master 5-16개
+- 32 GB+ Master는 CPU 낭비 (사용 안 함)
+- Queue Platform은 Sprint 12에 5-7 Master, Sprint 15+ 16 Master
+
+### Interview Point
+
+> "Redis는 Single Thread 특성으로 Master 하나가 CPU 코어 1개만 사용합니다. 8코어 서버여도 Redis 하나는 1코어만 사용해서 CPU가 낭비됩니다. 따라서 Master 크기를 크게 하는 것보다 Master 수를 늘리는 것이 처리량 극대화에 유리합니다. 처리량은 선형 증가하며, 물리 서버 하나에 여러 Master를 배치하면 CPU를 완전 활용할 수 있습니다. Netflix EVCache나 Twitter는 실제로 Master를 100개 이상 운영합니다. Queue Platform은 초기 3 Master로 시작하고, Sprint 12에 부하 편차 관찰 후 5-7개로, Sprint 15+에 최종 16 Master (4 Cluster × 4)로 확장할 계획입니다. 각 Master는 8-16 GB, 극대 분산 시 4 GB로 최적화합니다."
+
+### Related
+
+- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (부록 H)
+- §56 (Redis Single Thread 성능 한계)
+- §66 (Cluster 도입), §69 (극대 분산)
+
+---
+
+## 69. Sprint 15+ — 극대 분산 아키텍처 (4x4x4GB 최종 구성)
+
+**Date**: 2026-07-08
+**Context**: 1억 대기 처리 대비 최종 인프라 구성 확정. SLA 균등 조건, 성능 우선, 실무 관행 반영.
+
+### Decision
+
+**4 Cluster × 4 Master × 4 Replica × 4GB (총 32 노드)**
+
+- Cluster 수: 4개
+- 각 Cluster: 4 Master + 4 Replica
+- 각 Node: 4 GB
+- 총 노드: 32개
+- 총 저장 (Master): 64 GB
+- 총 저장 (Master + Replica): 128 GB
+- 총 처리량 (이론): 640,000 ops/초 (16 × 40,000)
+- Failover 손실: 6.25% (16 Master 중 1)
+
+### Rationale
+
+**1억 대기 데이터 계산**:
+- Redis ZSet 항목 128 bytes/member (UUID 기준)
+- 1억 항목 = 12.8 GB
+- Redis 오버헤드 20% + 안전 마진 30% = **약 22 GB 필요**
+
+**4 Cluster 분산 배치**:
+- Cluster별: 22 / 4 = 5.5 GB
+- 각 Cluster 저장 용량: 16 GB (4 Master × 4 GB)
+- 사용률: 34% (여유 66%)
+
+**Master 4 GB 최적 근거**:
+- 각 Master 4 GB × 4 = 16 GB per Cluster
+- CPU 1개 완전 활용 (Single Thread 한계)
+- 관리 부담 감당 가능
+- 확장 여유 3배
+
+**물리 서버 배치**:
+- r6g.2xlarge (8 vCPU, 64 GB) × 4대
+- 각 서버 8 Redis 프로세스 (4 Master + 4 Replica)
+- CPU 완전 활용
+- 메모리 32 GB 사용 (64 GB 여유)
+
+**비용 (EC2 자체 관리)**:
+- 컴퓨팅: $1,161/월
+- 네트워크: $500-1,000/월
+- 관리: $200-300/월
+- **총: $1,961-2,561/월**
+- 연간: $23,532-30,732
+- 사용자당: $0.00025 (0.25원)
+
+### Consequences
+
+**긍정**:
+- 대규모 트래픽 처리 (640,000 ops/초)
+- Failover 손실 최소 (6.25%)
+- 완전한 이중 라우팅 지원
+- 비용 효율 (EC2 관리로 ElastiCache 대비 66% 절감)
+- Multi-AZ 배치 (4 AZ 분산)
+- 확장 여유 3배 (Master 크기 증가로 5억 대기까지)
+
+**부정**:
+- 관리 복잡성 큼 (32 노드)
+- 자동화 필수 (Prometheus, Grafana, 자동 Failover)
+- 초기 설계 시간 큼
+- 팀 리소스 요구
+
+**중립**:
+- Sprint 5-E~10: 단일 Cluster 유지
+- Sprint 12: 이중 라우팅 도입 (Layer 2)
+- Sprint 15+: 4 Cluster 완성 (Layer 1+2)
+- 단계적 진화
+
+### Interview Point
+
+> "1억 대기 처리를 위한 최종 인프라는 4 Cluster × 4 Master × 4 Replica × 4 GB, 총 32 노드입니다. 데이터 크기는 Redis ZSet 항목 128 bytes 기준 1억 항목 = 12.8 GB, 오버헤드와 안전 마진 반영해 22 GB 필요합니다. 4 Cluster에 분산하면 각 Cluster 16 GB 저장 용량으로 34% 사용률에 여유 66%입니다. Master 크기를 4 GB로 유지하는 이유는 Redis Single Thread 특성 때문에 크기 늘려도 CPU 낭비이고, Master 수를 늘려야 처리량이 선형 증가하기 때문입니다. 물리 서버는 r6g.2xlarge 4대로 각 서버에 8 프로세스 배치해 CPU를 완전 활용합니다. AWS ElastiCache 대신 EC2 자체 관리로 월 $2,000 수준으로 66% 비용 절감이 가능합니다. Failover 시 16 Master 중 1대만 손실되어 영향이 6.25%로 최소화됩니다. Netflix EVCache, Twitter의 관행을 따른 설계입니다."
+
+### Related
+
+- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (부록 I)
+- §66 (Cluster 도입), §67 (이중 라우팅), §68 (Master 크기)
+- `doc/INFRA_SETUP.md` §6.5-10 (로컬-프로덕션 매핑)

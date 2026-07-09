@@ -1,7 +1,8 @@
 # 동시성 제어 (Concurrency Control)
 
-> Queue Platform의 동시성 제어 전략과 `@DistributedLock` 사용 가이드.  
+> Queue Platform의 동시성 제어 전략과 `@DistributedLock` 사용 가이드.
 > CLAUDE.md "동시성 제어" 섹션의 상세 문서.
+> **최종 업데이트**: 2026-07-08 (Cluster 학습 반영, Sprint 8+ 대비)
 
 ---
 
@@ -12,6 +13,17 @@
 - **수평 확장 (Horizontal Scaling)**: 인스턴스 N개를 추가하는 것만으로 처리량 증가
 - **수직 확장 (Vertical Scaling)**: 인스턴스 spec 증가로 처리량 증가
 - **Stateless**: 어떤 요청도 특정 인스턴스에 묶이지 않음
+
+### Redis 배포 방식별 확장성 (Sprint 5-D → Sprint 10+)
+
+| 배포 방식 | 저장 확장 | 처리량 확장 | 도입 Sprint |
+|-----------|-----------|-------------|-------------|
+| Sentinel | Scale-Up만 (Master 메모리) | Single Thread 한계 (40k ops/s) | Sprint 5-A (완료) |
+| Cluster (3 Master) | Scale-Out (Master 추가) | 3배 (120k ops/s) | Sprint 10 |
+| Cluster (5-7 Master) | 유연한 확장 | 5-7배 (200-280k ops/s) | Sprint 12 |
+| 4x4x4GB 극대 분산 | 최대 유연성 | 16배 (640k ops/s) | Sprint 15+ |
+
+**핵심**: Redis Cluster 도입 시 Redis 원자 연산의 원리는 동일 (각 Master가 Single Thread), 단 여러 Master가 병렬 처리.
 
 ### 이 전제가 의미하는 것
 
@@ -450,6 +462,79 @@ else
 end
 ```
 
+### 6.5 Cluster 환경에서 Multi-key Lua Script (Sprint 10+ 대비)
+
+Redis Cluster는 Lua Script 내 여러 key 사용 시 제약 있음.
+
+```lua
+-- ❌ 문제 시나리오
+-- KEYS[1] = "queue:q_bts:waiting" → slot A
+-- KEYS[2] = "queue:q_bts:count"   → slot B (다를 수 있음)
+-- Lua Script는 하나의 Master에서만 실행 → CROSSSLOT 에러
+
+-- 에러 예시:
+-- (error) CROSSSLOT Keys in request don't hash to the same slot
+```
+
+**해결책 - Hash Tag 활용**:
+```lua
+-- ✅ 같은 slot 강제
+-- KEYS[1] = "queue:{q_bts}:waiting"  → {q_bts}로 slot 계산
+-- KEYS[2] = "queue:{q_bts}:count"    → 같은 slot 보장
+-- 두 key 같은 slot → 같은 Master → Lua Script 정상 실행
+```
+
+**Queue Platform 관점**:
+- Sprint 5-E 현재 enqueue.lua는 **단일 key만 사용** → CROSSSLOT 이슈 없음
+- Sprint 10 Cluster 도입 시 무변경으로 작동
+- Sprint 12+ 이중 라우팅 도입 시 `queue:{shard_X}:{queueId}:waiting` 형식으로 Hash Tag 자연스럽게 사용
+
+### 6.6 Cluster Failover 중 짧은 순간 데이터 불일치
+
+Master 장애 시 Replica 승격까지 5-10초 소요. 이 사이 요청은 어떻게?
+
+```
+t=0    Master 장애
+t=1-5  Cluster 감지 (cluster-node-timeout)
+t=5-10 Replica 승격 완료
+
+t=1-10 사이 요청:
+- 해당 slot 담당 Master 없음
+- Lettuce가 MOVED/ASK 응답 처리 (재시도)
+- 최대 max-redirects (기본 3회) 재시도
+- 실패 시 클라이언트 에러
+```
+
+**완화책**:
+- Application 재시도 로직 (@Retryable)
+- 클라이언트 사이드 재시도 (SDK 자동)
+- Failover 감지 시간 단축 (cluster-node-timeout 조정, 기본 5000ms)
+
+**Queue Platform 관점**:
+- Enqueue 실패 시 클라이언트 SDK가 재시도
+- 실제 서비스 영향 최소화 (사용자 관점 5-10초 지연은 무관)
+
+### 6.7 Cluster 환경에서 분산 락 위치
+
+`@DistributedLock` (Redisson) 사용 시 어느 Master에 락이 저장되는가?
+
+```
+Redisson RLock 사용 시:
+- lock key: "lock:tenant:{tenantId}:queue-create"
+- Lettuce가 CRC16으로 담당 Master 결정
+- 해당 Master에만 락 저장
+
+주의사항:
+- Redisson은 자동으로 Cluster 감지
+- 단일 key 사용 시 자동 라우팅
+- Multi-lock (여러 key 락) 시 각 key가 다른 Master 가능
+```
+
+**Queue Platform 관행**:
+- 락 key는 항상 단일 도메인/ID 단위 (예: `lock:tenant:{tenantId}:queue-create`)
+- Multi-lock 필요 시 Hash Tag 활용 (`lock:{tenant_1}:queue-create`, `lock:{tenant_1}:api-key-issue`)
+- 락 위치 자동 라우팅에 위임
+
 ---
 
 ## 7. 테스트 전략
@@ -510,15 +595,41 @@ class QueueCreationConcurrencyTest {
 
 ## 8. 관련 결정 (DECISIONS.md)
 
-- DEC-XX: 동시성 제어 우선순위 정책
-- DEC-XX: Queue 생성 동시성 처리 방식 (비관적 락 + UNIQUE 제약)
-- DEC-XX: `@DistributedLock` 도입 및 모듈 배치
+- §57: 동시성 제어 우선순위 정책
+- §58: Queue 생성 동시성 처리 방식 (비관적 락 + UNIQUE 제약)
+- §59: `@DistributedLock` 도입 및 모듈 배치
+- §66: Redis Cluster 도입 결정 (Sprint 10+)
+- §67: 이중 라우팅 아키텍처 (Cluster + Hash Tag)
+- §68: Master 크기 최적화 원리
+- §69: 극대 분산 4x4x4GB 최종 구성
+
+### Cluster 환경 요약 (Sprint 10+ 대비)
+
+| 항목 | Sentinel (현재) | Cluster (Sprint 10+) | 이중 라우팅 (Sprint 12+) |
+|------|-----------------|---------------------|-------------------------|
+| Redis 원자성 | Master 하나 | 각 Master 개별 원자 | 각 Master 개별 원자 |
+| Lua Script | 모든 key 자유 | 단일 key 또는 Hash Tag | Hash Tag 필수 |
+| 분산 락 | Master 하나에 저장 | slot 담당 Master에 저장 | Hash Tag로 위치 제어 |
+| Multi-key 명령 | 자유 | CROSSSLOT 주의 | Hash Tag로 회피 |
+| 확장 방식 | Scale-Up만 | Scale-Out 가능 | 완전한 제어 |
+
+**Queue Platform 무변경 자산**:
+- enqueue.lua는 단일 key만 사용 → Cluster 무변경 작동
+- `@DistributedLock` key 패턴 (`lock:{domain}:{id}:{action}`) → Cluster 무변경
+- Rate Limiter Lua Script → 단일 key 사용, 무변경
+
+**Sprint 12+ 변경 예상**:
+- 필요 시 Lua Script에 Hash Tag 도입
+- `@DistributedLock` key도 Hash Tag 활용
+- 이중 라우팅 정보 도메인에 반영
 
 ---
 
 ## 9. 참조
 
 - CLAUDE.md "동시성 제어" 섹션
+- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (부록 F: 이중 라우팅, 부록 H: Master 최적화)
+- `doc/INFRA_SETUP.md` §6.5 (Cluster 로컬 실습)
 - Martin Kleppmann, "How to do distributed locking"
 - Redis Documentation, "Distributed Locks with Redis"
 - Redisson Wiki, "Distributed locks and synchronizers"
