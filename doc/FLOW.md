@@ -1,39 +1,40 @@
 # 🔄 Queue Platform — 상세 흐름도
 
-> **최종 업데이트**: 2026-07-08 (Sprint 5-D 완료, Sprint 5-E 진입, Cluster 학습 완료 반영)
-> **관련 문서**: DECISIONS.md §66-69, queue-domain/docs/ARCHITECTURE_ROADMAP.md, FRS v1.10
+> **최종 업데이트**: 2026-07-15 (Sprint 5-E Enqueue 구현 완료 — 하이브리드 폐기, Hash Tag 적용)
+> **관련 문서**: DECISIONS.md §66-70, doc/ARCHITECTURE_ROADMAP.md, FRS v1.10
 
 ---
 
-## Enqueue (Sprint 5-E 하이브리드)
+## Enqueue (Sprint 5-E — Bulk 단독)
 
-Sprint 5-E에서 확정된 하이브리드 전략을 반영한 최신 흐름.
+> ⚠️ **2026-07-15 개정 (§70).** 개정 전 이 문서는 "임계값 1000 req/s로 일반 Lua ↔ Bulk Lua 자동 전환"
+> 하이브리드 흐름이었다. 구현 과정에서 **하이브리드를 폐기**하고 모든 요청을 Bulk로 처리하도록 선회했다.
+> `enqueue.lua`와 `SlidingWindowCounter`는 존재하지 않는다.
 
 **핵심**:
-- 평상시: 일반 Lua Script (즉시 처리, 1-3ms)
-- 피크 시: Bulk Lua Script (배치 처리, 10-30ms)
-- 임계값 1000 req/s로 자동 전환 (SlidingWindowCounter)
+- **모든 요청**이 Global Queue에 적재 → `BatchProcessor`가 주기적으로 drain → Bulk Lua 1회
+- 경로가 하나뿐이라 순번 유일성 증명이 한 번으로 끝남 (하이브리드는 두 경로의 순번 일관성을 따로 증명해야 함)
+- 대가: 저부하 요청도 배치 주기를 부담 (`fixedRate=1000ms` → 평균 500ms) — 재조정 후속 과제
 
 ```mermaid
 flowchart TD
-    START(["POST /api/v1/queues/{queueId}/enqueue\nJWT 또는 ApiKey 인증\n{ identifier }"])
-    --> FILTER["① Filter Chain\nJwtAuthenticationFilter\nRateLimitFilter (초당 통제)"]
-    --> CTRL["② QueueController.enqueue()\nEnqueueRequest 파싱\nBean Validation"]
-    --> SERV["③ QueueService.enqueue()\nQueue 조회 (Cache first)\nTenant 소유권 검증\nQueue.isEnqueueable() 검증"]
-    --> ENG["④ QueueEngine.enqueue()\n(RedisQueueEngine 하이브리드)"]
-    --> COUNT["⑤ SlidingWindowCounter 확인\n현재 초당 요청 수 조회\n임계값 (1000 req/s) 비교"]
+    START(["POST /api/v1/queues/{queueId}/tokens\nX-API-Key 인증\n{ identifier }"])
+    --> FILTER["① Filter Chain\nApiKeyAuthenticationFilter\nRateLimitFilter (초당 통제)"]
+    --> CTRL["② QueueEngineController.enqueue()\nEnqueueRequest 파싱\nBean Validation"]
+    --> SERV["③ QueueEngineService.enqueue()\nQueue 조회\nTenant 소유권 검증\nQueue 활성 상태 검증"]
+    --> ENG["④ RedisQueueEngine.enqueue()\n(Producer)"]
 
-    COUNT -->|"< 1000 req/s"| NORMAL["⑥-A 일반 Lua Script 경로\n즉시 처리"]
-    COUNT -->|"≥ 1000 req/s"| BULK["⑥-B Bulk 모드\n배치 처리 대기"]
+    ENG --> OFFER["⑤ PendingEnqueue 생성\nglobalQueue.offer()\nfuture.get(30s) 대기"]
 
-    NORMAL --> LUA["enqueue.lua 실행\n(Redis 원자 실행)\n1. ZRANK 확인 (중복?)\n2. ZCARD 확인 (Capacity?)\n3. ZADD (score=timestamp)\n4. ZRANK 재조회 (순번)"]
-    LUA --> OK1(["200 OK\n{ status: OK/EXISTS/FULL,\n  rank, total }\n소요: 1-3ms"])
+    OFFER -.->|"블로킹 대기"| COMPLETE
 
-    BULK --> FUTURE["CompletableFuture 생성\nPendingEnqueue 생성\nBatchQueue.offer()\nfuture.get(1s) 대기"]
-    FUTURE --> SCHED["@Scheduled (fixedDelay=10ms)\nprocessBulk()\n최대 100개 배치 수집\nQueue별 그룹핑"]
-    SCHED --> BULKLUA["enqueue_bulk.lua 실행\n(Redis 원자 실행)\nfor 루프 numRequests:\n  ZRANK 확인\n  ZCARD 확인\n  ZADD (또는 skip)\n결과 array 반환"]
-    BULKLUA --> COMPLETE["각 future.complete(result)"]
-    COMPLETE --> OK2(["200 OK\n동일 응답 스키마\n소요: 10-30ms"])
+    SCHED["⑥ BatchProcessor (Consumer)\n@Scheduled(fixedRate=1000ms)"]
+    --> DRAIN["drain (최대 MAX_DRAIN=5000)\nqueueId별 groupBy"]
+    --> CHUNK["CHUNK_SIZE=500씩 분할"]
+    --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\n(Hash Tag — 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity? → FULL\n  INCR seq → score 발급\n  ZADD NX → 신규? OK : EXISTS\n  ZRANK → 순번\n결과 array (입력과 동일 순서)"]
+    --> COMPLETE["⑧ 위치(index)로 매칭하여\n각 future.complete(result)\n※ identifier는 중복 가능하므로 key로 쓰면 안 됨"]
+
+    COMPLETE --> OK(["200 OK\n{ status: OK/EXISTS/FULL,\n  rank, total }"])
 
     FILTER -->|"인증 실패"| E401(["401 UNAUTHORIZED"])
     FILTER -->|"Rate 초과"| E429(["429 RL_001 + Retry-After"])
@@ -42,25 +43,36 @@ flowchart TD
     SERV -->|"PAUSED/DRAINING"| E503(["503 QM_004 NOT_ACTIVE"])
 ```
 
-### Enqueue 하이브리드 결정 근거
+**처리량 상한**: 인스턴스당 `MAX_DRAIN / fixedRate` = **5,000 req/s**. 유입이 이를 넘으면
+globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,000×N.
 
-**8가지 확정 결정** (DECISIONS §66-69, ARCHITECTURE_ROADMAP 부록 A):
+### Enqueue 결정 근거
+
+**확정 결정** (DECISIONS §66-70, ARCHITECTURE_ROADMAP 부록 A):
 - D1: 자유 identifier (Tenant 제공, UUID/이메일/고객번호 등)
 - D2: ZSet 하나 (`queue:{queueId}:waiting`)
 - D3: ZRANK + ZCARD (별도 counter 없음)
 - D4: Java (부하 측정) + Lua (원자 처리) 분리
 - D5: Lua ZRANK 중복 방지
 - D6: Lua ZCARD Capacity 검증
-- D7: enqueue.lua + enqueue_bulk.lua 2개
-- D8: 임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s
+- ~~D7: enqueue.lua + enqueue_bulk.lua 2개~~ → **`enqueue_bulk.lua` 단독** (§70)
+- ~~D8: 임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s~~ → **하이브리드 폐기.** 배치 상수만 유지 (§70)
+  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
+  - ⚠️ 원안(10ms/1s) 대비 100배/30배 이탈 → 재조정 후속 과제
+- **D9: score = `INCR queue:{queueId}:seq`** (신설, §70) — 단조증가·유일 보장
+- **D10: Hash Tag 필수** (신설, §70) — `queue/QueueKeys.java`
 
-### Cluster 환경에서 (Sprint 10+ 반영)
+### Cluster 환경에서 (Sprint 8+ 반영)
 
-Sprint 10 이후 Redis Cluster 도입 시:
-- Lettuce가 `queue:{queueId}:waiting` key의 CRC16으로 자동 slot 계산
-- 해당 slot 담당 Master로 자동 라우팅
-- Lua Script 단일 key만 사용 → CROSSSLOT 이슈 없음
-- 이중 라우팅 (Sprint 12+): `queue:{shard_X}:{queueId}:waiting` 형식
+> ⚠️ 2026-07-15 개정 (§70). 개정 전엔 "Lua Script 단일 key만 사용 → CROSSSLOT 이슈 없음"이었으나,
+> D9(seq 키) 도입으로 **2-key가 되어 전제가 깨졌다.**
+
+- Lettuce가 key의 CRC16으로 자동 slot 계산 → 해당 slot 담당 Master로 자동 라우팅
+- `enqueue_bulk.lua`는 **키 2개**(waiting + seq)를 사용 → **해시태그로 동일 slot 강제** (D10)
+  - 해시태그 없으면: slot 7911 vs 11273 → 다른 Master → `CROSSSLOT` 에러
+  - 해시태그 있으면: 둘 다 slot 10592 → 같은 Master → 정상
+- Sentinel에선 무해하므로 **선제 적용 완료** (로컬 Cluster A에서 실제 스크립트 실행 검증)
+- 이중 라우팅 (Sprint 12+): 태그가 shard로 이동 → `queue:{shard_X}:{queueId}:waiting`
 
 ### Kafka 도입 후 (Sprint 11+ 계획)
 
@@ -478,7 +490,7 @@ Ticketmaster, 인터파크 등:
 | Polling (캐싱 후) | Redis 200k/s | Caffeine 80% + Redis 40k/s | -80% |
 
 **Sprint별 최적화 도입**:
-- Sprint 5-E: Enqueue 하이브리드 (완료)
+- Sprint 5-E: Enqueue Bulk 단독 + Hash Tag (완료, §70 — 하이브리드는 폐기)
 - Sprint 9: Rank Query + Caffeine 캐싱
 - Sprint 10: Cluster 도입 (부하 격리)
 - Sprint 11-12: Kafka (비동기 처리량 증가)

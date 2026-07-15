@@ -107,23 +107,30 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - Step 1 롤백 완료, Step 2-5 캐시 인프라 완료
 - dev 브랜치 merge 완료
 
-**5-E 진행 중** (Phase A 완료, 2026-07-08):
+**5-E 진행 중** (Phase A~E 완료, 2026-07-15):
 - Phase A ✅: QueueEngine Port + EnqueueResult Value Object
-- Phase B 🔄: enqueue.lua + enqueue_bulk.lua + Bean 등록
-- Phase C ⬜: SlidingWindowCounter + PendingEnqueue + RedisQueueEngine 하이브리드
-- Phase D ⬜: QueueService.enqueue + QueueController.enqueue
-- Phase E ⬜: 검증 (1,000 동시 Enqueue 순번 중복 0)
-- Phase F ⬜: 커밋
+- Phase B ✅: enqueue_bulk.lua + Bean 등록 (**하이브리드 폐기 → Bulk 단독**)
+- Phase C ✅: PendingEnqueue + RedisQueueEngine(Global Queue) + BatchProcessor
+- Phase D ✅: QueueEngineService + QueueEngineController + ApiKeyAuthenticationFilter
+- Phase E ✅: 검증 완료 — 전체 160건 통과
+  - 1,000 동시 Enqueue 순번 0~999 유일 (실제 Redis)
+  - WAS 3대 분산 10,000건 → 5개 큐에 2,000씩, 순번 중복 0
+  - 로컬 Cluster A에서 `enqueue_bulk.lua` 실행 검증 (해시태그)
+- Phase F ⬜: 커밋 (미완 — working tree 상태)
 
-**5-E 8가지 확정 결정** (DECISIONS §66-69 참조):
+**5-E 확정 결정** (DECISIONS §66-70 참조):
 - D1: 자유 identifier (Tenant 제공)
 - D2: ZSet 하나 (`queue:{queueId}:waiting`)
 - D3: ZRANK + ZCARD
 - D4: Java + Lua 분리
 - D5: Lua ZRANK 중복 방지
 - D6: Lua ZCARD Capacity
-- D7: enqueue.lua + enqueue_bulk.lua
-- D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)
+- ~~D7: enqueue.lua + enqueue_bulk.lua~~ → **`enqueue_bulk.lua` 단독** (§70)
+- ~~D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)~~ → **하이브리드 폐기** (§70)
+  - 현재 상수: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
+  - ⚠️ 원안(10ms/1s) 대비 100배/30배 이탈 → **재조정 후속 과제** (단건 경로가 사라져 저부하 요청도 평균 500ms 부담)
+- **D9: score = `INCR queue:{queueId}:seq`** (신설) — ZCARD+1/타임스탬프는 충돌·동점 → INCR만 단조증가·유일
+- **D10: Hash Tag 필수** (신설) — 2-key Lua라 해시태그 없으면 Cluster에서 CROSSSLOT. `queue/QueueKeys.java`에서 관리
 
 **Cluster 로컬 학습 완료** (2026-07-08 - Sprint 8 병행):
 - Sentinel 유지 + Cluster A (7001-7008) + Cluster B (8001-8008)
@@ -137,7 +144,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - DECISIONS.md 갱신 완료 (§66-69 신규)
 - ROADMAP.md 갱신 완료
 - CLAUDE.md 갱신 완료 (진행 상황 반영)
-- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` 신규 (2588 라인)
+- `doc/ARCHITECTURE_ROADMAP.md` 신규 (2588 라인)
 ---
 
 ## 코드 작성 규칙 (반드시 준수)
@@ -276,7 +283,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - ✅ Tenant Plan 도입 (SaaS 등급)
 - ✅ HTTP Filter 통합 (429 + Retry-After)
 - ✅ API Key 캐시 (apikey-cache:{sha256}, TTL 60s) (5-D)
-- 🔄 Queue Engine Lua Scripts (enqueue.lua + enqueue_bulk.lua, 5-E)
+- ✅ Queue Engine Lua Script (enqueue_bulk.lua 단독 + Hash Tag, 5-E / DECISIONS §70)
 - ⬜ Refresh Token 도메인 모델 + DB 저장 + Redis 캐시 (5-E 이후)
 
 ### Cluster 로컬 학습 완료 자산 (2026-07-08)
@@ -356,7 +363,7 @@ mysql -u root -p -P 3307  # Replica
 | `doc/schema.sql` | MySQL DDL + 파티션 운영 쿼리 |
 | `doc/CONCURRENCY.md` | 동시성 제어 전략, `@DistributedLock` 사용법, 확장성 전제 |
 | `doc/INFRA_SETUP.md` | WSL2 인프라 설치 가이드 (Sentinel + Cluster 로컬 실습 포함, §6.5) |
-| `queue-domain/docs/ARCHITECTURE_ROADMAP.md` | ⭐ **아키텍처 진화 로드맵 (Phase 0-4 + 부록 A-I)** |
+| `doc/ARCHITECTURE_ROADMAP.md` | ⭐ **아키텍처 진화 로드맵 (Phase 0-4 + 부록 A-I)** |
 | `doc/sprint-5/REDIS_SENTINEL.md` | Sprint 5 Phase 1 학습 노트 (Sentinel) |
 | `doc/sprint-5/LUA_SCRIPTS.md` | Sprint 5 Phase 2 학습 노트 (Lua 3종) |
 | `doc/sprint-5/RATE_LIMITER.md` | Rate Limiter 설계 통합 |
