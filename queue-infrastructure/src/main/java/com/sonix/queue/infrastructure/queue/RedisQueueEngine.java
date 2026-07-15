@@ -1,0 +1,141 @@
+package com.sonix.queue.infrastructure.queue;
+
+import com.sonix.queue.domain.queue.EnqueueResult;
+import com.sonix.queue.domain.queue.PendingEnqueue;
+import com.sonix.queue.domain.queue.QueueEngine;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Redis 기반 대기열 엔진 구현 (Global Queue 배치 방식).
+ * <p>단건(hybrid) 분기는 제거되었으며, 모든 요청이 배치로 처리된다.
+ *
+ * <p><b>Producer-Consumer 패턴:</b>
+ * <ul>
+ *   <li>Producer (이 클래스의 enqueue): PendingEnqueue를 Global Queue에 offer,
+ *       Future.get() 대기</li>
+ *   <li>Consumer (BatchProcessor @Scheduled): Global Queue drain,
+ *       queueId groupBy, 청크별 Bulk Lua 실행 후 Future.complete()</li>
+ * </ul>
+ *
+ * <p><b>Lua Script 반환 형식:</b>
+ * enqueue_bulk.lua: [{identifier, status, rank, total}, ...]
+ * */
+
+@Component
+public class RedisQueueEngine implements QueueEngine {
+
+    private static final long MAX_WAIT_SECONDS = 30L;
+
+    private final StringRedisTemplate redisTemplate;
+    private final RedisScript<List> enqueueBulkScript;
+
+    // global queue
+    private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
+
+    public RedisQueueEngine(
+            StringRedisTemplate redisTemplate,
+            @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript
+    ) {
+        this.redisTemplate = redisTemplate;
+        this.enqueueBulkScript = enqueueBulkScript;
+    }
+
+    @Override
+    public EnqueueResult enqueue(String queueId, String identifier) {
+        PendingEnqueue pending = new PendingEnqueue(queueId, identifier);
+
+        globalQueue.offer(pending);
+
+        try {
+            return pending.getFuture().get(MAX_WAIT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            throw new RuntimeException("Enqueue timeout after " + MAX_WAIT_SECONDS + " seconds", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Enqueue interrupted", e);
+        } catch (ExecutionException e) {
+            throw new RuntimeException("Enqueue failed", e.getCause());
+        }
+    }
+
+    /**
+    * enqueue.lua 결과 파싱: [status, rank, total]
+    */
+    private EnqueueResult parseEnqueueResult(List<Object> result) {
+        if (result == null || result.size() < 4) {
+            throw new IllegalStateException("Invalid Lua result: " + result);
+        }
+
+        String identifier = (String) result.get(0);
+        String status = (String) result.get(1);
+        long rank = ((Number) result.get(2)).longValue();
+        long total = ((Number) result.get(3)).longValue();
+
+        return switch (status) {
+            case "OK" -> EnqueueResult.ok(identifier, rank, total);
+            case "EXISTS" -> EnqueueResult.exists(identifier, rank, total);
+            case "FULL" -> EnqueueResult.full(identifier, total);
+            default -> throw new IllegalStateException("Unknown status: " + status);
+        };
+    }
+
+    /**
+     * Global Queue 조회 (BatchProcessor가 drain에 사용).
+     */
+    public ConcurrentLinkedQueue<PendingEnqueue> getGlobalQueue() {
+        return globalQueue;
+    }
+
+    /**
+     * Bulk Lua Script 실행 (BatchProcessor가 사용).
+     * 반환 형식: [{identifier, status, rank, total}, ...]
+     */
+    @SuppressWarnings("unchecked")
+    public List<Object> executeBulkLua(String queueId, List<PendingEnqueue> batch, long maxCapacity) {
+        String queueKey = QueueKeys.waiting(queueId);
+        String seqKey = QueueKeys.seq(queueId);
+
+        // ARGV 구성: maxCapacity, count, identifier1, identifier2, ...  (score 없음)
+        List<String> args = new ArrayList<>();
+        args.add(String.valueOf(maxCapacity));
+        args.add(String.valueOf(batch.size()));
+        for (PendingEnqueue pending : batch) {
+            args.add(pending.getIdentifier());   // identifier만 (한 번)
+        }
+
+        return (List<Object>) redisTemplate.execute(
+                enqueueBulkScript,
+                List.of(queueKey, seqKey),   // KEYS 두 개: [1]=waiting, [2]=seq
+                args.toArray()
+        );
+    }
+
+    /**
+     * enqueue_bulk.lua 결과 파싱 (BatchProcessor가 사용).
+     * 반환 형식: [{identifier, status, rank, total}, ...]
+     *
+     * <p>결과는 요청한 batch와 <b>같은 순서</b>로 반환된다. enqueue_bulk.lua의 루프는
+     * 모든 분기(OK/EXISTS/FULL)에서 정확히 한 건씩 결과를 쌓기 때문이다.
+     * identifier는 중복될 수 있으므로(EXISTS가 존재하는 이유) key로 쓰지 말 것.
+     */
+    @SuppressWarnings("unchecked")
+    public List<EnqueueResult> parseBulkResult(List<Object> result) {
+        List<EnqueueResult> results = new ArrayList<>(result.size());
+
+        for (Object item : result) {
+            results.add(parseEnqueueResult((List<Object>) item));
+        }
+
+        return results;
+    }
+
+}

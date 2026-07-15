@@ -21,6 +21,8 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 
+import java.util.List;
+
 /**
  * Redis 연결 설정 (Sentinel 기반, 최소 구성).
  *
@@ -72,6 +74,10 @@ public class RedisConfig {
         return loadScript("lua/fixed-window.lua", Long.class);
     }
 
+    @Bean
+    public RedisScript<List> enqueueBulkScript() {
+        return loadScript("lua/enqueue_bulk.lua", List.class);
+    }
 
     @Bean
     public RateLimiter rateLimiter(

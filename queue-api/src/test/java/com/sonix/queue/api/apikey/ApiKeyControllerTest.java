@@ -1,6 +1,7 @@
 package com.sonix.queue.api.apikey;
 
 import com.sonix.queue.api.apikey.dto.ApiKeyIssueResponse;
+import com.sonix.queue.api.security.ApiKeyAuthenticationFilter;
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.security.RateLimitFilter;
@@ -44,6 +45,9 @@ class ApiKeyControllerTest {
 
     @MockBean
     private RateLimitFilter rateLimitFilter;
+
+    @MockBean
+    private ApiKeyAuthenticationFilter apiKeyAuthenticationFilter;
 
     @BeforeEach
     void setUp() {

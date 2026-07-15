@@ -25,6 +25,9 @@ dependencies {
     // Validation
     implementation 'org.springframework.boot:spring-boot-starter-validation'
 
+    // Enqueue E2E 통합 테스트용 (StringRedisTemplate / RedisScript) — 테스트 스코프 전용
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis'
+
     compileOnly      "org.projectlombok:lombok:${lombokVersion}"
     annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
 }
