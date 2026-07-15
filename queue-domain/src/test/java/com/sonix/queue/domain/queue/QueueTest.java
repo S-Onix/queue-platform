@@ -45,27 +45,6 @@ public class QueueTest {
     }
 
     @Test
-    @DisplayName("sliceCount 자동 계산 - 250000 → 3")
-    void create_sliceCount_250000() {
-        Queue queue = Queue.create(1L, "test-queue", 250000, null, null);
-        assertEquals(3, queue.getSliceCount());
-    }
-
-    @Test
-    @DisplayName("sliceCount 자동 계산 - 50000 → 1")
-    void create_sliceCount_50000() {
-        Queue queue = Queue.create(1L, "test-queue", 50000, null, null);
-        assertEquals(1, queue.getSliceCount());
-    }
-
-    @Test
-    @DisplayName("sliceCount 자동 계산 - 100000 → 1")
-    void create_sliceCount_100000() {
-        Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
-        assertEquals(1, queue.getSliceCount());
-    }
-
-    @Test
     @DisplayName("pause 성공")
     void pause_success() {
         Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
@@ -208,27 +187,6 @@ public class QueueTest {
     }
 
     @Test
-    @DisplayName("sliceCount - 100001 → 2 (경계 바로 넘김)")
-    void sliceCount_boundary_100001() {
-        Queue queue = Queue.create(1L, "test", 100001, null, null);
-        assertEquals(2, queue.getSliceCount());
-    }
-
-    @Test
-    @DisplayName("sliceCount - 1 → 1 (최소값)")
-    void sliceCount_minimum() {
-        Queue queue = Queue.create(1L, "test", 1, null, null);
-        assertEquals(1, queue.getSliceCount());
-    }
-
-    @Test
-    @DisplayName("sliceCount - 1000000 → 10 (대규모)")
-    void sliceCount_large_scale() {
-        Queue queue = Queue.create(1L, "test", 1000000, null, null);
-        assertEquals(10, queue.getSliceCount());
-    }
-
-    @Test
     @DisplayName("isCapacityExceeded - 초과하면 true")
     void isCapacityExceeded_over() {
         Queue queue = Queue.create(1L, "test", 100, null, null);
@@ -265,7 +223,7 @@ public class QueueTest {
         LocalDateTime now = LocalDateTime.now();
         Queue queue = Queue.reconstruct(
                 1L, "q_test123", 100L, "my-queue",
-                200000, 2, 3600, 600,
+                200000, 3600, 600,
                 QueueStatus.PAUSED, now, null
         );
 
@@ -274,7 +232,6 @@ public class QueueTest {
         assertEquals(100L, queue.getTenantId());
         assertEquals("my-queue", queue.getName());
         assertEquals(200000, queue.getMaxCapacity());
-        assertEquals(2, queue.getSliceCount());
         assertEquals(3600, queue.getWaitingTtl());
         assertEquals(600, queue.getInactiveTtl());
         assertEquals(QueueStatus.PAUSED, queue.getStatus());

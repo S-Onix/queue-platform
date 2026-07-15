@@ -17,7 +17,6 @@ public class QueueEntity {
     Long tenantId;
     String name;
     int maxCapacity;
-    int sliceCount;
     int waitingTtl;
     int inactiveTtl;
     int status;
@@ -28,7 +27,7 @@ public class QueueEntity {
 
     public Queue toDomain() {
         return Queue.reconstruct(this.id, this.queueId, this.tenantId
-                , this.name, this.maxCapacity, this.sliceCount
+                , this.name, this.maxCapacity
                 , this.waitingTtl, this.inactiveTtl
                 , QueueStatus.fromCode(this.status)
                 , this.createdAt, this.deletedAt);
@@ -41,7 +40,6 @@ public class QueueEntity {
         entity.tenantId = queue.getTenantId();
         entity.name = queue.getName();
         entity.maxCapacity = queue.getMaxCapacity();
-        entity.sliceCount = queue.getSliceCount();
         entity.waitingTtl = queue.getWaitingTtl();
         entity.inactiveTtl = queue.getInactiveTtl();
         entity.status = queue.getStatus().getStatusCode();

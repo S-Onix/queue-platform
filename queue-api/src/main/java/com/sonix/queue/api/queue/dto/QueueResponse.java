@@ -11,7 +11,6 @@ public class QueueResponse {
     private String queueId;
     private String name;
     private int maxCapacity;
-    private int sliceCount;
     private Integer waitingTtl;
     private Integer inactiveTtl;
     private QueueStatus status;
@@ -24,7 +23,6 @@ public class QueueResponse {
         response.queueId = queue.getQueueId();
         response.name = queue.getName();
         response.maxCapacity = queue.getMaxCapacity();
-        response.sliceCount = queue.getSliceCount();
         response.waitingTtl = queue.getWaitingTtl();
         response.inactiveTtl = queue.getInactiveTtl();
         response.status = queue.getStatus();
