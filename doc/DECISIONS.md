@@ -3109,13 +3109,17 @@ public RedisScript<Long> fixedWindowScript() {
 - 자동화 필수 (Prometheus, Grafana)
 
 **중립**:
-- Lua Script 무변경 (단일 key 사용 - Queue Platform 특성)
+- ~~Lua Script 무변경 (단일 key 사용 - Queue Platform 특성)~~
+  → **개정 (§70, 2026-07-15)**: 5-E에서 `INCR seq`가 추가되어 `enqueue_bulk.lua`는 **2-key**가 됨.
+    Hash Tag를 선제 적용(`queue/QueueKeys.java`)하여 **결과적으로 무변경 작동은 유지**
 - Spring 코드 무변경 (application.yml 변경만)
 - Lettuce 자동 라우팅
 
 ### Interview Point
 
-> "Queue Platform은 Sprint 5까지 Sentinel 기반이지만, Sprint 10에서 Cluster로 전환합니다. Sentinel은 데이터 총량이 Master 하나 메모리로 제한되고 Single Thread 병목이 있어 대규모 트래픽 처리에 한계가 있습니다. Cluster는 자동 샤딩으로 여러 Master가 병렬 처리하여 처리량이 선형 증가하고, Master별 부하 격리로 Multi-tenant 서비스에 적합합니다. Sprint 8에서 로컬 WSL에 Sentinel과 병행 실행하여 학습했습니다. 프로덕션 Cluster는 실제 운영 관행에 따라 Master 크기를 8-16GB로 시작해 부하 편차 관찰 후 확장할 계획입니다. Lua Script는 단일 key만 사용하므로 CROSSSLOT 이슈 없이 그대로 사용 가능합니다."
+> "Queue Platform은 Sprint 5까지 Sentinel 기반이지만, Sprint 10에서 Cluster로 전환합니다. Sentinel은 데이터 총량이 Master 하나 메모리로 제한되고 Single Thread 병목이 있어 대규모 트래픽 처리에 한계가 있습니다. Cluster는 자동 샤딩으로 여러 Master가 병렬 처리하여 처리량이 선형 증가하고, Master별 부하 격리로 Multi-tenant 서비스에 적합합니다. Sprint 8에서 로컬 WSL에 Sentinel과 병행 실행하여 학습했습니다. 프로덕션 Cluster는 실제 운영 관행에 따라 Master 크기를 8-16GB로 시작해 부하 편차 관찰 후 확장할 계획입니다. Lua Script는 대기열 ZSet과 순번 카운터 두 키를 쓰기 때문에 Hash Tag로 같은 slot에 묶어 CROSSSLOT을 회피했고, 로컬 Cluster에서 실제로 검증했습니다."
+
+> ⚠️ 개정 (§70, 2026-07-15): 위 면접 답변의 마지막 문장은 원래 "Lua Script는 단일 key만 사용하므로 CROSSSLOT 이슈 없이 그대로 사용 가능합니다"였다. 5-E에서 `INCR seq` 도입으로 2-key가 되어 사실이 아니게 되었고, Hash Tag 적용 후 위 문장으로 개정했다.
 
 ### Related
 
@@ -3353,3 +3357,84 @@ public RedisScript<Long> fixedWindowScript() {
 - `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (부록 I)
 - §66 (Cluster 도입), §67 (이중 라우팅), §68 (Master 크기)
 - `doc/INFRA_SETUP.md` §6.5-10 (로컬-프로덕션 매핑)
+
+---
+
+## 70. Sprint 5-E — Bulk 단독 + seq 키 + Hash Tag (D7/D8 개정, CROSSSLOT 선제 대응)
+
+**Date**: 2026-07-15
+**Context**: 5-E 구현 과정에서 두 가지가 §66-69 수립 시점의 전제를 깼다.
+1. **하이브리드 단건 경로 제거** — D7(enqueue.lua + enqueue_bulk.lua 2개), D8(임계값 1000 req/s)이 코드와 불일치
+2. **score 발급을 `INCR seq`로 변경** — Lua가 **2-key**가 되면서 "단일 key만 사용 → CROSSSLOT 이슈 없음"(§67 전제, CONCURRENCY §6.5, FLOW)이 **거짓이 됨**
+
+### Decision
+
+**D7 개정**: `enqueue.lua` 폐기. **`enqueue_bulk.lua` 단독**으로 모든 요청 처리.
+
+**D8 개정**: 임계값·단건 분기 삭제. 배치 상수만 유지 (`MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s).
+> ⚠️ 원안(간격 10ms, 타임아웃 1s) 대비 100배/30배 이탈 상태. **재조정은 별도 과제**로 분리 (아래 Consequences 참조).
+
+**D9 신설 — score는 `INCR queue:{queueId}:seq`**: 큐별 전역 순번 카운터를 2번째 키로 도입.
+
+**D10 신설 — Hash Tag 필수**: 모든 Queue Engine 키는 `{queueId}`로 감싼다.
+```java
+// queue/QueueKeys.java (cache/RedisKeyFactory 아님 — ratelimit/RateLimitKeys 선례)
+public static String waiting(String queueId) { return "queue:{" + queueId + "}:waiting"; }
+public static String seq(String queueId)     { return "queue:{" + queueId + "}:seq"; }
+```
+
+### Rationale
+
+**왜 enqueue.lua를 폐기했나**:
+- 경로 2개 = 코드 2벌 + 임계값 튜닝 + **두 경로가 같은 순번 체계를 공유함을 증명할 부담**
+- 배치 하나면 모든 요청이 동일 코드를 지나므로 순번 유일성 증명이 한 번으로 끝남
+
+**왜 seq 키가 필요한가** (단일 key로 되돌릴 수 없는 이유):
+- `ZCARD + 1`: admit으로 중간이 빠지면 score 충돌
+- `System.currentTimeMillis()`: 같은 ms 요청끼리 동점 → 순서 뒤집힘
+- **`INCR`만이 단조증가·유일을 보장** → 2-key 구조는 불가피
+
+**왜 Hash Tag인가** (로컬 Cluster A 실측):
+```
+queue:q_bts:waiting     → slot 7911   → 포트 7002   ┐ 다른 마스터
+queue:q_bts:seq         → slot 11273  → 포트 7003   ┘ → CROSSSLOT 에러
+
+queue:{q_bts}:waiting   → slot 10592  → 포트 7003   ┐ 같은 마스터
+queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
+```
+- Cluster는 `CRC16(key) % 16384`로 슬롯 결정. Lua는 **노드 한 대에서만** 실행되므로 키가 다른 슬롯이면 시작조차 거부
+- 해시태그는 "같은 슬롯에 넣어달라"는 요청이 아니라 **"슬롯 계산 시 중괄호 안쪽만 본다"는 규칙**
+- 검증: `keyslot("q_bts")` = `keyslot("queue:{q_bts}:waiting")` = **10592** (동일 입력 → 동일 슬롯이 수학적으로 보장)
+
+**왜 Sprint 10이 아니라 지금인가**:
+| 시점 | 비용 |
+|---|---|
+| 지금 (Sentinel) | 문자열 2줄. 슬롯 개념이 없어 **무해**. 운영 데이터 0 |
+| Cluster 전환 후 | 키 이름 변경 = **슬롯 이동 = 데이터 이관**. 대기 중 유저의 순번을 유지한 무중단 마이그레이션 필요 |
+
+### Consequences
+
+**긍정**:
+- Cluster 전환 시 **무변경 작동** (§66 Sprint 8+ 목표 유지)
+- Sprint 10까지 미루지 않고 **로컬 Cluster A에서 실제 `enqueue_bulk.lua` 실행 검증 완료** (alice OK / bob OK / alice EXISTS, seq=3)
+- 키 조립이 `QueueKeys` 한 곳으로 집중 (기존엔 `RedisQueueEngine` + 테스트 3곳에 하드코딩)
+
+**부정**:
+- **단건 경로 제거의 대가**: 저부하 요청도 배치 주기를 전액 부담. `fixedRate=1000ms`면 **평균 500ms, 최악 1s**. 하이브리드 시절엔 단건 경로로 빠져나가 이 비용이 없었음
+  - → **후속 과제**: `fixedRate`를 D8 원안(10ms)~50ms로 재조정 후 실측
+- 인스턴스당 처리량 상한 = `MAX_DRAIN / fixedRate` = **5,000 req/s**. 유입이 이를 넘으면 globalQueue 적체 → 30s 타임아웃 → 실패
+
+**중립**:
+- **큐 1개 = 슬롯 1개 = 마스터 1대 고정.** D2(ZSet 하나)의 필연적 귀결이며 해시태그가 만든 문제가 아님. 1,000만 대기 시 ZSet 실측 **114.5 bytes/멤버 → 약 1.07 GB**가 단일 마스터에 집중 (§69의 128 bytes 추정과 근사)
+- §67 이중 라우팅 도입 시 태그가 shard로 이동: `queue:{shard_A2}:q_bts_002:waiting`
+
+### Interview Point
+
+> "Redis Cluster는 CRC16(key) % 16384로 슬롯을 정하고 마스터마다 슬롯 범위를 나눠 갖습니다. 저희 enqueue_bulk.lua는 대기열 ZSet과 순번 카운터 두 키를 함께 다루는데, 해시태그가 없으면 각각 slot 7911, 11273으로 흩어져 서로 다른 마스터에 저장됩니다. Lua Script는 노드 한 대에서만 원자적으로 실행되므로 CROSSSLOT 에러가 납니다. Redis가 옆 노드에서 알아서 가져오지 않는 이유는 그 순간 원자성이 깨지고, 이를 막으려면 분산 트랜잭션이 필요한데 Redis는 속도를 위해 그 복잡도를 거부했기 때문입니다. 해결책은 해시태그로, 키에 중괄호를 씌우면 슬롯 계산에 중괄호 안쪽만 쓰입니다. 두 키의 queueId가 같으니 같은 슬롯이 수학적으로 보장됩니다. 중요한 건 타이밍인데, 지금은 Sentinel이라 해시태그가 무해하지만 Cluster 전환 후에 고치면 키 이름 변경이 곧 슬롯 이동이라 대기 중인 사용자의 순번을 유지한 채 데이터를 이관해야 합니다. 2줄 수정과 무중단 마이그레이션 프로젝트의 차이라 선제 적용했고, 로컬 Cluster에서 실제 스크립트를 돌려 검증했습니다."
+
+### Related
+
+- §66 (Cluster 도입), §67 (이중 라우팅 — 태그가 shard로 이동), §69 (ZSet 128 bytes 추정)
+- `doc/CONCURRENCY.md` §6.5 (Multi-key Lua + Hash Tag)
+- `doc/FLOW.md` (Enqueue 결정 근거 D1-D10)
+- `queue-infrastructure/.../queue/QueueKeys.java`, `ratelimit/RateLimitKeys.java` (선례)

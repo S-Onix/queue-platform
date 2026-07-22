@@ -281,28 +281,40 @@ flowchart TD
 - ⬜ Refresh Token Redis 이중 저장 (5-E 이후 결정)
 - ⬜ Tenant 정보 Redis 캐시 (Rate Limiter 최적화)
 
-### 5-E. Queue Engine Lua Scripts 🔄 (Sprint 6 준비)
+### 5-E. Queue Engine 🔄 (Phase A-E 완료, 커밋만 남음)
 
 **Phase A 완료** (2026-07-08):
 - ✅ `QueueEngine.java` Port 인터페이스 (queue-domain)
 - ✅ `EnqueueResult.java` Value Object (OK/EXISTS/FULL)
 
-**Phase B-F 진행 예정**:
-- 🔄 `enqueue.lua` (ZRANK 중복 방지 + ZADD + ZCARD Capacity)
-- 🔄 `enqueue_bulk.lua` (배치 처리 + Adaptive Batching)
-- 🔄 `SlidingWindowCounter` (Enqueue 부하 측정)
-- 🔄 `RedisQueueEngine` 하이브리드 (일반 Lua + Bulk 모드)
-- 🔄 `QueueService.enqueue` + `QueueController.enqueue`
+**Phase B-E 완료** (2026-07-15) — **하이브리드 폐기, Bulk 단독으로 선회** (§70):
+- ✅ `enqueue_bulk.lua` (ZRANK 중복 방지 + ZADD NX + ZCARD Capacity + INCR seq)
+- ❌ ~~`enqueue.lua`~~ — 폐기 (경로 2개는 순번 일관성 증명 부담)
+- ❌ ~~`SlidingWindowCounter`~~ — 폐기 (임계값 분기가 없어져 부하 측정 불필요)
+- ✅ `PendingEnqueue` + `RedisQueueEngine`(Global Queue, Producer) + `BatchProcessor`(Consumer)
+- ✅ `QueueKeys` (Hash Tag) — `RateLimitKeys` 선례를 따름
+- ✅ `QueueEngineService` + `QueueEngineController` + `ApiKeyAuthenticationFilter`
+- ✅ 검증: 전체 **160건 통과**
+  - 1,000 동시 Enqueue → 순번 0~999 유일 (실제 Redis)
+  - 동일 identifier 중복 → OK 1 + EXISTS n (멱등성)
+  - WAS 3대 분산 10,000건 → 5개 큐에 2,000씩, 순번 중복 0
+  - 로컬 Cluster A에서 `enqueue_bulk.lua` 실행 검증 (Hash Tag)
 
-**8가지 확정 결정** (DECISIONS §66-69 참조):
+**Phase F ⬜**: 커밋 (working tree 상태)
+
+**확정 결정** (DECISIONS §66-70 참조):
 - D1: 자유 identifier (Tenant 제공)
 - D2: ZSet 하나 (`queue:{queueId}:waiting`)
 - D3: ZRANK + ZCARD
 - D4: Java + Lua 분리
 - D5: Lua ZRANK 중복 방지
 - D6: Lua ZCARD Capacity
-- D7: enqueue.lua + enqueue_bulk.lua
-- D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)
+- ~~D7: enqueue.lua + enqueue_bulk.lua~~ → **`enqueue_bulk.lua` 단독** (§70)
+- ~~D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)~~ → **하이브리드 폐기** (§70)
+  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
+  - ⚠️ 원안 대비 100배/30배 이탈 → **재조정 후속 과제**
+- **D9: score = `INCR queue:{queueId}:seq`** (신설, §70)
+- **D10: Hash Tag 필수** (신설, §70)
 
 ### 5-F. Sprint 5 마무리 🔄
 
@@ -769,9 +781,12 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 
 ### 즉시 (이번 주)
 - 5-E-A: QueueEngine Port + EnqueueResult ✅ 완료 (2026-07-08)
-- 5-E-B: enqueue.lua + enqueue_bulk.lua Bean 등록
-- 5-E-C: SlidingWindowCounter + PendingEnqueue + RedisQueueEngine 하이브리드
-- 5-E-D: QueueService.enqueue + QueueController.enqueue
+- 5-E-B: enqueue_bulk.lua 단독 + Bean 등록 ✅ 완료 (2026-07-15, §70 — enqueue.lua 폐기)
+- 5-E-C: PendingEnqueue + RedisQueueEngine(Global Queue) + BatchProcessor ✅ 완료
+  (~~SlidingWindowCounter~~ 폐기 — 하이브리드 폐기로 불필요)
+- 5-E-D: QueueEngineService + QueueEngineController ✅ 완료
+- 5-E-E: 검증 ✅ 완료 (160건 통과 + Cluster A Hash Tag 검증)
+- 5-E-F: 커밋 ⬜
 
 ### 단기 (1-2주)
 - 5-E-E: 검증 (Lua Script 동시성 테스트, 1,000 동시 Enqueue → 순번 중복 0)

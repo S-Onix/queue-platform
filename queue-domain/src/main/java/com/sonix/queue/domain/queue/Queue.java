@@ -7,14 +7,12 @@ import java.time.LocalDateTime;
 
 @Getter
 public class Queue {
-    private final int SLICE_STAND_COUNT = 100000;
 
     Long id;
     String queueId;
     Long tenantId;
     String name;
     int maxCapacity;
-    int sliceCount;
     int waitingTtl;
     int inactiveTtl;
     QueueStatus status;
@@ -29,16 +27,10 @@ public class Queue {
         this.queueId = IdGenerator.generate("q_");
         this.tenantId = tenantId;
         this.name = name;
-        this.maxCapacity = maxCapacity;
-        this.sliceCount = getSliceStandCount(this.maxCapacity);
-        this.waitingTtl = waitingTtl;
+        this.maxCapacity = maxCapacity;this.waitingTtl = waitingTtl;
         this.inactiveTtl = inactiveTtl;
         this.status = QueueStatus.ACTIVE;
         this.createdAt = LocalDateTime.now();
-    }
-
-    private int getSliceStandCount(int maxCapacity) {
-        return (int) Math.ceil((double) maxCapacity / SLICE_STAND_COUNT);
     }
 
     public static Queue create(Long tenantId, String name, int maxCapacity, Integer waitingTtl, Integer inactiveTtl) {
@@ -72,7 +64,7 @@ public class Queue {
     }
 
     public static Queue reconstruct(Long id, String queueId, Long tenantId, String name,
-                                    int maxCapacity, int sliceCount,
+                                    int maxCapacity,
                                     int waitingTtl, int inactiveTtl,
                                     QueueStatus status, LocalDateTime createdAt,
                                     LocalDateTime deletedAt) {
@@ -82,7 +74,6 @@ public class Queue {
         queue.tenantId = tenantId;
         queue.name = name;
         queue.maxCapacity = maxCapacity;
-        queue.sliceCount = sliceCount;
         queue.waitingTtl = waitingTtl;
         queue.inactiveTtl = inactiveTtl;
         queue.status = status;

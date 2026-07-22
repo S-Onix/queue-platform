@@ -1,5 +1,6 @@
 package com.sonix.queue.api.tenant;
 
+import com.sonix.queue.api.security.ApiKeyAuthenticationFilter;
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.security.RateLimitFilter;
@@ -40,6 +41,9 @@ class TenantControllerTest {
 
     @MockBean
     private RateLimitFilter rateLimitFilter;
+
+    @MockBean
+    private ApiKeyAuthenticationFilter apiKeyAuthenticationFilter;
 
     @Test
     @DisplayName("POST /signup → 200")

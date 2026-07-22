@@ -484,10 +484,26 @@ Redis Cluster는 Lua Script 내 여러 key 사용 시 제약 있음.
 -- 두 key 같은 slot → 같은 Master → Lua Script 정상 실행
 ```
 
-**Queue Platform 관점**:
-- Sprint 5-E 현재 enqueue.lua는 **단일 key만 사용** → CROSSSLOT 이슈 없음
-- Sprint 10 Cluster 도입 시 무변경으로 작동
-- Sprint 12+ 이중 라우팅 도입 시 `queue:{shard_X}:{queueId}:waiting` 형식으로 Hash Tag 자연스럽게 사용
+**Queue Platform 관점** (2026-07-15 개정 — DECISIONS §70):
+
+> ⚠️ 개정 전 이 문단은 "enqueue.lua는 단일 key만 사용 → CROSSSLOT 이슈 없음"이라고 적혀 있었다.
+> 5-E에서 score 발급을 `INCR seq`로 바꾸며 **Lua가 2-key가 되어 전제가 깨졌다.**
+
+- `enqueue_bulk.lua`는 **키 2개**를 사용 → **해시태그 없이는 CROSSSLOT 발생**
+  - `KEYS[1]` = 대기열 ZSet, `KEYS[2]` = 순번 카운터(`INCR`)
+  - seq 키는 제거 불가: `ZCARD+1`은 admit으로 중간이 빠지면 충돌, `currentTimeMillis()`는 동점 발생 → `INCR`만 단조증가·유일 보장
+- **해시태그 적용 완료** (`queue/QueueKeys.java`) → 두 키가 항상 같은 slot
+- 로컬 Cluster A 실측:
+  ```
+  queue:q_bts:waiting    → slot 7911   → 포트 7002  ┐ 다른 마스터 → CROSSSLOT
+  queue:q_bts:seq        → slot 11273  → 포트 7003  ┘
+
+  queue:{q_bts}:waiting  → slot 10592  → 포트 7003  ┐ 같은 마스터 → 정상
+  queue:{q_bts}:seq      → slot 10592  → 포트 7003  ┘
+  ```
+- Sentinel 환경에서는 슬롯 개념이 없어 해시태그가 **무해** → 선제 적용해도 안전
+- Sprint 8+ Cluster 도입 시 **무변경으로 작동** (로컬 Cluster A에서 실제 스크립트 실행 검증 완료)
+- Sprint 12+ 이중 라우팅 도입 시 태그가 shard로 이동: `queue:{shard_X}:{queueId}:waiting`
 
 ### 6.6 Cluster Failover 중 짧은 순간 데이터 불일치
 
@@ -614,12 +630,14 @@ class QueueCreationConcurrencyTest {
 | 확장 방식 | Scale-Up만 | Scale-Out 가능 | 완전한 제어 |
 
 **Queue Platform 무변경 자산**:
-- enqueue.lua는 단일 key만 사용 → Cluster 무변경 작동
+- ~~enqueue.lua는 단일 key만 사용 → Cluster 무변경 작동~~
+  → **`enqueue_bulk.lua`는 2-key(waiting + seq)이므로 Hash Tag 필수** (2026-07-15 개정, §70)
+  → Hash Tag 선제 적용 완료(`queue/QueueKeys.java`) → **이제 Cluster 무변경 작동**
 - `@DistributedLock` key 패턴 (`lock:{domain}:{id}:{action}`) → Cluster 무변경
-- Rate Limiter Lua Script → 단일 key 사용, 무변경
+- Rate Limiter Lua Script → 단일 key 사용, 무변경 (`rl:tenant:{id}`, `rl:{action}:ip:{ip}`)
 
 **Sprint 12+ 변경 예상**:
-- 필요 시 Lua Script에 Hash Tag 도입
+- ~~필요 시~~ Lua Script Hash Tag → **Sprint 5-E에서 이미 도입 완료**. Sprint 12+엔 태그 기준이 queueId → shard로 이동
 - `@DistributedLock` key도 Hash Tag 활용
 - 이중 라우팅 정보 도메인에 반영
 

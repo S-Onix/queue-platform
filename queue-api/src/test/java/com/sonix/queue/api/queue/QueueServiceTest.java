@@ -49,7 +49,6 @@ class QueueServiceTest {
         assertNotNull(response);
         assertEquals("이벤트 대기열", response.getName());
         assertEquals(100000, response.getMaxCapacity());
-        assertEquals(1, response.getSliceCount());
         assertEquals(QueueStatus.ACTIVE, response.getStatus());
         verify(queueRepository).save(any(Queue.class));
     }

@@ -54,7 +54,6 @@ CREATE TABLE queues (
     tenant_id    BIGINT       NOT NULL,
     name         VARCHAR(100) NOT NULL,
     max_capacity INT          NOT NULL,
-    slice_count  INT          NOT NULL,
     waiting_ttl  INT          NOT NULL DEFAULT 7200,
     inactive_ttl INT          NOT NULL DEFAULT 300,
     status       TINYINT      NOT NULL DEFAULT 0,
