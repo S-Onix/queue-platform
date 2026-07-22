@@ -53,7 +53,7 @@
 ```
 Phase 0: Sentinel + 학습 완료
    ↓
-Phase 1: WAS 확장 + Enqueue 하이브리드
+Phase 1: WAS 확장 + Enqueue Bulk 단독 (§70)
    ↓
 Phase 2: Redis Cluster + Caffeine + Rank Query
    ↓
@@ -139,21 +139,21 @@ Client
   ├─→ MySQL Sentinel (동일)
   │
   └─→ Redis Sentinel (동일)
-      + 하이브리드 Enqueue Engine
-      + Enqueue용 SlidingWindowCounter
+      + Bulk 단독 Enqueue Engine (Global Queue + BatchProcessor)
 
 [모니터링]
 Prometheus + Grafana
 ```
 
-### 3.2 Sprint 5-E: Enqueue 하이브리드
+### 3.2 Sprint 5-E: Enqueue Bulk 단독 (하이브리드 폐기 — §70)
 
 **목표**: Queue Platform의 도메인 목적 (부하 완충) 구현
 
-**핵심 결정**:
-- 일반 Lua Script + Bulk Lua Script 하이브리드
-- 부하 기반 자동 전환 (Adaptive Batching)
-- Enqueue 전용 SlidingWindowCounter
+**핵심 결정** (2026-07-15 개정 — §70):
+- ~~일반 Lua Script + Bulk Lua Script 하이브리드~~ → **Bulk Lua 단독**
+- ~~부하 기반 자동 전환 (Adaptive Batching)~~ → 폐기 (임계값 분기 없음)
+- ~~Enqueue 전용 SlidingWindowCounter~~ → 폐기 (전환할 경로가 없으니 부하 측정 불필요)
+- Hash Tag 필수 (2-key Lua)
 
 **구현 요소**:
 
@@ -163,32 +163,32 @@ queue-domain/queue/
 └── EnqueueResult.java (Value Object)
 
 queue-infrastructure/queue/
-├── RedisQueueEngine.java (Adapter - 하이브리드)
-├── SlidingWindowCounter.java (부하 측정)
-└── PendingEnqueue.java (배치 항목)
+├── RedisQueueEngine.java (Adapter - Global Queue Producer)
+├── BatchProcessor.java (@Scheduled Consumer - Bulk Lua 실행)
+└── QueueKeys.java (Hash Tag 키 관리)
+queue-domain/queue/
+└── PendingEnqueue.java (배치 항목 + CompletableFuture)
 
 queue-infrastructure/src/main/resources/lua/
-├── enqueue.lua (일반)
-└── enqueue_bulk.lua (Bulk)
+└── enqueue_bulk.lua (단독 — enqueue.lua는 폐기, §70)
 
 queue-api/queue/
 ├── QueueController.java (수정)
 └── QueueService.java (수정)
 ```
 
-**하이브리드 정책**:
+**Bulk 단독 정책** (2026-07-15 개정 — §70. 개정 전엔 임계값 1000 req/s 기준 하이브리드였다):
 
 ```
-평상시 (초당 <1000 req):
-  Client → QueueService → QueueEngine.enqueue()
-  → enqueueDirectly() → Lua Script 즉시 실행
-  → 응답 (1-2ms)
-
-피크 시 (초당 >=1000 req):
-  Client → QueueService → QueueEngine.enqueue()
-  → enqueueViaBatch() → CompletableFuture 대기 큐 추가
-  → @Scheduled(fixedDelay=10ms) processBulk() 실행
-  → Bulk Lua Script 배치 처리
+모든 요청 (부하 무관):
+  Client → QueueEngineService → RedisQueueEngine.enqueue()
+  → PendingEnqueue 생성 → globalQueue.offer()
+  → future.get(30s) 블로킹 대기
+        ↕
+  BatchProcessor @Scheduled(fixedRate=1000ms)
+  → drain(최대 5000) → queueId별 groupBy → 500씩 청크
+  → enqueue_bulk.lua 실행 (Hash Tag 2-key)
+  → 위치(index)로 매칭하여 future.complete()
   → CompletableFuture.complete() → 응답 (10-20ms)
 ```
 
@@ -314,10 +314,12 @@ redis-cli -c -p 7001 cluster keyslot "queue:q_bts_001:waiting"
 redis-cli --cluster check 127.0.0.1:7001
 ```
 
-**Step 4**: Lua Script Cluster 테스트
-- enqueue.lua는 단일 key (KEYS[1])만 사용
-- Cluster에서 완벽 작동 확인
-- CROSSSLOT 에러 없음
+**Step 4**: Lua Script Cluster 테스트 (2026-07-15 개정 — §70)
+- ~~enqueue.lua는 단일 key (KEYS[1])만 사용 → CROSSSLOT 에러 없음~~
+- `enqueue_bulk.lua`는 **2-key** (KEYS[1]=waiting, KEYS[2]=seq)
+  → **Hash Tag 없으면 CROSSSLOT** (slot 7911 vs 11273)
+  → `queue/QueueKeys.java`에서 `queue:{queueId}:...`로 감싸 동일 slot 보장
+- 로컬 Cluster A(7001)에서 실제 스크립트 실행 검증 완료
 
 **Step 5**: Failover 테스트
 - Master 강제 종료
@@ -538,7 +540,7 @@ services:
 [Enqueue 흐름 (Kafka 도입 후)]
 
 Step 1: Client → Server
-POST /api/v1/queues/{queueId}/enqueue
+POST /api/v1/queues/{queueId}/tokens
 Body: { "identifier": "user_a" }
 
 Step 2: Server → Kafka
@@ -821,7 +823,7 @@ Region A (Asia)      Region B (US)       Region C (EU)
    - 개발자 부담 X
 
 3. **본인 프로젝트 적합**
-   - 단일 key Lua Script (CROSSSLOT 문제 없음)
+   - Lua Script는 2-key지만 **Hash Tag로 동일 slot 보장** → CROSSSLOT 문제 없음 (§70)
    - Multi-tenant 자연스러운 분산
 
 **참고**: 통찰 70-71번
@@ -892,24 +894,33 @@ Region A (Asia)      Region B (US)       Region C (EU)
 
 **참고**: 통찰 63번 - "부하 특성별 최적 도구 선택"
 
-### 7.6 왜 하이브리드 Enqueue (단일 방식 아님)?
+### 7.6 왜 하이브리드 Enqueue를 **폐기**했나? (2026-07-15 개정 — §70)
 
-**결정**: Sprint 5-E에 하이브리드 도입
+> ⚠️ 이 절은 원래 "왜 하이브리드 Enqueue인가"였다. 구현하며 판단이 뒤집혔고,
+> **뒤집힌 이유 자체가 학습 자산**이므로 원래 근거와 반박을 함께 남긴다.
 
-**근거**:
-1. **도메인 목적 완결**
-   - Queue Platform = 부하 완충
-   - 단일 Lua로는 도메인 미스매치
+**최초 결정**: Sprint 5-E에 하이브리드 도입 (임계값 1000 req/s로 일반 Lua ↔ Bulk Lua 자동 전환)
 
-2. **부하 편차 대응**
-   - 평상시: 즉시 응답 (일반 Lua)
-   - 피크 시: 처리량 우선 (Bulk Lua)
+**최초 근거와 그에 대한 반박**:
 
-3. **실무 관행 (Adaptive Batching)**
-   - Netflix, Uber, Google 등
-   - Traffic Shaping
+| 최초 근거 | 구현 후 반박 |
+|---|---|
+| 도메인 목적 완결 — 단일 Lua로는 부하 완충 미스매치 | **Bulk 단독도 부하 완충이다.** 완충은 배치가 하는 일이지 "경로가 2개"라서 되는 게 아님 |
+| 부하 편차 대응 — 평상시 즉시 응답 | 배치 주기를 짧게(10ms) 두면 저부하에서도 즉시에 가까움. **경로를 나눌 필요가 없음** |
+| 실무 관행 (Adaptive Batching) | Netflix/Uber의 Adaptive Batching은 **배치 크기·주기**를 조절하는 것이지 **경로를 분기**하는 게 아님. 관행을 잘못 읽었음 |
 
-**참고**: 통찰 59번 - "도메인 목적에 맞는 구현 결정"
+**폐기의 결정적 이유 — 검증 비용**:
+- 경로가 2개면 **"두 경로가 같은 순번 체계를 공유한다"를 따로 증명**해야 한다
+- 일반 경로는 `ZADD score=timestamp`, Bulk 경로는 `INCR seq` → **score 체계가 달라 순번이 뒤섞일 위험**
+- 경로가 하나면 이 증명이 통째로 사라진다. 실제로 5-E 검증은 "1,000 동시 → 순번 0~999 유일" 한 번으로 끝났다
+
+**남은 대가 (정직하게)**:
+- 저부하 요청도 배치 주기를 전액 부담 (`fixedRate=1000ms` → 평균 500ms)
+- 하이브리드의 단건 경로는 이 비용을 회피하는 장치였음 → **폐기로 잃은 것이 실재함**
+- → `fixedRate` 재조정(10~50ms)이 후속 과제. 이걸 하면 잃은 것이 사실상 사라짐
+
+**학습 포인트**: "실무가 X를 한다"는 근거는 **X가 정확히 무엇인지** 확인하고 써야 한다.
+Adaptive Batching을 "경로 분기"로 오독한 것이 최초 설계의 뿌리 오류였다.
 
 ---
 
@@ -921,7 +932,7 @@ Region A (Asia)      Region B (US)       Region C (EU)
 |--------|---------|----------|
 | 5-D 완료 | 54개 | 캐시 인프라, Anti-pattern 인식 |
 | Cluster 학습 세션 (2026-07-08) | **88개** ⭐ | Cluster 완전 이해, 이중 라우팅, 극대 분산 설계 |
-| 5-E 완료 (예상) | 95-100개 | Lua Script 심화, Bulk 처리, Adaptive Batching |
+| 5-E 완료 | 95-100개 | Lua Script 심화, Bulk 처리, **Hash Tag/CROSSSLOT**, 하이브리드 폐기 판단 |
 | 6-7 완료 (예상) | 105-110개 | ApiKey 인증, Distributed Lock |
 | 8-10 완료 (예상) | 115-120개 | Redis Cluster 프로덕션 도입 |
 | 11-14 완료 (예상) | 130-135개 | Kafka, Polling+Jitter, 성장 대응 |
@@ -1019,7 +1030,7 @@ Region A (Asia)      Region B (US)       Region C (EU)
 
 | Sprint | 목표 | 기술 | 예상 시간 |
 |--------|------|------|-----------|
-| 5-E | Enqueue 하이브리드 | Lua + Bulk Lua | 6-8h |
+| 5-E | Enqueue Bulk 단독 | Bulk Lua + Hash Tag | 6-8h |
 | 6 | ApiKey 인증 | Cache 활용 | 4-6h |
 | 7 | WAS 확장 + DLock | Nginx + Redis Lock | 8-10h |
 | 8 | Cluster 학습 | 6 노드 로컬 | 8-12h |
@@ -1036,7 +1047,7 @@ Region A (Asia)      Region B (US)       Region C (EU)
 
 ### 10.1 확정된 결정
 
-- **Sprint 5-E**: 하이브리드 Enqueue (일반 + Bulk Lua)
+- **Sprint 5-E**: Bulk 단독 Enqueue + Hash Tag (§70 — 하이브리드 폐기)
 - **Sprint 5-E 이후 Polling**: 캐싱 우선 (Sprint 9 Caffeine)
 - **SSE 도입**: Sprint 13-14
 - **Cluster 도입**: Sprint 10 (Tenant 100+ 대응)
@@ -1160,9 +1171,9 @@ Region A (Asia)      Region B (US)       Region C (EU)
 
 ### A.4 결정 사항
 
-**Sprint 5-E**:
-- SlidingWindowCounter는 **Enqueue 요청만** 카운트
-- Enqueue 하이브리드 (일반 + Bulk Lua)
+**Sprint 5-E** (2026-07-15 개정 — §70):
+- ~~SlidingWindowCounter는 **Enqueue 요청만** 카운트~~ → 폐기 (하이브리드 폐기로 불필요)
+- ~~Enqueue 하이브리드 (일반 + Bulk Lua)~~ → **Bulk Lua 단독**
 - Polling은 Sprint 5-E 범위 밖
 
 **Sprint 9**:
@@ -1205,9 +1216,10 @@ QueueController.enqueue()
    ↓
 QueueService.enqueue()
    ↓
-RedisQueueEngine (하이브리드)
-   ├─ 평상시: 일반 Lua Script (1-2ms)
-   └─ 피크: Bulk Lua Script (10-20ms)
+RedisQueueEngine (Global Queue Producer)
+   ↓ PendingEnqueue.offer() / future.get()
+BatchProcessor (@Scheduled Consumer)
+   └─ enqueue_bulk.lua 단독 (Hash Tag 2-key)
 ```
 
 ---
@@ -1351,7 +1363,7 @@ Fallback 로직 필요
 - 표준 관행 따르고 싶음
 - Rebalancing 자동 원함
 - Node 추가/제거 유연
-- Lua Script 단일 key 사용 (본인 프로젝트)
+- Lua Script가 Hash Tag로 slot 고정됨 (본인 프로젝트, §70)
 - 팀에서 Cluster 학습 가능
 
 **애플리케이션 라우팅을 선택하는 경우**:
@@ -1365,10 +1377,10 @@ Fallback 로직 필요
 **Sprint 10**: Redis Cluster 선택
 
 **근거**:
-1. Queue Platform의 Lua Script는 **단일 key만 사용**
-   - enqueue.lua: KEYS[1] = queue:{queueId}:waiting
-   - enqueue_bulk.lua: 같은 큐만
-   - CROSSSLOT 문제 없음
+1. Queue Platform의 Lua Script는 **2-key지만 Hash Tag로 동일 slot 보장** (2026-07-15 개정, §70)
+   - `enqueue_bulk.lua`: KEYS[1] = `queue:{queueId}:waiting`, KEYS[2] = `queue:{queueId}:seq`
+   - 중괄호가 Hash Tag → 슬롯 계산에 `queueId`만 사용 → 두 키가 항상 같은 slot
+   - CROSSSLOT 문제 없음 (Hash Tag 덕분이지, 단일 key라서가 아님)
 
 2. Tenant 격리 요구 없음 (일반 SaaS)
 

@@ -3,6 +3,7 @@ package com.sonix.queue.api.queue;
 import com.sonix.queue.api.queue.dto.QueueCreateRequest;
 import com.sonix.queue.api.queue.dto.QueueResponse;
 import com.sonix.queue.api.queue.dto.QueueUpdateRequest;
+import com.sonix.queue.api.security.ApiKeyAuthenticationFilter;
 import com.sonix.queue.api.security.JwtAuthenticationFilter;
 import com.sonix.queue.api.security.JwtProvider;
 import com.sonix.queue.api.security.RateLimitFilter;
@@ -49,6 +50,9 @@ class QueueControllerTest {
 
     @MockBean
     private RateLimitFilter rateLimitFilter;
+
+    @MockBean
+    private ApiKeyAuthenticationFilter apiKeyAuthenticationFilter;
 
     private QueueResponse mockResponse() {
         Queue queue = Queue.create(1L, "이벤트 대기열", 100000, null, null);
