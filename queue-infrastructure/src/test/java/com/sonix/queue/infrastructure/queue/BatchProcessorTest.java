@@ -57,9 +57,9 @@ public class BatchProcessorTest {
     void groupsByQueueId_andExecutesBulkPerQueue() {
         // given: q_a 2건, q_b 1건이 섞인 globalQueue
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue a1 = new PendingEnqueue("q_a", "u1");
-        PendingEnqueue a2 = new PendingEnqueue("q_a", "u2");
-        PendingEnqueue b1 = new PendingEnqueue("q_b", "u3");
+        PendingEnqueue a1 = new PendingEnqueue("q_a", "u1", "tok_u1");
+        PendingEnqueue a2 = new PendingEnqueue("q_a", "u2", "tok_u2");
+        PendingEnqueue b1 = new PendingEnqueue("q_b", "u3", "tok_u3");
         global.offer(a1);
         global.offer(a2);
         global.offer(b1);
@@ -75,11 +75,11 @@ public class BatchProcessorTest {
         when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong())).thenReturn(rawA);
         when(queueEngine.executeBulkLua(eq("q_b"), anyList(), anyLong())).thenReturn(rawB);
         when(queueEngine.parseBulkResult(rawA)).thenReturn(List.of(
-                EnqueueResult.ok("u1", 0, 1),
-                EnqueueResult.ok("u2", 1, 2)
+                EnqueueResult.ok("u1", "tok_u1", 0, 1, 1),
+                EnqueueResult.ok("u2", "tok_u2", 1, 2, 2)
         ));
         when(queueEngine.parseBulkResult(rawB)).thenReturn(List.of(
-                EnqueueResult.ok("u3", 0, 1)
+                EnqueueResult.ok("u3", "tok_u3", 0, 1, 1)
         ));
 
         // when
@@ -96,7 +96,7 @@ public class BatchProcessorTest {
         // given: q_a에 1200건 → 500/500/200 = 3청크
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
         for (int i = 0; i < 1200; i++) {
-            global.offer(new PendingEnqueue("q_a", "u" + i));
+            global.offer(new PendingEnqueue("q_a", "u" + i, "tok_u" + i));
         }
 
         when(queueEngine.getGlobalQueue()).thenReturn(global);
@@ -110,7 +110,7 @@ public class BatchProcessorTest {
             List<Object> raw = inv.getArgument(0);
             List<EnqueueResult> results = new ArrayList<>();
             for (int i = 0; i < raw.size(); i++) {
-                results.add(EnqueueResult.ok((String) raw.get(i), i, i + 1));
+                results.add(EnqueueResult.ok((String) raw.get(i), "tok_" + raw.get(i), i, i + 1, i + 1));
             }
             return results;
         });
@@ -127,7 +127,7 @@ public class BatchProcessorTest {
     void bulkFailure_failsAllPendingInChunk() {
         // given
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1");
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1", "tok_u1");
         global.offer(p1);
 
         when(queueEngine.getGlobalQueue()).thenReturn(global);
@@ -147,9 +147,9 @@ public class BatchProcessorTest {
     void duplicateIdentifierInChunk_eachFutureGetsOwnResult() throws Exception {
         // given: 같은 identifier로 3건 동시 진입 → Lua는 OK 1 + EXISTS 2를 순서대로 반환
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue p1 = new PendingEnqueue("q_a", "dup");
-        PendingEnqueue p2 = new PendingEnqueue("q_a", "dup");
-        PendingEnqueue p3 = new PendingEnqueue("q_a", "dup");
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "dup", "tok_dup1");
+        PendingEnqueue p2 = new PendingEnqueue("q_a", "dup", "tok_dup2");
+        PendingEnqueue p3 = new PendingEnqueue("q_a", "dup", "tok_dup3");
         global.offer(p1);
         global.offer(p2);
         global.offer(p3);
@@ -160,9 +160,9 @@ public class BatchProcessorTest {
         List<Object> raw = List.of("raw");
         when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong())).thenReturn(raw);
         when(queueEngine.parseBulkResult(raw)).thenReturn(List.of(
-                EnqueueResult.ok("dup", 0, 1),
-                EnqueueResult.exists("dup", 0, 1),
-                EnqueueResult.exists("dup", 0, 1)
+                EnqueueResult.ok("dup", "tok_dup1", 0, 1, 1),
+                EnqueueResult.exists("dup", "tok_dup1", 0, 1, 1),
+                EnqueueResult.exists("dup", "tok_dup1", 0, 1, 1)
         ));
 
         // when
@@ -179,8 +179,8 @@ public class BatchProcessorTest {
     void resultSizeMismatch_failsWholeChunk() {
         // given: 2건 요청했는데 결과는 1건
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1");
-        PendingEnqueue p2 = new PendingEnqueue("q_a", "u2");
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1", "tok_u1");
+        PendingEnqueue p2 = new PendingEnqueue("q_a", "u2", "tok_u2");
         global.offer(p1);
         global.offer(p2);
 
@@ -189,7 +189,7 @@ public class BatchProcessorTest {
 
         List<Object> raw = List.of("raw");
         when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong())).thenReturn(raw);
-        when(queueEngine.parseBulkResult(raw)).thenReturn(List.of(EnqueueResult.ok("u1", 0, 1)));
+        when(queueEngine.parseBulkResult(raw)).thenReturn(List.of(EnqueueResult.ok("u1", "tok_u1", 0, 1, 1)));
 
         // when
         batchProcessor.processBatches();

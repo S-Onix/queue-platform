@@ -56,6 +56,7 @@ class EnqueueE2EIntegrationTest {
     private String queueId;
     private String queueKey;
     private String seqKey;
+    private String tokenKey;
 
     private Thread consumerThread;
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -74,8 +75,10 @@ class EnqueueE2EIntegrationTest {
 
         queueKey = QueueKeys.waiting(queueId);
         seqKey = QueueKeys.seq(queueId);
+        tokenKey = QueueKeys.tokens(queueId);
         redisTemplate.delete(queueKey);
         redisTemplate.delete(seqKey);
+        redisTemplate.delete(tokenKey);
 
         // 3) BatchProcessor consumer 구동 (스케줄러 대체)
         running.set(true);
@@ -104,6 +107,7 @@ class EnqueueE2EIntegrationTest {
         }
         redisTemplate.delete(queueKey);
         redisTemplate.delete(seqKey);
+        redisTemplate.delete(tokenKey);
     }
 
     @Test

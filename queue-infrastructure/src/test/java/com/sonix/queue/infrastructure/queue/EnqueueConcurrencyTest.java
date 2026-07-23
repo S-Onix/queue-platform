@@ -38,6 +38,7 @@ public class EnqueueConcurrencyTest {
     private static final String TEST_QUEUE_ID = "test_q_concurrency";
     private static final String QUEUE_KEY = QueueKeys.waiting(TEST_QUEUE_ID);
     private static final String SEQ_KEY = QueueKeys.seq(TEST_QUEUE_ID);
+    private static final String TOKEN_KEY = QueueKeys.tokens(TEST_QUEUE_ID);
 
     private Thread consumerThread;
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -45,7 +46,8 @@ public class EnqueueConcurrencyTest {
     @BeforeEach
     void startConsumer() {
         redisTemplate.delete(QUEUE_KEY);
-        redisTemplate.delete(SEQ_KEY);// 이전 잔여 데이터 정리
+        redisTemplate.delete(SEQ_KEY);
+        redisTemplate.delete(TOKEN_KEY);// 이전 잔여 데이터 정리
         running.set(true);
         consumerThread = new Thread(() -> {
             while (running.get()) {
@@ -72,6 +74,7 @@ public class EnqueueConcurrencyTest {
         }
         redisTemplate.delete(QUEUE_KEY);
         redisTemplate.delete(SEQ_KEY);
+        redisTemplate.delete(TOKEN_KEY);
     }
 
     @Test
