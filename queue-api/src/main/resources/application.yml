@@ -14,11 +14,22 @@ spring:
     exclude:
       - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
-      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
   data:
     redis:
       sentinel:
         master: mymaster      # Sentinel Master 이름 (공통)
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092,localhost:9094,localhost:9096}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all              # min.insync.replicas=2와 짝 — 2벌 확인돼야 성공
+      retries: 3
+      properties:
+        enable.idempotence: true  # 중복 발행 방지
+    listener:
+      ack-mode: manual
 
 server:
   port: ${SERVER_PORT:8080}

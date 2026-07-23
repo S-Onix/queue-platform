@@ -2,20 +2,21 @@ package com.sonix.queue.api.queue;
 
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
-import com.sonix.queue.domain.queue.EnqueueResult;
-import com.sonix.queue.domain.queue.Queue;
-import com.sonix.queue.domain.queue.QueueEngine;
-import com.sonix.queue.domain.queue.QueueRepository;
+import com.sonix.queue.domain.queue.*;
 import org.springframework.stereotype.Service;
+
+import java.time.Instant;
 
 @Service
 public class QueueEngineService {
     private final QueueRepository queueRepository;
     private final QueueEngine queueEngine;
+    private final EnqueueEventPublisher eventPublisher;
 
-    public QueueEngineService(QueueRepository queueRepository, QueueEngine queueEngine) {
+    public QueueEngineService(QueueRepository queueRepository, QueueEngine queueEngine, EnqueueEventPublisher eventPublisher) {
         this.queueEngine = queueEngine;
         this.queueRepository = queueRepository;
+        this.eventPublisher = eventPublisher;
     }
 
     /**
@@ -39,6 +40,10 @@ public class QueueEngineService {
 
         if (result.isFull()) {
             throw new BusinessException(ErrorCode.QUEUE_FULL);
+        }
+
+        if (result.isOk()) {
+            eventPublisher.publish(EnqueueEvent.of(tenantId, queueId, result, Instant.now()));
         }
 
         return result;
