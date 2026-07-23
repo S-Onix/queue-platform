@@ -2,9 +2,22 @@ logging:
   level:
     root: INFO
     com.sonix.queue: DEBUG
+    org.hibernate.sql: DEBUG
+    org.hibernate.orm.jdbc.bind: TRACE
 
 spring:
   data:
     redis:
       sentinel:
         nodes: 127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
+  datasource:
+    master:
+      jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&rewriteBatchedStatements=true
+      username: queueapp
+      password: queueapp1234
+      maximum-pool-size: 10
+    replica:
+      jdbc-url: jdbc:mysql://127.0.0.1:3307/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      username: queueapp
+      password: queueapp1234
+      maximum-pool-size: 10

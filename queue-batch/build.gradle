@@ -11,6 +11,10 @@ dependencies {
     // Kafka Consumer
     implementation 'org.springframework.kafka:spring-kafka'
 
+    // E2E/부하 테스트에서 JPA·Redis 클래스 컴파일 참조용 (infra의 것들은 implementation이라 미노출)
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis'
+
     compileOnly      "org.projectlombok:lombok:${lombokVersion}"
     annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
 }
