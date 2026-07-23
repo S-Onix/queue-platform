@@ -6,16 +6,16 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Bulk 처리를 위해 대기 중인 Enqueue 요청.
  *
- * 하이브리드 Enqueue 전략에서 사용된다.
- * SlidingWindowCounter가 임계값(1000 req/s)을 초과했다고 판단하면,
- * 즉시 처리 대신 이 객체로 감싸서 BatchQueue에 저장한다.
+ * <p>모든 Enqueue 요청은 Global Queue에 적재되어 배치로 처리된다(하이브리드 폐기, §70).
+ * Producer가 요청을 이 객체로 감싸 globalQueue에 offer하고, 이때 후보 tokenId도
+ * 함께 발급해 실어 보낸다(OK면 Lua가 채택, EXISTS/FULL이면 버려진다).
  *
  * <p><b>Producer-Consumer 흐름:</b>
  * <ul>
  *   <li>Producer (HTTP 요청 Thread): 요청을 PendingEnqueue로 감싸
- *       BatchQueue에 offer, {@code future.get()}으로 결과 대기</li>
- *   <li>Consumer (@Scheduled Thread): BatchQueue에서 poll,
- *       enqueue_bulk.lua 실행 후 각 PendingEnqueue.complete() 호출</li>
+ *       globalQueue에 offer, {@code future.get()}으로 결과 대기</li>
+ *   <li>Consumer (@Scheduled Thread): globalQueue에서 poll,
+ *       tokenId를 ARGV에 실어 enqueue_bulk.lua 실행 후 각 PendingEnqueue.complete() 호출</li>
  * </ul>
  *
  * <p>CompletableFuture를 통해 Producer와 Consumer가
@@ -29,13 +29,17 @@ import java.util.concurrent.CompletableFuture;
 public class PendingEnqueue {
     private final String queueId;
     private final String identifier;
+    private final String tokenId;
     private final CompletableFuture<EnqueueResult> future;
 
-    public PendingEnqueue(String queueId, String identifier){
+    public PendingEnqueue(String queueId, String identifier, String tokenId){
         this.queueId = queueId;
         this.identifier = identifier;
+        this.tokenId = tokenId;
         this.future = new CompletableFuture<>();
     }
+
+    public String getTokenId() { return this.tokenId;}
 
     public String getQueueId() { return this.queueId;}
 

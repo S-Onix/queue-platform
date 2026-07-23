@@ -1,5 +1,6 @@
 package com.sonix.queue.infrastructure.queue;
 
+import com.sonix.queue.common.util.IdGenerator;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
@@ -27,7 +28,7 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  *
  * <p><b>Lua Script 반환 형식:</b>
- * enqueue_bulk.lua: [{identifier, status, rank, total}, ...]
+ * enqueue_bulk.lua: [{identifier, tokenId, status, rank, total}, ...]
  * */
 
 @Component
@@ -51,7 +52,8 @@ public class RedisQueueEngine implements QueueEngine {
 
     @Override
     public EnqueueResult enqueue(String queueId, String identifier) {
-        PendingEnqueue pending = new PendingEnqueue(queueId, identifier);
+        String tokenId = IdGenerator.generate("tok_");
+        PendingEnqueue pending = new PendingEnqueue(queueId, identifier, tokenId);
 
         globalQueue.offer(pending);
 
@@ -68,21 +70,23 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-    * enqueue.lua 결과 파싱: [status, rank, total]
+    * enqueue_bulk.lua 단건 결과 파싱: [identifier, tokenId, status, rank, total]
     */
     private EnqueueResult parseEnqueueResult(List<Object> result) {
-        if (result == null || result.size() < 4) {
+        if (result == null || result.size() < 6) {
             throw new IllegalStateException("Invalid Lua result: " + result);
         }
 
         String identifier = (String) result.get(0);
-        String status = (String) result.get(1);
-        long rank = ((Number) result.get(2)).longValue();
-        long total = ((Number) result.get(3)).longValue();
+        String tokenId = (String) result.get(1);
+        String status = (String) result.get(2);
+        long rank = ((Number) result.get(3)).longValue();
+        long total = ((Number) result.get(4)).longValue();
+        long seq = ((Number) result.get(5)).longValue();
 
         return switch (status) {
-            case "OK" -> EnqueueResult.ok(identifier, rank, total);
-            case "EXISTS" -> EnqueueResult.exists(identifier, rank, total);
+            case "OK" -> EnqueueResult.ok(identifier, tokenId, rank, total, seq);
+            case "EXISTS" -> EnqueueResult.exists(identifier, tokenId, rank, total, seq);
             case "FULL" -> EnqueueResult.full(identifier, total);
             default -> throw new IllegalStateException("Unknown status: " + status);
         };
@@ -97,31 +101,33 @@ public class RedisQueueEngine implements QueueEngine {
 
     /**
      * Bulk Lua Script 실행 (BatchProcessor가 사용).
-     * 반환 형식: [{identifier, status, rank, total}, ...]
+     * 반환 형식: [{identifier, tokenId, status, rank, total}, ...]
      */
     @SuppressWarnings("unchecked")
     public List<Object> executeBulkLua(String queueId, List<PendingEnqueue> batch, long maxCapacity) {
         String queueKey = QueueKeys.waiting(queueId);
         String seqKey = QueueKeys.seq(queueId);
+        String tokenKey = QueueKeys.tokens(queueId);
 
-        // ARGV 구성: maxCapacity, count, identifier1, identifier2, ...  (score 없음)
+        // ARGV 구성: maxCapacity, count, identifier1, tokenId1, identifier2, tokenId2, ...  (아이템당 2개)
         List<String> args = new ArrayList<>();
         args.add(String.valueOf(maxCapacity));
         args.add(String.valueOf(batch.size()));
         for (PendingEnqueue pending : batch) {
-            args.add(pending.getIdentifier());   // identifier만 (한 번)
+            args.add(pending.getIdentifier());
+            args.add(pending.getTokenId());      // 후보 tokenId (OK일 때만 채택)
         }
 
         return (List<Object>) redisTemplate.execute(
                 enqueueBulkScript,
-                List.of(queueKey, seqKey),   // KEYS 두 개: [1]=waiting, [2]=seq
+                List.of(queueKey, seqKey, tokenKey),   // KEYS 세 개: [1]=waiting, [2]=seq, [3]=tokens
                 args.toArray()
         );
     }
 
     /**
      * enqueue_bulk.lua 결과 파싱 (BatchProcessor가 사용).
-     * 반환 형식: [{identifier, status, rank, total}, ...]
+     * 반환 형식: [{identifier, tokenId, status, rank, total}, ...]
      *
      * <p>결과는 요청한 batch와 <b>같은 순서</b>로 반환된다. enqueue_bulk.lua의 루프는
      * 모든 분기(OK/EXISTS/FULL)에서 정확히 한 건씩 결과를 쌓기 때문이다.
