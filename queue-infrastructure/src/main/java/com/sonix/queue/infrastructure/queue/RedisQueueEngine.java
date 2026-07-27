@@ -1,9 +1,12 @@
 package com.sonix.queue.infrastructure.queue;
 
+import com.sonix.queue.common.exception.BusinessException;
+import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.common.util.IdGenerator;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -31,6 +34,7 @@ import java.util.concurrent.TimeUnit;
  * enqueue_bulk.lua: [{identifier, tokenId, status, rank, total}, ...]
  * */
 
+@Slf4j
 @Component
 public class RedisQueueEngine implements QueueEngine {
 
@@ -60,14 +64,17 @@ public class RedisQueueEngine implements QueueEngine {
         try {
             return pending.getFuture().get(MAX_WAIT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
-            throw new RuntimeException("Enqueue timeout after " + MAX_WAIT_SECONDS + " seconds", e);
+            log.error("Enqueue timeout after {}s", MAX_WAIT_SECONDS, e);
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("Enqueue interrupted", e);
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         } catch (ExecutionException e) {
-            throw new RuntimeException("Enqueue failed", e.getCause());
+            log.error("Enqueue failed", e.getCause());
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         }
     }
+
 
     /**
     * enqueue_bulk.lua 단건 결과 파싱: [identifier, tokenId, status, rank, total]

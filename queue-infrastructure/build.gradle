@@ -9,9 +9,6 @@ dependencies {
     // Redis
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
 
-    // Kafka
-    implementation 'org.springframework.kafka:spring-kafka'
-
     // Jackson (Redis 캐시 JSON 직렬화용) ⭐ 추가
     implementation 'com.fasterxml.jackson.core:jackson-databind'
     implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'

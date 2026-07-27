@@ -102,7 +102,7 @@ class TokenJpaAdapterIntegrationTest {
     }
 
     @Test
-    @DisplayName("같은 (tokenId, issuedAt) 재적재(Kafka 재전달) → row 1개, 예외 없음, 기존 값 유지")
+    @DisplayName("같은 (tokenId, issuedAt) 재적재(outbox 재처리) → row 1개, 예외 없음, 기존 값 유지")
     void idempotent_acrossCalls() {
         String tokenId = "tok_idem_" + UUID.randomUUID();
 

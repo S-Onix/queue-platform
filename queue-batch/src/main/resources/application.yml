@@ -29,20 +29,5 @@ spring:
       sentinel:
         master: mymaster
 
-  kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092,localhost:9094,localhost:9096}
-    consumer:
-      group-id: token-enqueue-consumer
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      max-poll-records: 500        # batch_size와 동일하게
-      enable-auto-commit: false    # 수동 커밋 (DB INSERT 성공 후 커밋)
-      properties:
-        spring.json.trusted.packages: "com.sonix.queue.*"
-    listener:
-      type: batch                  # List<EnqueueEvent>로 수신
-      ack-mode: manual             # 수동 ack (DB 커밋 성공 후)
-
 server:
   port: ${SERVER_PORT:8081}

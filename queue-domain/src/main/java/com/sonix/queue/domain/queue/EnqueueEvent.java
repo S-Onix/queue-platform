@@ -3,11 +3,11 @@ package com.sonix.queue.domain.queue;
 import java.time.Instant;
 
 /**
- * Enqueue 완료 이벤트 (enqueue-events 토픽 payload).
+ * Enqueue 완료 이벤트
  *
  * <p>Consumer가 이 정보만으로 tokens row를 INSERT할 수 있도록 필요한 값을 모두 담는다:
  * tokenId, queueId, tenantId, userId(=identifier), seq(불변 score), issuedAt.
- * 순수 record라 도메인에 둬도 헥사고날 위반이 아니다(Spring/Kafka 의존성 없음).
+ * 순수 record라 도메인에 둬도 헥사고날 위반이 아니다
  */
 public record EnqueueEvent(
                 String tokenId,

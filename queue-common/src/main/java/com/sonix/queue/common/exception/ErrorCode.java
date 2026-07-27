@@ -16,8 +16,9 @@ public enum ErrorCode {
     DUPLICATE_QUEUE_NAME("Q003", "이미 존재하는 대기열 이름입니다.", 409),
     AK_001_UNAUTHORIZED("AK001", "인증이 필요합니다.", 401),
     AK_002_FORBIDDEN("AK002", "권한이 없습니다.", 403),
-    RL_001_KEY_LIMIT("RL001", "요청 한도를 초과했습니다.", 429)
-    ;
+    RL_001_KEY_LIMIT("RL001", "요청 한도를 초과했습니다.", 429),
+    QUEUE_ENGINE_UNAVAILABLE("QE001", "대기열 처리 중 일시적 오류입니다. 잠시 후 재시도하세요.", 503);
+
 
     private final String code;
     private final String message;

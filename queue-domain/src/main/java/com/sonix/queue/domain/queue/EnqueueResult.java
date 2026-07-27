@@ -67,6 +67,8 @@ public class EnqueueResult {
         return status == Status.EXISTS;
     }
 
+    public long getSeq() { return this.seq; }
+
     /**
      * 1-based 순번 (UX용).
      * rank가 -1이면 -1 반환.

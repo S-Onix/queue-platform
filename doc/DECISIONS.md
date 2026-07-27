@@ -3438,3 +3438,123 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 - `doc/CONCURRENCY.md` §6.5 (Multi-key Lua + Hash Tag)
 - `doc/FLOW.md` (Enqueue 결정 근거 D1-D10)
 - `queue-infrastructure/.../queue/QueueKeys.java`, `ratelimit/RateLimitKeys.java` (선례)
+
+---
+
+## 71. Sprint 5-E / 9+ — Enqueue 저장 순서(Redis → DB) 확정 + DB → Redis 복구 설계
+
+**Date**: 2026-07-27
+**Context**: enqueue 영속화가 **Redis(순서 부여) → Kafka → DB(비동기 적재)** 순서로 구현돼 있으나, (1) 왜 이 순서인가, (2) Redis 전손 시 DB로 어떻게 복구하는가가 문서화되지 않았다. §70 D9(`INCR seq`)로 seq를 Redis가 부여하고 DB `tokens.seq`에 저장하는데, **이 seq 저장이 복구의 열쇠**이므로 순서와 복구를 함께 확정한다.
+
+### Decision
+
+**D11 — Enqueue 저장 순서: Redis 먼저, DB 나중 (비동기)** (구현 완료, Sprint 5-E)
+- **Redis = 순서 진실원천**(seq·ZSet). enqueue 도착 즉시 `INCR`/`ZADD NX` 원자 부여 → 202 응답.
+- **DB = 내구 원장**. Kafka(현재) 또는 Redis Stream outbox(후속) 경유 **비동기** 적재.
+- seq는 **Redis가 부여, DB `tokens.seq`에 저장**(복구용).
+- ⚠️ 대비 — **종료 경로(만료/complete)는 반대: DB 먼저 → Redis 정리**. 그땐 최종 과금 상태의 권위가 DB이므로. → "권위가 어디냐"가 순서를 결정.
+
+**D12 — 복구 3계층 (DB 재구성은 최후수단)** (설계, 구현 후속)
+1. **Sentinel failover → replica 승격**(데이터 보유) → 복구 불필요 [최빈]
+2. **Redis AOF/RDB → 재시작 시 디스크 재적재** [Redis 자체 durability]
+3. **DB → Redis 재구성** → 1·2 모두 실패한 **전손 시** [disaster recovery]
+
+**D13 — DB → Redis 재구성 절차** (큐 단위, **분산락으로 큐 잠금 후** 실행)
+```
+① waiting ZSet:  SELECT user_id, seq FROM tokens WHERE queue_id=? AND status=0 (WAITING)
+                 → ZADD queue:{q}:waiting {seq} {user_id}        (청크 페이징, 배치 ZADD)
+② seq 카운터:    SELECT MAX(seq) FROM tokens WHERE queue_id=?    (모든 status! NULL이면 0)
+                 → SET queue:{q}:seq {maxSeq}                    (사용된 번호 재발급 방지)
+③ tokens 해시:   WAITING rows → HSET queue:{q}:tokens {user_id} {token_id}
+④ admit 키:      status=1(ADMIT_ISSUED) AND admit_token IS NOT NULL AND issued_at > now-60s
+                 → SET admit-token-by-token:{token_id} ... EX {남은 60s}   (양방향)
+                 (60s 초과분은 복원 안 함 → 배치가 returnToWaiting 처리)
+⑤ last-active:   재구성 안 함(비움) → 다음 폴링(ka=1)이 재populate. inactive_ttl 리셋뿐 무해
+```
+
+### Rationale
+
+**왜 Redis 먼저 (DB auto-increment로 seq 못 매기는 이유)**:
+- **타이밍** — 위치는 enqueue 순간(동기) 필요, DB insert는 async(수 초 후) → auto-inc는 너무 늦어 202/폴링에 순위 못 줌
+- **순서** — DB auto-inc = insert 순서(Kafka 파티션 병렬·Consumer 배치) ≠ **도착 순서** → FIFO 뒤집힘. `INCR`은 도착 순간 단일스레드 원자 → 정확
+- **단위** — auto-inc는 tokens 테이블 전역, 필요한 건 **큐별** 순번(`INCR queue:{q}:seq`는 자연히 큐별)
+- → **seq는 Redis가 부여, DB는 저장만**. 부여는 Redis, 기억은 DB.
+
+**왜 복구를 waiting ZSet 스캔이 아니라 DB로 하나 / 왜 seq 순으로**:
+- waiting ZSet은 **mutable**(admit/cancel/만료 시 ZREM) → "현재 대기자"이지 "모든 enqueue 로그"가 아님 → 소스로 부적합
+- DB `tokens.seq`로 `ZADD score=seq` → **원래 순서 그대로 복원**(rank 보존). seq를 DB에 저장한 값어치가 여기서 실현
+
+**왜 last-active는 복구 안 하나**:
+- DB에 "마지막 폴링 시각"이 없음. 비워도 무해 — 다음 폴링이 채우고 inactive_ttl만 리셋
+
+### Consequences
+
+**긍정**:
+- **DB가 안전망** → Redis 전손도 순서까지 정확 복구 가능 (seq 저장 = 복구 가능성의 근거)
+- 복구 계층화로 대부분(failover/AOF)은 자동 처리, DB 재구성은 드문 최후수단
+
+**부정**:
+- **복구 완전성 = DB 신선도만큼만**. async 적재 지연 중 Redis엔 있었지만 DB 미반영된 enqueue는 복구 불가 = 현재 **fire-and-forget Kafka의 유실 gap**. → **Outbox(Redis Stream) + 대사(reconciliation)**로 보강 (후속 과제)
+- 대용량 큐(수백만 대기) 재구성 = 청크 페이징 + 배치 ZADD 필요(메모리·시간)
+- 재구성 중 신규 enqueue와 경쟁 → **큐 분산락** 필요(재구성 원자성)
+
+**중립**:
+- 재구성 **트리거**: (a) lazy — enqueue/poll 시 `queue:{q}:seq` 없는데 DB에 WAITING 존재하면 rebuild, 또는 (b) admin/startup 잡. ZADD는 멱등이라 부분 재실행 안전
+- ADMIT_ISSUED-이나-60s-초과 토큰은 논리적으로 waiting 복귀 대상 → 배치가 재구성 후 정리
+
+### Interview Point
+> "enqueue의 순번은 Redis가 `INCR`로 부여하고 DB `tokens.seq` 컬럼에 저장합니다. DB auto-increment를 안 쓴 이유는 세 가지인데, 첫째 위치는 사용자가 enqueue하는 순간 필요한데 DB 적재는 Kafka를 거쳐 수 초 뒤 비동기라 너무 늦고, 둘째 auto-increment는 insert 순서를 반영하는데 그건 Kafka 파티션 병렬·Consumer 배치 때문에 도착 순서와 달라 FIFO가 뒤집히며, 셋째 auto-increment는 테이블 전역이라 큐별 순번을 못 줍니다. 그래서 Redis가 도착 순간 원자적으로 부여하고 DB는 저장만 합니다. 이 저장이 복구의 핵심인데, Redis가 전손되면 복구는 3계층입니다. 대부분은 Sentinel failover로 replica가 승격해 복구가 필요 없고, 그다음이 AOF/RDB 재적재, 최후수단이 DB 재구성입니다. DB 재구성은 큐를 분산락으로 잠근 뒤 WAITING 토큰을 seq 순서로 ZADD하면 대기 순서까지 정확히 복원됩니다. 여기서 주의할 점은 복구 완전성이 DB 신선도만큼이라, 비동기 적재 지연 중 Redis엔 있었지만 DB에 아직 안 들어간 enqueue는 유실될 수 있다는 겁니다. 현재 발행이 fire-and-forget이라 이 gap이 존재하고, Redis Stream Outbox와 대사(reconciliation)로 보강하는 게 후속 과제입니다. 그리고 복구 소스로 live waiting ZSet을 쓰면 안 되는데, admit/cancel로 멤버가 빠져나가는 mutable 구조라 짧게 살다 간 토큰을 놓치기 때문입니다. append-only인 DB(또는 outbox)가 소스여야 합니다."
+
+### Related
+- §70 (`INCR seq`·Hash Tag — 복구의 근거), §66 (Cluster/failover)
+- `doc/STATE.md` (Token 상태 0=WAITING/1=ADMIT_ISSUED), `doc/schema.sql` (tokens.seq/admit_token 컬럼)
+- memory: `sprint5-token-kafka-progress`(Kafka 적재·fire-and-forget gap), `token-ttl-design`(returnToWaiting)
+
+---
+
+## 72. Sprint 5-E 개정 — Enqueue DB 영속화: Kafka 제거 → Redis List outbox + @Scheduled + ShedLock
+
+**Date**: 2026-07-27
+**Context**: 5-E는 enqueue→DB 적재를 Kafka(`enqueue-events` 토픽 + `@KafkaListener` Consumer)로 구현했다(§70, `sprint5-token-kafka-progress`). Kafka 클러스터 운영 부담을 제거하고 **API 서버 내 처리**로 변경한다. 단 "API 서버 내 스케줄러"의 두 함정(**크래시 유실·스파이크 OOM**)을 피하려면 스케줄러가 읽을 소스가 **durable append-only**여야 한다. 이 결정은 §71 D11의 "적재 수단"을 Kafka에서 구체화하는 것으로, §71의 순서(Redis→DB)·복구(DB→Redis)는 그대로 유효하다.
+
+### Decision
+
+**Kafka 제거. Enqueue DB 영속화 = Redis List outbox + `@Scheduled` 소비 + ShedLock(리더 선출).**
+
+- **소스 = Redis List** (durable, append-only). ~~waiting ZSet~~(mutable → cancel/admit로 빠진 토큰 유실), ~~in-memory~~(유실/OOM) 배제.
+- **List(not Stream)인 이유**: **DB가 영구 원장**이라 처리 후 outbox 데이터를 보존할 필요가 없음(replay·다중 소비 need 없음) → **ack=삭제(LREM)로 자동 청소**가 딱 맞음. Stream의 로그 보존·XTRIM은 오버스펙.
+- **reliable-queue 패턴**: `RPUSH pending` → `LMOVE pending→processing`(claim, 안 지움) → 배치 INSERT(멱등) → `LREM processing`(ack=삭제). **reaper**가 processing에 오래 방치된 것(죽은 워커)을 pending으로 재-queue.
+- **중복방지(N대)**: **ShedLock(리더 1대, 직렬)**. List엔 consumer group 분배가 없으므로. DB 드레인 ~1.5만/s를 1대가 감당 → 충분.
+- **격리**: 소비를 **전용 스레드 + 별도 HikariCP 풀**(bulkhead)로 → 영속화가 요청용 커넥션·스레드 고갈 안 시킴.
+
+### Rationale
+
+- **왜 durable 소스 필수**: 스케줄러는 "소비자"일 뿐, 유실 방지엔 append-only durable **소스**가 별도로 필요. Redis-first라 그 소스가 Redis에 산다. 스케줄러가 소스를 없애주지 않는다.
+- **왜 List(not Stream)**: 소비자가 "DB 저장" 하나뿐 + DB=원장이라 완료분 보존 불필요 → `ack=LREM=삭제` 자동청소. Stream의 log/consumer-group/replay는 이 용도엔 짐(+ XTRIM 청소 부담).
+- **at-least-once + 멱등**: 순서는 반드시 **insert 먼저 → ack 나중**(ack 먼저면 크래시 시 유실=at-most-once). ack 실패 시 재처리로 **중복** 발생 → **멱등 insert**(`@SQLInsert ON DUPLICATE KEY UPDATE`)로 무해화. "안 놓치되 중복은 멱등으로".
+- **왜 ShedLock(not consumer group)**: List는 그룹 분배가 없어 N대가 같은 표를 집으면 중복 → 리더 1대만 드레인. 규모상 직렬로 충분(병렬 필요 시 Stream 승급).
+
+### Consequences
+
+**긍정**:
+- Kafka 클러스터 운영·의존성 제거. 개념 단순(List 명령). 완료분 자동 청소(XTRIM 불필요).
+- 포트 추상화 덕에 **어댑터·소비만 교체**, 도메인 로직 무변경.
+
+**부정**:
+- 영속화가 **API JVM에서** 실행 → 스파이크 때 heap/GC/CPU를 요청 처리와 **공유**(머신 격리 안 됨; Kafka는 별 머신이었음). → 전용 스레드+별도 DB 풀로 **스케줄링만 격리**, 리소스는 공유(트레이드오프 인지).
+- **리더 1대 직렬** → 영속화 처리량 = 1대 능력치. 병렬 필요 시 Stream+consumer group 승급.
+- **reliable-queue(processing+reaper)를 직접 구현**해야 함(Stream이면 XPENDING/XAUTOCLAIM 내장).
+- **poison message**(계속 insert 실패) → 무한 재시도로 outbox 정체 가능 → 재시도 한도+**dead-letter** 별도 필요(후속 과제).
+
+**중립**:
+- 제거 대상: `KafkaEnqueueEventPublisher`, `TokenEnqueueConsumer`(@KafkaListener), Kafka 토픽/리스너 설정·의존성, 관련 Kafka 테스트.
+- 유지: `EnqueueEventPublisher`(포트), `EnqueueEvent`, `TokenEntity`(멱등 insert)·`TokenRepository`·`TokenEnqueueService`, **seq는 Redis `INCR`**(§70 D9).
+- 교체: 발행 어댑터 Kafka send → **List `RPUSH`** / 소비 @KafkaListener → **@Scheduled 리커버리-큐 드레인**.
+
+### Interview Point
+> "enqueue의 DB 적재를 Kafka에서 Redis List outbox + 스케줄러로 바꿨습니다. 핵심은 스케줄러가 소비자일 뿐 유실 방지엔 durable append-only 소스가 따로 필요하다는 점인데, Redis-first 구조라 그 소스가 Redis에 삽니다. 대기열 ZSet은 admit·cancel로 멤버가 빠지는 mutable 구조라 짧게 산 토큰을 놓쳐 소스로 못 쓰고, in-memory는 크래시 유실·스파이크 OOM이라 안 됩니다. Stream이 아니라 List를 고른 이유는 DB가 영구 원장이라 처리 끝난 outbox 데이터를 보존할 필요가 없어서, ack을 곧 삭제(LREM)로 두는 자동 청소가 딱 맞기 때문입니다. Stream의 로그 보존·replay·XTRIM은 이 용도엔 오히려 짐입니다. 신뢰성은 pending에서 processing으로 LMOVE해 옮겨두고 DB insert 성공 후에만 LREM하는 reliable-queue 패턴으로 at-least-once를 보장하고, ack 실패 시 재처리로 생기는 중복은 tokenId 유니크 + ON DUPLICATE KEY의 멱등 insert로 무해화합니다. 서버가 여러 대라 같은 표를 중복 처리하지 않도록 ShedLock으로 리더 한 대만 드레인하는데, DB 드레인 속도를 한 대가 감당하는 규모라 직렬로 충분하고 병렬이 필요해지면 Stream의 consumer group으로 승급하면 됩니다. 트레이드오프는 영속화가 API JVM에서 돌아 스파이크 때 리소스를 요청과 공유한다는 점이라, 전용 스레드와 별도 커넥션 풀로 스케줄링을 격리했습니다."
+
+### Related
+- §71 (Redis→DB 순서·DB→Redis 복구 — 이 결정이 D11의 적재 수단을 구체화), §70 (`INCR seq`)
+- memory: `sprint5-token-kafka-progress` (제거 대상 Kafka 구현체 목록)
+- `doc/CONCURRENCY.md` (@DistributedLock/ShedLock — 리더 선출)
