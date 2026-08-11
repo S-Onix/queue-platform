@@ -48,16 +48,19 @@ public class RedisQueueEngine implements QueueEngine {
 
     private final StringRedisTemplate redisTemplate;
     private final RedisScript<List> enqueueBulkScript;
+    private final RedisScript<Long> pollVerifyScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
 
     public RedisQueueEngine(
             StringRedisTemplate redisTemplate,
-            @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript
+            @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
+            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript
     ) {
         this.redisTemplate = redisTemplate;
         this.enqueueBulkScript = enqueueBulkScript;
+        this.pollVerifyScript = pollVerifyScript;
     }
 
     @Override
@@ -101,18 +104,23 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     @Override
-    public boolean isWaiting(String queueId, long seq) {
-        // ZCOUNT waiting seq seq → seq는 유일하니 0 또는 1
-        Long count = redisTemplate.opsForZSet()
-                .count(QueueKeys.waiting(queueId), seq, seq);
-        return count != null && count > 0;
-    }
+    public boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis) {
+        if (tokenId == null || tokenId.isBlank()) {
+            return false;
+        }
 
-    @Override
-    public void touchLastActive(String queueId, long seq, long nowMillis) {
-        // ZADD last-active {nowMillis} {seq}   (member=seq 문자열, score=now ms)
-        redisTemplate.opsForZSet()
-                .add(QueueKeys.lastActive(queueId), Long.toString(seq), (double) nowMillis);
+        // poll_verify.lua: seq -> identifier -> 저장된 tokenId 대조, 통과 시에만 last-active 갱신.
+        // 검증과 갱신을 한 스크립트에 묶어야 그 사이 이탈한 항목을 되살리지 않는다.
+        Long result = redisTemplate.execute(
+                pollVerifyScript,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId)),
+                Long.toString(seq),
+                tokenId,
+                keepalive ? "1" : "0",
+                Long.toString(nowMillis)
+        );
+
+        return result != null && result == 1L;
     }
 
     /**

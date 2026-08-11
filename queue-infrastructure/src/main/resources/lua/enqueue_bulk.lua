@@ -9,8 +9,9 @@
 -- ARGV[1]: maxCapacity (Queue 최대 인원)
 -- ARGV[2]: requestCount (Bulk 요청 개수)
 -- ARGV[3]: issuedAt (이 청크의 발급 시각, epoch millis 문자열)
---   Lua에서 시각을 만들지 않는 이유: redis.call('TIME')은 비결정적이고, 무엇보다
---   DB에 저장될 포맷을 Java가 통제해야 하기 때문이다.
+--   Lua에서 시각을 만들지 않는 이유는 TIME이 비결정적이어서가 아니다. Redis 5+의
+--   effects replication 하에서는 write 스크립트에서 TIME을 써도 안전하다.
+--   DB에 저장될 포맷(tokens 테이블의 issued_at)을 Java가 통제해야 하기 때문이다.
 -- ARGV[4..]: identifier1, tokenId1, identifier2, tokenId2, ...   (아이템당 2개)
 --   score는 Lua가 INCR로 발급. tokenId는 Java에서 발급한 후보로,
 --   OK일 때만 채택되고 EXISTS/FULL이면 버려진다.

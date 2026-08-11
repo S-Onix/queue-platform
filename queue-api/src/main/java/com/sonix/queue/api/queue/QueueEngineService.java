@@ -72,15 +72,14 @@ public class QueueEngineService {
         boolean ready = false;
         String admitToken = null;
 
-        if(!queueEngine.isWaiting(queueId, seq)) {
+        // 존재(seq)만이 아니라 소유권(tokenId)까지 검증한다. seq는 큐별 INCR이라 추측이 자명해서,
+        // 존재 판정만 하면 남의 대기 항목에 ka=1로 keepalive를 걸 수 있다.
+        // keepalive 갱신도 이 호출 안에서 원자적으로 처리된다(poll_verify.lua).
+        if(!queueEngine.verifyWaiting(queueId, seq, tokenId, keepalive, clock.millis())) {
             throw new BusinessException(ErrorCode.TOKEN_NOT_FOUND);
         }
 
         QueueSnapshot snap = snapshotCache.get(queueId);
-
-        if(keepalive) {
-            queueEngine.touchLastActive(queueId, seq, clock.millis());
-        }
 
         long rank = (snap.frontSeq() < 0) ? 0 : Math.max(0, seq-snap.frontSeq());
         int next = nextPollAfterSec(rank);

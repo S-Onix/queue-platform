@@ -21,14 +21,14 @@ public interface QueueEngine {
     QueueSnapshot readSnapshot(String queueId);
 
     /**
-     * 대기열에 score=seq인 멤버가 있는지 확인 (존재=대기 항목 유효). 읽기.
-     * ZCOUNT로 boolean만 판정 — 멤버(identifier)는 불필요.
+     * 폴링 소유권 검증 + keepalive를 한 번에 수행. 쓰기(master).
+     *
+     * <p>seq에 해당하는 대기 항목이 있고, 그 항목에 발급된 tokenId가 인자와 일치할 때만 true.
+     * seq는 큐별 INCR이라 추측이 자명하므로 seq 존재만으로 판정하면 남의 대기 항목을
+     * 들여다보고 keepalive까지 걸 수 있다 — 검증과 갱신을 분리하지 말 것.
+     *
+     * @param keepalive true면 검증 통과 시 last-active를 nowMillis로 갱신
+     * @return 검증 통과 여부
      */
-    boolean isWaiting(String queueId, long seq);
-
-    /**
-     * inactive_ttl 갱신 — last-active ZSet에 seq를 now(ms)로 기록. 쓰기(master).
-     * 폴링 keepalive(ka=1 & 존재통과) 시에만 호출.
-     */
-    void touchLastActive(String queueId, long seq, long nowMillis);
+    boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis);
 }
