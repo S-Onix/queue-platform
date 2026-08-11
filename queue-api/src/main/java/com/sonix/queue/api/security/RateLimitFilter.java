@@ -106,11 +106,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private boolean checkAuthenticatedRateLimit(
             TenantAuth tenantAuth, HttpServletResponse response) throws IOException {
 
-        //Optional<Tenant> tenantOpt = tenantRepository.findByTenantId(tenantAuth.getTenantId());
-        Optional<Tenant> tenantOpt = loadTenant(tenantAuth.getTenantId());
+        // PK로 조회한다. TenantAuth.tenantId(String)는 API-Key 인증 경로에서 null이라
+        // 그것으로 조회하면 항상 미스가 나고, 아래 분기가 모든 요청을 통과시켜
+        // Rate Limit이 사실상 꺼진 상태가 된다.
+        Optional<Tenant> tenantOpt = loadTenant(tenantAuth.getId());
 
         if (tenantOpt.isEmpty()) {
-            log.warn("Tenant not found for rate limit: tenantId={}", tenantAuth.getTenantId());
+            // 인증은 됐는데 Tenant가 없다 = 데이터 정합성 문제. 요청을 막지는 않되 드러나게 남긴다.
+            log.warn("Tenant not found for rate limit: id={}", tenantAuth.getId());
             return true;  // 통과 (인증 실패는 다른 Filter가 처리)
         }
 
@@ -175,10 +178,16 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * Cache Aside 패턴
      * 캐시에 있으면 캐시 없으면 DB 조회
      * */
-    private Optional<Tenant> loadTenant(String tenantId) {
-        return tenantCache.get(tenantId)
+    /**
+     * Tenant 조회 (Cache Aside).
+     *
+     * <p>PK로 조회하는 이유: JWT와 API-Key 두 인증 경로가 공통으로 확보하는 식별자가 PK뿐이다.
+     * API-Key는 {@code api_keys.tenant_id}(PK)만 들고 있어 {@code t_xxx} 형태를 모른다.
+     */
+    private Optional<Tenant> loadTenant(Long id) {
+        return tenantCache.get(id)
                 .or(() -> {
-                    Optional<Tenant> dbResult = tenantRepository.findByTenantId(tenantId);
+                    Optional<Tenant> dbResult = tenantRepository.findById(id);
                     dbResult.ifPresent(tenantCache::put);
                     return dbResult;
                 });

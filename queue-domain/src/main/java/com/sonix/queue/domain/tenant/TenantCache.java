@@ -16,10 +16,15 @@ public interface TenantCache {
     /**
      * 캐시에서 Tenant 조회.
      *
-     * @param tenantId 도메인 ID ({@code t_xxx} 형태)
+     * <p><b>조회 키가 PK(Long)인 이유:</b> 이 캐시를 쓰는 Rate Limit 경로는 인증 방식이
+     * 두 가지인데(JWT / API-Key), 두 경로가 <b>공통으로 확보하는 식별자는 PK 하나</b>다.
+     * API-Key는 {@code api_keys.tenant_id}(PK)만 들고 있어 {@code t_xxx} 형태를 알려면
+     * Tenant를 한 번 더 조회해야 한다.
+     *
+     * @param id Tenant PK
      * @return 캐시 존재 시 Tenant, 미스 시 {@link Optional#empty()}
      */
-    Optional<Tenant> get(String tenantId);
+    Optional<Tenant> get(Long id);
 
     /**
      * 캐시에 Tenant 저장.
@@ -37,7 +42,7 @@ public interface TenantCache {
      * <p>Tenant 변경 시점(예: Plan 변경) 호출.
      * 캐시에 없어도 예외 X (idempotent 보장).
      *
-     * @param tenantId 도메인 ID
+     * @param id Tenant PK
      */
-    void invalidate(String tenantId);
+    void invalidate(Long id);
 }
