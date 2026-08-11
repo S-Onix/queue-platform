@@ -4,7 +4,7 @@
 # - DB: 로컬 MySQL Master/Replica (Docker)
 # - JWT: 평문 secret 사용 (편의)
 # - 로그: DEBUG 레벨 (디버깅 편의)
-# - JPA: ddl-auto=update (자동 스키마 변경)
+# - JPA: ddl-auto=validate (스키마 정본은 doc/schema.sql)
 # ============================================================================
 
 spring:
@@ -21,7 +21,19 @@ spring:
       maximum-pool-size: 10
   jpa:
     hibernate:
-      ddl-auto: update
+      # local도 validate다. update는 스키마를 엔티티에 맞춰 조용히 바꿔버린다.
+      #
+      # 실제로 일어났던 일:
+      #   · schema.sql의 TINYINT(설계상 저장공간 최적화)를 전부 INT로 되돌림
+      #   · @Column(length) 없는 String 필드를 VARCHAR(255)로 넓힘 (인덱스 컬럼 포함)
+      #   · CHAR(64) → VARCHAR(64), DATETIME(3) → DATETIME(6)
+      #   · 엔티티에서 제거한 컬럼은 삭제하지 않아 NOT NULL 유령 컬럼이 남음
+      #     (그 결과 큐 생성 INSERT가 전부 실패했다)
+      #
+      # 더 나쁜 건 이 모두가 local에서만 조용히 넘어가고 dev/prod(validate)에서
+      # 기동 실패로 터진다는 점이다. 스키마 정본은 doc/schema.sql이며,
+      # 변경은 그 파일과 마이그레이션으로만 한다.
+      ddl-auto: validate
     show-sql: true
     properties:
       hibernate:

@@ -6,6 +6,7 @@ import com.sonix.queue.infrastructure.entity.QueueEntity;
 import com.sonix.queue.infrastructure.repository.QueueJpaRepository;
 import org.springframework.stereotype.Repository;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 

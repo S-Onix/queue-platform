@@ -17,16 +17,20 @@ public class RefreshTokenEntity {
     @Column(name = "tenant_id", nullable = false)
     private Long tenantId;
 
-    @Column(name = "token_hash", nullable = false, length = 64, unique = true)
+    // columnDefinition으로 CHAR를 명시한다. Hibernate는 String을 VARCHAR로만 매핑하므로
+    // 생략하면 ddl-auto: update가 CHAR(64)를 VARCHAR(64)로 바꿔버린다.
+    // SHA-256 hex는 길이가 정확히 64로 고정이라 CHAR가 맞다.
+    @Column(name = "token_hash", nullable = false, unique = true, columnDefinition = "CHAR(64)")
     private String tokenHash;
 
-    @Column(name = "issued_at", nullable = false)
+    // 다른 테이블과 같은 밀리초 정밀도. 생략하면 Hibernate 기본값(6)으로 넓어진다.
+    @Column(name = "issued_at", nullable = false, columnDefinition = "DATETIME(3)")
     private LocalDateTime issuedAt;
 
-    @Column(name = "expires_at", nullable = false)
+    @Column(name = "expires_at", nullable = false, columnDefinition = "DATETIME(3)")
     private LocalDateTime expiresAt;
 
-    @Column(name = "revoked_at")
+    @Column(name = "revoked_at", columnDefinition = "DATETIME(3)")
     private LocalDateTime revokedAt;
 
     protected RefreshTokenEntity() {
