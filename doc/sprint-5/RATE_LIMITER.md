@@ -371,18 +371,14 @@ windowNo = currentTimeMillis / windowSizeMillis
 ### 5.4 IP 추출
 
 ```java
-private String extractIp(HttpServletRequest request) {
-    String xForwardedFor = request.getHeader("X-Forwarded-For");
-    if (xForwardedFor != null && !xForwardedFor.isBlank()) {
-        return xForwardedFor.split(",")[0].trim();
-    }
-    return request.getRemoteAddr();
-}
+String ip = request.getRemoteAddr();
 ```
 
-**X-Forwarded-For 우선 이유:**
-- Nginx 등 프록시 거친 경우 실제 클라이언트 IP
-- 프록시 미사용 시 RemoteAddr fallback
+**peer IP만 쓰는 이유:**
+- 현재 구성에 프록시(Nginx/ALB)가 없다 → `X-Forwarded-For`는 클라이언트가 직접 쓰는 값
+- 그 값을 버킷 키로 쓰면 요청마다 헤더만 바꿔 매번 새 버킷 → 인증 전 Rate Limit이 무력화 (실증됨)
+- TCP peer 주소는 위조할 수 없으므로 유일하게 신뢰 가능한 식별자
+- LB 도입(Sprint 11) 시: 앱 코드가 아니라 `server.forward-headers-strategy=native`(RemoteIpValve) + 신뢰 프록시 목록으로 처리
 
 ### 5.5 NAT 공유 IP 대응
 

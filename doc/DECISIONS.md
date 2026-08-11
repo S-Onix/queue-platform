@@ -2893,7 +2893,8 @@ public enum Plan {
 **왜 IP 기반 인증 전 한도인가**:
 - Tenant 식별 불가 (인증 안 됨)
 - IP가 유일한 식별자
-- X-Forwarded-For 헤더 우선 (Nginx 프록시 대응)
+- IP는 `request.getRemoteAddr()`(TCP peer)만 신뢰. 현재 프록시가 없으므로 `X-Forwarded-For`는 클라이언트가 임의로 쓰는 값이고, 이를 키로 쓰면 헤더만 바꿔 한도를 무한 우회할 수 있다 (실증됨)
+- LB/Nginx 도입(Sprint 11) 시에는 앱 코드가 아니라 `server.forward-headers-strategy=native`(RemoteIpValve) + internal-proxies 설정으로 처리한다
 
 **왜 NAT 공유 IP에도 한도 너무 엄격하지 않은가**:
 - 회사 100명 동시 가입 = 같은 IP
@@ -2919,7 +2920,7 @@ public enum Plan {
 
 ### Interview Point
 
-> "Rate Limit Filter는 JWT 인증 뒤에 배치합니다. JWT 파싱이 먼저 SecurityContext에 Tenant 정보를 저장하고, RateLimitFilter가 그 정보로 Plan 한도를 적용합니다. 인증 전 endpoint(signup/login/refresh)는 IP 기반 + Fixed Window로 Brute Force와 회원가입 남용을 방지합니다. X-Forwarded-For 헤더로 실제 IP를 추출하고, NAT 공유 IP 대비 한도를 너무 엄격하게 잡지 않습니다."
+> "Rate Limit Filter는 JWT 인증 뒤에 배치합니다. JWT 파싱이 먼저 SecurityContext에 Tenant 정보를 저장하고, RateLimitFilter가 그 정보로 Plan 한도를 적용합니다. 인증 전 endpoint(signup/login/refresh)는 IP 기반 + Fixed Window로 Brute Force와 회원가입 남용을 방지합니다. 이때 IP는 TCP peer(`getRemoteAddr()`)만 씁니다. 프록시가 없는 구성에서 X-Forwarded-For를 신뢰하면 공격자가 헤더만 바꿔 매 요청 다른 버킷을 만들어 한도를 무력화할 수 있기 때문입니다. LB를 두게 되면 앱 코드가 아니라 RemoteIpValve(신뢰 프록시 목록)로 헤더를 검증해 처리합니다. NAT 공유 IP 대비 한도는 너무 엄격하게 잡지 않습니다."
 
 ### Related
 
@@ -3648,3 +3649,135 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 - `scripts/kafka/create-topics.sh` (D17 — 파티션 수 불일치 감지 포함)
 - `queue-consumer/` (D20), `queue-infrastructure/.../queue/KafkaEnqueueEventPublisher.java` (D16·D19)
 - 후속 과제: reconciliation 스위퍼(유령 토큰 복구), `DelegatingByTypeSerializer`(DLT 원문 보존), 상태 전이 순서 설계(Sprint 6-7)
+
+---
+
+## §74 — 폴링 소유권 검증: seq 존재 판정 → tokenId 대조 (Lua 원자 1회)
+
+**일자**: 2026-08-11 · **Sprint 5-E** · **관련**: §63(Rate Limit 신뢰 경계), §70(INCR seq·Hash Tag), §71(복구)
+
+### Context
+
+`GET /api/v1/queues/{queueId}/tokens/{tokenId}?seq&ka` 는 **permitAll**이다. 브라우저가 Platform을
+직접 폴링하는 구조라 API Key도 JWT도 받지 않고, 설계 의도는 **"tokenId 소유가 곧 자격(capability)"** 이었다.
+
+그런데 구현은 tokenId를 한 번도 보지 않았다. `isWaiting(queueId, seq)` 로 **seq 존재만** 확인했다.
+`seq`는 `INCR` 발급이라 `1, 2, 3...`으로 추측이 자명하다. 즉 자격 증명이 URL에 실려 있는데 검사하지 않아,
+**아무나 `?seq=1&ka=1`을 반복해 남의 대기 항목 inactive_ttl을 무한 연장**할 수 있었다.
+
+피해는 "남의 자리를 뺏는 것"이 아니라 **"남의 자리를 대신 지켜주는 것"** 이다. 이탈했어야 할 유령 대기자가
+계속 살아남아 앞자리를 점유하고, inactive 판정 배치가 통째로 무력화된다.
+
+### Decision
+
+**D21 — 검증과 keepalive를 `poll_verify.lua` 하나로 묶는다 (원자 1회)**
+
+```
+ZRANGEBYSCORE waiting seq seq  →  identifier      (없으면 0)
+HGET tokens identifier         →  "tokenId|issuedAt"
+'|' 앞부분과 제시된 tokenId를 문자열 비교           (불일치면 0)
+keepalive='1'이면 ZADD lastActive nowMillis seq
+return 1
+```
+
+**D22 — 도메인 포트에서 `isWaiting`·`touchLastActive`를 삭제하고 `verifyWaiting` 하나로 통합한다**
+
+```java
+boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis);
+```
+
+**D23 — tokenId는 반드시 문자열 비교. Lua에서 `tonumber`를 태우지 않는다**
+`tok_` + UUIDv7이므로 숫자 변환은 `nil`이 되어 모든 비교가 통과하거나 실패하는 사고가 된다.
+
+**D24 — `ZADD` member는 `ARGV[1]` 원문을 그대로 쓴다**
+`tostring(tonumber(x))`는 Lua 5.1의 `%.14g` 포맷을 거쳐 Java가 만든 문자열과 어긋날 수 있다.
+이 member는 inactive_ttl 배치가 seq로 되읽을 값이다.
+
+### Rationale
+
+**왜 왕복을 나누면 안 되는가 (D21의 핵심)**
+
+검증(read)과 touch(write)를 분리하면 이 순서가 성립한다.
+
+```
+1. 검증 통과            (이 시점엔 항목이 있다)
+2. ← admit 또는 이탈로 waiting에서 제거됨
+3. touch 실행           → 이미 사라진 seq의 last-active가 되살아난다 (좀비)
+```
+
+Redis 스크립트는 단일 실행이므로 세 명령 사이에 아무것도 끼어들 수 없다. 부수적으로 RTT도 2회 → 1회.
+
+**왜 포트를 합쳤는가 (D22)**
+
+두 메서드가 분리돼 있는 한 **"검증 없이 touch"** 를 다시 호출할 수 있다. 그게 정확히 이번 결함이다.
+API 표면에 남겨두면 같은 실수가 재발한다. 호출처가 `poll()` 하나뿐이라 합치는 쪽이 diff도 작다.
+
+`keepalive`·`nowMillis`가 도메인 포트에 노출되는 것은 구현 세부 누출로 보일 수 있으나 **정당하다.**
+이 둘을 분리하는 순간 원자성이 깨지고, 그게 방금 고친 결함이기 때문이다. 포트가 표현해야 하는 것은
+"검증한다"와 "갱신한다"가 아니라 **"검증에 성공한 경우에만 갱신한다"** 라는 하나의 불가분 연산이다.
+
+**버린 대안**
+
+| 대안 | 버린 이유 |
+|---|---|
+| Java에서 `isWaiting` → `HGET` 비교 → `ZADD` 3회 왕복 | 위 좀비 경쟁이 그대로 남는다. RTT 3배 |
+| 검증만 Lua, touch는 별도 호출 | 같은 이유. 원자성이 절반만 생긴다 |
+| 폴링에 인증(API Key/JWT) 부여 | 브라우저 직접 폴링 전제(β)가 깨진다. 범위 밖 |
+| tokenId 대신 seq에 서명을 붙여 검증 | 발급 경로 전체 변경 필요. 현 구조에서 Hash 대조로 충분 |
+
+**fail-closed 설계**
+`tokens` Hash가 유실되면 `HGET`이 nil → `0` → 404다. "못 찾으면 통과"가 아니라 **"못 찾으면 거부"** 다.
+Redis 유실 후 복구 전 폴링은 404를 받는데, 이는 §71 복구 과제와 함께 다룬다.
+
+**상태코드를 단일화한 이유**
+"존재하지만 남의 것"과 "아예 없음"을 모두 `TOKEN_NOT_FOUND`(404)로 반환한다.
+구분하면 공격자가 **seq 열거로 대기열 점유 상태를 읽어낼 수 있다.**
+
+### 검증 (2026-08-11)
+
+악의적 사용자 전제로 실 Redis 20건 + 순수 Mockito 2건. 전체 **202 tests / 0 failures**.
+
+| 공격 | 결과 |
+|---|---|
+| 교차 탈취 (남의 seq + 내 tokenId, 양방향) | false, `last-active` 미기록 |
+| TTL 연장 연타 `ka=true` × 100 | zcard 끝까지 **0** |
+| seq 열거 1~50 / 경계값 `0·-1·Long.MAX·MIN` | 예외 없이 전부 false |
+| 구분자 주입 `tok_X\|999`, `\|tok_X` | 전부 false |
+| 이상 tokenId 13종 (NUL·개행·`\r\nHGETALL`·Lua 조각·10KB·이모지) | 예외 없이 전부 false |
+| 큐 교차 (A의 유효 쌍 → B) | A=true, B=false |
+| `tokens` Hash 유실 / admit 이탈 후 keepalive | fail-closed, 좀비 없음 |
+
+**`|` 주입이 통하지 않는 이유**: Lua는 **저장값**만 `|`로 자르고 **입력값**은 그대로 비교한다
+(`storedTokenId ~= tokenId`). `tok_X|999`를 제시해도 저장된 `tok_X`와 문자열이 다르다.
+
+### Consequences
+
+**긍정**
+- permitAll 엔드포인트에 실제 자격 검사가 생겼다. 설계 의도(capability)와 구현이 일치.
+- 좀비 last-active가 원천 차단되어 inactive_ttl 배치(Sprint 7/9)의 판정 근거가 신뢰 가능해졌다.
+- 포트가 하나로 줄어 "검증 없이 touch" 경로가 API 표면에서 사라졌다.
+
+**부정**
+- 폴링이 `ZCOUNT`(read 1회) → **EVAL 3키**로 바뀌었다. Lua는 write로 분류되어 **replica 라우팅 여지가 사라진다.**
+  현재 `ReadFrom` 미설정(전부 master)이라 회귀는 아니지만, 30만 폴링 규모의 실측은 **없다(미검증)**.
+- `last-active` ZSet은 여전히 `ZADD`만 있고 `ZREM`·`EXPIRE`가 **전 소스에 0건**이다.
+  이벤트 100회면 3천만 멤버가 영구 적재된다 → **inactive_ttl 배치에서 "판정 후 ZREM"을 같은 스크립트에 넣을 것.**
+
+**중립 / 남는 전제**
+- **score 유일성을 암묵 전제**한다(`members[1]`만 채택). 현재는 `INCR`이 보장하나,
+  §71 DB→Redis 복구가 중복 score를 주입하면 뒤로 밀린 사용자가 **영구 404**가 된다.
+  → 복구 스크립트에 seq 유일성 단언이 필요하다.
+- `last-active` score의 출처는 요청을 받은 **WAS의 벽시계**다. NTP 미동작 시 조기 EXPIRE 가능.
+  배치 판정을 Redis `TIME` 기준으로 통일하면 오차원이 하나로 준다.
+- tokenId가 URL 경로에 실리므로 로그·리퍼러로 유출되면 소유권 증명이 무력하다. 서명 토큰(HMAC)은 후속.
+
+### Interview Point
+
+> "폴링 엔드포인트가 인증이 없는 대신 tokenId 소유를 자격으로 삼는 설계였는데, 정작 코드가 tokenId를 안 보고 seq 존재만 확인하고 있었습니다. seq는 INCR로 발급해서 1부터 훑으면 되니까, 아무나 남의 순번에 keepalive를 걸어서 이탈했어야 할 대기자를 계속 살려둘 수 있었습니다. 흥미로운 건 이게 '남의 자리를 뺏는' 공격이 아니라 '남의 자리를 대신 지켜주는' 공격이라, 피해자는 아무 이상을 못 느끼고 뒷사람 전체가 손해를 본다는 점입니다. 고칠 때 검증만 추가하면 될 것 같지만 그러면 안 되는데, 검증하고 나서 갱신하는 사이에 그 사람이 admit되거나 이탈하면 이미 사라진 순번의 last-active가 되살아나기 때문입니다. 그래서 Lua 스크립트 하나에 조회, 대조, 갱신을 다 넣어서 원자적으로 처리했습니다. 도메인 포트도 isWaiting과 touchLastActive 두 개를 verifyWaiting 하나로 합쳤는데, 두 개로 남겨두면 '검증 없이 touch'를 다시 호출할 수 있어서 같은 실수가 재발하기 때문입니다. 포트가 표현해야 하는 건 '검증한다'와 '갱신한다'가 아니라 '검증에 성공한 경우에만 갱신한다'라는 불가분 연산이라고 봤습니다. 검증할 때는 정상 사용자가 아니라 공격자를 가정하고 시나리오를 짰습니다. 구분자 주입이나 개행 섞은 Redis 명령 주입, 10KB 문자열 같은 것까지 넣어봤고, 특히 테스트가 진짜 회귀를 잡는지 확인하려고 고친 코드를 일부러 되돌려서 테스트가 실패하는 것까지 봤습니다. 테스트가 있다는 것과 테스트가 작동한다는 건 다른 문제라서요."
+
+### Related
+- §63 (Rate Limit — 같은 뿌리의 결함: 신뢰할 수 없는 입력을 권한·한도의 근거로 삼음)
+- §70 D9/D10 (`INCR seq`가 유일성을 보장한다는 전제, Hash Tag로 3키 동일 슬롯)
+- §71 (DB→Redis 복구 — seq 유일성 제약을 여기서 지켜야 한다)
+- 리뷰 기록: `doc/reviews/2026-08-11-poll-ownership-xff.md`
+- 후속: `last-active` 정리 로직(Sprint 7/9), 폴링 Rate Limit 키 카디널리티, 폴링 부하 실측

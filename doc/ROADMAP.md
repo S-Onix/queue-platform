@@ -624,6 +624,10 @@ flowchart TD
 - **MSK Serverless** (Private Subnet, IAM 인증, 토픽 3개)
 - **EC2** (queue-api × 2 + queue-batch × 1, t3.medium)
 - **ALB** (queue-api 앞에)
+  - ⚠️ **`application-prod.yml`에 `server.forward-headers-strategy: native` + `server.tomcat.remoteip.internal-proxies`(ALB 서브넷 CIDR로 좁힐 것) 필수.**
+    앱은 XFF를 신뢰하지 않고 TCP peer만 쓰므로(§74), 이 설정이 없으면 **모든 요청의 peer가 ALB 사설 IP 하나**가 되어
+    인증 전 Rate Limit이 단일 버킷을 공유한다 → signup/login이 전역 차단(역방향 self-DoS).
+  - ⚠️ **8080 인바운드는 ALB의 Security Group에서만 허용.** VPC 내부 직결이 열려 있으면 사설대역에서 XFF 위조가 살아난다(설정이 아니라 SG가 실질 방어).
 - **ECR** 레포지토리 (queue-api, queue-batch)
 - CloudWatch Log Group 2개
 
