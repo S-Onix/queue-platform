@@ -657,6 +657,11 @@ Sentinel: Master 1 + Slave 2 + Sentinel 3
 쿼럼 = 2, min-replicas-to-write 1
 ```
 
+> ⚠️ **위는 현재 구현(Sentinel) 기준이다.** 목표 구성은 **독립 2 Cluster + 큐 단위 이중 라우팅**으로
+> 확정되었다(DECISIONS §75, 전환 시점 미정). 전환 후 위 표의 "Sentinel Failover 5~10초"는
+> **각 클러스터 내부의 master–replica failover**로 바뀐다. 두 클러스터 분리는 **용량 방어**이며
+> **가용성 방어가 아니다** — cluster1 장애를 cluster2가 대신 받지 않는다 (§75 Consequences ⑥).
+
 ### Virtual Thread (Spring MVC)
 
 ```yaml

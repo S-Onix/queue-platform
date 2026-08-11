@@ -27,7 +27,9 @@ Language: Java 21 (Virtual Thread, Record, Pattern Matching)
 Framework: Spring Boot 3.3.4 + MVC + Tomcat (NOT WebFlux)
 ORM: JPA (Hibernate) + JDBC
 DB: MySQL 8.0 (Master 3306 + Replica 3307, GTID 복제)
-Cache: Redis Sentinel (Master + Slave 2 + Sentinel 3)
+Cache: Redis — 현재 구현 Sentinel (Master + Slave 2 + Sentinel 3)
+       목표 확정: 독립 2 Cluster + 큐 단위 이중 라우팅 (DECISIONS §75, 전환 시점 미정)
+       Sentinel은 폐기가 아니라 학습·로컬 자산으로 격하 (§75 D28)
 Messaging: Spring Kafka (KRaft)
 Build: Gradle 멀티모듈 (5개)
 Architecture: Hexagonal + DDD
@@ -247,6 +249,12 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
    - 콜드패스(createQueue 등 관리성): DB 비관적 락 또는 `@DistributedLock`
    - 표준 분산 락 어노테이션은 없음 → 사내 `@DistributedLock` (Redisson + AOP)
    - 어노테이션은 `queue-common`, Aspect는 `queue-infrastructure`
+
+10. **Redis 목표 구성: 독립 2 Cluster + 큐 단위 이중 라우팅** (DECISIONS §75, 시점 미정)
+   - 한 큐의 키 4종(`waiting`/`seq`/`tokens`/`last-active`)은 **같은 클러스터**에 놓인다 (§75 D26)
+   - 새 큐 상태 키는 반드시 `QueueKeys`를 거칠 것 — 태그 없는 키를 다중 키 Lua의 KEYS에 끼우면
+     Cluster에서만 `CROSSSLOT`으로 깨진다. **로컬 Sentinel 테스트로는 안 잡힌다**
+   - Sentinel은 학습·로컬 자산으로 격하 (폐기 아님, §75 D28)
 
 ---
 

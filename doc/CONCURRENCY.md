@@ -19,11 +19,16 @@
 | 배포 방식 | 저장 확장 | 처리량 확장 | 도입 Sprint |
 |-----------|-----------|-------------|-------------|
 | Sentinel | Scale-Up만 (Master 메모리) | Single Thread 한계 (40k ops/s) | Sprint 5-A (완료) |
-| Cluster (3 Master) | Scale-Out (Master 추가) | 3배 (120k ops/s) | Sprint 10 |
-| Cluster (5-7 Master) | 유연한 확장 | 5-7배 (200-280k ops/s) | Sprint 12 |
-| 4x4x4GB 극대 분산 | 최대 유연성 | 16배 (640k ops/s) | Sprint 15+ |
+| Cluster (3 Master) | Scale-Out (Master 추가) | 3배 (120k ops/s) | ~~Sprint 10~~ **미정** |
+| Cluster (5-7 Master) | 유연한 확장 | 5-7배 (200-280k ops/s) | ~~Sprint 12~~ **미정** |
+| 4x4x4GB 극대 분산 | 최대 유연성 | 16배 (640k ops/s) | ~~Sprint 15+~~ **미정** |
 
 **핵심**: Redis Cluster 도입 시 Redis 원자 연산의 원리는 동일 (각 Master가 Single Thread), 단 여러 Master가 병렬 처리.
+
+> ⚠️ **개정 (§75, 2026-08-11)**: Cluster 전환은 **확정**되었으나 **시점은 미정**이다(위 Sprint 번호는 확정 아님).
+> 또한 목표는 **단일 Cluster의 Master 추가 확장이 아니라 독립 2 Cluster + 큐 단위 이중 라우팅**이다.
+> §70 D10의 해시태그 때문에 한 큐는 Master 한 대에 고정되므로, 위 "3배/16배"는 **큐가 여러 개일 때만** 성립한다.
+> 최악 케이스인 **단일 큐 30만 대기**에는 적용되지 않는다. → §75
 
 ### 이 전제가 의미하는 것
 
@@ -619,9 +624,13 @@ class QueueCreationConcurrencyTest {
 - §68: Master 크기 최적화 원리
 - §69: 극대 분산 4x4x4GB 최종 구성
 
-### Cluster 환경 요약 (Sprint 10+ 대비)
+### Cluster 환경 요약 (전환 확정 · 시점 미정, §75)
 
-| 항목 | Sentinel (현재) | Cluster (Sprint 10+) | 이중 라우팅 (Sprint 12+) |
+> **§75 추가 제약**: 이중 라우팅에서 **한 큐의 키 4종은 같은 클러스터**에 놓인다(라우팅 단위 = 큐 1개).
+> 해시태그는 *한 클러스터 안의* 슬롯만 정렬하며 **클러스터 경계는 못 넘기 때문**에, 큐가 두 클러스터에
+> 걸치면 3키 Lua(`enqueue_bulk`·`poll_verify`)를 같은 EVAL로 보낼 수조차 없다.
+
+| 항목 | Sentinel (현재 구현) | Cluster (확정, 시점 미정) | 이중 라우팅 (§75 — 큐 단위) |
 |------|-----------------|---------------------|-------------------------|
 | Redis 원자성 | Master 하나 | 각 Master 개별 원자 | 각 Master 개별 원자 |
 | Lua Script | 모든 key 자유 | 단일 key 또는 Hash Tag | Hash Tag 필수 |
