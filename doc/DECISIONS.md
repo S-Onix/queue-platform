@@ -3558,3 +3558,93 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 - §71 (Redis→DB 순서·DB→Redis 복구 — 이 결정이 D11의 적재 수단을 구체화), §70 (`INCR seq`)
 - memory: `sprint5-token-kafka-progress` (제거 대상 Kafka 구현체 목록)
 - `doc/CONCURRENCY.md` (@DistributedLock/ShedLock — 리더 선출)
+
+---
+
+## 73. Sprint 5-E 재개정 — Enqueue 영속화: List → Stream → **Kafka 복귀** + 소비 전담 모듈 분리
+
+**Date**: 2026-08-10
+**Context**: §72로 Kafka를 걷어내고 Redis List outbox를 도입했으나, 이후 **Redis Stream(Consumer Group)으로 한 번 더 옮겼고 그 전환은 문서화되지 않았다**. 여기에 Sprint 6-7의 상태 전이(admit/complete/cancel/expire)를 설계하면서 **Stream으로는 풀 수 없는 요구**가 드러나 Kafka로 되돌린다. 세 세대(List → Stream → Kafka)를 한 절에 정리해, "왜 왔다 갔는가"가 기록에서 끊기지 않게 한다. §71의 순서(Redis→DB)·복구(DB→Redis)는 그대로 유효하며, 이 결정은 §72와 마찬가지로 **적재 수단만** 바꾼다.
+
+### Decision
+
+**D14 — List → Stream (중간 세대, 문서화만 하고 폐기)**
+- §72가 손으로 만들기로 했던 것 — `processing:{worker}` 목록, heartbeat, 워커 명단, reaper, ShedLock 리더 선출 — 이 **전부 Consumer Group + PEL의 기본 기능**이었다. 직접 구현분이 통째로 삭제됐다.
+- `LREM`은 **payload 바이트가 일치해야** 지워진다 → 재직렬화가 끼어들면 ack이 조용히 무력화. `XACK`은 **엔트리 ID 기준**이라 그 취약점이 구조적으로 없다.
+- 큐별 스트림 `queue:{queueId}:outbox` + 해시태그 → `enqueue_bulk.lua`가 waiting·seq·outbox를 **한 원자 단위**로 쓸 수 있는 길이 열렸다(§70 D10과 동일 슬롯).
+- 대가: `XACK`은 PEL에서만 빼고 **원본을 남긴다** → `XTRIM`(MINID+MAXLEN) 청소를 직접 해야 한다. List의 `ack=삭제` 자동 청소는 잃었다.
+
+**D15 — Stream → Kafka 복귀 (본 결정)**
+- 발행: `KafkaEnqueueEventPublisher`(infra 어댑터), 소비: **신설 `queue-consumer` 모듈**.
+- **`EnqueueEventPublisher` 포트는 그대로.** 도메인·서비스 코드 무변경 — 어댑터만 교체.
+
+**D16 — 파티션 키 = `tokenId`** (⚠️ 이 결정이 D15의 핵심)
+- 같은 토큰의 모든 이벤트가 같은 파티션 → **상태 전이 순서 보장**.
+- ~~`queueId`~~ 배제: 큐 카디널리티가 낮고 "한 큐에 30만 명"이 정상 시나리오라 **트래픽 99%가 한 파티션**에 몰린다(파티션을 늘려도 해결 안 됨). `tokenId`는 토큰마다 유일해 분산과 묶음을 동시에 얻는다.
+
+**D17 — 파티션 18 / `replication.factor=3` / `min.insync.replicas=2` / `acks=all` / `enable.idempotence=true`**
+- 18은 컨슈머 대수 후보(2·3·6·9)로 나눠떨어지는 값. **파티션은 줄일 수 없고, 늘리면 `hash % N`이 바뀌어 살아 있는 토큰의 순서 관계가 끊긴다**(토큰 수명 최대 `waitingTtl` 2시간) → 처음에 넉넉히 잡는 값.
+- `min.insync.replicas=1`이면 `acks=all`이 사실상 `acks=1`이 되어 리더 장애 시 유실 → 협상 대상 아님.
+
+**D18 — 토픽 = `token-lifecycle` (생명주기 통합 단일 토픽)**
+- Kafka의 순서 보장은 **같은 토픽의 같은 파티션** 안에서만 성립. `enqueue-events` / `token-status-changed`로 나누면 키가 같아도 `WAITING → ADMIT_ISSUED` 순서가 보장되지 않는다.
+- **컨슈머 그룹은 나누지 않는다.** 그룹 분리는 *팬아웃*(쓰기 대상이 다를 때)이지 *작업 분담*이 아니다. 같은 `tokens` 행을 두 그룹이 쓰면 각자 독립 offset으로 달려 순서가 다시 깨진다. 병렬화는 파티션이 담당한다. "전담 컨슈머"는 **한 리스너 안에서 핸들러 분기**로 표현한다.
+
+**D19 — 발행 시한: `max.block.ms=4000` + `request.timeout.ms=3000` + `delivery.timeout.ms=8000` + `linger.ms=5`, 어댑터 대기 `12000ms`**
+- 기본값(`max.block` 60s + `delivery` 120s)은 **동기 요청 경로에 맞지 않는다**. 발행이 오래 매달리면 호출자가 먼저 포기해 503을 전달할 곳이 없어진다.
+- 사슬: `max.block(4s) + delivery(8s) = 12s ≤ 어댑터 대기(12s) < 클라이언트 타임아웃`. 어댑터 대기를 프로듀서 최악 시한보다 **크게** 두는 이유는, 더 짧으면 브로커가 판정 중인데 우리가 먼저 포기해 **"모름"을 "실패"로 단정**하기 때문이다.
+
+**D20 — 소비를 `queue-consumer` 모듈로 분리 (≠ queue-batch)**
+- **확장 방향이 반대**다. 소비는 유입량에 비례해 파티션 수만큼 늘려야 하고, 스케줄 작업(TTL 만료 감지·파티션 정리)은 늘릴수록 중복 실행 방지 장치가 필요해진다. 한 프로세스에 두면 어느 쪽도 제대로 늘릴 수 없다.
+- `queue-batch`는 껍데기로 남긴다(Sprint 7·9에서 채운다). consumer에는 **`@EnableScheduling`을 붙이지 않는다** — 붙이면 infra의 `@Scheduled` 빈까지 함께 돌아 이중 적재가 된다.
+
+### Rationale
+
+- **왜 Stream을 버리는가 ① 순서**: Stream의 Consumer Group은 **건별 배분**이라 같은 토큰의 두 이벤트가 다른 소비자에게 갈 수 있다. 순서를 얻으려면 소비자를 1대로 묶거나(=§72 ShedLock 회귀, 병렬 포기) 스트림을 `outbox:{hash(tokenId)%N}`으로 샤딩해야 하는데 **후자는 파티션을 손으로 재구현하는 것**이다. Kafka의 파티션은 "쪼갬 + 순서 경계 + **그룹 내 독점**"을 한 번에 준다. 셋째가 핵심이고 Stream에 없는 것도 그것뿐이다.
+- **왜 Stream을 버리는가 ② 복구 완전성**: outbox가 대기열 ZSet과 **같은 Redis 인스턴스**에 살면 상관 실패(correlated failure)다. 전손 시 잃어버린 데이터와 **"무엇을 잃었는지 알려줄 증거"가 함께 사라진다**. §71 D12/D13이 남긴 "복구 완전성 = DB 신선도만큼" 갭을 메울 수단이 Stream엔 없다. Kafka는 다른 머신·디스크·3중 복제라 Redis 전손과 **독립 사건**이 되어, `MAX(seq)` 이후를 replay해 갭을 메울 수 있다.
+- **갭 크기 비교(판단이 뒤집힌 지점)**: Lua 원자화가 막는 갭은 "Lua 성공 ~ 발행 사이 프로세스 크래시" = **수 ms**. Redis 전손 갭은 "마지막 적재 이후 유입분" = **수 초~수 분**. 폭이 100배 이상 다르다 — Lua 원자성을 결정적 근거로 삼은 것은 영향 폭 기준으로 과대평가였다.
+- **포기하는 것**: `XADD`를 `enqueue_bulk.lua`로 옮겨 at-least-once를 완성하는 길. Redis와 Kafka 사이엔 분산 트랜잭션이 없어 **이 갭은 Kafka에서 영구적**이다 → **reconciliation(정합성 대사)이 필수 후속 과제**가 된다.
+- **왜 순서 보장이 정확성의 유일한 근거가 되면 안 되는가**: 파티션 순서는 평시 대부분을 커버하지만 **리밸런스 재처리·파티션 증설·DLT 격리·프로듀서 재시도**에서 깨진다. 순서는 "평소에 단순하게", 별도 방어는 "그래도 틀리지 않게"를 담당한다(상태 전이 설계는 §후속).
+- **왜 실패를 2분류하는가**: 제약 위반은 재시도해도 결과가 같아 뒤의 정상 항목까지 막고(독약), 일시 장애를 격리하면 멀쩡한 수백 건을 버린다. Spring Kafka 기본값은 예외를 가리지 않고 재시도 후 격리 → `addNotRetryableExceptions(DataIntegrityViolationException)`으로 명시해야 한다. 배치 리스너는 인덱스 없이 던지면 **배치 전체가 DLT로** 가므로, 이분 탐색으로 범인 인덱스를 찾아 `BatchListenerFailedException`으로 **한 건만** 격리한다(§72가 List에서 만든 이분 탐색 로직의 이식).
+
+### 실측 (2026-08-10, 로컬 100만건 enqueue)
+
+| 지점 | 결과 |
+|---|---|
+| 부하 | 1,000,000 성공 / 실패 0 / 429 0 / 625s (1,600 RPS, 평균 593ms) |
+| Redis `ZCARD` = `seq` = DB `tokens` | 1,000,001 전부 일치 |
+| `DISTINCT token_id` / `DISTINCT seq` | 중복 0, seq 결번 0 |
+| consumer lag / DLT | 0 / 0 |
+| 파티션 분포(18개) | 편차 **1.4%** — D16이 의도대로 동작 |
+
+**1차 시도는 1,410건 실패**했는데 원인은 애플리케이션이 아니라 **WSL2 VM suspend 16.8분**이었다. 진단 근거: 모노토닉 625.9s vs 벽시계 1,634s(차이 1,008s), `/proc/uptime`이 벽시계보다 67분 적음, Kafka 배치 만료 age가 정확히 1,004.8s, DB에 16분 공백. **`HttpTimeoutException`·Kafka `TimeoutException`은 "패킷이 안 갔다"가 아니라 "시간이 지났다"** — 정지 중 벽시계만 흐르다 재개 순간 타이머가 일괄 발화한 것이다(네트워크는 끊긴 적 없음: Redis·MySQL 에러 0, ISR 정상). 이때 **835건이 "Redis엔 있고 DB엔 없는 유령 토큰"**으로 남아, D15가 예고한 발행 갭이 실측으로 확인됐다.
+
+### Consequences
+
+**긍정**:
+- 토큰 단위 **순서 보장 + 소비 병렬화**를 동시에 확보(Stream은 양자택일이었다).
+- outbox가 Redis 밖으로 나가 **전손과 독립** → §71 D13 복구에 "Kafka replay로 DB 미적재분 보충" 계층이 추가 가능.
+- Redis 메모리 압박 해소. outbox가 부풀어 `waiting` ZSet을 evict할 위험이 사라졌다.
+- 소비 코드 대폭 감소: 회수(`XCLAIM`)·트림·그룹 생성·큐 목록 캐시·회전 커서·예산 3상수가 통째로 삭제. 배치 크기는 `max.poll.records` 하나로 결정된다(Stream의 `COUNT`는 스트림별이라 큐 수에 비례해 폭주했다).
+- 자원 격리: 적재가 API JVM 밖(별도 프로세스·머신)으로 나가 §72가 인지한 트레이드오프가 해소됐다.
+
+**부정**:
+- **Kafka 클러스터 운영 부담이 돌아온다**(§72가 없애려던 것). KRaft 3브로커.
+- **발행 원자성의 길이 닫힌다.** `XADD`를 Lua로 옮기는 경로가 사라져 발행 갭이 영구화 → **reconciliation 스위퍼 필수**.
+- **파티션 증설이 위험 작업**이 된다(D17). 순서에 의존하는 대가.
+- **head-of-line blocking이 큐 경계를 넘는다.** Stream은 큐마다 독립 스트림이라 한 큐가 막혀도 다른 큐는 멀쩡했지만, 이제 여러 토큰이 파티션을 공유한다.
+- 역직렬화 자체가 실패한 항목은 값이 null이고 원본이 헤더에 남는다 → 원문 보존하려면 `DelegatingByTypeSerializer` 필요(후속).
+
+**중립**:
+- 제거: `RedisStreamOutboxPublisher/Consumer`, `OutboxKeys`, `OutboxDrainScheduler`, `TokenEnqueueService`, `EnqueueOutbox`·`OutboxEntry`·`DeadLetterReason`, 관련 테스트. `QueueRepository.findDrainableQueueIds`도 호출자가 사라져 함께 제거(Kafka는 브로커가 배분하므로 "훑을 큐 목록" 개념이 없다).
+- 유지: `EnqueueEventPublisher`(포트), `EnqueueEvent`, `TokenEntity`(멱등 insert)·`TokenRepository`, **seq는 Redis `INCR`**(§70 D9), 해시태그(§70 D10 — Lua 통합 목적은 사라졌지만 큐 상태 키의 슬롯 일관성은 유효).
+- `ShedLock` 리더 선출은 D14(Stream) 시점에 이미 불필요해졌고 Kafka에서도 필요 없다.
+
+### Interview Point
+> "enqueue 적재를 Redis List → Stream → Kafka 순으로 두 번 바꿨습니다. List에서 Stream으로 간 건 reliable-queue를 손으로 만들던 것 — 워커별 처리 목록, heartbeat, reaper, 리더 선출 — 이 전부 Consumer Group과 PEL의 기본 기능이었기 때문입니다. 그런데 Stream을 다시 버린 이유가 둘인데, 첫째는 순서입니다. Sprint 7에 admit·complete 같은 상태 전이가 들어오면 같은 토큰의 이벤트 순서가 필요한데, Stream의 consumer group은 건별로 배분해서 같은 토큰의 두 이벤트가 다른 소비자에게 갈 수 있습니다. 순서를 얻으려면 소비자를 한 대로 묶어 병렬을 포기하거나 스트림을 해시로 샤딩해야 하는데, 후자는 결국 파티션을 손으로 재구현하는 겁니다. Kafka 파티션의 본질은 쪼개는 능력이 아니라 쪼갠 것을 그룹 안에서 한 소비자가 독점한다는 규칙이고, Stream에 없는 게 정확히 그것뿐입니다. 둘째는 복구인데, outbox가 대기열 ZSet과 같은 Redis에 살면 전손 시 잃은 데이터와 무엇을 잃었는지 알려줄 증거가 같이 사라집니다. Kafka는 다른 머신이라 독립 사건이 되고, DB 최대 seq 이후를 replay해 갭을 메울 수 있습니다. 대신 포기한 게 있는데, Redis Stream이었다면 XADD를 Lua 안에 넣어 순번 부여와 이벤트 기록을 한 원자 단위로 묶을 수 있었지만 Redis와 Kafka 사이엔 분산 트랜잭션이 없어 그 길이 닫힙니다. 다만 그 갭은 프로세스 크래시 순간의 수 밀리초인 반면 Redis 전손 갭은 수 초에서 수 분이라, 영향 폭으로 보면 후자를 막는 게 맞다고 판단했습니다. 남는 갭은 정합성 대사로 메웁니다. 파티션 키는 tokenId인데, queueId로 잡으면 티켓팅처럼 한 큐에 30만 명이 몰리는 게 정상인 서비스라 트래픽이 통째로 한 파티션에 가서 파티션을 늘려도 소용이 없습니다. 실제로 100만건을 넣어보니 18개 파티션 편차가 1.4%였고, Redis와 DB 카운트가 정확히 일치하며 순번 중복도 결번도 0이었습니다."
+
+### Related
+- §72 (이 결정이 뒤집는 대상 — Kafka 제거·List 채택), §71 (Redis→DB 순서·복구 — 여전히 유효), §70 (`INCR seq`·Hash Tag)
+- `scripts/kafka/create-topics.sh` (D17 — 파티션 수 불일치 감지 포함)
+- `queue-consumer/` (D20), `queue-infrastructure/.../queue/KafkaEnqueueEventPublisher.java` (D16·D19)
+- 후속 과제: reconciliation 스위퍼(유령 토큰 복구), `DelegatingByTypeSerializer`(DLT 원문 보존), 상태 전이 순서 설계(Sprint 6-7)
