@@ -1042,6 +1042,19 @@ scrape_configs:
           application: 'queue-api'
           environment: 'local'
 
+  # Queue Platform Consumer (Kafka lag / 적재량)
+  - job_name: 'queue-platform-consumer'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['172.19.64.1:8082']    # Windows host IP
+        labels:
+          application: 'queue-consumer'
+          environment: 'local'
+
+# queue-batch(8081)는 actuator 의존성이 없어 /actuator/prometheus를 노출하지 않는다.
+# job을 넣으면 항상 DOWN으로 뜨므로, 의존성을 추가한 뒤에 등록할 것.
+
 # 향후 확장 (Phase 5 — 인프라 Exporter):
 # - job_name: 'mysql'         # mysqld_exporter (9104)
 # - job_name: 'redis'         # redis_exporter (9121)

@@ -165,11 +165,11 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 - **1분 안에 확인**:
   ```bash
   curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8082/actuator/prometheus   # 404 예상
-  grep -c "micrometer-registry-prometheus" queue-consumer/build.gradle                  # 0 예상
+  grep -c "micrometer-registry-prometheus" queue-consumer/build.gradle                  # 1 예상
   ```
-- **정상 범위**: 200 + `kafka_consumer_fetch_manager_records_lag_max` 노출. **현재는 미충족.**
+- **정상 범위**: 200 + `kafka_consumer_fetch_manager_records_lag_max` 노출. **충족**(실측 200 / 메트릭 213줄).
 - **원인별 분기**: 404 → 의존성 누락(재배포 필요). 403/401 → Security(consumer엔 Security 없음, 해당 없음). 연결 거부 → 프로세스 미기동.
-- **조치**: 즉시 조치 불가(빌드 변경 필요). 그동안 lag은 `kafka-consumer-groups.sh` CLI로만 본다. 또한 Prometheus의 `scrape_configs`에 **queue-consumer(8082) job 자체가 없다** — `doc/INFRA_SETUP.md` §prometheus.yml에는 `queue-platform-api`(8080)만 있다.
+- **조치**: 404가 다시 나오면 의존성이 빠진 것이다(재배포 필요). scrape 대상은 `doc/INFRA_SETUP.md` §prometheus.yml의 `queue-platform-consumer` job(8082)이다. 그래도 안 보이면 lag은 `kafka-consumer-groups.sh` CLI로 확인한다.
 - **하면 안 되는 것**: consumer가 지표를 안 내니 "lag이 0이다"라고 가정하는 것. 지표가 없는 것과 문제가 없는 것은 다르다.
 
 ---
