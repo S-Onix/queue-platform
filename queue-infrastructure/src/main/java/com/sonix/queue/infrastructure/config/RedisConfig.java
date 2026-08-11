@@ -16,11 +16,13 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.connection.RedisSentinelConfiguration;
+import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 
+import java.time.Duration;
 import java.util.List;
 
 /**
@@ -35,6 +37,31 @@ import java.util.List;
 @Configuration
 public class RedisConfig {
 
+    /**
+     * Redis 커맨드 응답 대기 상한.
+     *
+     * <p>Lettuce 기본값은 60초다. 그 값이면 종료 경로에 시한이 없어진다 —
+     * Redis가 응답하지 못하는 상태에서 SIGTERM이 오면 BatchProcessor의 마지막 drain이
+     * 실행 중인 커맨드 하나에 60초를 매달리고, {@code SmartLifecycle.stop()}은 동기라
+     * {@code timeout-per-shutdown-phase}로도 끊을 수 없다.
+     *
+     * <p><b>트레이드오프:</b> Sentinel failover 실측 5~10초({@code doc/INFRA_SETUP.md})를
+     * 못 타고 넘는 대신, 종료 시한을 확정한다. failover 중 실패는 클라이언트가 재시도로
+     * 회복 가능한 <b>명시적 실패</b>(5xx, 흔적이 남음)이고, SIGKILL로 인한 in-memory
+     * 유실은 <b>회복 불가·검출 불가</b>다. 회복 가능한 실패를 택했다.
+     *
+     * <p>같은 프로젝트의 Kafka 프로듀서도 request 3s / delivery 8s / send 12s로 전부
+     * 시한이 명시돼 있다. Redis만 무기한인 것은 설계가 아니라 누락이었다.
+     *
+     * <p><b>⚠️ 이 값이 확정하는 것은 "Redis 쪽" 시한뿐이다.</b> 종료 drain의 상한
+     * ({@code BatchProcessor.SHUTDOWN_DRAIN_TIMEOUT_MS 5s} + 이 값 5s ≈ 10s)은
+     * <b>MySQL이 응답한다는 전제 위에서만</b> 성립한다. 같은 사이클의 DB 호출
+     * ({@code findByQueueId}, 캐시 없음)은 JDBC {@code socketTimeout} 미설정
+     * (Connector/J 기본 0 = 무기한)이라 시한이 없고, DB 무응답 시 종료 상한도 없다.
+     * → 후속 과제(부하 검증 후 별도 브랜치).
+     */
+    private static final Duration COMMAND_TIMEOUT = Duration.ofSeconds(5);
+
     @Bean
     public RedisConnectionFactory redisConnectionFactory(
             @Value("${spring.data.redis.sentinel.master:mymaster}") String master,
@@ -45,7 +72,11 @@ public class RedisConfig {
             String[] hostPort = node.trim().split(":");
             sentinel.sentinel(hostPort[0], Integer.parseInt(hostPort[1]));
         }
-        return new LettuceConnectionFactory(sentinel);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .commandTimeout(COMMAND_TIMEOUT)
+                .build();
+
+        return new LettuceConnectionFactory(sentinel, clientConfig);
     }
 
     /**
