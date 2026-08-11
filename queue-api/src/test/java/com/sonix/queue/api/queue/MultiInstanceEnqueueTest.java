@@ -87,7 +87,8 @@ class MultiInstanceEnqueueTest {
             RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript);
             BatchProcessor batch = new BatchProcessor(engine, queueRepository);
             // Kafka 브로커 없이 Enqueue(Redis) 흐름만 검증 → no-op 발행자
-            QueueEngineService service = new QueueEngineService(queueRepository, engine, event -> { });
+            QueueEngineService service = new QueueEngineService(queueRepository, engine, event -> { },
+                    new QueueSnapshotCache(engine), java.time.Clock.systemUTC());
             instances.add(new Was(engine, batch, service));
 
             Thread consumer = new Thread(() -> {

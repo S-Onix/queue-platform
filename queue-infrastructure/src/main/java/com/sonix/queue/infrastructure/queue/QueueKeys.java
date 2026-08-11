@@ -38,4 +38,9 @@ public final class QueueKeys {
     public static String tokens(String queueId) {
         return "queue:{" + queueId + "}:tokens";
     }
+
+    /** inactive_ttl용 last-active ZSet (member=seq, score=timestamp ms). */
+    public static String lastActive(String queueId) {
+        return "queue:{" + queueId + "}:last-active";
+    }
 }

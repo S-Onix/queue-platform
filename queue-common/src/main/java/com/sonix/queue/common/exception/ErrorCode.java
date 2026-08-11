@@ -17,7 +17,8 @@ public enum ErrorCode {
     AK_001_UNAUTHORIZED("AK001", "인증이 필요합니다.", 401),
     AK_002_FORBIDDEN("AK002", "권한이 없습니다.", 403),
     RL_001_KEY_LIMIT("RL001", "요청 한도를 초과했습니다.", 429),
-    QUEUE_ENGINE_UNAVAILABLE("QE001", "대기열 처리 중 일시적 오류입니다. 잠시 후 재시도하세요.", 503);
+    QUEUE_ENGINE_UNAVAILABLE("QE001", "대기열 처리 중 일시적 오류입니다. 잠시 후 재시도하세요.", 503),
+    TOKEN_NOT_FOUND("TK001", "대기 토큰을 찾을 수 없습니다.", 404);
 
 
     private final String code;

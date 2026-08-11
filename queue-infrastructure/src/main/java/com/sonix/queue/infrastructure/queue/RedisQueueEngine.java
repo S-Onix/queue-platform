@@ -6,15 +6,19 @@ import com.sonix.queue.common.util.IdGenerator;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
+import com.sonix.queue.domain.queue.QueueSnapshot;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -75,6 +79,40 @@ public class RedisQueueEngine implements QueueEngine {
             log.error("Enqueue failed", e.getCause());
             throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         }
+    }
+
+    @Override
+    public QueueSnapshot readSnapshot(String queueId) {
+        String waitingKey = QueueKeys.waiting(queueId);
+
+        Set<ZSetOperations.TypedTuple<String>> front = redisTemplate.opsForZSet().rangeWithScores(waitingKey, 0, 0);
+
+        long total = Optional.ofNullable(
+                redisTemplate.opsForZSet().zCard(waitingKey)).orElse(0L);
+
+        long frontSeq = -1L;
+
+        if(front != null && !front.isEmpty()) {
+            Double score = front.iterator().next().getScore();
+            if(score != null) frontSeq = score.longValue();
+        }
+
+        return new QueueSnapshot(frontSeq, total);
+    }
+
+    @Override
+    public boolean isWaiting(String queueId, long seq) {
+        // ZCOUNT waiting seq seq → seq는 유일하니 0 또는 1
+        Long count = redisTemplate.opsForZSet()
+                .count(QueueKeys.waiting(queueId), seq, seq);
+        return count != null && count > 0;
+    }
+
+    @Override
+    public void touchLastActive(String queueId, long seq, long nowMillis) {
+        // ZADD last-active {nowMillis} {seq}   (member=seq 문자열, score=now ms)
+        redisTemplate.opsForZSet()
+                .add(QueueKeys.lastActive(queueId), Long.toString(seq), (double) nowMillis);
     }
 
     /**

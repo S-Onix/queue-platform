@@ -59,7 +59,8 @@ public class EnqueueE2ETestConfig {
     @Bean
     public QueueEngineService queueEngineService(QueueRepository queueRepository, RedisQueueEngine engine,
                                                  EnqueueEventPublisher eventPublisher) {
-        return new QueueEngineService(queueRepository, engine, eventPublisher);
+        return new QueueEngineService(queueRepository, engine, eventPublisher,
+                new QueueSnapshotCache(engine), java.time.Clock.systemUTC());
     }
 
     /**

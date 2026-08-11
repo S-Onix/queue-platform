@@ -73,6 +73,15 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        //Polling의 경우 API-KEY로 인증하지 않기 떄문에 선처리하여 확인한다.
+        if (isPollPath(request)) {
+            if (!checkPollRateLimit(request, response)) {
+                return;   // 429로 종료
+            }
+            filterChain.doFilter(request, response);
+            return;
+        }
+
         // 2) 인증 여부 확인
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
 
@@ -89,6 +98,27 @@ public class RateLimitFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    /** GET /api/v1/queues/{queueId}/tokens/{tokenId} 형태만 poll로 인식. */
+    private boolean isPollPath(HttpServletRequest req) {
+        return "GET".equals(req.getMethod())
+                && req.getRequestURI().matches("/api/v1/queues/[^/]+/tokens/[^/]+");
+    }
+
+    /** tokenId 기준 Token Bucket. @return true=통과, false=거부(429 완료). */
+    private boolean checkPollRateLimit(HttpServletRequest req, HttpServletResponse res)
+            throws IOException {
+        String uri = req.getRequestURI();
+        String tokenId = uri.substring(uri.lastIndexOf('/') + 1);   // 마지막 세그먼트
+        String key = RateLimitKeys.pollToken(tokenId);
+
+        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, 5, 0.5);  // cap5, refill0.5/s  (로드테스트 튜닝)
+        if (!allowed) {
+            writeTooManyRequests(res, 2);   // 기존 429 응답기 재사용, Retry-After 2s
+            return false;
+        }
+        return true;
     }
 
     /**
