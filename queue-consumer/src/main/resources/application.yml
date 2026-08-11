@@ -1,0 +1,100 @@
+spring:
+  application:
+    name: queue-consumer
+
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
+
+  threads:
+    virtual:
+      enabled: true
+
+  autoconfigure:
+    exclude:
+      # queue-infrastructure의 RedisConfig가 Sentinel 연결 팩토리를 직접 만든다.
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+
+  jpa:
+    # 이 서버는 HTTP 요청을 처리하지 않지만, 켜두면 actuator 요청까지 커넥션을 붙든다.
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate           # consumer는 스키마를 건드리지 않는다
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        jdbc:
+          batch_size: 500          # ⚠️ kafka max-poll-records와 같은 값을 유지할 것.
+                                   #    어긋나면 JDBC 배치가 중간에 쪼개져 왕복이 늘어난다
+        order_inserts: true
+
+  data:
+    redis:
+      sentinel:
+        master: mymaster
+        # 이 서버는 Redis를 쓰지 않지만, scanBasePackages가 com.sonix.queue 전체라
+        # queue-infrastructure의 Redis 빈이 함께 생성된다. Lettuce는 연결을 지연
+        # 생성하므로 실제 통신은 일어나지 않는다.
+        # 스캔 범위를 좁히면 이 블록을 제거할 수 있다(후속 정리 대상).
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092,localhost:9094,localhost:9096}
+    consumer:
+      group-id: db-writer
+      # 그룹이 생기기 전에 쌓인 메시지를 건너뛰지 않는다. latest면 새 그룹을 만들 때마다
+      # 그 시점 이전 이벤트가 조용히 사라진다.
+      auto-offset-reset: earliest
+      enable-auto-commit: false    # DB 커밋 성공 후 수동 ack
+      max-poll-records: 500        # hibernate batch_size와 일치
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # 역직렬화 실패 1건이 배치 전체를 영원히 막지 않도록 래핑한다.
+      # 래핑하지 않으면 그 한 건이 poll될 때마다 예외가 나고 offset이 전진하지 못한다.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.trusted.packages: "com.sonix.queue.*"
+        # 프로듀서가 타입 헤더를 붙이지 않아도 역직렬화되도록 기본 타입을 고정한다.
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.sonix.queue.domain.queue.EnqueueEvent
+        # 기본(eager) 전략은 리밸런스 때 모든 파티션을 회수했다 재배분한다(stop-the-world).
+        # cooperative는 옮겨야 할 파티션만 건드려 중복 처리 구간을 줄인다.
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+        # ⚠️ 500건 적재의 최악 소요 시간보다 넉넉해야 한다. 넘기면 브로커가 이 컨슈머를
+        #    죽은 것으로 보고 추방하는데, 정작 본인은 모른 채 적재를 계속해 같은 레코드를
+        #    두 컨슈머가 동시에 처리하게 된다. 실측 후 조정할 것.
+        max.poll.interval.ms: 300000
+    producer:
+      # 격리된 항목을 DLT로 보내기 위한 것. 이 서버는 업무 이벤트를 발행하지 않는다.
+      #
+      # 역직렬화까지 성공한 뒤 적재에서 실패한 경우, DLT로 보낼 값은 원본 바이트가 아니라
+      # 이미 객체가 된 EnqueueEvent다. 그래서 컨슈머 쪽 역직렬화와 짝이 되는 직렬화를 쓴다.
+      #
+      # ⚠️ 역직렬화 자체가 실패한 항목(ErrorHandlingDeserializer가 걸러낸 것)은 값이 null이고
+      #    원본 바이트가 헤더에 담긴다. 그 경우까지 원문 그대로 보관하려면
+      #    DelegatingByTypeSerializer로 byte[]와 POJO를 함께 다뤄야 한다(후속 과제).
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        spring.json.add.type.headers: false
+    listener:
+      type: batch                  # List<EnqueueEvent>로 수신
+      # ack-mode는 기본값(BATCH)을 쓴다. 리스너가 정상 반환한 뒤 커밋하므로
+      # 트랜잭션 커밋 후 ack이라는 의도가 그대로 성립하고, 실패 경로의 오프셋 관리를
+      # 에러 핸들러가 일관되게 가져간다(수동 ack이면 둘이 나눠 갖게 되어 DLT와 어긋난다).
+
+queue:
+  consumer:
+    topic: token-lifecycle
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: queue-consumer
+
+server:
+  port: ${SERVER_PORT:8082}        # api 8080 / batch 8081 / consumer 8082

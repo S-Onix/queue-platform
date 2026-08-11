@@ -17,6 +17,7 @@ import com.sonix.queue.domain.queue.EnqueueResult;
  * {
  *   "queueId": "q_xyz789",
  *   "identifier": "user_12345",
+ *   "tokenId": "tok_12345",
  *   "rank": 501,
  *   "total": 100,
  *   "already": false
@@ -27,13 +28,17 @@ public class EnqueueResponse {
 
     private final String queueId;
     private final String identifier;
+    private final String tokenId;
+    private final long seq;
     private final long rank;
     private final long total;
     private final boolean already;
 
-    private EnqueueResponse(String queueId, String identifier, long rank, long total, boolean already) {
+    private EnqueueResponse(String queueId, String identifier, String tokenId, long seq, long rank, long total, boolean already) {
         this.queueId = queueId;
         this.identifier = identifier;
+        this.tokenId = tokenId;
+        this.seq = seq;
         this.rank = rank;
         this.total = total;
         this.already = already;
@@ -69,6 +74,8 @@ public class EnqueueResponse {
         return new EnqueueResponse(
                 queueId,
                 result.getIdentifier(),
+                result.getTokenId(),
+                result.getSeq(),
                 rankOneBased,
                 result.getTotal(),
                 already
@@ -83,6 +90,8 @@ public class EnqueueResponse {
         return identifier;
     }
 
+    public String getTokenId() { return tokenId; }
+
     public long getRank() {
         return rank;
     }
@@ -95,4 +104,5 @@ public class EnqueueResponse {
         return already;
     }
 
+    public long getSeq() { return seq; }
 }

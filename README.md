@@ -243,6 +243,10 @@ admit_token: DB 저장 → Redis 미스 시 Fallback
 
 ## 🔴 Redis Sentinel
 
+> 아래는 **현재 구현** 상태다. 목표 구성은 **독립 2 Cluster + 큐 단위 이중 라우팅**으로 확정
+> (cluster1 master 50% 초과 시 신규 큐를 cluster2로). 전환 시점은 미정. → [DECISIONS §75](doc/DECISIONS.md)
+> Sentinel은 폐기가 아니라 학습·로컬 자산으로 남긴다.
+
 ```
 Master 1 + Slave 2 + Sentinel 3
 쿼럼 = 2 | min-replicas-to-write 1 (Split Brain 방지)
@@ -374,7 +378,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | DB 연결 | JDBC + Virtual Thread | blocking → spring.threads.virtual.enabled=true |
 | Messaging | Spring Kafka | Enqueue 버퍼 + 상태 이벤트 |
 | Batch | Spring MVC + Tomcat | @Scheduled + Spring Kafka Consumer |
-| Cache | Redis Sentinel | FIFO Sorted Set + Lua 원자 |
+| Cache | Redis Sentinel (현재) → 독립 2 Cluster (확정, 시점 미정) | FIFO Sorted Set + Lua 원자 · 큐 단위 이중 라우팅 ([DECISIONS §75](doc/DECISIONS.md)) |
 | DB | MySQL 8.0 | Range 파티셔닝 + Replica |
 | Architecture | Hexagonal + DDD | 도메인 단위 테스트 |
 | Build | Gradle 멀티모듈 5개 | 의존성 명확 분리 |

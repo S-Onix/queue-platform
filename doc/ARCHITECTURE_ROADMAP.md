@@ -391,6 +391,11 @@ CaffeineRankCache 조회
 
 ### 4.4 Sprint 10: Production Cluster 도입
 
+> ⚠️ **개정 (§75, 2026-08-11)**: Cluster 전환은 **확정**, **시점은 미정**(아래 "Sprint 10"은 확정 아님).
+> 목표 형태도 아래의 **단일 Cluster 3 Master + 3 Replica**가 아니라
+> **독립 2 Cluster + 큐 단위 이중 라우팅**(cluster1 master 50% 초과 시 신규 큐를 cluster2로)이다.
+> 아래 구성·마이그레이션 계획은 **2026-07-08 시점의 검토안**으로 보존한다. → DECISIONS §75
+
 **목표**: Sentinel → Cluster 마이그레이션
 
 **Cluster 구성** (Tenant 100개 대응):
@@ -435,7 +440,7 @@ CaffeineRankCache 조회
 
 [T+1일] 안정화
 - 성능 지표 검증
-- Sentinel 폐기
+- ~~Sentinel 폐기~~ → §75 D28: Sentinel은 **학습·로컬 자산으로 격하(존치)**. 폐기 여부 미정
 - 문서화
 ```
 

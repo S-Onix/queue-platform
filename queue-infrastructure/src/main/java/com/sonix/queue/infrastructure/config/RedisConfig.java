@@ -80,6 +80,11 @@ public class RedisConfig {
     }
 
     @Bean
+    public RedisScript<Long> pollVerifyScript() {
+        return loadScript("lua/poll_verify.lua", Long.class);
+    }
+
+    @Bean
     public RateLimiter rateLimiter(
             StringRedisTemplate redisTemplate,
             @Qualifier("tokenBucketScript") RedisScript<Long> tokenBucketScript

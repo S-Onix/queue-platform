@@ -29,8 +29,12 @@ public final class RedisKeyFactory {
         return "apikey:" + keyHash;
     }
 
-    public static String tenant(String tenantId) {
-        return "tenant:" + tenantId;
+    /**
+     * Tenant 캐시 키. <b>PK 기준</b>이다 — 캐시를 쓰는 Rate Limit 경로에서 JWT·API-Key 두
+     * 인증 방식이 공통으로 확보하는 식별자가 PK뿐이기 때문이다.
+     */
+    public static String tenant(Long id) {
+        return "tenant:" + id;
     }
 
     public static String refreshToken(String tokenHash) {

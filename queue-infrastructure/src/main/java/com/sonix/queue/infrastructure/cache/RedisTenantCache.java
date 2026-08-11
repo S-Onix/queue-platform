@@ -39,8 +39,8 @@ public class RedisTenantCache implements TenantCache {
     }
 
     @Override
-    public Optional<Tenant> get(String tenantId) {
-        String key = RedisKeyFactory.tenant(tenantId);
+    public Optional<Tenant> get(Long id) {
+        String key = RedisKeyFactory.tenant(id);
         try{
             String json = redisTemplate.opsForValue().get(key);
             if(json == null) {
@@ -49,18 +49,18 @@ public class RedisTenantCache implements TenantCache {
             Tenant tenant = objectMapper.readValue(json, Tenant.class);
             return Optional.of(tenant);
         }catch(JsonProcessingException e) {
-            log.warn("Tenant 캐시 역직렬화 실패, 손상 데이터 삭제 후 DB fallback: tenantId={}", tenantId, e);
+            log.warn("Tenant 캐시 역직렬화 실패, 손상 데이터 삭제 후 DB fallback: id={}", id, e);
             safeDelete(key);
             return Optional.empty();
         }catch (Exception e) {
-            log.warn("Tenant 캐시 조회 실패, DB fallback: tenantId={}", tenantId, e);
+            log.warn("Tenant 캐시 조회 실패, DB fallback: id={}", id, e);
             return Optional.empty();
         }
     }
 
     @Override
     public void put(Tenant tenant) {
-        String key = RedisKeyFactory.tenant(tenant.getTenantId());
+        String key = RedisKeyFactory.tenant(tenant.getId());
         try{
             String json = objectMapper.writeValueAsString(tenant);
             redisTemplate.opsForValue().set(key, json, TTL);
@@ -73,13 +73,13 @@ public class RedisTenantCache implements TenantCache {
     }
 
     @Override
-    public void invalidate(String tenantId) {
-        String key = RedisKeyFactory.tenant(tenantId);
+    public void invalidate(Long id) {
+        String key = RedisKeyFactory.tenant(id);
         try{
             Boolean deleted = redisTemplate.delete(key);
-            log.debug("Tenant 캐시 무효화: tenantId={}, deleted={}", tenantId, deleted);
+            log.debug("Tenant 캐시 무효화: id={}, deleted={}", id, deleted);
         } catch (Exception e) {
-            log.warn("Tenant 캐시 무효화 실패: tenantId={}", tenantId, e);
+            log.warn("Tenant 캐시 무효화 실패: id={}", id, e);
         }
     }
 

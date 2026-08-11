@@ -42,6 +42,8 @@ public class SecurityConfig {
                         .requestMatchers("/actuator/health", "/actuator/info", "/actuator/prometheus").permitAll()
                         .requestMatchers("/actuator/**").denyAll()    // 그 외 actuator 차단
 
+                        // === token의 polling은 api-key인증을 거치지 않는다 ===
+                        .requestMatchers(HttpMethod.GET, "/api/v1/queues/*/tokens/*").permitAll()
                         // === 그 외 모두 인증 필요 ===
                         .anyRequest().authenticated()
                 )

@@ -8,8 +8,13 @@ dependencies {
     // Spring MVC (Batch도 내장 Tomcat)
     implementation 'org.springframework.boot:spring-boot-starter-web'
 
-    // Kafka Consumer
-    implementation 'org.springframework.kafka:spring-kafka'
+    // @Transactional(spring-tx). infra가 전이 제공하지만 명시한다 —
+    // 스케줄 작업(Sprint 9)이 트랜잭션을 직접 쓰게 되므로 남의 의존성에 기대지 않는다.
+    implementation 'org.springframework:spring-tx'
+
+    // 통합 테스트에서 JPA·Redis 클래스 컴파일 참조용 (infra의 것들은 implementation이라 미노출)
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis'
 
     compileOnly      "org.projectlombok:lombok:${lombokVersion}"
     annotationProcessor "org.projectlombok:lombok:${lombokVersion}"

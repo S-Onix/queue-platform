@@ -11,6 +11,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -39,6 +40,9 @@ public class BatchProcessorTest {
     @InjectMocks
     private BatchProcessor batchProcessor;
 
+    /** 발급 시각 고정값. BatchProcessor가 Instant.now()로 만들어 넘기므로 stub은 any()로 받는다. */
+    private static final Instant T0 = Instant.parse("2026-08-04T00:00:00Z");
+
     @Test
     @DisplayName("빈 globalQueue면 아무 처리도 하지 않는다")
     void emptyQueue_doesNothing() {
@@ -49,7 +53,7 @@ public class BatchProcessorTest {
         batchProcessor.processBatches();
 
         // then
-        verify(queueEngine, never()).executeBulkLua(anyString(), anyList(), anyLong());
+        verify(queueEngine, never()).executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class));
     }
 
     @Test
@@ -57,9 +61,9 @@ public class BatchProcessorTest {
     void groupsByQueueId_andExecutesBulkPerQueue() {
         // given: q_a 2건, q_b 1건이 섞인 globalQueue
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue a1 = new PendingEnqueue("q_a", "u1");
-        PendingEnqueue a2 = new PendingEnqueue("q_a", "u2");
-        PendingEnqueue b1 = new PendingEnqueue("q_b", "u3");
+        PendingEnqueue a1 = new PendingEnqueue("q_a", "u1", "tok_u1");
+        PendingEnqueue a2 = new PendingEnqueue("q_a", "u2", "tok_u2");
+        PendingEnqueue b1 = new PendingEnqueue("q_b", "u3", "tok_u3");
         global.offer(a1);
         global.offer(a2);
         global.offer(b1);
@@ -72,22 +76,22 @@ public class BatchProcessorTest {
         // 큐별로 결과 개수가 달라야 하므로 raw 반환값을 sentinel로 구분해 stub한다.
         List<Object> rawA = List.of("raw_a");
         List<Object> rawB = List.of("raw_b");
-        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong())).thenReturn(rawA);
-        when(queueEngine.executeBulkLua(eq("q_b"), anyList(), anyLong())).thenReturn(rawB);
+        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong(), any(Instant.class))).thenReturn(rawA);
+        when(queueEngine.executeBulkLua(eq("q_b"), anyList(), anyLong(), any(Instant.class))).thenReturn(rawB);
         when(queueEngine.parseBulkResult(rawA)).thenReturn(List.of(
-                EnqueueResult.ok("u1", 0, 1),
-                EnqueueResult.ok("u2", 1, 2)
+                EnqueueResult.ok("u1", "tok_u1", 0, 1, 1, T0),
+                EnqueueResult.ok("u2", "tok_u2", 1, 2, 2, T0)
         ));
         when(queueEngine.parseBulkResult(rawB)).thenReturn(List.of(
-                EnqueueResult.ok("u3", 0, 1)
+                EnqueueResult.ok("u3", "tok_u3", 0, 1, 1, T0)
         ));
 
         // when
         batchProcessor.processBatches();
 
         // then: queue별로 각각 1회씩 Bulk 실행
-        verify(queueEngine).executeBulkLua(eq("q_a"), argThat(list -> list.size() == 2), anyLong());
-        verify(queueEngine).executeBulkLua(eq("q_b"), argThat(list -> list.size() == 1), anyLong());
+        verify(queueEngine).executeBulkLua(eq("q_a"), argThat(list -> list.size() == 2), anyLong(), any(Instant.class));
+        verify(queueEngine).executeBulkLua(eq("q_b"), argThat(list -> list.size() == 1), anyLong(), any(Instant.class));
     }
 
     @Test
@@ -96,13 +100,13 @@ public class BatchProcessorTest {
         // given: q_a에 1200건 → 500/500/200 = 3청크
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
         for (int i = 0; i < 1200; i++) {
-            global.offer(new PendingEnqueue("q_a", "u" + i));
+            global.offer(new PendingEnqueue("q_a", "u" + i, "tok_u" + i));
         }
 
         when(queueEngine.getGlobalQueue()).thenReturn(global);
         when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.of(mockQueue(100000)));
         // 청크마다 크기가 다르므로(500/500/200) 요청 크기에 맞춰 결과를 생성한다
-        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong())).thenAnswer(inv -> {
+        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong(), any(Instant.class))).thenAnswer(inv -> {
             List<PendingEnqueue> chunk = inv.getArgument(1);
             return chunk.stream().map(p -> (Object) p.getIdentifier()).toList();
         });
@@ -110,7 +114,7 @@ public class BatchProcessorTest {
             List<Object> raw = inv.getArgument(0);
             List<EnqueueResult> results = new ArrayList<>();
             for (int i = 0; i < raw.size(); i++) {
-                results.add(EnqueueResult.ok((String) raw.get(i), i, i + 1));
+                results.add(EnqueueResult.ok((String) raw.get(i), "tok_" + raw.get(i), i, i + 1, i + 1, T0));
             }
             return results;
         });
@@ -119,7 +123,7 @@ public class BatchProcessorTest {
         batchProcessor.processBatches();
 
         // then: 1200건 → 3청크 (500, 500, 200)
-        verify(queueEngine, times(3)).executeBulkLua(eq("q_a"), anyList(), anyLong());
+        verify(queueEngine, times(3)).executeBulkLua(eq("q_a"), anyList(), anyLong(), any(Instant.class));
     }
 
     @Test
@@ -127,12 +131,12 @@ public class BatchProcessorTest {
     void bulkFailure_failsAllPendingInChunk() {
         // given
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1");
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1", "tok_u1");
         global.offer(p1);
 
         when(queueEngine.getGlobalQueue()).thenReturn(global);
         when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.of(mockQueue(10000)));
-        when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong()))
+        when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))
                 .thenThrow(new RuntimeException("Redis down"));
 
         // when
@@ -147,9 +151,9 @@ public class BatchProcessorTest {
     void duplicateIdentifierInChunk_eachFutureGetsOwnResult() throws Exception {
         // given: 같은 identifier로 3건 동시 진입 → Lua는 OK 1 + EXISTS 2를 순서대로 반환
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue p1 = new PendingEnqueue("q_a", "dup");
-        PendingEnqueue p2 = new PendingEnqueue("q_a", "dup");
-        PendingEnqueue p3 = new PendingEnqueue("q_a", "dup");
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "dup", "tok_dup1");
+        PendingEnqueue p2 = new PendingEnqueue("q_a", "dup", "tok_dup2");
+        PendingEnqueue p3 = new PendingEnqueue("q_a", "dup", "tok_dup3");
         global.offer(p1);
         global.offer(p2);
         global.offer(p3);
@@ -158,11 +162,11 @@ public class BatchProcessorTest {
         when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.of(mockQueue(10000)));
 
         List<Object> raw = List.of("raw");
-        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong())).thenReturn(raw);
+        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong(), any(Instant.class))).thenReturn(raw);
         when(queueEngine.parseBulkResult(raw)).thenReturn(List.of(
-                EnqueueResult.ok("dup", 0, 1),
-                EnqueueResult.exists("dup", 0, 1),
-                EnqueueResult.exists("dup", 0, 1)
+                EnqueueResult.ok("dup", "tok_dup1", 0, 1, 1, T0),
+                EnqueueResult.exists("dup", "tok_dup1", 0, 1, 1, T0),
+                EnqueueResult.exists("dup", "tok_dup1", 0, 1, 1, T0)
         ));
 
         // when
@@ -179,8 +183,8 @@ public class BatchProcessorTest {
     void resultSizeMismatch_failsWholeChunk() {
         // given: 2건 요청했는데 결과는 1건
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
-        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1");
-        PendingEnqueue p2 = new PendingEnqueue("q_a", "u2");
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1", "tok_u1");
+        PendingEnqueue p2 = new PendingEnqueue("q_a", "u2", "tok_u2");
         global.offer(p1);
         global.offer(p2);
 
@@ -188,8 +192,8 @@ public class BatchProcessorTest {
         when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.of(mockQueue(10000)));
 
         List<Object> raw = List.of("raw");
-        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong())).thenReturn(raw);
-        when(queueEngine.parseBulkResult(raw)).thenReturn(List.of(EnqueueResult.ok("u1", 0, 1)));
+        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong(), any(Instant.class))).thenReturn(raw);
+        when(queueEngine.parseBulkResult(raw)).thenReturn(List.of(EnqueueResult.ok("u1", "tok_u1", 0, 1, 1, T0)));
 
         // when
         batchProcessor.processBatches();

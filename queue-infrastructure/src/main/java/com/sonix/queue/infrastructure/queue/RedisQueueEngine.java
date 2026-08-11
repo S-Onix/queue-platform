@@ -1,18 +1,28 @@
 package com.sonix.queue.infrastructure.queue;
 
+import com.sonix.queue.common.exception.BusinessException;
+import com.sonix.queue.common.exception.ErrorCode;
+import com.sonix.queue.common.util.IdGenerator;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
+import com.sonix.queue.domain.queue.QueueSnapshot;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
-import java.util.*;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Redis 기반 대기열 엔진 구현 (Global Queue 배치 방식).
@@ -27,9 +37,10 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  *
  * <p><b>Lua Script 반환 형식:</b>
- * enqueue_bulk.lua: [{identifier, status, rank, total}, ...]
+ * enqueue_bulk.lua: [{identifier, tokenId, status, rank, total, seq, issuedAt}, ...]
  * */
 
+@Slf4j
 @Component
 public class RedisQueueEngine implements QueueEngine {
 
@@ -37,55 +48,110 @@ public class RedisQueueEngine implements QueueEngine {
 
     private final StringRedisTemplate redisTemplate;
     private final RedisScript<List> enqueueBulkScript;
+    private final RedisScript<Long> pollVerifyScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
 
     public RedisQueueEngine(
             StringRedisTemplate redisTemplate,
-            @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript
+            @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
+            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript
     ) {
         this.redisTemplate = redisTemplate;
         this.enqueueBulkScript = enqueueBulkScript;
+        this.pollVerifyScript = pollVerifyScript;
     }
 
     @Override
     public EnqueueResult enqueue(String queueId, String identifier) {
-        PendingEnqueue pending = new PendingEnqueue(queueId, identifier);
+        String tokenId = IdGenerator.generate("tok_");
+        PendingEnqueue pending = new PendingEnqueue(queueId, identifier, tokenId);
 
         globalQueue.offer(pending);
 
         try {
             return pending.getFuture().get(MAX_WAIT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
-            throw new RuntimeException("Enqueue timeout after " + MAX_WAIT_SECONDS + " seconds", e);
+            log.error("Enqueue timeout after {}s", MAX_WAIT_SECONDS, e);
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("Enqueue interrupted", e);
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         } catch (ExecutionException e) {
-            throw new RuntimeException("Enqueue failed", e.getCause());
+            log.error("Enqueue failed", e.getCause());
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         }
     }
 
+    @Override
+    public QueueSnapshot readSnapshot(String queueId) {
+        String waitingKey = QueueKeys.waiting(queueId);
+
+        Set<ZSetOperations.TypedTuple<String>> front = redisTemplate.opsForZSet().rangeWithScores(waitingKey, 0, 0);
+
+        long total = Optional.ofNullable(
+                redisTemplate.opsForZSet().zCard(waitingKey)).orElse(0L);
+
+        long frontSeq = -1L;
+
+        if(front != null && !front.isEmpty()) {
+            Double score = front.iterator().next().getScore();
+            if(score != null) frontSeq = score.longValue();
+        }
+
+        return new QueueSnapshot(frontSeq, total);
+    }
+
+    @Override
+    public boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis) {
+        if (tokenId == null || tokenId.isBlank()) {
+            return false;
+        }
+
+        // poll_verify.lua: seq -> identifier -> 저장된 tokenId 대조, 통과 시에만 last-active 갱신.
+        // 검증과 갱신을 한 스크립트에 묶어야 그 사이 이탈한 항목을 되살리지 않는다.
+        Long result = redisTemplate.execute(
+                pollVerifyScript,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId)),
+                Long.toString(seq),
+                tokenId,
+                keepalive ? "1" : "0",
+                Long.toString(nowMillis)
+        );
+
+        return result != null && result == 1L;
+    }
+
     /**
-    * enqueue.lua 결과 파싱: [status, rank, total]
+    * enqueue_bulk.lua 단건 결과 파싱: [identifier, tokenId, status, rank, total, seq, issuedAt]
     */
     private EnqueueResult parseEnqueueResult(List<Object> result) {
-        if (result == null || result.size() < 4) {
+        if (result == null || result.size() < 7) {
             throw new IllegalStateException("Invalid Lua result: " + result);
         }
 
         String identifier = (String) result.get(0);
-        String status = (String) result.get(1);
-        long rank = ((Number) result.get(2)).longValue();
-        long total = ((Number) result.get(3)).longValue();
+        String tokenId = (String) result.get(1);
+        String status = (String) result.get(2);
+        long rank = ((Number) result.get(3)).longValue();
+        long total = ((Number) result.get(4)).longValue();
+        long seq = ((Number) result.get(5)).longValue();
+        Instant issuedAt = parseIssuedAt((String) result.get(6));
 
         return switch (status) {
-            case "OK" -> EnqueueResult.ok(identifier, rank, total);
-            case "EXISTS" -> EnqueueResult.exists(identifier, rank, total);
+            case "OK" -> EnqueueResult.ok(identifier, tokenId, rank, total, seq, issuedAt);
+            case "EXISTS" -> EnqueueResult.exists(identifier, tokenId, rank, total, seq, issuedAt);
             case "FULL" -> EnqueueResult.full(identifier, total);
             default -> throw new IllegalStateException("Unknown status: " + status);
         };
+    }
+
+    private static Instant parseIssuedAt(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return null;
+        }
+        return Instant.ofEpochMilli(Long.parseLong(raw));
     }
 
     /**
@@ -97,31 +163,34 @@ public class RedisQueueEngine implements QueueEngine {
 
     /**
      * Bulk Lua Script 실행 (BatchProcessor가 사용).
-     * 반환 형식: [{identifier, status, rank, total}, ...]
+     * 반환 형식: [{identifier, tokenId, status, rank, total, seq, issuedAt}, ...]
      */
     @SuppressWarnings("unchecked")
-    public List<Object> executeBulkLua(String queueId, List<PendingEnqueue> batch, long maxCapacity) {
+    public List<Object> executeBulkLua(String queueId, List<PendingEnqueue> batch, long maxCapacity, Instant issuedAt) {
         String queueKey = QueueKeys.waiting(queueId);
         String seqKey = QueueKeys.seq(queueId);
+        String tokenKey = QueueKeys.tokens(queueId);
 
-        // ARGV 구성: maxCapacity, count, identifier1, identifier2, ...  (score 없음)
+        // ARGV 구성: maxCapacity, count, issuedAt, identifier1, tokenId1, identifier2, tokenId2, ...  (아이템당 2개)
         List<String> args = new ArrayList<>();
         args.add(String.valueOf(maxCapacity));
         args.add(String.valueOf(batch.size()));
+        args.add(String.valueOf(issuedAt.toEpochMilli()));
         for (PendingEnqueue pending : batch) {
-            args.add(pending.getIdentifier());   // identifier만 (한 번)
+            args.add(pending.getIdentifier());
+            args.add(pending.getTokenId());      // 후보 tokenId (OK일 때만 채택)
         }
 
         return (List<Object>) redisTemplate.execute(
                 enqueueBulkScript,
-                List.of(queueKey, seqKey),   // KEYS 두 개: [1]=waiting, [2]=seq
+                List.of(queueKey, seqKey, tokenKey),   // KEYS 세 개: [1]=waiting, [2]=seq, [3]=tokens
                 args.toArray()
         );
     }
 
     /**
      * enqueue_bulk.lua 결과 파싱 (BatchProcessor가 사용).
-     * 반환 형식: [{identifier, status, rank, total}, ...]
+     * 반환 형식: [{identifier, tokenId, status, rank, total, seq, issuedAt}, ...]
      *
      * <p>결과는 요청한 batch와 <b>같은 순서</b>로 반환된다. enqueue_bulk.lua의 루프는
      * 모든 분기(OK/EXISTS/FULL)에서 정확히 한 건씩 결과를 쌓기 때문이다.

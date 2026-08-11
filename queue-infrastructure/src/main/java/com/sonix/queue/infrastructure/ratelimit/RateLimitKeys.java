@@ -12,4 +12,6 @@ public final class RateLimitKeys {
     public static String publicEndPoint(String action, String ip) {
         return "rl:" + action + ":ip" + ip;
     }
+
+    public static String pollToken(String tokenId) {return "rl:poll:token:" + tokenId;}
 }

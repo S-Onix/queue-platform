@@ -73,6 +73,15 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        //Polling의 경우 API-KEY로 인증하지 않기 떄문에 선처리하여 확인한다.
+        if (isPollPath(request)) {
+            if (!checkPollRateLimit(request, response)) {
+                return;   // 429로 종료
+            }
+            filterChain.doFilter(request, response);
+            return;
+        }
+
         // 2) 인증 여부 확인
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
 
@@ -91,6 +100,27 @@ public class RateLimitFilter extends OncePerRequestFilter {
         filterChain.doFilter(request, response);
     }
 
+    /** GET /api/v1/queues/{queueId}/tokens/{tokenId} 형태만 poll로 인식. */
+    private boolean isPollPath(HttpServletRequest req) {
+        return "GET".equals(req.getMethod())
+                && req.getRequestURI().matches("/api/v1/queues/[^/]+/tokens/[^/]+");
+    }
+
+    /** tokenId 기준 Token Bucket. @return true=통과, false=거부(429 완료). */
+    private boolean checkPollRateLimit(HttpServletRequest req, HttpServletResponse res)
+            throws IOException {
+        String uri = req.getRequestURI();
+        String tokenId = uri.substring(uri.lastIndexOf('/') + 1);   // 마지막 세그먼트
+        String key = RateLimitKeys.pollToken(tokenId);
+
+        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, 5, 0.5);  // cap5, refill0.5/s  (로드테스트 튜닝)
+        if (!allowed) {
+            writeTooManyRequests(res, 2);   // 기존 429 응답기 재사용, Retry-After 2s
+            return false;
+        }
+        return true;
+    }
+
     /**
      * Rate Limit 적용 제외 endpoint.
      */
@@ -106,11 +136,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private boolean checkAuthenticatedRateLimit(
             TenantAuth tenantAuth, HttpServletResponse response) throws IOException {
 
-        //Optional<Tenant> tenantOpt = tenantRepository.findByTenantId(tenantAuth.getTenantId());
-        Optional<Tenant> tenantOpt = loadTenant(tenantAuth.getTenantId());
+        // PK로 조회한다. TenantAuth.tenantId(String)는 API-Key 인증 경로에서 null이라
+        // 그것으로 조회하면 항상 미스가 나고, 아래 분기가 모든 요청을 통과시켜
+        // Rate Limit이 사실상 꺼진 상태가 된다.
+        Optional<Tenant> tenantOpt = loadTenant(tenantAuth.getId());
 
         if (tenantOpt.isEmpty()) {
-            log.warn("Tenant not found for rate limit: tenantId={}", tenantAuth.getTenantId());
+            // 인증은 됐는데 Tenant가 없다 = 데이터 정합성 문제. 요청을 막지는 않되 드러나게 남긴다.
+            log.warn("Tenant not found for rate limit: id={}", tenantAuth.getId());
             return true;  // 통과 (인증 실패는 다른 Filter가 처리)
         }
 
@@ -148,7 +181,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return true;
         }
 
-        String ip = extractIp(request);
+        // 프록시가 없으므로 TCP peer가 유일한 사실. XFF는 클라이언트가 쓰는 값이라 신뢰 근거가 없다.
+        // LB 도입 시 server.forward-headers-strategy=native + internal-proxies로 처리한다(앱 코드 아님).
+        String ip = request.getRemoteAddr();
         String action = resolveActionName(path);
         String key = RateLimitKeys.publicEndPoint(action, ip);
 
@@ -175,10 +210,16 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * Cache Aside 패턴
      * 캐시에 있으면 캐시 없으면 DB 조회
      * */
-    private Optional<Tenant> loadTenant(String tenantId) {
-        return tenantCache.get(tenantId)
+    /**
+     * Tenant 조회 (Cache Aside).
+     *
+     * <p>PK로 조회하는 이유: JWT와 API-Key 두 인증 경로가 공통으로 확보하는 식별자가 PK뿐이다.
+     * API-Key는 {@code api_keys.tenant_id}(PK)만 들고 있어 {@code t_xxx} 형태를 모른다.
+     */
+    private Optional<Tenant> loadTenant(Long id) {
+        return tenantCache.get(id)
                 .or(() -> {
-                    Optional<Tenant> dbResult = tenantRepository.findByTenantId(tenantId);
+                    Optional<Tenant> dbResult = tenantRepository.findById(id);
                     dbResult.ifPresent(tenantCache::put);
                     return dbResult;
                 });
@@ -196,18 +237,6 @@ public class RateLimitFilter extends OncePerRequestFilter {
         if (path.equals("/api/v1/tenants/login")) return "login";
         if (path.equals("/api/v1/tenants/refresh")) return "refresh";
         return "unknown";
-    }
-
-    /**
-     * 실제 클라이언트 IP 추출.
-     * X-Forwarded-For 헤더 우선 (Nginx 등 프록시 거친 경우).
-     */
-    private String extractIp(HttpServletRequest request) {
-        String xForwardedFor = request.getHeader("X-Forwarded-For");
-        if (xForwardedFor != null && !xForwardedFor.isBlank()) {
-            return xForwardedFor.split(",")[0].trim();
-        }
-        return request.getRemoteAddr();
     }
 
     /**

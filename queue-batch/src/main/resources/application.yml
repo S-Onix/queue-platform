@@ -11,10 +11,25 @@ spring:
 
   autoconfigure:
     exclude:
-      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
-      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+
+  jpa:
+    # 요청이 끝날 때까지 DB 커넥션을 붙들지 않는다.
+    #
+    # enqueue는 배치 처리를 기다리느라 최대 1초를 블록하는데, OSIV가 켜져 있으면 그동안
+    # 커넥션을 점유한다. 동시 요청이 풀 크기를 넘는 순간 대기가 쌓이고, 인증 조회조차
+    # 커넥션을 못 받아 401/403이 쏟아진다(원인과 무관한 에러라 진단이 어렵다).
+    # 실측: on 22 req/s → off 627 req/s.
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate           # batch는 스키마 안 건드림
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        jdbc:
+          batch_size: 500          # 배치 INSERT 크기 (CHUNK와 맞춤)
+        order_inserts: true        # 같은 테이블 INSERT 모아 배치 효율↑
 
   data:
     redis:

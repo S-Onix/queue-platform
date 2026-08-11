@@ -7,7 +7,7 @@ package com.sonix.queue.infrastructure.queue;
  * ({@code ratelimit.RateLimitKeys}와 같은 이유 — Lua 원자 연산으로 다루는 원본 데이터)
  *
  * <p><b>해시태그 {@code {queueId}} 필수:</b>
- * enqueue_bulk.lua는 waiting/seq 두 키를 함께 넘겨받는다. Redis Cluster는
+ * enqueue_bulk.lua는 waiting/seq/tokens 세 키를 함께 넘겨받는다. Redis Cluster는
  * {@code CRC16(key) % 16384}로 슬롯을 정하는데, 해시태그가 없으면
  * {@code queue:q_bts:waiting}(slot 7911)과 {@code queue:q_bts:seq}(slot 11273)가
  * 서로 다른 마스터에 저장된다. Lua Script는 노드 한 대에서만 실행되므로
@@ -32,5 +32,15 @@ public final class QueueKeys {
     /** 큐별 전역 순번 카운터 (INCR). */
     public static String seq(String queueId) {
         return "queue:{" + queueId + "}:seq";
+    }
+
+    /** identifier -> tokenId 매핑 Hash (발급 원장 + EXISTS 재사용). */
+    public static String tokens(String queueId) {
+        return "queue:{" + queueId + "}:tokens";
+    }
+
+    /** inactive_ttl용 last-active ZSet (member=seq, score=timestamp ms). */
+    public static String lastActive(String queueId) {
+        return "queue:{" + queueId + "}:last-active";
     }
 }

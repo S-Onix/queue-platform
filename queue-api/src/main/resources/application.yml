@@ -14,11 +14,66 @@ spring:
     exclude:
       - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
-      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
   data:
     redis:
       sentinel:
         master: mymaster      # Sentinel Master 이름 (공통)
+
+  jpa:
+    # 요청이 끝날 때까지 DB 커넥션을 붙들지 않는다.
+    #
+    # enqueue는 배치 처리를 기다리느라 최대 1초를 블록한다. OSIV가 켜져 있으면 그동안
+    # 커넥션을 점유하므로, 동시 요청이 풀 크기를 넘는 순간 대기가 쌓이고 인증 조회조차
+    # 커넥션을 못 받아 401/403이 쏟아진다(원인과 무관한 에러라 진단이 어렵다).
+    #
+    # 실측(동시 200): on 22 req/s → off 627 req/s.
+    # 가상 스레드는 요청을 무한히 받지만 DB 커넥션은 유한하다는 점이 이 구조의 핵심 제약이다.
+    open-in-view: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092,localhost:9094,localhost:9096}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # outbox의 존재 이유가 유실 방지이므로 협상 불가한 값들.
+      #   acks=all      : ISR 전원이 받아야 성공 처리
+      #   idempotence   : 프로듀서 재시도로 인한 중복·순서 역전 방지
+      #                   (파티션 내 순서 보장의 전제 — 이게 꺼지면 재시도 시 뒤집힌다)
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5   # idempotence 켠 상태의 상한
+        # 컨슈머가 spring.json.use.type.headers=false 로 읽으므로 타입 헤더를 싣지 않는다.
+        # 양쪽이 어긋나면 역직렬화가 엉뚱한 타입으로 시도된다.
+        spring.json.add.type.headers: false
+
+        # ── 시한 설계 ────────────────────────────────────────────────
+        # 기본값(max.block 60s + delivery 120s)은 이 경로에 맞지 않는다. enqueue는 사용자가
+        # 응답을 기다리는 동기 요청이라, 발행이 오래 매달리면 호출자가 먼저 포기해버린다.
+        # 그러면 서버는 503을 만들어봐야 전달할 곳이 없고, 클라이언트는 성공·실패를
+        # 구분하지 못한 채 타임아웃만 본다(실측: 1,410건).
+        #
+        # 그래서 "발행은 빨리 확정되거나 빨리 실패한다"로 못박는다:
+        #   max.block(4s) + delivery(8s) = 최악 12s < 어댑터 대기 12s < 클라이언트 타임아웃
+        #
+        # ⚠️ 제약: delivery.timeout.ms >= linger.ms + request.timeout.ms
+        max.block.ms: 4000          # 버퍼 소진·메타데이터 대기로 send()가 매달리는 상한
+        request.timeout.ms: 3000    # 브로커 1회 응답 대기
+        delivery.timeout.ms: 8000   # 재시도까지 포함한 배달 시한
+
+        # 배칭으로 produce 요청 수를 줄인다. linger=0(기본)이면 요청마다 배치 1건이라
+        # acks=all 왕복이 건당 발생해 버퍼가 밀린다. 5ms만 모아도 배치당 수~수십 건이 되어
+        # 요청 수가 한 자릿수 배로 줄고, 그만큼 지연 상한도 안정된다.
+        linger.ms: 5
+
+# 토큰 생명주기 이벤트 발행 설정
+queue:
+  event:
+    topic: token-lifecycle
+    # 프로듀서의 최악 시한(max.block 4s + delivery 8s)보다 크게 잡는다.
+    # 더 짧으면 브로커가 아직 판정 중인데 우리가 먼저 포기하는 셈이라, 실제로는 발행에
+    # 성공한 건까지 실패로 보고하게 된다("모름"을 "실패"로 단정하는 것).
+    send-timeout-ms: 12000
 
 server:
   port: ${SERVER_PORT:8080}

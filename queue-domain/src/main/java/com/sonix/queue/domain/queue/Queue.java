@@ -63,6 +63,7 @@ public class Queue {
         return currentCount >= maxCapacity;
     }
 
+
     public static Queue reconstruct(Long id, String queueId, Long tenantId, String name,
                                     int maxCapacity,
                                     int waitingTtl, int inactiveTtl,

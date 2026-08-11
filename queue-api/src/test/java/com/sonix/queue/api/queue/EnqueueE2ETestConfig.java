@@ -1,5 +1,6 @@
 package com.sonix.queue.api.queue;
 
+import com.sonix.queue.domain.queue.EnqueueEventPublisher;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.tenant.Tenant;
@@ -45,9 +46,10 @@ public class EnqueueE2ETestConfig {
     @Bean
     public RedisQueueEngine redisQueueEngine(
             StringRedisTemplate redisTemplate,
-            @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript
+            @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
+            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript);
     }
 
     @Bean
@@ -56,8 +58,19 @@ public class EnqueueE2ETestConfig {
     }
 
     @Bean
-    public QueueEngineService queueEngineService(QueueRepository queueRepository, RedisQueueEngine engine) {
-        return new QueueEngineService(queueRepository, engine);
+    public QueueEngineService queueEngineService(QueueRepository queueRepository, RedisQueueEngine engine,
+                                                 EnqueueEventPublisher eventPublisher) {
+        return new QueueEngineService(queueRepository, engine, eventPublisher,
+                new QueueSnapshotCache(engine), java.time.Clock.systemUTC());
+    }
+
+    /**
+     * no-op 발행자. Enqueue 흐름(Redis) 검증에 집중하기 위해 Kafka 브로커를 띄우지 않는다.
+     * (Kafka 발행/소비의 실제 동작은 별도 통합 테스트에서 검증)
+     */
+    @Bean
+    public EnqueueEventPublisher enqueueEventPublisher() {
+        return event -> { /* no-op */ };
     }
 
     /**

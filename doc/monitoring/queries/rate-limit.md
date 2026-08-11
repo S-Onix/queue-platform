@@ -1,0 +1,185 @@
+# 조회 쿼리 — Rate Limit
+
+> RunBook: [`doc/monitoring/runbook/rate-limit.md`](../runbook/rate-limit.md)
+
+## 0. 준비
+
+```bash
+export DB_PASSWORD=queueapp1234
+alias MYR='mysql -h127.0.0.1 -P3307 -uqueueapp -p"$DB_PASSWORD" queue_platform -t'
+alias MYW='mysql -h127.0.0.1 -P3306 -uqueueapp -p"$DB_PASSWORD" queue_platform -t'
+alias RR='redis-cli -p 6380'    # 조회
+alias RW='redis-cli -p 6379'    # 쓰기
+```
+
+**위험 명령 금지**: `KEYS rl:*` (키가 수백만 개면 그 한 줄로 Redis가 멈춘다) · `FLUSHDB`/`FLUSHALL` (같은 DB에 대기열 ZSet이 있다) · `--scan` 결과를 파이프 없이 통째로 받는 것(수백만 줄).
+
+### 키 형식 요약
+
+| 경로 | 키 | 한도 | TTL |
+|---|---|---|---|
+| 폴링 | `rl:poll:token:{tokenId}` (Hash) | cap 5, refill 0.5/s **하드코딩** | 3600s |
+| 인증 후 | `rl:tenant:{tenantId}` (Hash) | Tenant `Plan` | 3600s |
+| signup | `rl:signup:ip{ip}:{윈도우번호}` (String) | 5 / 60s | 윈도우+1s |
+| login | `rl:login:ip{ip}:{윈도우번호}` | 10 / 60s | 윈도우+1s |
+| refresh | `rl:refresh:ip{ip}:{윈도우번호}` | 30 / 60s | 윈도우+1s |
+
+> 키에 콜론이 없다: `"rl:" + action + ":ip" + ip` (`RateLimitKeys.java:13`). 패턴 매칭 시 `rl:signup:ip*` 로 쓸 것.
+
+---
+
+## 1. 특정 대상이 왜 429인가 (Token Bucket)
+
+```bash
+TOK=tok_019...;  TENANT=t_xxx
+RR hgetall "rl:poll:token:$TOK"     # tokens(남은 토큰, 실수), lastRefillMillis
+RR ttl     "rl:poll:token:$TOK"
+RR hgetall "rl:tenant:$TENANT"
+```
+
+| `tokens` 값 | 판정 |
+|---|---|
+| ≥ 1.0 | 다음 요청 통과 |
+| < 1.0 | **지금 거부 상태.** 1.0까지 회복에 `(1 - tokens) / refill` 초 소요 (폴링이면 refill 0.5/s) |
+| 0에 붙어 있음 | 지속 초과. 클라이언트가 한도보다 빠르게 폴링 중 |
+| 키 없음 | 아직 요청이 없었거나 TTL 만료(1시간 무요청) |
+
+**폴링 한도의 구조적 문제**: refill 0.5/s = 2초당 1건인데 `nextPollAfterSec` 최솟값도 2초(`QueueEngineService.java:91`).
+대기열 앞쪽(rank ≤ 50) 사용자는 **여유 0의 경계선**에서 폴링한다. 지터·재시도·중복 탭 하나면 429다.
+
+---
+
+## 2. Fixed Window 현재 카운트 (signup/login/refresh)
+
+```bash
+IP=127.0.0.1; ACTION=signup; LIMIT=5
+WIN=$(( $(date +%s%3N) / 60000 ))                 # 윈도우 크기 60,000ms 기준
+RR get "rl:$ACTION:ip$IP:$WIN"
+RR ttl "rl:$ACTION:ip$IP:$WIN"
+```
+
+| 값 | 판정 |
+|---|---|
+| `> LIMIT` (signup 5 / login 10 / refresh 30) | 이 윈도우에서 거부 중. `ttl`초 뒤 자동 회복 |
+| `nil` | 이 윈도우 첫 요청 전 |
+| `ttl` = -1 | **이상.** `fixed-window.lua:33`의 EXPIRE가 안 걸렸다 |
+
+---
+
+## 3. ★ LB 뒤 단일 IP 버킷 검출 (Sprint 11 self-DoS 조기 발견)
+
+```bash
+# 고유 IP 버킷 개수 — '몇 개인가'가 아니라 '1개뿐인가'를 본다
+for A in signup login refresh; do
+  N=$(RR --scan --pattern "rl:$A:ip*" -i 0.01 | sed 's/:[0-9]*$//' | sort -u | wc -l)
+  echo "$A: 고유 IP 버킷 $N개"
+done
+RR --scan --pattern 'rl:signup:ip*' -i 0.01 | head -10
+```
+
+| 결과 | 판정 |
+|---|---|
+| 고유 IP 수 ≈ 실제 클라이언트 IP 수 | 정상 |
+| **1~2개**인데 429가 쏟아짐 | **`server.forward-headers-strategy: native` 누락 확정.** 전 요청이 LB 사설 IP 하나로 집계 |
+| IP가 사설 대역(10.x / 172.16–31.x / 192.168.x) | LB/프록시 IP다. 같은 원인 |
+
+```bash
+# 설정 존재 확인 (없으면 확정)
+grep -rn "forward-headers-strategy" queue-api/src/main/resources/
+```
+
+**즉시 조치** (60초짜리 임시방편):
+```bash
+RR --scan --pattern 'rl:signup:ip10.0.1.7*' -i 0.01 | xargs -r -n 200 redis-cli -p 6379 del
+```
+**근본 조치**: `application-prod.yml`에 `server.forward-headers-strategy: native` 추가 + 재배포. (앱 코드 수정 아님.)
+
+---
+
+## 4. Rate Limit이 꺼진 것처럼 보일 때
+
+```bash
+LOG=<queue-api 로그>
+grep -c "Tenant not found for rate limit" $LOG     # 0이 아니면 그 테넌트는 무제한
+RR --scan --pattern 'rl:tenant:*' -i 0.01 | wc -l
+```
+
+| 관찰 | 판정 |
+|---|---|
+| `Tenant not found` 로그 있음 | `RateLimitFilter.java:144-148`이 통과시킨다. **고아 API Key 확정** |
+| `rl:tenant:*` 키 0개 + 트래픽 있음 | 필터가 아예 안 탄다. 경로가 `/actuator/`로 시작하는지, 필터 체인 순서가 바뀌지 않았는지 확인 |
+| `rl:tenant:*` 키 수 ≈ 최근 1시간 요청 테넌트 수 | 정상 (TTL 3600s) |
+
+```sql
+-- 고아 API Key 찾기 (Replica). api_keys는 작아서 조인해도 안전
+SELECT k.id, k.tenant_id, k.status
+FROM api_keys k LEFT JOIN tenants t ON t.id = k.tenant_id
+WHERE t.id IS NULL;
+
+-- 조치 (Master). 되돌리기: status 원복
+UPDATE api_keys SET status = <REVOKED> WHERE id = <id>;
+```
+
+```sql
+-- Tenant 등급별 한도 확인 (Plan enum: FREE/STARTER/PRO/ENTERPRISE)
+SELECT tenant_id, plan, status FROM tenants WHERE tenant_id = 't_xxx';
+```
+
+---
+
+## 5. 키 개수·TTL 위생 점검
+
+```bash
+RR info keyspace                                     # db0: keys=..., expires=...
+# 표본 50개의 TTL만 확인. 전수 스캔 금지
+RR --scan --pattern 'rl:*' -i 0.01 | head -50 | \
+  while read k; do echo "$(redis-cli -p 6380 ttl "$k") $k"; done | sort -n | head -10
+```
+
+| 관찰 | 판정 |
+|---|---|
+| TTL이 전부 양수 | 정상. 개수가 많아도 1시간 내 자연 감소 |
+| TTL `-1`인 `rl:` 키 존재 | **이상.** Lua의 EXPIRE가 안 걸렸다 → `RW script exists <sha>` 로 스크립트 확인 |
+| `rl:poll:token:*` 수 >> 활성 대기자 수 | **랜덤 tokenId 공격 의심** (키가 공격자 통제값) |
+
+```bash
+# 대량 정리가 꼭 필요할 때 — --scan 사용. KEYS 절대 금지
+RR --scan --pattern 'rl:poll:token:*' -i 0.01 | xargs -r -n 500 redis-cli -p 6379 del
+```
+되돌리기 불필요(전원 한도가 초기화되어 잠시 관대해질 뿐).
+
+---
+
+## 6. HTTP 측 지표 (PromQL)
+
+```promql
+# 429 총량 — uri 라벨을 걸지 마라
+sum(rate(http_server_requests_seconds_count{status="429"}[5m]))
+
+# 429 비율
+sum(rate(http_server_requests_seconds_count{status="429"}[5m]))
+/
+sum(rate(http_server_requests_seconds_count[5m]))
+```
+
+| 지표 | 정상 | 이상 |
+|---|---|---|
+| 429 비율 | **기준선 수집 필요.** 폴링 한도가 경계값 설계라 정상 트래픽에서도 얼마가 나오는지 데이터가 없다. **SDK 붙은 실사용 3일치를 재라. 1%를 넘으면 한도 설계 자체를 재검토** | |
+| 429 절대량이 0 | Rate Limit이 꺼졌을 가능성 → §4 | |
+
+**주의 2가지**
+1. `uri` 라벨이 `UNKNOWN`으로 집계될 가능성이 높다 — 필터가 DispatcherServlet 전에 응답을 끝낸다. (**실측 확인 필요.**)
+2. HTTP 429는 **Rate Limit(RL001)과 정원 초과(Q005)가 공유**한다. 메트릭만으로 구분 불가 — 응답 본문의 `error` 필드로 봐야 한다.
+
+---
+
+## 7. Lua 스크립트 무결성 (드물지만 치명적)
+
+```bash
+RW info memory | grep -E 'used_memory_lua|number_of_cached_scripts'
+RW info commandstats | grep -E 'cmdstat_(eval|evalsha|script)'
+```
+`cmdstat_eval`(EVALSHA가 아닌 EVAL)이 계속 증가하면 스크립트 캐시가 매번 미스 중이다 —
+Redis 재기동/failover 직후에 잠깐 나타나면 정상, 지속되면 조사 대상.
+
+**`SCRIPT FLUSH`는 실행하지 마라.** 전 WAS가 동시에 EVAL로 재등록하며 순간 부하가 튄다.

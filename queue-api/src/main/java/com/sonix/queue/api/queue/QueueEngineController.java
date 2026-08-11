@@ -3,6 +3,7 @@ package com.sonix.queue.api.queue;
 import com.sonix.queue.api.common.response.ApiResponse;
 import com.sonix.queue.api.queue.dto.EnqueueRequest;
 import com.sonix.queue.api.queue.dto.EnqueueResponse;
+import com.sonix.queue.api.queue.dto.PollResponse;
 import com.sonix.queue.api.security.TenantAuth;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import jakarta.validation.Valid;
@@ -49,5 +50,31 @@ public class QueueEngineController {
         EnqueueResult result = queueEngineService.enqueue(tenantAuth.getId(),queueId, request.getIdentifier());
         EnqueueResponse response = EnqueueResponse.from(queueId, result);
         return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    /**
+     * 대기 상태 폴링 (End-user 브라우저가 Platform 직접 호출).
+     *
+     * <p>GET /api/v1/queues/{queueId}/tokens/{tokenId}?seq={mySeq}&ka={0|1}
+     *
+     * <p><b>인증 없음(permitAll)</b> — tokenId 소유가 곧 자격(capability).
+     * enqueue/admit 등과 달리 X-API-Key를 받지 않는다. 실제 유효성은
+     * 서비스에서 tokenId·seq로 판정하며, 미존재 시 404(TOKEN_NOT_FOUND).
+     *
+     * @param queueId 대기열 ID
+     * @param tokenId 대기 토큰(자격 증명)
+     * @param seq     enqueue 때 발급된 내 순번(mySeq) — rank/keepalive 기준
+     * @param ka      keepalive 플래그(30~60s에 1회만 1) — inactive_ttl 갱신
+     */
+    @GetMapping("/{queueId}/tokens/{tokenId}")
+    public ResponseEntity<ApiResponse<PollResponse>> poll(
+            @PathVariable String queueId,
+            @PathVariable String tokenId,
+            @RequestParam long seq,
+            @RequestParam(defaultValue = "false") boolean ka
+
+    ){
+        PollResult result = queueEngineService.poll(queueId, tokenId, seq, ka);
+        return ResponseEntity.ok(ApiResponse.ok(PollResponse.from(result)));
     }
 }

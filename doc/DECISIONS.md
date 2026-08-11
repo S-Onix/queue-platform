@@ -2893,7 +2893,8 @@ public enum Plan {
 **왜 IP 기반 인증 전 한도인가**:
 - Tenant 식별 불가 (인증 안 됨)
 - IP가 유일한 식별자
-- X-Forwarded-For 헤더 우선 (Nginx 프록시 대응)
+- IP는 `request.getRemoteAddr()`(TCP peer)만 신뢰. 현재 프록시가 없으므로 `X-Forwarded-For`는 클라이언트가 임의로 쓰는 값이고, 이를 키로 쓰면 헤더만 바꿔 한도를 무한 우회할 수 있다 (실증됨)
+- LB/Nginx 도입(Sprint 11) 시에는 앱 코드가 아니라 `server.forward-headers-strategy=native`(RemoteIpValve) + internal-proxies 설정으로 처리한다
 
 **왜 NAT 공유 IP에도 한도 너무 엄격하지 않은가**:
 - 회사 100명 동시 가입 = 같은 IP
@@ -2919,7 +2920,7 @@ public enum Plan {
 
 ### Interview Point
 
-> "Rate Limit Filter는 JWT 인증 뒤에 배치합니다. JWT 파싱이 먼저 SecurityContext에 Tenant 정보를 저장하고, RateLimitFilter가 그 정보로 Plan 한도를 적용합니다. 인증 전 endpoint(signup/login/refresh)는 IP 기반 + Fixed Window로 Brute Force와 회원가입 남용을 방지합니다. X-Forwarded-For 헤더로 실제 IP를 추출하고, NAT 공유 IP 대비 한도를 너무 엄격하게 잡지 않습니다."
+> "Rate Limit Filter는 JWT 인증 뒤에 배치합니다. JWT 파싱이 먼저 SecurityContext에 Tenant 정보를 저장하고, RateLimitFilter가 그 정보로 Plan 한도를 적용합니다. 인증 전 endpoint(signup/login/refresh)는 IP 기반 + Fixed Window로 Brute Force와 회원가입 남용을 방지합니다. 이때 IP는 TCP peer(`getRemoteAddr()`)만 씁니다. 프록시가 없는 구성에서 X-Forwarded-For를 신뢰하면 공격자가 헤더만 바꿔 매 요청 다른 버킷을 만들어 한도를 무력화할 수 있기 때문입니다. LB를 두게 되면 앱 코드가 아니라 RemoteIpValve(신뢰 프록시 목록)로 헤더를 검증해 처리합니다. NAT 공유 IP 대비 한도는 너무 엄격하게 잡지 않습니다."
 
 ### Related
 
@@ -3054,6 +3055,13 @@ public RedisScript<Long> fixedWindowScript() {
 
 ## 66. Sprint 8+ — Redis Cluster 도입 결정 (Sentinel → Cluster 확장)
 
+> ⚠️ **부분 폐기 — §75(2026-08-11)로 대체됨.**
+> Cluster로 간다는 방향은 **확정**되었으나, 이 절의 다음 두 가지는 더 이상 유효하지 않다.
+> ① **"Sprint 10 전환" 시점** → 미정으로 재설정 (§75 D29)
+> ② **단일 Cluster를 Master 추가로 확장한다는 전제** → **독립 2 Cluster + 큐 단위 이중 라우팅**으로 대체 (§75 D25·D26).
+>    §70 D10의 해시태그 때문에 한 큐가 Master 한 대에 고정되므로, 단일 Cluster 확장은 단일 대형 큐(최악 30만)에 효과가 없다.
+> 아래 Rationale·수치(3배/16배 등)는 **2026-07-08 시점의 계획 근거**로 보존한다. 지우지 않는다.
+
 **Date**: 2026-07-08
 **Context**: Sprint 5-D 완료 후 대규모 확장 대비 검토. 현재 Sentinel은 데이터 총량 한계 (Master 1대 메모리), Master Single Thread 병목이 명확. Multi-tenant SaaS로 성장 시 Tenant 30+ 시점에 인프라 전환 필요.
 
@@ -3130,6 +3138,12 @@ public RedisScript<Long> fixedWindowScript() {
 ---
 
 ## 67. Sprint 12+ — 이중 라우팅 아키텍처 (Cluster + Hash Tag)
+
+> ⚠️ **§75(2026-08-11)에서 확정·구체화됨.**
+> 이 절이 "Sprint 12+ 계획"으로 적어둔 Layer 1(Cluster 선택)이 **채택 확정**되었고,
+> §75가 두 가지를 못 박았다: **라우팅 단위 = 큐 1개**(D26), **큐 생성 시 배정 후 고정**(D27).
+> 반면 이 절의 **Sprint 번호(12/15+)와 "Least Load 알고리즘"·Tenant Tier 기준은 확정이 아니다**
+> — §75의 배정 기준은 "cluster1 master 50% 초과 시 cluster2"이며 임계 정의는 미정이다.
 
 **Date**: 2026-07-08
 **Context**: Cluster만으로는 자동 slot 분배에 의존해 부하 편차 제어 불가. 대형 Queue 하나가 특정 Master로 몰릴 때 다른 Master로 회피 불가. 애플리케이션의 세밀한 제어 필요.
@@ -3438,3 +3452,600 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 - `doc/CONCURRENCY.md` §6.5 (Multi-key Lua + Hash Tag)
 - `doc/FLOW.md` (Enqueue 결정 근거 D1-D10)
 - `queue-infrastructure/.../queue/QueueKeys.java`, `ratelimit/RateLimitKeys.java` (선례)
+
+---
+
+## 71. Sprint 5-E / 9+ — Enqueue 저장 순서(Redis → DB) 확정 + DB → Redis 복구 설계
+
+**Date**: 2026-07-27
+**Context**: enqueue 영속화가 **Redis(순서 부여) → Kafka → DB(비동기 적재)** 순서로 구현돼 있으나, (1) 왜 이 순서인가, (2) Redis 전손 시 DB로 어떻게 복구하는가가 문서화되지 않았다. §70 D9(`INCR seq`)로 seq를 Redis가 부여하고 DB `tokens.seq`에 저장하는데, **이 seq 저장이 복구의 열쇠**이므로 순서와 복구를 함께 확정한다.
+
+### Decision
+
+**D11 — Enqueue 저장 순서: Redis 먼저, DB 나중 (비동기)** (구현 완료, Sprint 5-E)
+- **Redis = 순서 진실원천**(seq·ZSet). enqueue 도착 즉시 `INCR`/`ZADD NX` 원자 부여 → 202 응답.
+- **DB = 내구 원장**. Kafka(현재) 또는 Redis Stream outbox(후속) 경유 **비동기** 적재.
+- seq는 **Redis가 부여, DB `tokens.seq`에 저장**(복구용).
+- ⚠️ 대비 — **종료 경로(만료/complete)는 반대: DB 먼저 → Redis 정리**. 그땐 최종 과금 상태의 권위가 DB이므로. → "권위가 어디냐"가 순서를 결정.
+
+**D12 — 복구 3계층 (DB 재구성은 최후수단)** (설계, 구현 후속)
+1. **Sentinel failover → replica 승격**(데이터 보유) → 복구 불필요 [최빈]
+2. **Redis AOF/RDB → 재시작 시 디스크 재적재** [Redis 자체 durability]
+3. **DB → Redis 재구성** → 1·2 모두 실패한 **전손 시** [disaster recovery]
+
+**D13 — DB → Redis 재구성 절차** (큐 단위, **분산락으로 큐 잠금 후** 실행)
+```
+① waiting ZSet:  SELECT user_id, seq FROM tokens WHERE queue_id=? AND status=0 (WAITING)
+                 → ZADD queue:{q}:waiting {seq} {user_id}        (청크 페이징, 배치 ZADD)
+② seq 카운터:    SELECT MAX(seq) FROM tokens WHERE queue_id=?    (모든 status! NULL이면 0)
+                 → SET queue:{q}:seq {maxSeq}                    (사용된 번호 재발급 방지)
+③ tokens 해시:   WAITING rows → HSET queue:{q}:tokens {user_id} {token_id}
+④ admit 키:      status=1(ADMIT_ISSUED) AND admit_token IS NOT NULL AND issued_at > now-60s
+                 → SET admit-token-by-token:{token_id} ... EX {남은 60s}   (양방향)
+                 (60s 초과분은 복원 안 함 → 배치가 returnToWaiting 처리)
+⑤ last-active:   재구성 안 함(비움) → 다음 폴링(ka=1)이 재populate. inactive_ttl 리셋뿐 무해
+```
+
+### Rationale
+
+**왜 Redis 먼저 (DB auto-increment로 seq 못 매기는 이유)**:
+- **타이밍** — 위치는 enqueue 순간(동기) 필요, DB insert는 async(수 초 후) → auto-inc는 너무 늦어 202/폴링에 순위 못 줌
+- **순서** — DB auto-inc = insert 순서(Kafka 파티션 병렬·Consumer 배치) ≠ **도착 순서** → FIFO 뒤집힘. `INCR`은 도착 순간 단일스레드 원자 → 정확
+- **단위** — auto-inc는 tokens 테이블 전역, 필요한 건 **큐별** 순번(`INCR queue:{q}:seq`는 자연히 큐별)
+- → **seq는 Redis가 부여, DB는 저장만**. 부여는 Redis, 기억은 DB.
+
+**왜 복구를 waiting ZSet 스캔이 아니라 DB로 하나 / 왜 seq 순으로**:
+- waiting ZSet은 **mutable**(admit/cancel/만료 시 ZREM) → "현재 대기자"이지 "모든 enqueue 로그"가 아님 → 소스로 부적합
+- DB `tokens.seq`로 `ZADD score=seq` → **원래 순서 그대로 복원**(rank 보존). seq를 DB에 저장한 값어치가 여기서 실현
+
+**왜 last-active는 복구 안 하나**:
+- DB에 "마지막 폴링 시각"이 없음. 비워도 무해 — 다음 폴링이 채우고 inactive_ttl만 리셋
+
+### Consequences
+
+**긍정**:
+- **DB가 안전망** → Redis 전손도 순서까지 정확 복구 가능 (seq 저장 = 복구 가능성의 근거)
+- 복구 계층화로 대부분(failover/AOF)은 자동 처리, DB 재구성은 드문 최후수단
+
+**부정**:
+- **복구 완전성 = DB 신선도만큼만**. async 적재 지연 중 Redis엔 있었지만 DB 미반영된 enqueue는 복구 불가 = 현재 **fire-and-forget Kafka의 유실 gap**. → **Outbox(Redis Stream) + 대사(reconciliation)**로 보강 (후속 과제)
+- 대용량 큐(수백만 대기) 재구성 = 청크 페이징 + 배치 ZADD 필요(메모리·시간)
+- 재구성 중 신규 enqueue와 경쟁 → **큐 분산락** 필요(재구성 원자성)
+
+**중립**:
+- 재구성 **트리거**: (a) lazy — enqueue/poll 시 `queue:{q}:seq` 없는데 DB에 WAITING 존재하면 rebuild, 또는 (b) admin/startup 잡. ZADD는 멱등이라 부분 재실행 안전
+- ADMIT_ISSUED-이나-60s-초과 토큰은 논리적으로 waiting 복귀 대상 → 배치가 재구성 후 정리
+
+### Interview Point
+> "enqueue의 순번은 Redis가 `INCR`로 부여하고 DB `tokens.seq` 컬럼에 저장합니다. DB auto-increment를 안 쓴 이유는 세 가지인데, 첫째 위치는 사용자가 enqueue하는 순간 필요한데 DB 적재는 Kafka를 거쳐 수 초 뒤 비동기라 너무 늦고, 둘째 auto-increment는 insert 순서를 반영하는데 그건 Kafka 파티션 병렬·Consumer 배치 때문에 도착 순서와 달라 FIFO가 뒤집히며, 셋째 auto-increment는 테이블 전역이라 큐별 순번을 못 줍니다. 그래서 Redis가 도착 순간 원자적으로 부여하고 DB는 저장만 합니다. 이 저장이 복구의 핵심인데, Redis가 전손되면 복구는 3계층입니다. 대부분은 Sentinel failover로 replica가 승격해 복구가 필요 없고, 그다음이 AOF/RDB 재적재, 최후수단이 DB 재구성입니다. DB 재구성은 큐를 분산락으로 잠근 뒤 WAITING 토큰을 seq 순서로 ZADD하면 대기 순서까지 정확히 복원됩니다. 여기서 주의할 점은 복구 완전성이 DB 신선도만큼이라, 비동기 적재 지연 중 Redis엔 있었지만 DB에 아직 안 들어간 enqueue는 유실될 수 있다는 겁니다. 현재 발행이 fire-and-forget이라 이 gap이 존재하고, Redis Stream Outbox와 대사(reconciliation)로 보강하는 게 후속 과제입니다. 그리고 복구 소스로 live waiting ZSet을 쓰면 안 되는데, admit/cancel로 멤버가 빠져나가는 mutable 구조라 짧게 살다 간 토큰을 놓치기 때문입니다. append-only인 DB(또는 outbox)가 소스여야 합니다."
+
+### Related
+- §70 (`INCR seq`·Hash Tag — 복구의 근거), §66 (Cluster/failover)
+- `doc/STATE.md` (Token 상태 0=WAITING/1=ADMIT_ISSUED), `doc/schema.sql` (tokens.seq/admit_token 컬럼)
+- memory: `sprint5-token-kafka-progress`(Kafka 적재·fire-and-forget gap), `token-ttl-design`(returnToWaiting)
+
+---
+
+## 72. Sprint 5-E 개정 — Enqueue DB 영속화: Kafka 제거 → Redis List outbox + @Scheduled + ShedLock
+
+**Date**: 2026-07-27
+**Context**: 5-E는 enqueue→DB 적재를 Kafka(`enqueue-events` 토픽 + `@KafkaListener` Consumer)로 구현했다(§70, `sprint5-token-kafka-progress`). Kafka 클러스터 운영 부담을 제거하고 **API 서버 내 처리**로 변경한다. 단 "API 서버 내 스케줄러"의 두 함정(**크래시 유실·스파이크 OOM**)을 피하려면 스케줄러가 읽을 소스가 **durable append-only**여야 한다. 이 결정은 §71 D11의 "적재 수단"을 Kafka에서 구체화하는 것으로, §71의 순서(Redis→DB)·복구(DB→Redis)는 그대로 유효하다.
+
+### Decision
+
+**Kafka 제거. Enqueue DB 영속화 = Redis List outbox + `@Scheduled` 소비 + ShedLock(리더 선출).**
+
+- **소스 = Redis List** (durable, append-only). ~~waiting ZSet~~(mutable → cancel/admit로 빠진 토큰 유실), ~~in-memory~~(유실/OOM) 배제.
+- **List(not Stream)인 이유**: **DB가 영구 원장**이라 처리 후 outbox 데이터를 보존할 필요가 없음(replay·다중 소비 need 없음) → **ack=삭제(LREM)로 자동 청소**가 딱 맞음. Stream의 로그 보존·XTRIM은 오버스펙.
+- **reliable-queue 패턴**: `RPUSH pending` → `LMOVE pending→processing`(claim, 안 지움) → 배치 INSERT(멱등) → `LREM processing`(ack=삭제). **reaper**가 processing에 오래 방치된 것(죽은 워커)을 pending으로 재-queue.
+- **중복방지(N대)**: **ShedLock(리더 1대, 직렬)**. List엔 consumer group 분배가 없으므로. DB 드레인 ~1.5만/s를 1대가 감당 → 충분.
+- **격리**: 소비를 **전용 스레드 + 별도 HikariCP 풀**(bulkhead)로 → 영속화가 요청용 커넥션·스레드 고갈 안 시킴.
+
+### Rationale
+
+- **왜 durable 소스 필수**: 스케줄러는 "소비자"일 뿐, 유실 방지엔 append-only durable **소스**가 별도로 필요. Redis-first라 그 소스가 Redis에 산다. 스케줄러가 소스를 없애주지 않는다.
+- **왜 List(not Stream)**: 소비자가 "DB 저장" 하나뿐 + DB=원장이라 완료분 보존 불필요 → `ack=LREM=삭제` 자동청소. Stream의 log/consumer-group/replay는 이 용도엔 짐(+ XTRIM 청소 부담).
+- **at-least-once + 멱등**: 순서는 반드시 **insert 먼저 → ack 나중**(ack 먼저면 크래시 시 유실=at-most-once). ack 실패 시 재처리로 **중복** 발생 → **멱등 insert**(`@SQLInsert ON DUPLICATE KEY UPDATE`)로 무해화. "안 놓치되 중복은 멱등으로".
+- **왜 ShedLock(not consumer group)**: List는 그룹 분배가 없어 N대가 같은 표를 집으면 중복 → 리더 1대만 드레인. 규모상 직렬로 충분(병렬 필요 시 Stream 승급).
+
+### Consequences
+
+**긍정**:
+- Kafka 클러스터 운영·의존성 제거. 개념 단순(List 명령). 완료분 자동 청소(XTRIM 불필요).
+- 포트 추상화 덕에 **어댑터·소비만 교체**, 도메인 로직 무변경.
+
+**부정**:
+- 영속화가 **API JVM에서** 실행 → 스파이크 때 heap/GC/CPU를 요청 처리와 **공유**(머신 격리 안 됨; Kafka는 별 머신이었음). → 전용 스레드+별도 DB 풀로 **스케줄링만 격리**, 리소스는 공유(트레이드오프 인지).
+- **리더 1대 직렬** → 영속화 처리량 = 1대 능력치. 병렬 필요 시 Stream+consumer group 승급.
+- **reliable-queue(processing+reaper)를 직접 구현**해야 함(Stream이면 XPENDING/XAUTOCLAIM 내장).
+- **poison message**(계속 insert 실패) → 무한 재시도로 outbox 정체 가능 → 재시도 한도+**dead-letter** 별도 필요(후속 과제).
+
+**중립**:
+- 제거 대상: `KafkaEnqueueEventPublisher`, `TokenEnqueueConsumer`(@KafkaListener), Kafka 토픽/리스너 설정·의존성, 관련 Kafka 테스트.
+- 유지: `EnqueueEventPublisher`(포트), `EnqueueEvent`, `TokenEntity`(멱등 insert)·`TokenRepository`·`TokenEnqueueService`, **seq는 Redis `INCR`**(§70 D9).
+- 교체: 발행 어댑터 Kafka send → **List `RPUSH`** / 소비 @KafkaListener → **@Scheduled 리커버리-큐 드레인**.
+
+### Interview Point
+> "enqueue의 DB 적재를 Kafka에서 Redis List outbox + 스케줄러로 바꿨습니다. 핵심은 스케줄러가 소비자일 뿐 유실 방지엔 durable append-only 소스가 따로 필요하다는 점인데, Redis-first 구조라 그 소스가 Redis에 삽니다. 대기열 ZSet은 admit·cancel로 멤버가 빠지는 mutable 구조라 짧게 산 토큰을 놓쳐 소스로 못 쓰고, in-memory는 크래시 유실·스파이크 OOM이라 안 됩니다. Stream이 아니라 List를 고른 이유는 DB가 영구 원장이라 처리 끝난 outbox 데이터를 보존할 필요가 없어서, ack을 곧 삭제(LREM)로 두는 자동 청소가 딱 맞기 때문입니다. Stream의 로그 보존·replay·XTRIM은 이 용도엔 오히려 짐입니다. 신뢰성은 pending에서 processing으로 LMOVE해 옮겨두고 DB insert 성공 후에만 LREM하는 reliable-queue 패턴으로 at-least-once를 보장하고, ack 실패 시 재처리로 생기는 중복은 tokenId 유니크 + ON DUPLICATE KEY의 멱등 insert로 무해화합니다. 서버가 여러 대라 같은 표를 중복 처리하지 않도록 ShedLock으로 리더 한 대만 드레인하는데, DB 드레인 속도를 한 대가 감당하는 규모라 직렬로 충분하고 병렬이 필요해지면 Stream의 consumer group으로 승급하면 됩니다. 트레이드오프는 영속화가 API JVM에서 돌아 스파이크 때 리소스를 요청과 공유한다는 점이라, 전용 스레드와 별도 커넥션 풀로 스케줄링을 격리했습니다."
+
+### Related
+- §71 (Redis→DB 순서·DB→Redis 복구 — 이 결정이 D11의 적재 수단을 구체화), §70 (`INCR seq`)
+- memory: `sprint5-token-kafka-progress` (제거 대상 Kafka 구현체 목록)
+- `doc/CONCURRENCY.md` (@DistributedLock/ShedLock — 리더 선출)
+
+---
+
+## 73. Sprint 5-E 재개정 — Enqueue 영속화: List → Stream → **Kafka 복귀** + 소비 전담 모듈 분리
+
+**Date**: 2026-08-10
+**Context**: §72로 Kafka를 걷어내고 Redis List outbox를 도입했으나, 이후 **Redis Stream(Consumer Group)으로 한 번 더 옮겼고 그 전환은 문서화되지 않았다**. 여기에 Sprint 6-7의 상태 전이(admit/complete/cancel/expire)를 설계하면서 **Stream으로는 풀 수 없는 요구**가 드러나 Kafka로 되돌린다. 세 세대(List → Stream → Kafka)를 한 절에 정리해, "왜 왔다 갔는가"가 기록에서 끊기지 않게 한다. §71의 순서(Redis→DB)·복구(DB→Redis)는 그대로 유효하며, 이 결정은 §72와 마찬가지로 **적재 수단만** 바꾼다.
+
+### Decision
+
+**D14 — List → Stream (중간 세대, 문서화만 하고 폐기)**
+- §72가 손으로 만들기로 했던 것 — `processing:{worker}` 목록, heartbeat, 워커 명단, reaper, ShedLock 리더 선출 — 이 **전부 Consumer Group + PEL의 기본 기능**이었다. 직접 구현분이 통째로 삭제됐다.
+- `LREM`은 **payload 바이트가 일치해야** 지워진다 → 재직렬화가 끼어들면 ack이 조용히 무력화. `XACK`은 **엔트리 ID 기준**이라 그 취약점이 구조적으로 없다.
+- 큐별 스트림 `queue:{queueId}:outbox` + 해시태그 → `enqueue_bulk.lua`가 waiting·seq·outbox를 **한 원자 단위**로 쓸 수 있는 길이 열렸다(§70 D10과 동일 슬롯).
+- 대가: `XACK`은 PEL에서만 빼고 **원본을 남긴다** → `XTRIM`(MINID+MAXLEN) 청소를 직접 해야 한다. List의 `ack=삭제` 자동 청소는 잃었다.
+
+**D15 — Stream → Kafka 복귀 (본 결정)**
+- 발행: `KafkaEnqueueEventPublisher`(infra 어댑터), 소비: **신설 `queue-consumer` 모듈**.
+- **`EnqueueEventPublisher` 포트는 그대로.** 도메인·서비스 코드 무변경 — 어댑터만 교체.
+
+**D16 — 파티션 키 = `tokenId`** (⚠️ 이 결정이 D15의 핵심)
+- 같은 토큰의 모든 이벤트가 같은 파티션 → **상태 전이 순서 보장**.
+- ~~`queueId`~~ 배제: 큐 카디널리티가 낮고 "한 큐에 30만 명"이 정상 시나리오라 **트래픽 99%가 한 파티션**에 몰린다(파티션을 늘려도 해결 안 됨). `tokenId`는 토큰마다 유일해 분산과 묶음을 동시에 얻는다.
+
+**D17 — 파티션 18 / `replication.factor=3` / `min.insync.replicas=2` / `acks=all` / `enable.idempotence=true`**
+- 18은 컨슈머 대수 후보(2·3·6·9)로 나눠떨어지는 값. **파티션은 줄일 수 없고, 늘리면 `hash % N`이 바뀌어 살아 있는 토큰의 순서 관계가 끊긴다**(토큰 수명 최대 `waitingTtl` 2시간) → 처음에 넉넉히 잡는 값.
+- `min.insync.replicas=1`이면 `acks=all`이 사실상 `acks=1`이 되어 리더 장애 시 유실 → 협상 대상 아님.
+
+**D18 — 토픽 = `token-lifecycle` (생명주기 통합 단일 토픽)**
+- Kafka의 순서 보장은 **같은 토픽의 같은 파티션** 안에서만 성립. `enqueue-events` / `token-status-changed`로 나누면 키가 같아도 `WAITING → ADMIT_ISSUED` 순서가 보장되지 않는다.
+- **컨슈머 그룹은 나누지 않는다.** 그룹 분리는 *팬아웃*(쓰기 대상이 다를 때)이지 *작업 분담*이 아니다. 같은 `tokens` 행을 두 그룹이 쓰면 각자 독립 offset으로 달려 순서가 다시 깨진다. 병렬화는 파티션이 담당한다. "전담 컨슈머"는 **한 리스너 안에서 핸들러 분기**로 표현한다.
+
+**D19 — 발행 시한: `max.block.ms=4000` + `request.timeout.ms=3000` + `delivery.timeout.ms=8000` + `linger.ms=5`, 어댑터 대기 `12000ms`**
+- 기본값(`max.block` 60s + `delivery` 120s)은 **동기 요청 경로에 맞지 않는다**. 발행이 오래 매달리면 호출자가 먼저 포기해 503을 전달할 곳이 없어진다.
+- 사슬: `max.block(4s) + delivery(8s) = 12s ≤ 어댑터 대기(12s) < 클라이언트 타임아웃`. 어댑터 대기를 프로듀서 최악 시한보다 **크게** 두는 이유는, 더 짧으면 브로커가 판정 중인데 우리가 먼저 포기해 **"모름"을 "실패"로 단정**하기 때문이다.
+
+**D20 — 소비를 `queue-consumer` 모듈로 분리 (≠ queue-batch)**
+- **확장 방향이 반대**다. 소비는 유입량에 비례해 파티션 수만큼 늘려야 하고, 스케줄 작업(TTL 만료 감지·파티션 정리)은 늘릴수록 중복 실행 방지 장치가 필요해진다. 한 프로세스에 두면 어느 쪽도 제대로 늘릴 수 없다.
+- `queue-batch`는 껍데기로 남긴다(Sprint 7·9에서 채운다). consumer에는 **`@EnableScheduling`을 붙이지 않는다** — 붙이면 infra의 `@Scheduled` 빈까지 함께 돌아 이중 적재가 된다.
+
+### Rationale
+
+- **왜 Stream을 버리는가 ① 순서**: Stream의 Consumer Group은 **건별 배분**이라 같은 토큰의 두 이벤트가 다른 소비자에게 갈 수 있다. 순서를 얻으려면 소비자를 1대로 묶거나(=§72 ShedLock 회귀, 병렬 포기) 스트림을 `outbox:{hash(tokenId)%N}`으로 샤딩해야 하는데 **후자는 파티션을 손으로 재구현하는 것**이다. Kafka의 파티션은 "쪼갬 + 순서 경계 + **그룹 내 독점**"을 한 번에 준다. 셋째가 핵심이고 Stream에 없는 것도 그것뿐이다.
+- **왜 Stream을 버리는가 ② 복구 완전성**: outbox가 대기열 ZSet과 **같은 Redis 인스턴스**에 살면 상관 실패(correlated failure)다. 전손 시 잃어버린 데이터와 **"무엇을 잃었는지 알려줄 증거"가 함께 사라진다**. §71 D12/D13이 남긴 "복구 완전성 = DB 신선도만큼" 갭을 메울 수단이 Stream엔 없다. Kafka는 다른 머신·디스크·3중 복제라 Redis 전손과 **독립 사건**이 되어, `MAX(seq)` 이후를 replay해 갭을 메울 수 있다.
+- **갭 크기 비교(판단이 뒤집힌 지점)**: Lua 원자화가 막는 갭은 "Lua 성공 ~ 발행 사이 프로세스 크래시" = **수 ms**. Redis 전손 갭은 "마지막 적재 이후 유입분" = **수 초~수 분**. 폭이 100배 이상 다르다 — Lua 원자성을 결정적 근거로 삼은 것은 영향 폭 기준으로 과대평가였다.
+- **포기하는 것**: `XADD`를 `enqueue_bulk.lua`로 옮겨 at-least-once를 완성하는 길. Redis와 Kafka 사이엔 분산 트랜잭션이 없어 **이 갭은 Kafka에서 영구적**이다 → **reconciliation(정합성 대사)이 필수 후속 과제**가 된다.
+- **왜 순서 보장이 정확성의 유일한 근거가 되면 안 되는가**: 파티션 순서는 평시 대부분을 커버하지만 **리밸런스 재처리·파티션 증설·DLT 격리·프로듀서 재시도**에서 깨진다. 순서는 "평소에 단순하게", 별도 방어는 "그래도 틀리지 않게"를 담당한다(상태 전이 설계는 §후속).
+- **왜 실패를 2분류하는가**: 제약 위반은 재시도해도 결과가 같아 뒤의 정상 항목까지 막고(독약), 일시 장애를 격리하면 멀쩡한 수백 건을 버린다. Spring Kafka 기본값은 예외를 가리지 않고 재시도 후 격리 → `addNotRetryableExceptions(DataIntegrityViolationException)`으로 명시해야 한다. 배치 리스너는 인덱스 없이 던지면 **배치 전체가 DLT로** 가므로, 이분 탐색으로 범인 인덱스를 찾아 `BatchListenerFailedException`으로 **한 건만** 격리한다(§72가 List에서 만든 이분 탐색 로직의 이식).
+
+### 실측 (2026-08-10, 로컬 100만건 enqueue)
+
+| 지점 | 결과 |
+|---|---|
+| 부하 | 1,000,000 성공 / 실패 0 / 429 0 / 625s (1,600 RPS, 평균 593ms) |
+| Redis `ZCARD` = `seq` = DB `tokens` | 1,000,001 전부 일치 |
+| `DISTINCT token_id` / `DISTINCT seq` | 중복 0, seq 결번 0 |
+| consumer lag / DLT | 0 / 0 |
+| 파티션 분포(18개) | 편차 **1.4%** — D16이 의도대로 동작 |
+
+**1차 시도는 1,410건 실패**했는데 원인은 애플리케이션이 아니라 **WSL2 VM suspend 16.8분**이었다. 진단 근거: 모노토닉 625.9s vs 벽시계 1,634s(차이 1,008s), `/proc/uptime`이 벽시계보다 67분 적음, Kafka 배치 만료 age가 정확히 1,004.8s, DB에 16분 공백. **`HttpTimeoutException`·Kafka `TimeoutException`은 "패킷이 안 갔다"가 아니라 "시간이 지났다"** — 정지 중 벽시계만 흐르다 재개 순간 타이머가 일괄 발화한 것이다(네트워크는 끊긴 적 없음: Redis·MySQL 에러 0, ISR 정상). 이때 **835건이 "Redis엔 있고 DB엔 없는 유령 토큰"**으로 남아, D15가 예고한 발행 갭이 실측으로 확인됐다.
+
+### Consequences
+
+**긍정**:
+- 토큰 단위 **순서 보장 + 소비 병렬화**를 동시에 확보(Stream은 양자택일이었다).
+- outbox가 Redis 밖으로 나가 **전손과 독립** → §71 D13 복구에 "Kafka replay로 DB 미적재분 보충" 계층이 추가 가능.
+- Redis 메모리 압박 해소. outbox가 부풀어 `waiting` ZSet을 evict할 위험이 사라졌다.
+- 소비 코드 대폭 감소: 회수(`XCLAIM`)·트림·그룹 생성·큐 목록 캐시·회전 커서·예산 3상수가 통째로 삭제. 배치 크기는 `max.poll.records` 하나로 결정된다(Stream의 `COUNT`는 스트림별이라 큐 수에 비례해 폭주했다).
+- 자원 격리: 적재가 API JVM 밖(별도 프로세스·머신)으로 나가 §72가 인지한 트레이드오프가 해소됐다.
+
+**부정**:
+- **Kafka 클러스터 운영 부담이 돌아온다**(§72가 없애려던 것). KRaft 3브로커.
+- **발행 원자성의 길이 닫힌다.** `XADD`를 Lua로 옮기는 경로가 사라져 발행 갭이 영구화 → **reconciliation 스위퍼 필수**.
+- **파티션 증설이 위험 작업**이 된다(D17). 순서에 의존하는 대가.
+- **head-of-line blocking이 큐 경계를 넘는다.** Stream은 큐마다 독립 스트림이라 한 큐가 막혀도 다른 큐는 멀쩡했지만, 이제 여러 토큰이 파티션을 공유한다.
+- 역직렬화 자체가 실패한 항목은 값이 null이고 원본이 헤더에 남는다 → 원문 보존하려면 `DelegatingByTypeSerializer` 필요(후속).
+
+**중립**:
+- 제거: `RedisStreamOutboxPublisher/Consumer`, `OutboxKeys`, `OutboxDrainScheduler`, `TokenEnqueueService`, `EnqueueOutbox`·`OutboxEntry`·`DeadLetterReason`, 관련 테스트. `QueueRepository.findDrainableQueueIds`도 호출자가 사라져 함께 제거(Kafka는 브로커가 배분하므로 "훑을 큐 목록" 개념이 없다).
+- 유지: `EnqueueEventPublisher`(포트), `EnqueueEvent`, `TokenEntity`(멱등 insert)·`TokenRepository`, **seq는 Redis `INCR`**(§70 D9), 해시태그(§70 D10 — Lua 통합 목적은 사라졌지만 큐 상태 키의 슬롯 일관성은 유효).
+- `ShedLock` 리더 선출은 D14(Stream) 시점에 이미 불필요해졌고 Kafka에서도 필요 없다.
+
+### Interview Point
+> "enqueue 적재를 Redis List → Stream → Kafka 순으로 두 번 바꿨습니다. List에서 Stream으로 간 건 reliable-queue를 손으로 만들던 것 — 워커별 처리 목록, heartbeat, reaper, 리더 선출 — 이 전부 Consumer Group과 PEL의 기본 기능이었기 때문입니다. 그런데 Stream을 다시 버린 이유가 둘인데, 첫째는 순서입니다. Sprint 7에 admit·complete 같은 상태 전이가 들어오면 같은 토큰의 이벤트 순서가 필요한데, Stream의 consumer group은 건별로 배분해서 같은 토큰의 두 이벤트가 다른 소비자에게 갈 수 있습니다. 순서를 얻으려면 소비자를 한 대로 묶어 병렬을 포기하거나 스트림을 해시로 샤딩해야 하는데, 후자는 결국 파티션을 손으로 재구현하는 겁니다. Kafka 파티션의 본질은 쪼개는 능력이 아니라 쪼갠 것을 그룹 안에서 한 소비자가 독점한다는 규칙이고, Stream에 없는 게 정확히 그것뿐입니다. 둘째는 복구인데, outbox가 대기열 ZSet과 같은 Redis에 살면 전손 시 잃은 데이터와 무엇을 잃었는지 알려줄 증거가 같이 사라집니다. Kafka는 다른 머신이라 독립 사건이 되고, DB 최대 seq 이후를 replay해 갭을 메울 수 있습니다. 대신 포기한 게 있는데, Redis Stream이었다면 XADD를 Lua 안에 넣어 순번 부여와 이벤트 기록을 한 원자 단위로 묶을 수 있었지만 Redis와 Kafka 사이엔 분산 트랜잭션이 없어 그 길이 닫힙니다. 다만 그 갭은 프로세스 크래시 순간의 수 밀리초인 반면 Redis 전손 갭은 수 초에서 수 분이라, 영향 폭으로 보면 후자를 막는 게 맞다고 판단했습니다. 남는 갭은 정합성 대사로 메웁니다. 파티션 키는 tokenId인데, queueId로 잡으면 티켓팅처럼 한 큐에 30만 명이 몰리는 게 정상인 서비스라 트래픽이 통째로 한 파티션에 가서 파티션을 늘려도 소용이 없습니다. 실제로 100만건을 넣어보니 18개 파티션 편차가 1.4%였고, Redis와 DB 카운트가 정확히 일치하며 순번 중복도 결번도 0이었습니다."
+
+### Related
+- §72 (이 결정이 뒤집는 대상 — Kafka 제거·List 채택), §71 (Redis→DB 순서·복구 — 여전히 유효), §70 (`INCR seq`·Hash Tag)
+- `scripts/kafka/create-topics.sh` (D17 — 파티션 수 불일치 감지 포함)
+- `queue-consumer/` (D20), `queue-infrastructure/.../queue/KafkaEnqueueEventPublisher.java` (D16·D19)
+- 후속 과제: reconciliation 스위퍼(유령 토큰 복구), `DelegatingByTypeSerializer`(DLT 원문 보존), 상태 전이 순서 설계(Sprint 6-7)
+
+---
+
+## §74 — 폴링 소유권 검증: seq 존재 판정 → tokenId 대조 (Lua 원자 1회)
+
+**일자**: 2026-08-11 · **Sprint 5-E** · **관련**: §63(Rate Limit 신뢰 경계), §70(INCR seq·Hash Tag), §71(복구)
+
+### Context
+
+`GET /api/v1/queues/{queueId}/tokens/{tokenId}?seq&ka` 는 **permitAll**이다. 브라우저가 Platform을
+직접 폴링하는 구조라 API Key도 JWT도 받지 않고, 설계 의도는 **"tokenId 소유가 곧 자격(capability)"** 이었다.
+
+그런데 구현은 tokenId를 한 번도 보지 않았다. `isWaiting(queueId, seq)` 로 **seq 존재만** 확인했다.
+`seq`는 `INCR` 발급이라 `1, 2, 3...`으로 추측이 자명하다. 즉 자격 증명이 URL에 실려 있는데 검사하지 않아,
+**아무나 `?seq=1&ka=1`을 반복해 남의 대기 항목 inactive_ttl을 무한 연장**할 수 있었다.
+
+피해는 "남의 자리를 뺏는 것"이 아니라 **"남의 자리를 대신 지켜주는 것"** 이다. 이탈했어야 할 유령 대기자가
+계속 살아남아 앞자리를 점유하고, inactive 판정 배치가 통째로 무력화된다.
+
+### Decision
+
+**D21 — 검증과 keepalive를 `poll_verify.lua` 하나로 묶는다 (원자 1회)**
+
+```
+ZRANGEBYSCORE waiting seq seq  →  identifier      (없으면 0)
+HGET tokens identifier         →  "tokenId|issuedAt"
+'|' 앞부분과 제시된 tokenId를 문자열 비교           (불일치면 0)
+keepalive='1'이면 ZADD lastActive nowMillis seq
+return 1
+```
+
+**D22 — 도메인 포트에서 `isWaiting`·`touchLastActive`를 삭제하고 `verifyWaiting` 하나로 통합한다**
+
+```java
+boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis);
+```
+
+**D23 — tokenId는 반드시 문자열 비교. Lua에서 `tonumber`를 태우지 않는다**
+`tok_` + UUIDv7이므로 숫자 변환은 `nil`이 되어 모든 비교가 통과하거나 실패하는 사고가 된다.
+
+**D24 — `ZADD` member는 `ARGV[1]` 원문을 그대로 쓴다**
+`tostring(tonumber(x))`는 Lua 5.1의 `%.14g` 포맷을 거쳐 Java가 만든 문자열과 어긋날 수 있다.
+이 member는 inactive_ttl 배치가 seq로 되읽을 값이다.
+
+### Rationale
+
+**왜 왕복을 나누면 안 되는가 (D21의 핵심)**
+
+검증(read)과 touch(write)를 분리하면 이 순서가 성립한다.
+
+```
+1. 검증 통과            (이 시점엔 항목이 있다)
+2. ← admit 또는 이탈로 waiting에서 제거됨
+3. touch 실행           → 이미 사라진 seq의 last-active가 되살아난다 (좀비)
+```
+
+Redis 스크립트는 단일 실행이므로 세 명령 사이에 아무것도 끼어들 수 없다. 부수적으로 RTT도 2회 → 1회.
+
+**왜 포트를 합쳤는가 (D22)**
+
+두 메서드가 분리돼 있는 한 **"검증 없이 touch"** 를 다시 호출할 수 있다. 그게 정확히 이번 결함이다.
+API 표면에 남겨두면 같은 실수가 재발한다. 호출처가 `poll()` 하나뿐이라 합치는 쪽이 diff도 작다.
+
+`keepalive`·`nowMillis`가 도메인 포트에 노출되는 것은 구현 세부 누출로 보일 수 있으나 **정당하다.**
+이 둘을 분리하는 순간 원자성이 깨지고, 그게 방금 고친 결함이기 때문이다. 포트가 표현해야 하는 것은
+"검증한다"와 "갱신한다"가 아니라 **"검증에 성공한 경우에만 갱신한다"** 라는 하나의 불가분 연산이다.
+
+**버린 대안**
+
+| 대안 | 버린 이유 |
+|---|---|
+| Java에서 `isWaiting` → `HGET` 비교 → `ZADD` 3회 왕복 | 위 좀비 경쟁이 그대로 남는다. RTT 3배 |
+| 검증만 Lua, touch는 별도 호출 | 같은 이유. 원자성이 절반만 생긴다 |
+| 폴링에 인증(API Key/JWT) 부여 | 브라우저 직접 폴링 전제(β)가 깨진다. 범위 밖 |
+| tokenId 대신 seq에 서명을 붙여 검증 | 발급 경로 전체 변경 필요. 현 구조에서 Hash 대조로 충분 |
+
+**fail-closed 설계**
+`tokens` Hash가 유실되면 `HGET`이 nil → `0` → 404다. "못 찾으면 통과"가 아니라 **"못 찾으면 거부"** 다.
+Redis 유실 후 복구 전 폴링은 404를 받는데, 이는 §71 복구 과제와 함께 다룬다.
+
+**상태코드를 단일화한 이유**
+"존재하지만 남의 것"과 "아예 없음"을 모두 `TOKEN_NOT_FOUND`(404)로 반환한다.
+구분하면 공격자가 **seq 열거로 대기열 점유 상태를 읽어낼 수 있다.**
+
+### 검증 (2026-08-11)
+
+악의적 사용자 전제로 실 Redis 20건 + 순수 Mockito 2건. 전체 **202 tests / 0 failures**.
+
+| 공격 | 결과 |
+|---|---|
+| 교차 탈취 (남의 seq + 내 tokenId, 양방향) | false, `last-active` 미기록 |
+| TTL 연장 연타 `ka=true` × 100 | zcard 끝까지 **0** |
+| seq 열거 1~50 / 경계값 `0·-1·Long.MAX·MIN` | 예외 없이 전부 false |
+| 구분자 주입 `tok_X\|999`, `\|tok_X` | 전부 false |
+| 이상 tokenId 13종 (NUL·개행·`\r\nHGETALL`·Lua 조각·10KB·이모지) | 예외 없이 전부 false |
+| 큐 교차 (A의 유효 쌍 → B) | A=true, B=false |
+| `tokens` Hash 유실 / admit 이탈 후 keepalive | fail-closed, 좀비 없음 |
+
+**`|` 주입이 통하지 않는 이유**: Lua는 **저장값**만 `|`로 자르고 **입력값**은 그대로 비교한다
+(`storedTokenId ~= tokenId`). `tok_X|999`를 제시해도 저장된 `tok_X`와 문자열이 다르다.
+
+### Consequences
+
+**긍정**
+- permitAll 엔드포인트에 실제 자격 검사가 생겼다. 설계 의도(capability)와 구현이 일치.
+- 좀비 last-active가 원천 차단되어 inactive_ttl 배치(Sprint 7/9)의 판정 근거가 신뢰 가능해졌다.
+- 포트가 하나로 줄어 "검증 없이 touch" 경로가 API 표면에서 사라졌다.
+
+**부정**
+- 폴링이 `ZCOUNT`(read 1회) → **EVAL 3키**로 바뀌었다. Lua는 write로 분류되어 **replica 라우팅 여지가 사라진다.**
+  현재 `ReadFrom` 미설정(전부 master)이라 회귀는 아니지만, 30만 폴링 규모의 실측은 **없다(미검증)**.
+- `last-active` ZSet은 여전히 `ZADD`만 있고 `ZREM`·`EXPIRE`가 **전 소스에 0건**이다.
+  이벤트 100회면 3천만 멤버가 영구 적재된다 → **inactive_ttl 배치에서 "판정 후 ZREM"을 같은 스크립트에 넣을 것.**
+
+**중립 / 남는 전제**
+- **score 유일성을 암묵 전제**한다(`members[1]`만 채택). 현재는 `INCR`이 보장하나,
+  §71 DB→Redis 복구가 중복 score를 주입하면 뒤로 밀린 사용자가 **영구 404**가 된다.
+  → 복구 스크립트에 seq 유일성 단언이 필요하다.
+- `last-active` score의 출처는 요청을 받은 **WAS의 벽시계**다. NTP 미동작 시 조기 EXPIRE 가능.
+  배치 판정을 Redis `TIME` 기준으로 통일하면 오차원이 하나로 준다.
+- tokenId가 URL 경로에 실리므로 로그·리퍼러로 유출되면 소유권 증명이 무력하다. 서명 토큰(HMAC)은 후속.
+
+### Interview Point
+
+> "폴링 엔드포인트가 인증이 없는 대신 tokenId 소유를 자격으로 삼는 설계였는데, 정작 코드가 tokenId를 안 보고 seq 존재만 확인하고 있었습니다. seq는 INCR로 발급해서 1부터 훑으면 되니까, 아무나 남의 순번에 keepalive를 걸어서 이탈했어야 할 대기자를 계속 살려둘 수 있었습니다. 흥미로운 건 이게 '남의 자리를 뺏는' 공격이 아니라 '남의 자리를 대신 지켜주는' 공격이라, 피해자는 아무 이상을 못 느끼고 뒷사람 전체가 손해를 본다는 점입니다. 고칠 때 검증만 추가하면 될 것 같지만 그러면 안 되는데, 검증하고 나서 갱신하는 사이에 그 사람이 admit되거나 이탈하면 이미 사라진 순번의 last-active가 되살아나기 때문입니다. 그래서 Lua 스크립트 하나에 조회, 대조, 갱신을 다 넣어서 원자적으로 처리했습니다. 도메인 포트도 isWaiting과 touchLastActive 두 개를 verifyWaiting 하나로 합쳤는데, 두 개로 남겨두면 '검증 없이 touch'를 다시 호출할 수 있어서 같은 실수가 재발하기 때문입니다. 포트가 표현해야 하는 건 '검증한다'와 '갱신한다'가 아니라 '검증에 성공한 경우에만 갱신한다'라는 불가분 연산이라고 봤습니다. 검증할 때는 정상 사용자가 아니라 공격자를 가정하고 시나리오를 짰습니다. 구분자 주입이나 개행 섞은 Redis 명령 주입, 10KB 문자열 같은 것까지 넣어봤고, 특히 테스트가 진짜 회귀를 잡는지 확인하려고 고친 코드를 일부러 되돌려서 테스트가 실패하는 것까지 봤습니다. 테스트가 있다는 것과 테스트가 작동한다는 건 다른 문제라서요."
+
+### Related
+- §63 (Rate Limit — 같은 뿌리의 결함: 신뢰할 수 없는 입력을 권한·한도의 근거로 삼음)
+- §70 D9/D10 (`INCR seq`가 유일성을 보장한다는 전제, Hash Tag로 3키 동일 슬롯)
+- §71 (DB→Redis 복구 — seq 유일성 제약을 여기서 지켜야 한다)
+- 리뷰 기록: `doc/reviews/2026-08-11-poll-ownership-xff.md`
+- 후속: `last-active` 정리 로직(Sprint 7/9), 폴링 Rate Limit 키 카디널리티, 폴링 부하 실측
+
+
+---
+
+## §75 — Redis 배포 방식 확정: Sentinel → 독립 2 Cluster + 큐 단위 이중 라우팅
+
+**일자**: 2026-08-11 · **관련**: §66(Cluster 도입 계획 — 이 결정이 시점·목적을 재설정), §67(이중 라우팅 — 이 결정이 구체화), §70 D10(Hash Tag), §74(poll_verify 3키), §73(findDrainableQueueIds 제거)
+
+### Context
+
+**현재 구성 (2026-08-11 기준, 코드 확인)**
+- 인프라: Master 6379 + Slave 6380/6381 + Sentinel 26379/26380/26381 (Sprint 5-A, `INFRA_SETUP.md` §6)
+- 애플리케이션: `RedisConfig.redisConnectionFactory()`가 `RedisSentinelConfiguration`으로 `LettuceConnectionFactory` **단일 빈**을 만든다. 연결처가 하나라는 전제가 코드에 박혀 있다
+- `spring.data.redis.sentinel.*`가 **api / batch / consumer 세 모듈의 yml 9개**에 흩어져 있음
+- api / batch / consumer는 **모두 N대 전제**다 (같은 날 확정). Redis는 세 종류 프로세스 × N대가 공유하는 유일한 상태 저장소다
+
+**이미 있는 것 (전부 이번 결정의 준비물)**
+- 로컬 Cluster 학습 환경 **2벌**: Cluster A(7001-7008), Cluster B(8001-8008), 각 4 Master + 4 Replica × 1GB. Failover 실증 + **완전 독립성 확인** 완료 (`doc/INFRA_SETUP.md` §6.5)
+- 큐 상태 키에 §70 D10의 `queue:{queueId}:...` 해시태그 **선제 적용**
+- `QueueKeys.java` 클래스 주석에 이미 예고돼 있다:
+  > "Sprint 12+ 이중 라우팅 도입 시 태그를 shard 단위로 옮긴다 (`queue:{shard_X}:{queueId}:waiting`)."
+
+  즉 이번 결정은 새 방향이 아니라 **이미 코드 주석과 §67에 예고돼 있던 경로의 확정**이다. 로컬에 클러스터를 **둘** 띄우고 독립성까지 확인해 둔 것도 이 그림을 전제한 준비였다.
+
+§66(2026-07-08)의 "Sprint 10에 Cluster 전환"은 **계획**이었고 확정이 아니었다.
+
+### Decision
+
+**D25 — Redis는 Cluster로 간다. 단, 단일 Cluster의 자동 샤딩이 목적이 아니다.**
+**독립된 2개 Cluster + 애플리케이션 레벨 이중 라우팅**이 목표 형태다.
+- cluster1의 master가 **50% 이상 차면** 이후 데이터는 cluster2에 쌓는다
+- **cluster1의 (용량) 방어 역할을 cluster2가 맡는다**
+
+**D26 — 라우팅 단위는 "쓰기 1건"이 아니라 "큐 1개"다. (확정)**
+한 큐의 키 4종 — `queue:{q}:waiting` / `:seq` / `:tokens` / `:last-active` — 은 **반드시 같은 클러스터**에 놓인다.
+요청 단위·토큰 단위로 클러스터를 고르는 방식은 **채택하지 않는다.**
+
+> 이것은 선호가 아니라 **Lua 원자성을 유지하려면 강제되는 제약**이다.
+> 해시태그는 *한 클러스터 안의* 슬롯만 정렬한다. **클러스터 경계는 못 넘는다.**
+> 한 큐가 두 클러스터에 걸치면 `enqueue_bulk.lua`(3키)와 `poll_verify.lua`(3키)는
+> **같은 EVAL로 보낼 수조차 없다.** CROSSSLOT은 한 클러스터 *안*의 문제고, 클러스터가 다르면
+> 그 이전 단계 — 커넥션이 다르다 — 에서 실행 자체가 불가능하다.
+
+**D27 — 큐 → 클러스터 매핑은 큐 생성 시점에 정해져 큐 수명 동안 고정된다 (sticky).**
+매핑이 고정이면 운영 중 데이터 이동이 없으므로 마이그레이션 문제 자체가 사라진다.
+이 매핑은 WAS N대가 **같은 답**을 봐야 하는 **영속 상태**다.
+
+**D27-1 — 매핑은 `queues` 테이블의 별도 컬럼에 저장한다. (확정, 2026-08-11)**
+현재 `doc/schema.sql`의 `queues`에는 해당 컬럼이 없으므로 **스키마 변경이 선행 작업**이다.
+컬럼명·타입은 dba가 정한다. `Queue` 도메인 필드 추가와 생성 시 배정 로직이 함께 필요하다.
+
+**D27-2 — 이미 배치된 큐는 옮기지 않는다. 새 큐만 cluster2로 간다. (확정, 2026-08-11)**
+따라서 rebalancing 절차·마이그레이션 도구가 **필요 없다.** 매핑이 불변이므로 라우팅 캐시에
+무효화 로직도 없다 — 한 번 읽으면 영구히 유효하다.
+
+**D27-3 — 50% 임계는 master 노드 *각각* 을 개별 판정한다. replica 포함, `maxmemory` 대비 비율. (확정, 2026-08-11)**
+합계가 아니다. **master 4대 중 하나라도** 자기 `maxmemory`의 50%를 넘으면 그 클러스터는
+신규 큐를 받지 않는다 — 가장 뜨거운 노드가 기준이다.
+합계로 재면 한 노드가 90%여도 평균이 50% 미만이면 계속 배정되어, 정작 터지는 노드를 못 막는다.
+
+> ⚠️ **전제 충돌**: 리뷰에서 `maxmemory 0`(무제한) 권고가 나온 바 있다. `maxmemory`가 0이면
+> "대비 비율"이 성립하지 않는다. 이 판정을 쓰려면 **`maxmemory`를 반드시 설정**해야 한다.
+> 현재 로컬은 1GB로 설정돼 있다(D2 결정 — admit 구현까지 이 값 유지).
+
+> **측정 주기·캐시 위치·히스테리시스(임계 진동 시 큐가 번갈아 배정되는 문제)는 여전히 미정이다.**
+
+**D27-4 — 큐에 종속되지 않는 키는 cluster1에 고정한다. (확정, 2026-08-11)**
+`rl:*`(Rate Limit), `apikey:*`, `tenant:*`, `refresh-token:*` 등 특정 큐에 속하지 않는 키가 대상이다.
+전부 **단일 키 연산**이라 해시태그·CROSSSLOT 제약이 없고, 어느 클러스터에 두든 동작은 같다.
+양쪽에 나눠 두면 Rate Limit 카운터가 클러스터별로 갈라져 **한도가 2배로 늘어나는** 문제가 생기므로,
+한쪽 고정이 맞다.
+
+> ⚠️ **감수하는 대가 — cluster2가 방어하지 못하는 부류가 생긴다.**
+> `rl:poll:token:{tokenId}`는 실측상 **요청 1건당 키 1개, TTL 약 1시간**이다
+> (랜덤 tokenId 50회 → 키 50개 신규 생성). 즉 이 키 부류는 **큐 개수가 아니라 요청량에 비례**한다.
+>
+> cluster1 고정이면 cluster1을 50%로 밀어올리는 **가장 빠른 요인이 정작 cluster2가 손댈 수 없는 것**이 된다.
+> 신규 큐를 cluster2로 보내도 cluster1의 Rate Limit 키는 계속 쌓인다.
+> → 이 구조에서 cluster1의 메모리 여유는 **폴링 Rate Limit 키의 카디널리티 문제**(§74 후속)와
+> 직접 연결된다. 그쪽을 먼저 해결하지 않으면 D25의 50% 임계가 큐 배정과 무관한 이유로 먼저 도달한다.
+
+**D28 — Sentinel은 폐기가 아니라 격하다.** 학습·로컬 실습 자산으로 남긴다.
+`doc/sprint-5/REDIS_SENTINEL.md`, `INFRA_SETUP.md` §6, Sprint 5-A 이력 서술은 **그대로 보존**한다.
+(→ `ARCHITECTURE_ROADMAP.md` §4.4의 "T+1일 Sentinel 폐기"는 이 결정과 충돌한다. 폐기 여부는 미정으로 재설정)
+
+**D29 — 다음은 이 결정에 포함되지 않는다. 미정이다.**
+
+| 미정 항목 | 상태 |
+|---|---|
+| 50% 판정의 측정 주기·캐시 위치 | 미정 (판정 기준 자체는 D27-3에서 확정) |
+| 임계 히스테리시스 | 미정 — 50% 부근에서 진동하면 큐가 두 클러스터에 번갈아 배정된다 |
+| 클러스터 개수 | 미정 — 2개 고정인가, N개 확장형으로 설계하는가 |
+| 전환 시점 (어느 Sprint) | 미정 — §66의 "Sprint 10", `QueueKeys` 주석의 "Sprint 12+" 모두 **확정 아님** |
+| 프로덕션 노드 구성 | 미정 — 로컬은 4 master + 4 replica × 1GB × 2, §69의 목표는 4×4×4GB로 적혀 있으나 **확정 여부 확인 필요** |
+| 로컬 Sentinel 환경 폐기 여부 | 미정 (D28에 따라 기본은 존치) |
+
+> **확정으로 옮겨간 항목** (2026-08-11 사용자 결정): 50% 임계 정의 → D27-3 /
+> 매핑 저장 위치 → D27-1 / rebalancing → D27-2 / 큐 비종속 키의 소속 → D27-4
+
+### Rationale
+
+**왜 단일 Cluster의 자동 샤딩이 아닌가**
+
+단일 Cluster를 키우는 방식이었다면 §70 D10의 `{queueId}` 해시태그가 곧 한계가 된다. 태그는 한 큐의 모든 키를 **한 슬롯 = 한 Master**에 못 박으므로, Master를 3대로 늘리든 16대로 늘리든 **그 큐의 부하는 흩어지지 않는다.** 이 서비스의 최악 케이스가 **단일 큐 30만 대기**라는 점을 감안하면, 단일 Cluster의 "Master 수만큼 선형 확장"은 **큐가 여러 개일 때만** 성립하는 이야기다.
+
+이번 결정은 그 축을 바꾼다. 한 큐를 쪼개 여러 노드에 퍼뜨리는 대신, **큐 단위로 클러스터를 나눠 담는다.** 확장의 단위가 "슬롯"에서 "큐"로 올라간 것이다.
+
+**왜 하나의 큰 Cluster가 아니라 독립된 둘인가**
+
+cluster1이 차오를 때 노드를 추가하는 대신 cluster2로 신규 큐를 보낸다. 이때 두 클러스터가 **완전히 독립**이라는 점이 핵심이다 — 슬롯 재분배도, 리샤딩 중 마이그레이션도, 한쪽 장애의 전파도 없다. 로컬에서 A/B를 띄우고 "완전 독립성"을 먼저 확인해 둔 것이 이 성질을 겨냥한 것이다.
+
+**이 결정이 코드 주석과 정합한다**
+
+`QueueKeys.java`가 예고한 **"이중 라우팅"이라는 방향 자체는** 이 결정과 맞물린다. 새 방향이 아니라 예고된 경로의 확정이다.
+
+> ⚠️ **다만 그 주석이 제시한 구체적 형태(`queue:{shard_X}:{queueId}:waiting`)는 이제 틀렸다.**
+> 그것은 **한 클러스터 안에서 샤딩**할 때의 계획이다. 독립 2 클러스터 + 큐 단위 라우팅에서는
+> **클러스터 선택이 곧 샤딩**이므로 태그를 바꿀 이유가 없다.
+> 오히려 `{shard_X}`로 묶으면 **여러 큐가 한 슬롯에 몰려** 지금보다 나빠진다
+> (현재 `{queueId}` 태그는 큐마다 슬롯이 흩어진다 — 이게 맞는 상태다).
+>
+> **결론: `QueueKeys`와 Lua 스크립트 2개는 전환 시 변경 없음.** 전환 비용을 크게 줄이는 사실이다.
+> `QueueKeys.java`의 해당 주석은 정정 대상이다(코드 수정 필요 — 이번 문서 작업 범위 밖).
+
+**버린 대안**
+
+| 대안 | 버린 이유 |
+|---|---|
+| 단일 Cluster를 Master 추가로 키움 | 해시태그 때문에 단일 대형 큐의 부하가 안 흩어진다. 30만 단일 큐가 주요 시나리오인 서비스에 안 맞음 |
+| 쓰기 1건 단위 클러스터 선택 | `enqueue_bulk.lua`·`poll_verify.lua`가 실행 불가. Lua 원자성을 포기해야 함 (D26 근거) |
+| Sentinel 유지 + Master Scale-Up | 저장 총량이 Master 1대 메모리로 묶인다 (§66) |
+
+### Consequences
+
+아래는 **현재 코드·스키마에서 확인한 사실**과 그로부터 따라오는 제약이다.
+
+**① 다중 키 Lua는 한 클러스터 안에서는 이미 준비돼 있다**
+
+| 스크립트 | KEYS | 키 | 같은 슬롯? |
+|---|---|---|---|
+| `enqueue_bulk.lua` | 3 | `queue:{q}:waiting`, `:seq`, `:tokens` | O (태그 `{q}`) |
+| `poll_verify.lua` (§74) | 3 | `queue:{q}:waiting`, `:tokens`, `:last-active` | O |
+| `token-bucket.lua` | 1 | `rl:tenant:{id}` | 무관 |
+| `fixed-window.lua` | 1 | `rl:{action}:ip{ip}` | 무관 |
+
+큐 키 문자열은 `QueueKeys.java` 한 곳에서만 만들어진다 (main 소스의 `"queue:` 리터럴 4건이 전부 그 파일). 태그 누락 경로가 현재는 없다.
+
+**② 새 키를 태그 없이 기존 Lua의 KEYS에 끼우면 그 순간 깨진다**
+Sentinel에서는 아무 일도 없고 Cluster에서만 `CROSSSLOT Keys in request don't hash to the same slot`으로 실패한다. **로컬 Sentinel 테스트로는 절대 잡히지 않는 부류의 결함**이다. 새 큐 상태 키는 반드시 `QueueKeys`를 거치게 하고, 다중 키 Lua는 로컬 Cluster A에서 한 번 돌려봐야 한다.
+
+**③ "어느 큐가 어느 클러스터에 있는가"는 잃으면 안 되는 영속 상태다**
+이 매핑을 잃으면 **데이터가 어디 있는지 알 수 없다.** 인메모리 맵·설정 파일로는 부족하다 — api/batch/consumer가 각각 N대이므로 **모든 프로세스가 같은 답**을 봐야 하고, 재기동 후에도 같아야 한다.
+
+> **스키마 영향 (확인함)**: `doc/schema.sql`의 `queues` 테이블에는
+> `id / queue_id / tenant_id / name / max_capacity / waiting_ttl / inactive_ttl / status / created_at / deleted_at` 만 있다.
+> **클러스터·shard를 담을 컬럼이 없다.** D27-1(=`queues` 컬럼 저장)에 따라 **스키마 변경이 선행 작업**이다:
+> `queues` 컬럼 추가 + `Queue` 도메인 필드 추가 + 생성 시 배정 로직. 컬럼명·타입은 DBA 몫이므로 여기서 DDL을 쓰지 않는다.
+>
+> **부수 이점**: 큐 조회 경로에 이미 있는 테이블이라 **매핑을 얻는 데 추가 왕복이 생기지 않는다.**
+> D27-2(불변)와 합치면 **라우팅 캐시에 무효화 로직이 필요 없다** — 값이 안 바뀌므로 TTL도 evict 이벤트도 없다.
+> api/batch/consumer가 각각 N대인 환경에서 "어느 인스턴스가 아직 옛 매핑을 보고 있는가"라는 문제 자체가 성립하지 않는다.
+
+**④ 50% 판정은 "가장 뜨거운 노드"가 기준이다 (D27-3 확정)**
+master 노드 **각각을 개별 판정**하고, replica를 포함하며, `maxmemory` **대비 비율**로 잰다. 합계·평균이 아니다.
+
+| 항목 | 확정 내용 |
+|---|---|
+| 판정 단위 | master **노드별 개별** — 하나라도 50% 초과면 그 클러스터는 신규 큐를 받지 않음 |
+| replica | **포함** |
+| 기준값 | `maxmemory` **대비 비율** (절대 바이트 아님) |
+
+**여기서 따라 나오는 운영 전제 2건**
+1. **`maxmemory`를 반드시 설정해야 한다.** 0(무제한)이면 "대비 비율"이 계산되지 않아 배정 로직이 성립하지 않는다. `doc/reviews`의 Redis 설정 점검에 `maxmemory 0` 권고가 있으므로 **이 결정과 충돌한다 — 전환 시 재조정 필요.**
+2. **노드별 `used_memory`/`maxmemory`를 관측할 수 있어야 한다.** 현재 `doc/monitoring/MONITORING_DESIGN.md` §2-2는 Sentinel 전제(Master/Slave/Sentinel)라 **클러스터별 × 노드별 메모리 지표가 없다.** 판정 근거를 실제로 볼 수 없으므로 모니터링 보강이 선행된다.
+
+**아직 미정**: 측정 주기, 판정값 캐시 위치(매 큐 생성마다 노드 전체에 `INFO`를 칠 것인가), 히스테리시스(50% 부근 진동 시 큐가 두 클러스터에 번갈아 배정됨).
+
+**⑤ 배치·컨슈머·스위퍼는 두 클러스터를 다 봐야 한다**
+main 소스 전수 확인 결과 `KEYS`, `SCAN`/`ScanOptions`, `executePipelined`, `multi()`/`SessionCallback`, `multiGet` **사용 0건**이다. 즉 지금 당장 깨질 전수 순회 코드는 없다. 하지만 예정된 것이 전부 "여러 큐를 훑는" 성격이다.
+- inactive_ttl 판정 배치 (Sprint 7/9) — `last-active` ZSet 순회
+- reconciliation 스위퍼 (§73 후속) — Redis ↔ DB 대사
+
+이들이 **클러스터 1개를 가정하면 절반을 조용히 놓친다.** 누락된 절반은 예외도 로그도 남기지 않는다 — 그냥 "처리할 것이 없다"로 보인다. 게다가 `SCAN`은 원래도 노드별인데 이제 **클러스터별 × 노드별**로 돌아야 한다.
+
+> **권장 형태**: §73에서 `QueueRepository.findDrainableQueueIds`를 제거했으므로, **큐 목록은 Redis 순회가 아니라 MySQL `queues` 테이블에서 얻는다.** DB에서 (큐, 클러스터) 목록을 받아 큐별로 해당 클러스터에 키를 지정해 접근하면, 노드·클러스터 경계 문제가 애초에 발생하지 않는다.
+
+**⑥ 이 구조는 용량 방어지 가용성 방어가 아니다 (혼동 주의)**
+"cluster1의 방어를 cluster2가 맡는다"는 **용량**에 대한 이야기다.
+- cluster1이 **50%를 넘기 전에 죽으면** cluster2는 아무 역할도 하지 않는다. cluster2에는 그 큐의 데이터가 애초에 없다
+- 가용성은 **각 클러스터 내부의 master–replica**가 담당한다 (Cluster의 자동 failover)
+- 즉 두 축은 독립이다: 용량 = 클러스터 분리, 가용성 = 클러스터 내부 복제
+- cluster1 전손 시 그 클러스터에 배정된 큐 전체가 영향을 받는다. 복구는 §71(DB → Redis 복구)의 문제이지 cluster2가 메워주지 않는다
+
+**⑦ Rate Limit·캐시 키는 키 형태 무변경, 소속은 cluster1 고정 (D27-4)**
+- Rate Limit: `rl:tenant:{id}`, `rl:{action}:ip{ip}`, `rl:poll:token:{tokenId}` — Lua 둘 다 KEYS 1개, 태그 없음
+- 캐시: `apikey:{hash}`, `tenant:{id}`, `refresh-token:{hash}` — 단일 키 GET/SET
+- 전부 단일 키 연산이라 슬롯 제약이 없다. **키 문자열은 한 글자도 바뀌지 않는다.**
+- 소속은 D27-4로 **cluster1 고정** — 양쪽에 나누면 Rate Limit 한도가 2배로 새기 때문이다
+- **귀결**: 이 부류는 큐 개수가 아니라 **요청량**에 비례하므로, cluster1의 메모리 압박에 큐 배정과 무관한 성분이 상시로 얹힌다. D27-3의 50% 판정이 cluster1에서 더 빨리 걸린다는 뜻이다 (D27-4의 "감수하는 대가" 참조)
+
+**⑧ 전환 변경량 — 코드 확인 결과 (범위가 좁고, 무거운 건 딱 하나)**
+
+| 대상 | 개수 | 내용 |
+|---|:-:|---|
+| 연결 설정 | **1곳** | `RedisConfig` (`RedisSentinelConfiguration` + `LettuceConnectionFactory`) |
+| `RedisTemplate` 주입 파일 | **6개** | `RedisQueueEngine`, `RedisTokenBucketRateLimiter`, `RedisFixedWindowRateLimiter`, `RedisApiKeyCache`, `RedisTenantCache`, `RedisConfig` — **전부 `queue-infrastructure`** |
+| yml | 9개 | api/batch/consumer × (base·local·dev·prod) |
+| `QueueKeys` + Lua 2개 | **0** | 해시태그 그대로 유지 (Rationale 참조) |
+| 도메인·API·배치 코드 | 0 | 포트 시그니처 변경 없음 |
+
+**가장 무거운 작업은 파일 수가 아니라 구조다**: 지금은 `StringRedisTemplate` **단일 빈**을 6곳이 주입받는다. 이중 라우팅은 "큐마다 연결처가 다르다"는 뜻이므로, 이 6곳이 **템플릿을 직접 받는 대신 "큐로 템플릿을 고르는 계층"을 거치게** 바뀐다.
+
+- 큐 범위 키를 쓰는 곳은 `RedisQueueEngine` **하나뿐**이라 라우팅이 실제로 필요한 지점은 좁다
+- 나머지 5곳(Rate Limit 2 + 캐시 2 + Config)은 **큐에 종속되지 않으므로 라우팅 대상이 아니다.** D27-4로 **cluster1 고정**이 확정됐으므로, 이 5곳은 **cluster1 커넥션을 그대로 주입받으면 된다** — 즉 실질 변경이 "빈 이름/한정자" 수준으로 줄어든다
+- 정리하면 **라우팅 계층이 실제로 걸리는 지점은 `RedisQueueEngine` 한 곳**이다. 나머지는 고정 연결이다
+
+Lettuce의 MOVED/ASK 리다이렉트 처리·`ClusterTopologyRefreshOptions`는 **현재 미설정**이며 전환 시 결정 항목이다.
+
+**⑨ 테스트 전제**
+`EnqueueE2EIntegrationTest`, `EnqueueBenchmarkTest`가 로컬 Sentinel(26379-26381) 기동을 전제로 한다. 전환 시 이 전제가 바뀐다. 반대로 로컬 Cluster A/B가 이미 있으므로 **이중 라우팅 통합 테스트는 로컬에서 실증 가능**하다.
+
+### Interview Point
+
+> "Redis를 Cluster로 가되, 단일 클러스터를 키우는 게 아니라 독립된 클러스터 두 개로 갑니다. cluster1의 master가 50% 이상 차면 그다음 큐부터는 cluster2에 쌓는 구조입니다. 왜 단일 클러스터 샤딩이 아니냐면, 저희는 한 큐의 키 네 개를 해시태그로 같은 슬롯에 묶어놨거든요. Lua로 원자 처리를 하려면 그래야 합니다. 그런데 그 대가로 한 큐가 통째로 master 한 대에 고정됩니다. 티켓팅처럼 큐 하나에 30만 명이 몰리는 게 정상인 서비스에서는 노드를 늘려도 그 큐의 부하가 안 흩어져요. 그래서 확장의 단위를 슬롯에서 큐로 올렸습니다. 라우팅 단위를 큐로 잡은 건 취향이 아니라 강제입니다. 해시태그는 한 클러스터 안의 슬롯만 정렬하지 클러스터 경계는 못 넘습니다. 한 큐가 두 클러스터에 걸치면 3키짜리 Lua를 같은 EVAL로 보낼 수조차 없어서, CROSSSLOT 에러 이전에 실행 자체가 안 됩니다. 그리고 배정은 큐 생성 시점에 고정합니다. 큐 수명 동안 안 바뀌면 운영 중 데이터 이동이 없어서 마이그레이션 문제가 통째로 사라집니다. 한 가지 분명히 해둘 건, 이건 용량 방어지 가용성 방어가 아니라는 겁니다. cluster1이 50% 차기 전에 죽으면 cluster2에는 그 큐 데이터가 아예 없어서 아무것도 못 합니다. 가용성은 각 클러스터 안의 master-replica가 따로 담당합니다. 이 둘을 섞어서 설명하면 장애 대응 설계가 통째로 틀어집니다."
+
+### Related
+- §66 (Sprint 8+ Cluster 도입 계획 — **이 결정이 시점과 목적을 재설정**. §66은 단일 Cluster 확장을 전제했다)
+- §67 (이중 라우팅 Layer1/Layer2 — **이 결정이 Layer 1을 확정하고 라우팅 단위를 큐로 못 박음**)
+- §70 D10 (Hash Tag — ①의 근거이자, 단일 Cluster를 버린 이유)
+- §74 (`poll_verify.lua` 3키 — D26 근거의 두 번째 스크립트)
+- §73 (`findDrainableQueueIds` 제거 — ⑤의 배경)
+- §71 (DB → Redis 복구 — ⑥의 클러스터 전손 시나리오가 여기로 연결)
+- `doc/INFRA_SETUP.md` §6.5 (로컬 Cluster A/B — 완전 독립성 확인이 이 결정의 준비물)
+- `queue-infrastructure/.../queue/QueueKeys.java` (클래스 주석의 `{shard_X}` 태그 계획 — **이 결정과 어긋나므로 정정 대상**. 방향은 맞으나 형태가 틀렸다)
+- `doc/schema.sql` `queues` 테이블 (③ — 클러스터 컬럼 없음, D27-1에 따라 추가 필요)
+- `doc/monitoring/MONITORING_DESIGN.md` §2-2 (④ — Sentinel 전제라 **클러스터별 × 노드별 메모리 지표가 없다.** D27-3 판정 근거를 관측하려면 보강 필요)
+
+### 채워야 할 질문 (사용자 확인 필요)
+
+> ✅ **답변 완료 (2026-08-11)** — 아래 3건은 확정되어 Decision으로 이동했다.
+> 50% 임계 정의 → **D27-3** (master 개별 판정, replica 포함, `maxmemory` 대비) /
+> 매핑 저장 위치 → **D27-1** (`queues` 테이블 컬럼) /
+> rebalancing → **D27-2** (새 큐만 이동, 마이그레이션 없음) /
+> 큐 비종속 키의 소속 → **D27-4** (cluster1 고정)
+
+**남은 질문**
+
+1. **50% 판정의 측정 주기·캐시 위치** — 기준은 D27-3에서 정해졌으나, 얼마나 자주 어디서 재는지는 미정
+2. **임계 히스테리시스** — 50% 부근에서 진동하면 큐가 두 클러스터에 번갈아 배정된다. 되돌아오지 않게 할 것인가?
+3. **클러스터 개수** — 2개 고정인가, N개로 늘어날 수 있는 구조로 설계하는가?
+4. **전환 시점** — 무엇이 먼저 끝나야 착수 가능한가? (§66은 Sprint 10, `QueueKeys` 주석은 Sprint 12+로 적혀 있어 서로 다르다)
+5. **프로덕션 노드 구성** — §69의 4×4×4GB가 확정인가, 검토안인가?
+
+> ⚠️ **D27-3의 전제**: `maxmemory 0`(무제한)이면 "대비 비율" 판정이 성립하지 않는다.
+> 이 방식을 쓰려면 `maxmemory` 설정이 필수다. (현재 로컬 1GB)

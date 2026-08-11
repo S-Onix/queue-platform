@@ -53,6 +53,7 @@ class MultiInstanceEnqueueTest {
 
     @Autowired private StringRedisTemplate redisTemplate;
     @Autowired @Qualifier("enqueueBulkScript") private RedisScript<List> enqueueBulkScript;
+    @Autowired @Qualifier("pollVerifyScript") private RedisScript<Long> pollVerifyScript;
     @Autowired private QueueRepository queueRepository;
     @Autowired private TenantRepository tenantRepository;
 
@@ -78,14 +79,17 @@ class MultiInstanceEnqueueTest {
             queueIds.add(queue.getQueueId());
             redisTemplate.delete(queueKey(queue.getQueueId()));
             redisTemplate.delete(seqKey(queue.getQueueId()));
+            redisTemplate.delete(tokenKey(queue.getQueueId()));
         }
 
         // WAS 3대: 각자 독립 engine(=독립 Global Queue) + 독립 batch, 공유 repo/redis
         running.set(true);
         for (int w = 0; w < WAS_COUNT; w++) {
-            RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript);
+            RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript);
             BatchProcessor batch = new BatchProcessor(engine, queueRepository);
-            QueueEngineService service = new QueueEngineService(queueRepository, engine);
+            // Kafka 브로커 없이 Enqueue(Redis) 흐름만 검증 → no-op 발행자
+            QueueEngineService service = new QueueEngineService(queueRepository, engine, event -> { },
+                    new QueueSnapshotCache(engine), java.time.Clock.systemUTC());
             instances.add(new Was(engine, batch, service));
 
             Thread consumer = new Thread(() -> {
@@ -114,6 +118,7 @@ class MultiInstanceEnqueueTest {
         for (String queueId : queueIds) {
             redisTemplate.delete(queueKey(queueId));
             redisTemplate.delete(seqKey(queueId));
+            redisTemplate.delete(tokenKey(queueId));
         }
     }
 
@@ -193,4 +198,5 @@ class MultiInstanceEnqueueTest {
 
     private String queueKey(String queueId) { return QueueKeys.waiting(queueId); }
     private String seqKey(String queueId) { return QueueKeys.seq(queueId); }
+    private String tokenKey(String queueId) { return QueueKeys.tokens(queueId); }
 }
