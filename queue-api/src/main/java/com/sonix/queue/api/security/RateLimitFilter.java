@@ -181,7 +181,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return true;
         }
 
-        String ip = extractIp(request);
+        // 프록시가 없으므로 TCP peer가 유일한 사실. XFF는 클라이언트가 쓰는 값이라 신뢰 근거가 없다.
+        // LB 도입 시 server.forward-headers-strategy=native + internal-proxies로 처리한다(앱 코드 아님).
+        String ip = request.getRemoteAddr();
         String action = resolveActionName(path);
         String key = RateLimitKeys.publicEndPoint(action, ip);
 
@@ -235,18 +237,6 @@ public class RateLimitFilter extends OncePerRequestFilter {
         if (path.equals("/api/v1/tenants/login")) return "login";
         if (path.equals("/api/v1/tenants/refresh")) return "refresh";
         return "unknown";
-    }
-
-    /**
-     * 실제 클라이언트 IP 추출.
-     * X-Forwarded-For 헤더 우선 (Nginx 등 프록시 거친 경우).
-     */
-    private String extractIp(HttpServletRequest request) {
-        String xForwardedFor = request.getHeader("X-Forwarded-For");
-        if (xForwardedFor != null && !xForwardedFor.isBlank()) {
-            return xForwardedFor.split(",")[0].trim();
-        }
-        return request.getRemoteAddr();
     }
 
     /**
