@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -109,7 +110,9 @@ public class BatchProcessor {
      */
     private void processChunk(String queueId, List<PendingEnqueue> chunk, long maxCapacity) {
         try {
-            List<Object> bulkResult = queueEngine.executeBulkLua(queueId, chunk, maxCapacity);
+            Instant issuedAt = Instant.now();
+
+            List<Object> bulkResult = queueEngine.executeBulkLua(queueId, chunk, maxCapacity, issuedAt);
             List<EnqueueResult> results = queueEngine.parseBulkResult(bulkResult);
             completePending(chunk, results);
         } catch (Exception e) {

@@ -10,6 +10,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.lang.management.ManagementFactory;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -79,7 +80,7 @@ public class EnqueueBenchmarkTest {
         Runnable setup = () -> resetQueue(Q_ONE);
         Runnable timed = () -> {
             List<PendingEnqueue> batch = pendings(Q_ONE, ids);
-            List<Object> raw = queueEngine.executeBulkLua(Q_ONE, batch, CAPACITY);
+            List<Object> raw = queueEngine.executeBulkLua(Q_ONE, batch, CAPACITY, Instant.now());
             List<EnqueueResult> parsed = queueEngine.parseBulkResult(raw);
             if (parsed.size() != TOTAL) throw new IllegalStateException("size " + parsed.size());
         };
@@ -102,7 +103,7 @@ public class EnqueueBenchmarkTest {
             for (int q = 0; q < MULTI_QUEUES; q++) {
                 String queueId = Q_MULTI_PREFIX + q;
                 List<PendingEnqueue> batch = pendings(queueId, ids);
-                List<Object> raw = queueEngine.executeBulkLua(queueId, batch, CAPACITY);
+                List<Object> raw = queueEngine.executeBulkLua(queueId, batch, CAPACITY, Instant.now());
                 queueEngine.parseBulkResult(raw);
             }
         };

@@ -2,6 +2,8 @@ package com.sonix.queue.domain.queue;
 
 import lombok.Getter;
 
+import java.time.Instant;
+
 @Getter
 public class EnqueueResult {
     public enum Status {
@@ -16,28 +18,30 @@ public class EnqueueResult {
     private final long seq;  // 불변 score (WAITING 복원용, FULL 일경우 -1)
     private final String identifier;
     private final String tokenId;
+    private final Instant issuedAt;
 
-    private EnqueueResult(Status status, long rank, long total, long seq, String identifier, String tokenId) {
+    private EnqueueResult(Status status, long rank, long total, long seq, String identifier, String tokenId, Instant issuedAt) {
         this.status = status;
         this.rank = rank;
         this.total = total;
         this.seq = seq;
         this.identifier = identifier;
         this.tokenId = tokenId;
+        this.issuedAt = issuedAt;
     }
 
     /**
      * 신규 진입 성공.
      */
-    public static EnqueueResult ok(String identifier, String tokenId, long rank, long total, long seq) {
-        return new EnqueueResult(Status.OK, rank, total, seq, identifier, tokenId);
+    public static EnqueueResult ok(String identifier, String tokenId, long rank, long total, long seq, Instant issuedAt) {
+        return new EnqueueResult(Status.OK, rank, total, seq, identifier, tokenId, issuedAt);
     }
 
     /**
      * 이미 대기 중 (중복 방지).
      */
-    public static EnqueueResult exists(String identifier, String tokenId, long rank, long total, long seq) {
-        return new EnqueueResult(Status.EXISTS, rank, total, seq, identifier, tokenId);
+    public static EnqueueResult exists(String identifier, String tokenId, long rank, long total, long seq, Instant issuedAt) {
+        return new EnqueueResult(Status.EXISTS, rank, total, seq, identifier, tokenId, issuedAt);
     }
 
 
@@ -46,7 +50,7 @@ public class EnqueueResult {
      * 대기열 초과 (거부).
      */
     public static EnqueueResult full(String identifier, long total) {
-        return new EnqueueResult(Status.FULL, -1, total, -1, identifier, null);
+        return new EnqueueResult(Status.FULL, -1, total, -1, identifier, null, null);
     }
 
     public boolean isSuccess() {

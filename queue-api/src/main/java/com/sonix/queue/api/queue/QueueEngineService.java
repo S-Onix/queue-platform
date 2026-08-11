@@ -5,17 +5,17 @@ import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.*;
 import org.springframework.stereotype.Service;
 
-import java.time.Instant;
-
 @Service
 public class QueueEngineService {
+
     private final QueueRepository queueRepository;
     private final QueueEngine queueEngine;
     private final EnqueueEventPublisher eventPublisher;
 
-    public QueueEngineService(QueueRepository queueRepository, QueueEngine queueEngine, EnqueueEventPublisher eventPublisher) {
-        this.queueEngine = queueEngine;
+    public QueueEngineService(QueueRepository queueRepository, QueueEngine queueEngine,
+                              EnqueueEventPublisher eventPublisher) {
         this.queueRepository = queueRepository;
+        this.queueEngine = queueEngine;
         this.eventPublisher = eventPublisher;
     }
 
@@ -43,7 +43,7 @@ public class QueueEngineService {
         }
 
         if (result.isOk()) {
-            eventPublisher.publish(EnqueueEvent.of(tenantId, queueId, result, Instant.now()));
+            eventPublisher.publish(EnqueueEvent.of(tenantId, queueId, result));
         }
 
         return result;

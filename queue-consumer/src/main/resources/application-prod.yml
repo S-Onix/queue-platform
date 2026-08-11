@@ -1,0 +1,25 @@
+logging:
+  level:
+    root: WARN
+    com.sonix.queue: INFO
+
+spring:
+  data:
+    redis:
+      sentinel:
+        nodes: ${REDIS_SENTINEL_NODES:redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379}
+        password: ${REDIS_PASSWORD:}
+  datasource:
+    master:
+      # ⚠️ rewriteBatchedStatements=true 는 협상 불가. 이게 빠지면 addBatch()가
+      #    multi-row INSERT로 합쳐지지 않아 500건이 500번 왕복한다. 예외도 로그도
+      #    남지 않아 성능 저하의 원인을 찾기 어렵다.
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&serverTimezone=Asia/Seoul&rewriteBatchedStatements=true
+      username: ${DB_USERNAME}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+    replica:
+      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&serverTimezone=Asia/Seoul
+      username: ${DB_USERNAME}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 5

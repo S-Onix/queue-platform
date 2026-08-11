@@ -18,10 +18,10 @@ public record EnqueueEvent(
                 Instant issuedAt
         ) {
     /** OK 결과 + 발행 맥락(tenantId, issuedAt)으로 이벤트 생성. */
-    public static EnqueueEvent of(long tenantId, String queueId, EnqueueResult result, Instant issuedAt) {
+    public static EnqueueEvent of(long tenantId, String queueId, EnqueueResult result) {
         return new EnqueueEvent(
                 result.getTokenId(), queueId, tenantId,
-                result.getIdentifier(), result.getSeq(), issuedAt
+                result.getIdentifier(), result.getSeq(), result.getIssuedAt()
         );
     }
 }

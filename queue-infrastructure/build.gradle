@@ -9,6 +9,10 @@ dependencies {
     // Redis
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
 
+    // Kafka (발행 어댑터). 소비 측은 queue-consumer가 담당하지만, 포트 구현인 발행
+    // 어댑터는 헥사고날 원칙상 여기에 있어야 한다.
+    implementation 'org.springframework.kafka:spring-kafka'
+
     // Jackson (Redis 캐시 JSON 직렬화용) ⭐ 추가
     implementation 'com.fasterxml.jackson.core:jackson-databind'
     implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'

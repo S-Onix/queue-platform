@@ -1,0 +1,24 @@
+apply plugin: 'org.springframework.boot'
+
+dependencies {
+    implementation project(':queue-domain')
+    implementation project(':queue-infrastructure')
+    implementation project(':queue-common')
+
+    implementation 'org.springframework.kafka:spring-kafka'
+
+    // actuator를 HTTP로 노출하기 위한 내장 Tomcat (Prometheus 수집 — MONITORING_DESIGN.md)
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // @Transactional(spring-tx): spring-kafka가 전이 제공하지만 명시한다.
+    // queue-batch가 Kafka 제거 때 이 의존성이 조용히 사라져 컴파일이 깨진 전례가 있다.
+    implementation 'org.springframework:spring-tx'
+
+    // 통합 테스트에서 JPA 클래스를 컴파일 참조 (infra의 것은 implementation이라 미노출)
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    testImplementation 'org.springframework.kafka:spring-kafka-test'
+
+    compileOnly      "org.projectlombok:lombok:${lombokVersion}"
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+}
