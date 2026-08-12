@@ -18,6 +18,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.HashSet;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -90,33 +92,43 @@ class QueueEnginePollTest {
         verify(queueEngine).verifyWaiting("q1", 100L, "tok_x", true, NOW);
     }
 
-    @DisplayName("nextPollAfterSec: rank 구간별 등급")
-    @ParameterizedTest(name = "seq={0}, frontSeq={1} → {2}s")
+    @DisplayName("nextPollAfterSec: rank 구간별 등급 + 지터는 등급 하한 위로만 (base ~ base+max(1,base/4))")
+    @ParameterizedTest(name = "seq={0}, frontSeq={1} → {2}~{3}s")
     @CsvSource({
-            "10,    1,  2",     // rank 9     → ≤50    → 2
-            "600,   1,  5",     // rank 599   → ≤1000  → 5
-            "3001,  1,  10",    // rank 3000  → ≤5000  → 10
-            "8001,  1,  15",    // rank 8000  → ≤10000 → 15
-            "20001, 1,  20"     // rank 20000 → else   → 20
+            "10,    1,  2,  3",     // rank 9     → ≤50    → 2  (+0~1)
+            "600,   1,  5,  6",     // rank 599   → ≤1000  → 5  (+0~1)
+            "3001,  1,  10, 12",    // rank 3000  → ≤5000  → 10 (+0~2)
+            "8001,  1,  15, 18",    // rank 8000  → ≤10000 → 15 (+0~3)
+            "20001, 1,  20, 25"     // rank 20000 → else   → 20 (+0~5)
     })
-    void nextPollAfterSec_tiers(long seq, long frontSeq, int expectedNext) {
+    void nextPollAfterSec_tiers(long seq, long frontSeq, int min, int max) {
         when(queueEngine.verifyWaiting("q1", seq, "tok_x", false, NOW)).thenReturn(true);
         when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(frontSeq, 100_000L));
 
-        PollResult r = service.poll("q1", "tok_x", seq, false);
+        // 지터가 있으므로 단발 호출로는 하한 위반을 못 잡는다. 반복해서 구간 전체를 본다.
+        Set<Integer> seen = new HashSet<>();
+        for (int i = 0; i < 300; i++) {
+            seen.add(service.poll("q1", "tok_x", seq, false).nextPollAfterSec());
+        }
 
-        assertThat(r.nextPollAfterSec()).isEqualTo(expectedNext);
+        assertThat(seen).allSatisfy(v -> assertThat(v).isBetween(min, max));
+        assertThat(seen).hasSizeGreaterThan(1);   // 지터가 실제로 흩어지는가 (전부 같은 값이면 몰림 그대로)
+
+        // 구간의 양 끝이 실제로 나오는가. 상한을 안 보면 nextInt의 +1이 빠져 상한이 영영
+        // 안 나와도(폭이 1 좁아져도) 위 두 assert는 그대로 통과한다.
+        // 300회면 폭이 가장 넓은 20s 등급(6종)에서도 한쪽 끝을 못 볼 확률이 (5/6)^300 ≈ 1e-24.
+        assertThat(seen).contains(min, max);
     }
 
     @Test
-    @DisplayName("frontSeq=-1(빈 스냅샷) 엣지 → rank 0으로 처리 → 2s")
+    @DisplayName("frontSeq=-1(빈 스냅샷) 엣지 → rank 0으로 처리 → 2~3s")
     void emptySnapshotEdge() {
         when(queueEngine.verifyWaiting("q1", 5000L, "tok_x", false, NOW)).thenReturn(true);
         when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(-1L, 0L));
 
         PollResult r = service.poll("q1", "tok_x", 5000L, false);
 
-        assertThat(r.nextPollAfterSec()).isEqualTo(2);   // rank=0 → ≤50 → 2
+        assertThat(r.nextPollAfterSec()).isBetween(2, 3);   // rank=0 → ≤50 → 2 (+지터)
         assertThat(r.frontSeq()).isEqualTo(-1L);
     }
 }

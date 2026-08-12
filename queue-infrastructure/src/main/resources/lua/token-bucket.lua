@@ -42,7 +42,19 @@ end
 
 -- 5) 양동이 상태 저장
 redis.call('HMSET', key, 'tokens', newTokens, 'lastRefillMillis', now)
--- TTL 설정 (옛 키 자동 정리, 1시간)
-redis.call('EXPIRE', key, 3600)
+-- TTL: 버킷이 가득 회복된 뒤의 상태는 키가 없을 때(= capacity로 시작)와 결과가 같다.
+-- 그래서 full refill 시간만 버티면 되고, 그 위 60초는 경계 여유다.
+-- 3600 고정은 폴링 키(rl:poll:token:*)를 토큰 하나당 1시간씩 남겼다. 폴링은 토큰 수만큼
+-- 키가 생기므로 이 상수가 곧 Redis 메모리 상한이 된다 — 큐 비종속 키라 Cluster 전환 시
+-- cluster1 한 곳에 전부 몰린다(DECISIONS §75 D27-4).
+--   폴링(cap 5, refill 1/s)      → 65초
+--   Tenant plan(cap = refill×60) → 120초
+--
+-- 60~3600으로 조인다. capacity/refillRate는 호출자가 넘기는 값이라 이 스크립트가 통제하지 못한다.
+--   refillRate = 0  → inf    → 상한 3600. 클램프가 없으면 EXPIRE 인자 오류로 스크립트가 죽는데,
+--                              위 HMSET은 이미 커밋된 뒤라 TTL 없는 키가 영구히 남는다
+--   refillRate 극소 → 수만 초 → 상한 3600. 줄이려던 메모리가 도리어 늘어나는 것을 막는다
+--   refillRate < 0  → 음수   → 하한 60. 음수 EXPIRE는 키를 즉시 지워 한도를 리셋시킨다
+redis.call('EXPIRE', key, math.max(60, math.min(3600, math.ceil(capacity / refillRate) + 60)))
 
 return allowed

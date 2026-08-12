@@ -47,6 +47,18 @@ import java.util.Optional;
 @Log4j2
 public class RateLimitFilter extends OncePerRequestFilter {
 
+    /** 폴링 버킷 용량. 재접속·화면 복귀 시의 연속 요청을 흡수할 만큼만 둔다. */
+    private static final int POLL_CAPACITY = 5;
+
+    /**
+     * 폴링 버킷 회복 속도.
+     *
+     * <p>0.5/s였을 때 {@code nextPollAfterSec} 최소값 2초와 소비 속도가 정확히 같아,
+     * 앞줄(rank≤50) 사용자는 여유가 0이었다. 시계 오차나 재시도 한 번이 곧바로 429가 됐다.
+     * 1.0/s면 2초 간격 폴링이 토큰 1개를 쓰고 2개를 회복해 버킷이 늘 차 있다.
+     */
+    private static final double POLL_REFILL_PER_SEC = 1.0;
+
     private final RateLimiter tokenBucketRateLimiter;
     private final FixedWindowRateLimiter fixedWindowRateLimiter;
     private final TenantRepository tenantRepository;
@@ -113,7 +125,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         String tokenId = uri.substring(uri.lastIndexOf('/') + 1);   // 마지막 세그먼트
         String key = RateLimitKeys.pollToken(tokenId);
 
-        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, 5, 0.5);  // cap5, refill0.5/s  (로드테스트 튜닝)
+        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, POLL_CAPACITY, POLL_REFILL_PER_SEC);
         if (!allowed) {
             writeTooManyRequests(res, 2);   // 기존 429 응답기 재사용, Retry-After 2s
             return false;

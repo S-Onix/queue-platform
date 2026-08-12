@@ -18,8 +18,8 @@ alias RW='redis-cli -p 6379'    # 쓰기
 
 | 경로 | 키 | 한도 | TTL |
 |---|---|---|---|
-| 폴링 | `rl:poll:token:{tokenId}` (Hash) | cap 5, refill 0.5/s **하드코딩** | 3600s |
-| 인증 후 | `rl:tenant:{tenantId}` (Hash) | Tenant `Plan` | 3600s |
+| 폴링 | `rl:poll:token:{tokenId}` (Hash) | cap 5, refill 1.0/s **하드코딩** | 65s |
+| 인증 후 | `rl:tenant:{tenantId}` (Hash) | Tenant `Plan` | 120s (4종 동일) |
 | signup | `rl:signup:ip{ip}:{윈도우번호}` (String) | 5 / 60s | 윈도우+1s |
 | login | `rl:login:ip{ip}:{윈도우번호}` | 10 / 60s | 윈도우+1s |
 | refresh | `rl:refresh:ip{ip}:{윈도우번호}` | 30 / 60s | 윈도우+1s |
@@ -40,12 +40,18 @@ RR hgetall "rl:tenant:$TENANT"
 | `tokens` 값 | 판정 |
 |---|---|
 | ≥ 1.0 | 다음 요청 통과 |
-| < 1.0 | **지금 거부 상태.** 1.0까지 회복에 `(1 - tokens) / refill` 초 소요 (폴링이면 refill 0.5/s) |
+| < 1.0 | **지금 거부 상태.** 1.0까지 회복에 `(1 - tokens) / refill` 초 소요 (폴링이면 refill 1.0/s → 1초 이내) |
 | 0에 붙어 있음 | 지속 초과. 클라이언트가 한도보다 빠르게 폴링 중 |
-| 키 없음 | 아직 요청이 없었거나 TTL 만료(1시간 무요청) |
+| 키 없음 | 아직 요청이 없었거나 TTL 만료(폴링 65초 / Plan 120초 무요청) |
 
-**폴링 한도의 구조적 문제**: refill 0.5/s = 2초당 1건인데 `nextPollAfterSec` 최솟값도 2초(`QueueEngineService.java:91`).
-대기열 앞쪽(rank ≤ 50) 사용자는 **여유 0의 경계선**에서 폴링한다. 지터·재시도·중복 탭 하나면 429다.
+**TTL은 고정값이 아니다.** `max(60, min(3600, ceil(capacity / refillRate) + 60))` (`token-bucket.lua`).
+버킷이 full refill되면 그 상태는 키가 없을 때와 결과가 같으므로 그 시간만 버티면 된다.
+Plan 4종이 전부 `cap = refill×60` 비율이라 등급과 무관하게 120s로 같다.
+
+**폴링 한도의 여유** (2026-08-12 이전에는 여유가 0이었다):
+refill 1.0/s에 `nextPollAfterSec` 최솟값 2초(`QueueEngineService.java:106`)라 정상 클라이언트 하나는
+**초당 0.5건 소비 / 1.0건 회복**으로 버킷이 cap 5에 붙어 있다. 손익분기는 **초당 1.0건 = 같은 토큰 탭 2개**.
+과거에는 refill 0.5/s여서 소비와 회복이 정확히 같아, 재시도 한 번이 곧 429였다.
 
 ---
 
@@ -106,9 +112,9 @@ RR --scan --pattern 'rl:tenant:*' -i 0.01 | wc -l
 
 | 관찰 | 판정 |
 |---|---|
-| `Tenant not found` 로그 있음 | `RateLimitFilter.java:144-148`이 통과시킨다. **고아 API Key 확정** |
+| `Tenant not found` 로그 있음 | `RateLimitFilter.java:156-160`이 통과시킨다. **고아 API Key 확정** |
 | `rl:tenant:*` 키 0개 + 트래픽 있음 | 필터가 아예 안 탄다. 경로가 `/actuator/`로 시작하는지, 필터 체인 순서가 바뀌지 않았는지 확인 |
-| `rl:tenant:*` 키 수 ≈ 최근 1시간 요청 테넌트 수 | 정상 (TTL 3600s) |
+| `rl:tenant:*` 키 수 ≈ 최근 **2분** 요청 테넌트 수 | 정상 (TTL 120s). 장기 활성 테넌트 수 용도로는 못 쓴다 |
 
 ```sql
 -- 고아 API Key 찾기 (Replica). api_keys는 작아서 조인해도 안전
@@ -138,7 +144,7 @@ RR --scan --pattern 'rl:*' -i 0.01 | head -50 | \
 
 | 관찰 | 판정 |
 |---|---|
-| TTL이 전부 양수 | 정상. 개수가 많아도 1시간 내 자연 감소 |
+| TTL이 전부 양수 | 정상. 개수가 많아도 폴링 65초 / Plan 120초 내 자연 감소 |
 | TTL `-1`인 `rl:` 키 존재 | **이상.** Lua의 EXPIRE가 안 걸렸다 → `RW script exists <sha>` 로 스크립트 확인 |
 | `rl:poll:token:*` 수 >> 활성 대기자 수 | **랜덤 tokenId 공격 의심** (키가 공격자 통제값) |
 

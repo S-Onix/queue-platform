@@ -8,13 +8,14 @@
 
 ```
 GET .../tokens/{tokenId}?seq&ka          ← 인증 없음. tokenId 소유가 곧 자격
-  └ RateLimitFilter.checkPollRateLimit() : Redis EVAL token-bucket  (cap 5, refill 0.5/s)  ★1회차 Redis 왕복
+  └ RateLimitFilter.checkPollRateLimit() : Redis EVAL token-bucket  (cap 5, refill 1.0/s)  ★1회차 Redis 왕복
   └ QueueEngineService.poll()
       └ verifyWaiting() → poll_verify.lua : ZRANGEBYSCORE(waiting, seq, seq)  ★2회차 Redis 왕복 (master 쓰기)
                                             HGET(tokens, identifier) → tokenId 대조
                                             ka=1이면 ZADD(last-active, now, seq)
       └ QueueSnapshotCache.get()          : Caffeine WAS-local 2초. miss면 ZRANGE+ZCARD
-      └ rank = seq - frontSeq,  nextPollAfterSec(rank) → 2/5/10/15/20초
+      └ rank = seq - frontSeq,  nextPollAfterSec(rank) → 등급 2/5/10/15/20초 + 지터(위로만, 폭 base/4)
+                                            실제 응답값: 2~3 / 5~6 / 10~12 / 15~18 / 20~25초
 ```
 
 **이 경로에서 가장 위험한 두 가지**
@@ -91,11 +92,11 @@ GET .../tokens/{tokenId}?seq&ka          ← 인증 없음. tokenId 소유가 �
 - **정상 범위**: **기준선 수집 필요.** `poll_verify.lua`는 `ZRANGEBYSCORE`가 O(log N + M), M=1이라 30만에서도 이론상 가볍지만 **실측이 없다**. 평상시 폴링 부하 3일치의 `usec_per_call` p95를 재고 그 3배를 경고선으로 시작할 것.
 - **원인별 분기**:
   - `evalsha calls` ≈ 2 × HTTP 폴링 수 → 구조상 정상. 트래픽이 많은 것.
-  - `evalsha calls` >> 2 × HTTP 폴링 수 → 클라이언트가 `nextPollAfterSec`를 무시하고 있다. 응답의 `nextPollAfterSec`(2~20초)를 SDK가 지키는지 확인.
+  - `evalsha calls` >> 2 × HTTP 폴링 수 → 클라이언트가 `nextPollAfterSec`를 무시하고 있다. 응답의 `nextPollAfterSec`(2~25초)를 SDK가 지키는지 확인.
   - CPU는 높은데 ops/sec은 낮다 → 개별 명령이 무겁다. `slowlog get 10`.
   - 특정 큐만 → 핫키. 키가 전부 `{queueId}` 해시태그라 **Cluster여도 슬롯 하나에 집중된다.** 분산되지 않는다.
 - **조치**:
-  - 즉시 수단은 폴링 Rate Limit을 조이는 것뿐인데 **capacity/refill이 코드에 하드코딩**돼 있다(`RateLimitFilter.java:116`). 런타임 변경 불가.
+  - 즉시 수단은 폴링 Rate Limit을 조이는 것뿐인데 **capacity/refill이 코드에 하드코딩**돼 있다(`RateLimitFilter.java:110,119`). 런타임 변경 불가.
   - 큐 단위로 트래픽을 끊으려면 해당 큐를 정지시켜 신규 유입을 막는다(기존 폴링은 계속된다).
   - 스냅샷 조회(`readSnapshot`)만은 replica로 뺄 수 있으나 코드 변경이 필요하다 — 후속 과제.
 - **하면 안 되는 것**:
