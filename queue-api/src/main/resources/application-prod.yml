@@ -11,12 +11,12 @@
 spring:
   datasource:
     master:
-      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&serverTimezone=Asia/Seoul
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
       maximum-pool-size: 50
     replica:
-      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&serverTimezone=Asia/Seoul
+      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
       maximum-pool-size: 50

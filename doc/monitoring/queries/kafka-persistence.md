@@ -19,7 +19,11 @@ alias RR='redis-cli -p 6380'
 
 `TokenLifecycleConsumer.toToken()`이 `LocalDateTime.ofInstant(instant, ZoneOffset.UTC)`로 변환하므로
 **`tokens.issued_at` 컬럼에는 UTC 벽시계 값이 들어간다.** 그런데 JDBC URL은 `serverTimezone=Asia/Seoul`이고
-MySQL 서버의 `NOW()`/`CURDATE()`는 서버 타임존(대개 KST)을 따른다 → **9시간 어긋난다.**
+MySQL **서버** `default-time-zone`은 여전히 `+09:00`이라, **셸에서 `mysql`로 붙으면**
+`NOW()`/`CURDATE()`가 KST다 → UTC로 저장된 값과 **9시간 어긋난다.**
+
+> 앱(JDBC)은 `forceConnectionTimeZoneToSession=true`로 세션이 UTC라 문제가 없다.
+> **CLI만 다르다** — 아래 규칙은 사람이 직접 쿼리할 때의 이야기다. (DECISIONS §77)
 
 ```sql
 -- ❌ 틀림: KST 기준. UTC로 저장된 값과 최대 9시간 어긋난다
