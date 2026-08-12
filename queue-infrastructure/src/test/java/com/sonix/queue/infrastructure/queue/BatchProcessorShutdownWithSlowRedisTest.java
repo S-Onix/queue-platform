@@ -98,7 +98,9 @@ class BatchProcessorShutdownWithSlowRedisTest {
         assertThat(elapsedMs).isGreaterThan(9_000L);
         // (3) 무응답이어도 아무도 매달리지 않는다: 큐는 비고 모든 Future가 완결된다
         assertThat(global).isEmpty();
-        assertThat(all).allSatisfy(p -> assertThat(p.getFuture()).isDone());
+        // 카운트로 본다. allSatisfy는 실패 건마다 메시지를 조립하는데 all이 수천 건이라
+        // 부분 실패 시 그 문자열이 Gradle daemon을 OOM으로 죽인다(실측 재현).
+        assertThat(all.stream().filter(p -> p.getFuture().isDone()).count()).isEqualTo(all.size());
 
         long ok = all.stream().filter(p -> !p.getFuture().isCompletedExceptionally()).count();
         System.out.printf("[slow-redis] elapsed=%dms, ok=%d, failed=%d, chunks=%d%n",
@@ -138,7 +140,9 @@ class BatchProcessorShutdownWithSlowRedisTest {
         assertThat(calls.get()).isEqualTo(1);
         assertThat(elapsedMs).isLessThan(6_500L);
         assertThat(global).isEmpty();
-        assertThat(all).allSatisfy(p -> assertThat(p.getFuture()).isCompletedExceptionally());
+        // 카운트로 본다(위 slow-redis 주석과 같은 이유 — 부분 실패 시 OOM).
+        assertThat(all.stream().filter(p -> p.getFuture().isCompletedExceptionally()).count())
+                .isEqualTo(all.size());
         System.out.printf("[dead-redis] elapsed=%dms, luaCalls=%d%n", elapsedMs, calls.get());
     }
 

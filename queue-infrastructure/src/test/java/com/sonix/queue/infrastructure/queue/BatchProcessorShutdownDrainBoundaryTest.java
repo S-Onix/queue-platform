@@ -62,10 +62,11 @@ class BatchProcessorShutdownDrainBoundaryTest {
         batchProcessor.stop();
 
         assertThat(global).isEmpty();
-        assertThat(all).allSatisfy(p -> {
-            assertThat(p.getFuture()).isCompleted();
-            assertThat(p.getFuture()).isNotCompletedExceptionally();
-        });
+        // 카운트로 본다. allSatisfy는 실패 건마다 메시지를 모아 하나의 문자열로 조립하는데,
+        // 여기 all은 수천~1만 건이라 부분 실패 시 그 문자열이 수백 MB가 되어 Gradle daemon을
+        // OOM으로 죽인다(실측 재현). 회귀 탐지선이 회귀 때 못 쓰이면 목적과 모순이다.
+        assertThat(all.stream().filter(p -> p.getFuture().isDone()).count()).isEqualTo(all.size());
+        assertThat(all.stream().filter(p -> p.getFuture().isCompletedExceptionally()).count()).isZero();
     }
 
     @Test
@@ -98,7 +99,8 @@ class BatchProcessorShutdownDrainBoundaryTest {
         // 잔여를 조용히 버리지 않는다: 큐는 비고, 모든 Future가 어떤 형태로든 완결된다
         assertThat(global).isEmpty();
         // isCompleted()는 "정상 완료"만 통과하므로 여기서는 isDone()으로 본다(예외 완결도 완결).
-        assertThat(all).allSatisfy(p -> assertThat(p.getFuture()).isDone());
+        // allSatisfy가 아니라 카운트인 이유는 위 boundary 테스트의 주석 참조(부분 실패 시 OOM).
+        assertThat(all.stream().filter(p -> p.getFuture().isDone()).count()).isEqualTo(all.size());
         long failed = all.stream().filter(p -> p.getFuture().isCompletedExceptionally()).count();
         assertThat(failed).isGreaterThan(0);
         // 상한 = 데드라인 5,000ms + 검사를 통과해 이미 시작된 청크 1회(스텁 400ms) = 5,400ms.

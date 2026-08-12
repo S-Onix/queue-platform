@@ -26,6 +26,17 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * 있으므로, 여기 남은 채 프로세스가 내려가면 그 요청은 Redis에도 DB에도 흔적이 없다.
  * 3자 대조(HTTP↔Redis↔MySQL)로도 검출되지 않는 유실이다. 그래서 종료 시 마지막 drain을
  * 돌려 대기 중인 Future를 전부 완결시킨다({@link #stop()}).
+ *
+ * <p><b>이 보장의 범위:</b> {@link #stop()}은 Global Queue에 <b>남아 있는</b> 것만 본다.
+ * SIGTERM 시점에 실행 중이던 {@code @Scheduled} 틱이 이미 가져간 건들은 그 틱이 처리하며,
+ * 양쪽이 같은 {@code drainDeadlineNanos}를 공유해 동일한 상한을 받는다.
+ * 근거와 전제는 {@link #stop()}·{@link #getPhase()} javadoc에 적었다.
+ *
+ * <p><b>운영 전제:</b> 이 종료 경로는 <b>LB deregistration이 SIGTERM보다 먼저</b> 일어나는 것을
+ * 전제한다. {@code stop()}이 {@code markShuttingDown()}을 켜는 시점부터 웹 커넥터가 pause되기까지
+ * 최대 ≈10초(DB 무응답 시 무한) 동안, 이 인스턴스는 <b>새 enqueue를 100% 503으로 거절하면서
+ * 커넥션은 계속 받는다.</b> LB가 늦게 빼면 롤링 배포마다 인스턴스당 그 시간만큼 503 스파이크가 난다.
+ * → 배포 런북 필요(후속 과제).
  * */
 
 @Component
@@ -112,9 +123,22 @@ public class BatchProcessor implements SmartLifecycle {
      *
      * <p><b>@Scheduled에 기대면 안 되는 이유:</b> 이 프로젝트는 가상 스레드 전제
      * ({@code spring.threads.virtual.enabled=true})라 스케줄러가 {@code SimpleAsyncTaskScheduler}인데,
-     * 이 구현은 {@code ContextClosedEvent}에서 내부 executor를 바로 shutdown한다. 즉
-     * <b>모든 Lifecycle stop보다 먼저</b> 주기 실행이 끊긴다. 종료 시 drain은 스케줄러가
-     * 아니라 이 훅이 책임진다.
+     * 이 구현은 {@code ContextClosedEvent}에서 내부 executor를 shutdown한다. 종료 시 drain은
+     * 스케줄러가 아니라 이 훅이 책임진다.
+     *
+     * <p><b>⚠️ 다만 그 shutdown이 끊는 것은 "새 틱"뿐이다 — 이미 실행 중인 틱은 안 끊는다.</b>
+     * 근거(Spring 원본 대조):
+     * <ul>
+     *   <li>{@code SimpleAsyncTaskScheduler}가 내부 {@code scheduledExecutor}에 넣는 작업은
+     *       {@code () -> execute(task)}, 즉 <b>가상 스레드로 디스패치만</b> 한다. 본문은
+     *       스케줄러 스레드 밖에서 돈다.</li>
+     *   <li>{@code ContextClosedEvent}에서 호출하는 것은 {@code shutdown()}이지 {@code shutdownNow()}가
+     *       아니며, 어느 쪽이든 이미 디스패치된 본문에는 영향이 없다.</li>
+     *   <li>{@code ExecutorLifecycleDelegate}의 활성 작업 카운터는 디스패치만 세므로,
+     *       스케줄러의 {@code stop(Runnable)}도 실행 중인 틱을 기다리지 않고 즉시 콜백한다.</li>
+     * </ul>
+     * 즉 <b>실행 중인 틱을 기다려주는 주체가 종료 경로에 하나도 없다.</b> 그래도 안전한 이유는
+     * {@link #stop()} javadoc 참조 — 그 틱도 같은 {@code drainDeadlineNanos}에 묶이기 때문이다.
      */
     @Override
     public int getPhase() {
@@ -126,6 +150,28 @@ public class BatchProcessor implements SmartLifecycle {
      *
      * <p>남은 요청을 전부 처리해 Future를 완결시킨다. 처리하지 못한 잔여분은 조용히 버리지 않고
      * <b>건수를 ERROR로 남긴 뒤</b> 예외로 완결시킨다(호출자는 30초를 기다리는 대신 즉시 503).
+     *
+     * <p><b>⚠️ "유실 0"은 이 메서드 단독의 보장이 아니다.</b> SIGTERM이 {@code @Scheduled} 틱
+     * 중간에 도착하면, 그 틱이 이미 {@code poll}해 간 최대 {@code MAX_DRAIN}건은 Global Queue에서
+     * 빠져나가 <b>이 메서드의 시야 밖</b>에 있다. {@code while (!globalQueue.isEmpty())}는 그것들을
+     * 보지 못하고 즉시 반환할 수 있다.
+     *
+     * <p>그럼에도 유실되지 않는 근거는 다음 넷이다.
+     * <ol>
+     *   <li>{@code drainDeadlineNanos}는 이 싱글턴의 {@code volatile} 필드이고, 실행 중인 틱도
+     *       {@code processQueueGroup}에서 <b>같은 필드</b>를 읽는다. 이 메서드가 데드라인을 세우는
+     *       순간 그 틱도 함께 묶여, 틱의 상한도 <b>≈10s</b>(5s + 진행 중 커맨드 1회)다.</li>
+     *   <li>그 건들은 전부 {@code future.get(30s)}에 매달린 in-flight HTTP 요청이므로,
+     *       다음 phase의 웹 graceful 20s가 그들을 기다려준다. 10s &lt; 20s.</li>
+     *   <li>이중 처리는 불가능하다. {@code ConcurrentLinkedQueue.poll()}이 원자적이라 한 항목은
+     *       틱 또는 이 메서드 <b>둘 중 하나만</b> 가져간다.</li>
+     *   <li>틱이 버린 건수도 {@code processQueueGroup}이 자기 ERROR 로그를 남기므로 계정이 유지된다.</li>
+     * </ol>
+     *
+     * <p>따라서 <b>이 보장은 "틱이 공유 데드라인을 지킨다"는 전제 위에 있다.</b> 그 전제가 깨지는
+     * 유일한 경우는 DB 무응답으로 단일 호출이 무한히 늘어나는 것인데, 이는 {@code stop()} 자신에게도
+     * 동일하게 적용되는 별건({@code socketTimeout} 후속 과제)이다.
+     * <b>실행 중 틱이 데드라인을 실제로 준수하는지는 소스 논증으로만 확인했고 테스트가 없다 — 후속 과제.</b>
      */
     @Override
     public void stop() {

@@ -107,9 +107,16 @@ server:
   #
   # ⚠️ 이 한 줄만으로는 부족하다. enqueue의 in-flight 요청은 BatchProcessor가 Global Queue를
   # drain해 줘야 끝나는데, 가상 스레드 환경의 스케줄러(SimpleAsyncTaskScheduler)는
-  # ContextClosedEvent에서 곧바로 멈춘다. 그래서 BatchProcessor가 웹 graceful 단계보다
+  # ContextClosedEvent에서 새 틱을 멈춘다(실행 중인 틱은 안 끊는다 — BatchProcessor.getPhase()
+  # javadoc 참조). 그래서 BatchProcessor가 웹 graceful 단계보다
   # 한 단계 먼저(phase +1) 마지막 drain을 돌린다 — 그게 없으면 종료가 안전해지는 게 아니라
   # 요청이 30초 매달렸다 503이 될 뿐이다.
+  #
+  # ⚠️ 운영 전제: LB deregistration이 SIGTERM보다 "먼저" 일어나야 한다.
+  #    BatchProcessor.stop()이 markShuttingDown()을 켜는 시점부터 아래 graceful로 커넥터가
+  #    pause되기까지 최대 약 10초(DB 무응답 시 무한) 동안, 이 인스턴스는 새 enqueue를
+  #    100% 503으로 거절하면서 커넥션은 계속 받는다. LB가 늦게 빼면 롤링 배포마다
+  #    인스턴스당 그 시간만큼 503 스파이크가 난다. 배포 런북 필요(후속 과제).
   shutdown: graceful
 
 # Actuator (Sprint 1: health check만)
