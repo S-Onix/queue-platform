@@ -101,7 +101,7 @@ RW slowlog get 10
 | 관찰 | 판정 |
 |---|---|
 | `evalsha calls` 증가율 ≈ 폴링 RPS × 2 | 구조상 정상 (token-bucket 1회 + poll_verify 1회) |
-| `evalsha calls` >> 폴링 RPS × 2 | 클라이언트가 `nextPollAfterSec`(2/5/10/15/20초)를 무시 |
+| `evalsha calls` >> 폴링 RPS × 2 | 클라이언트가 `nextPollAfterSec`(등급 2/5/10/15/20 + 지터 → 실제 2~25초)를 무시 |
 | `evalsha usec_per_call` | **기준선 수집 필요.** 평상시 폴링 3일치 p50/p95를 재고 p95×3을 경고선으로 |
 | `slowlog` 신규 항목 | 0건/시간이 정상 |
 

@@ -28,14 +28,17 @@ import static org.mockito.Mockito.*;
 class RateLimitFilterIpSourceTest {
 
     private FixedWindowRateLimiter fixedWindow;
+    private RateLimiter tokenBucket;
     private RateLimitFilter filter;
 
     @BeforeEach
     void setUp() {
         fixedWindow = mock(FixedWindowRateLimiter.class);
         when(fixedWindow.tryAcquire(anyString(), anyInt(), anyLong())).thenReturn(true);
+        tokenBucket = mock(RateLimiter.class);
+        when(tokenBucket.tryAcquire(anyString(), anyInt(), anyDouble())).thenReturn(true);
         filter = new RateLimitFilter(
-                mock(RateLimiter.class), fixedWindow,
+                tokenBucket, fixedWindow,
                 mock(TenantRepository.class), mock(TenantCache.class));
     }
 
@@ -74,6 +77,22 @@ class RateLimitFilterIpSourceTest {
         assertThat(key.getAllValues()).containsOnly(key.getAllValues().get(0));  // 5회 전부 동일 키
         assertThat(key.getAllValues()).allSatisfy(k ->
                 assertThat(k).doesNotContain("9.9.9.9", "8.8.8.8", "7.7.7.7", "6.6.6.6", "5.5.5.5"));
+    }
+
+    @Test
+    @DisplayName("폴링 경로는 Token Bucket에 cap 5 / refill 1.0/s를 그대로 넘긴다 (상수→Redis 배선)")
+    void pollPathPassesPollBucketParameters() throws Exception {
+        // 상수만 바꿔 놓고 호출부에 반영이 안 되면 Lua 쪽 테스트는 (파라미터를 직접 주므로) 전부 초록이다.
+        // 필터가 실제로 그 값을 넘기는지는 여기서만 드러난다.
+        // refill을 0.5로 되돌리면 이 테스트가 깨진다.
+        MockHttpServletRequest req =
+                new MockHttpServletRequest("GET", "/api/v1/queues/q_test_wiring/tokens/tok_1");
+        req.setRemoteAddr("1.2.3.4");
+
+        filter.doFilterInternal(req, new MockHttpServletResponse(), new MockFilterChain());
+
+        verify(tokenBucket).tryAcquire(contains("tok_1"), eq(5), eq(1.0));
+        verifyNoInteractions(fixedWindow);   // 폴링은 인증 전 Fixed Window 분기로 새지 않는다
     }
 
     @Test

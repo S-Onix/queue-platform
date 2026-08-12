@@ -8,19 +8,23 @@
 
 | 경로 | 알고리즘 | 키 | 한도 | 코드 |
 |---|---|---|---|---|
-| 폴링 `GET /queues/*/tokens/*` | Token Bucket | `rl:poll:token:{tokenId}` | **cap 5, refill 0.5/s** (하드코딩) | `RateLimitFilter.java:110-122` |
-| 인증 후 (X-API-Key / JWT) | Token Bucket | `rl:tenant:{tenantId}` | Tenant `Plan`의 capacity/refill | `:136-167` |
-| 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip{ip}` | SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분 | `:173-207` |
-| `/actuator/**` | 적용 제외 | — | — | `:127-130` |
+| 폴링 `GET /queues/*/tokens/*` | Token Bucket | `rl:poll:token:{tokenId}` | **cap 5, refill 1.0/s** (하드코딩) | `RateLimitFilter.java:121-134` |
+| 인증 후 (X-API-Key / JWT) | Token Bucket | `rl:tenant:{tenantId}` | Tenant `Plan`의 capacity/refill | `:148-179` |
+| 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip{ip}` | SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분 | `:185-219` |
+| `/actuator/**` | 적용 제외 | — | — | `:139-142` |
 
 거부 시 HTTP **429** + `Retry-After` + 본문 `{"error":"RL001",...}`.
-Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도우+1s`(`fixed-window.lua:33`).
+Redis 키 TTL: token-bucket은 **고정값이 아니라 한도에서 계산**된다(`token-bucket.lua`).
+`max(60, min(3600, ceil(capacity / refillRate) + 60))` — 버킷이 full refill되면 그 상태는 키가
+없을 때와 결과가 같으므로 그 시간만 버티면 된다. **폴링 65s, Tenant Plan 4종 전부 120s**(실측).
+상·하한은 호출자 인자 방어용이다(refill 0 → 3600, refill 음수 → 60).
+fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 
 ---
 
 ### [증상] 신규 가입/로그인이 전 세계에서 429가 된다 (Sprint 11 ALB 도입 직후)
 
-- **먼저 의심할 것**: `server.forward-headers-strategy: native` 누락. `RateLimitFilter.java:186`은 `request.getRemoteAddr()`만 쓰므로, LB 뒤에서는 **모든 요청의 IP가 LB 사설 IP 하나**가 된다 → `rl:signup:ip10.0.1.7` 단일 버킷 → **전 세계 신규 가입이 분당 5건.** 역방향 self-DoS.
+- **먼저 의심할 것**: `server.forward-headers-strategy: native` 누락. `RateLimitFilter.java:198`은 `request.getRemoteAddr()`만 쓰므로, LB 뒤에서는 **모든 요청의 IP가 LB 사설 IP 하나**가 된다 → `rl:signup:ip10.0.1.7` 단일 버킷 → **전 세계 신규 가입이 분당 5건.** 역방향 self-DoS.
 - **1분 안에 확인**:
   ```bash
   # ① 설정 존재 여부
@@ -40,7 +44,7 @@ Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도�
      redis-cli -p 6379 --scan --pattern 'rl:signup:ip10.0.1.7:*' -i 0.01 | xargs -r redis-cli -p 6379 del
      ```
      되돌리기: 불필요(키가 다시 생성된다). **다만 이건 60초짜리 임시 조치다. 근본 해결은 설정 추가+재배포.**
-  2. 근본: `application-prod.yml`에 `server.forward-headers-strategy: native` 추가 후 재배포. (**앱 코드 수정 아님** — 필터 주석 `:184-185`가 명시하는 의도된 방식이다.)
+  2. 근본: `application-prod.yml`에 `server.forward-headers-strategy: native` 추가 후 재배포. (**앱 코드 수정 아님** — 필터 주석 `:196-197`이 명시하는 의도된 방식이다.)
 - **하면 안 되는 것**:
   - 한도를 5 → 5000으로 올려 급한 불을 끄는 것. 버킷이 하나라는 사실은 그대로라 brute-force 방어가 통째로 사라진다.
   - 애플리케이션 코드에서 `X-Forwarded-For`를 직접 읽도록 고치는 것. 검증 없는 XFF는 헤더 한 줄로 우회된다(과거 이 구현이었고 `getRemoteAddr()`로 되돌린 이력이 있다).
@@ -49,21 +53,29 @@ Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도�
 
 ### [증상] 폴링이 429(RL001)를 계속 뱉는다
 
-- **먼저 의심할 것**: **한도가 클라이언트 폴링 주기와 거의 정확히 맞물려 있다.** refill 0.5/s = 2초에 1건인데, `nextPollAfterSec`의 최솟값도 **2초**(`QueueEngineService.java:91`, rank ≤ 50). 즉 대기열 앞쪽 사용자는 **여유 0으로 정확히 경계선에서 폴링한다.** 지터·재시도·중복 탭이 하나만 끼어도 429다.
+- **먼저 의심할 것**: **같은 tokenId를 여러 곳이 동시에 폴링하고 있다**(탭 3개 이상, 또는 SDK가
+  `nextPollAfterSec`를 무시하고 자체 주기로 도는 것).
+  refill 1.0/s에 최소 폴링 간격 2초(`QueueEngineService.java:106`, rank ≤ 50)라 정상 클라이언트
+  하나는 **초당 0.5건을 쓰고 1.0건을 회복**한다 — 버킷이 cap 5에 붙어 있는 게 정상이다.
+  손익분기는 **초당 1.0건 = 같은 토큰으로 탭 2개**이고, 탭 3개(1.5/s)면 full에서 10초 뒤 429다.
+
+  > 이전에는 refill 0.5/s여서 최소 폴링 간격과 소비·회복이 정확히 같았다(여유 0). 탭 하나가
+  > 이미 경계선이라 재시도 한 번이 곧 429였다. 그 구조적 문제는 refill 상향 + 응답 지터로
+  > 해소됐다 — **이 증상이 다시 보이면 한도 설계가 아니라 클라이언트 쪽을 먼저 의심하라.**
 - **1분 안에 확인**:
   ```bash
   TOK=tok_019...
   redis-cli -p 6380 hgetall "rl:poll:token:$TOK"   # tokens(남은 토큰), lastRefillMillis
-  redis-cli -p 6380 ttl  "rl:poll:token:$TOK"      # 3600 근처면 최근 갱신됨
+  redis-cli -p 6380 ttl  "rl:poll:token:$TOK"      # 폴링 키의 TTL 상한은 65. 65 근처면 최근 갱신됨
   ```
   **`tokens` 값이 1.0 미만이면 그 토큰은 지금 거부 상태.** 0에 붙어 있으면 지속 초과다.
-- **정상 범위**: `tokens` ≥ 1.0. 429 비율은 **기준선 수집 필요** — 경계값 설계라 정상 트래픽에서도 얼마가 나오는지 데이터가 없다. **SDK가 붙은 실사용 3일치 429 비율을 재고, 그 값이 1%를 넘으면 한도 설계 자체를 재검토**해야 한다.
+- **정상 범위**: `tokens` ≥ 1.0, 정상 폴링 중이면 대개 cap 5에 붙어 있다. 429 비율은 **기준선 수집 필요** — **SDK가 붙은 실사용 3일치 429 비율을 재고, 그 값이 1%를 넘으면 한도 설계 자체를 재검토**해야 한다.
 - **원인별 분기**:
-  - 다수 tokenId가 동시에 429 → **한도 설계 문제**(위 경계 문제). 개별 사용자 문제가 아니다.
-  - 소수 tokenId만 429 → 그 클라이언트가 `nextPollAfterSec`를 무시하고 있다. SDK/브라우저 확인.
+  - 다수 tokenId가 동시에 429 → 여유가 0이던 옛 구조와 달리 지금은 **한도 설계가 아닌 다른 원인**을 먼저 봐라. SDK 배포판이 `nextPollAfterSec`를 안 지키거나, 재시도 루프가 백오프 없이 도는 경우다.
+  - 소수 tokenId만 429 → 그 클라이언트가 `nextPollAfterSec`를 무시하고 있다. SDK/브라우저 확인. 탭 3개 이상도 여기 해당한다.
   - 429인데 `rl:poll:token:*` 키가 없다 → 폴링 경로가 아니라 다른 경로의 429다. 응답 본문 `error` 확인(`RL001` vs `Q005` 정원 초과).
 - **조치**:
-  - **런타임 조정 불가.** capacity 5 / refill 0.5는 `RateLimitFilter.java:116`에 하드코딩돼 있다.
+  - **런타임 조정 불가.** capacity 5 / refill 1.0은 `RateLimitFilter.java:51,60`(`POLL_CAPACITY`, `POLL_REFILL_PER_SEC`)에 하드코딩돼 있다.
   - 개별 사용자 구제가 필요하면 그 버킷만 지운다(즉시 5개 토큰 회복):
     ```bash
     redis-cli -p 6379 del "rl:poll:token:tok_019..."
@@ -76,14 +88,19 @@ Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도�
 
 ### [증상] Rate Limit이 아예 안 걸린다 (429가 0건)
 
-- **먼저 의심할 것**: `RateLimitFilter.java:144-148` — Tenant 조회 실패 시 **`return true`로 통과시킨다.** 인증은 됐는데 Tenant 행이 없으면 그 테넌트는 무제한이 된다.
+- **먼저 의심할 것**: `RateLimitFilter.java:156-160` — Tenant 조회 실패 시 **`return true`로 통과시킨다.** 인증은 됐는데 Tenant 행이 없으면 그 테넌트는 무제한이 된다.
 - **1분 안에 확인**:
   ```bash
   grep -c "Tenant not found for rate limit" <api-log>     # 0이 아니면 확정
   redis-cli -p 6380 --scan --pattern 'rl:tenant:*' -i 0.01 | wc -l
   ```
-  **`Tenant not found` 로그가 있는데 429가 0이면 확정.** `rl:tenant:*` 키가 활성 테넌트 수보다 적어도 같은 신호다.
-- **정상 범위**: `Tenant not found for rate limit` 로그 0건. `rl:tenant:*` 키 수 = 최근 1시간 내 요청한 테넌트 수(TTL 3600s).
+  **`Tenant not found` 로그가 있는데 429가 0이면 확정.**
+  `rl:tenant:*` 키 수는 이 판정에 쓰지 마라 — TTL이 120s라 **키 수가 활성 테넌트 수보다 적은 것이 정상**이다.
+- **정상 범위**: `Tenant not found for rate limit` 로그 0건. `rl:tenant:*` 키 수 = **최근 2분 내** 요청한 테넌트 수(TTL 120s).
+
+  > ⚠️ **관측 창이 1시간 → 2분으로 줄었다.** TTL이 한도에서 계산되도록 바뀌면서 생긴 대가다.
+  > 이 키 수는 이제 "오늘 활동한 테넌트"가 아니라 **"지금 트래픽이 흐르는 테넌트"**를 뜻한다.
+  > 장기 활성 테넌트 수가 필요하면 Redis 키 개수가 아니라 접근 로그·DB를 봐라.
 - **원인별 분기**:
   - `Tenant not found` 로그 있음 → 데이터 정합성 문제. `api_keys.tenant_id`가 가리키는 `tenants` 행이 없다.
   - 로그 없음 + `rl:tenant:*` 키도 정상 → 한도에 안 닿는 것뿐. 정상.
@@ -104,7 +121,7 @@ Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도�
 
 ### [증상] 랜덤 tokenId 폴링 공격을 받고 있다 (permitAll 자원 증폭)
 
-- **먼저 의심할 것**: 폴링 Rate Limit 키가 **공격자가 정하는 값**이다(`RateLimitFilter.java:113` — URI 마지막 세그먼트). 매 요청 다른 tokenId를 쓰면 버킷이 매번 새로 만들어져 **한도에 영원히 안 걸린다.** 그런데 요청 1건마다 Redis master EVAL 2회(token-bucket + poll_verify의 ZRANGEBYSCORE)는 확정 실행된다.
+- **먼저 의심할 것**: 폴링 Rate Limit 키가 **공격자가 정하는 값**이다(`RateLimitFilter.java:125` — URI 마지막 세그먼트). 매 요청 다른 tokenId를 쓰면 버킷이 매번 새로 만들어져 **한도에 영원히 안 걸린다.** 그런데 요청 1건마다 Redis master EVAL 2회(token-bucket + poll_verify의 ZRANGEBYSCORE)는 확정 실행된다.
 - **1분 안에 확인**:
   ```bash
   # ① 폴링 404율 (랜덤 tokenId는 거의 전부 404)
@@ -113,7 +130,7 @@ Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도�
   redis-cli -p 6380 info keyspace
   ```
   **404 비율이 0.5(50%)를 넘고 `rl:poll:token:*` 키 수가 활성 대기자 수를 크게 초과하면 공격 의심.**
-- **정상 범위**: 폴링 404 비율 < 0.05. `rl:poll:token:*` 키 수 ≈ (최근 1시간 폴링한 고유 토큰 수). **정확한 임계값은 기준선 수집 필요 — 실사용 3일치 404 비율을 먼저 재라.**
+- **정상 범위**: 폴링 404 비율 < 0.05. `rl:poll:token:*` 키 수 ≈ (**최근 65초** 폴링한 고유 토큰 수). **정확한 임계값은 기준선 수집 필요 — 실사용 3일치 404 비율을 먼저 재라.**
 - **원인별 분기**:
   - 404 비율 높음 + 소수 IP 집중 → 공격. 그 IP를 차단.
   - 404 비율 높음 + IP 분산 → 분산 공격이거나 SDK 버그(옛 tokenId 재사용).
@@ -133,7 +150,7 @@ Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도�
 
 ### [증상] Redis에 `rl:*` 키가 수백만 개 쌓였다
 
-- **먼저 의심할 것**: TTL은 정상적으로 걸려 있다(token-bucket 3600s, fixed-window 윈도우+1s). 개수가 많다면 **실제로 그만큼의 고유 키가 만들어지고 있다**는 뜻 — 대부분 `rl:poll:token:{tokenId}`다(토큰마다 1개).
+- **먼저 의심할 것**: TTL은 정상적으로 걸려 있다(token-bucket **폴링 65s / Plan 120s**, fixed-window 윈도우+1s). 개수가 많다면 **실제로 그만큼의 고유 키가 만들어지고 있다**는 뜻 — 대부분 `rl:poll:token:{tokenId}`다(토큰마다 1개).
 - **1분 안에 확인**:
   ```bash
   redis-cli -p 6380 info keyspace     # db0 keys=N, expires=M
@@ -142,10 +159,12 @@ Redis 키 TTL: token-bucket 3600s(`token-bucket.lua:46`), fixed-window `윈도�
     while read k; do echo "$(redis-cli -p 6380 ttl "$k") $k"; done | sort -n | head
   ```
   **TTL이 `-1`(무기한)인 `rl:` 키가 하나라도 나오면 이상.** 정상은 전부 양수다.
-- **정상 범위**: `rl:poll:token:*` 수 ≤ 최근 1시간 폴링한 고유 토큰 수. `expires` / `keys` 비율이 `rl:` 영역에서 1.0.
+- **정상 범위**: `rl:poll:token:*` 수 ≤ **최근 65초** 폴링한 고유 토큰 수. `expires` / `keys` 비율이 `rl:` 영역에서 1.0.
 - **원인별 분기**:
-  - TTL 전부 양수 + 개수 많음 → 정상 동작. 트래픽이 많은 것. 1시간 뒤 자연 감소.
+  - TTL 전부 양수 + 개수 많음 → 정상 동작. 트래픽이 많은 것. **65초** 뒤 자연 감소.
   - TTL `-1` 존재 → `token-bucket.lua`의 `EXPIRE`가 안 걸린 경우. 스크립트 버전 확인(`SCRIPT EXISTS`).
+    옛 스크립트는 `refillRate=0`에서 `EXPIRE` 인자 오류로 죽으면서 `HMSET`만 커밋돼 무기한 키를 남겼다.
+    지금은 상·하한 클램프로 그 경로가 없다 — `-1`이 보이면 **구버전 스크립트가 캐시에 남아 있는 것**을 의심하라.
   - `rl:` 키가 메모리의 상당 부분을 차지 → [`runbook/polling.md`](polling.md) 의 메모리 항목과 함께 판단. **`noeviction`이라 상한에 닿으면 Rate Limit 쓰기도 실패하고, 실패하면 `redisTemplate.execute`가 예외를 던져 요청이 500이 된다.**
 - **조치**: TTL이 정상이면 조치 불필요. 메모리 압박이면 만료가 빠른 것부터 자연 감소를 기다리고, 급하면 패턴 삭제:
   ```bash

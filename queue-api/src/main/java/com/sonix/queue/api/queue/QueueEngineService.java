@@ -6,6 +6,7 @@ import com.sonix.queue.domain.queue.*;
 import org.springframework.stereotype.Service;
 
 import java.time.Clock;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 public class QueueEngineService {
@@ -87,7 +88,21 @@ public class QueueEngineService {
         return new PollResult(ready, admitToken, snap.frontSeq(), snap.total(), next);
     }
 
+    /**
+     * 등급 간격에 지터를 더한다.
+     *
+     * <p>같은 등급의 대기자는 전부 같은 초를 받아 다음 폴링이 동시에 몰린다. 등급 경계에서
+     * 한 번 정렬되면 그 뒤로도 계속 같은 초에 돌아와, 큐가 클수록 주기적인 스파이크가 된다.
+     *
+     * <p>위로만 흩는다. 아래로 흩으면 간격이 등급 하한보다 짧아져 Rate Limit(cap 5, refill 1/s)을
+     * 먼저 때린다. 폭은 등급의 1/4 — 등급 자체가 뭉개지지 않는 선이다.
+     */
     private int nextPollAfterSec(long rank) {
+        int base = basePollAfterSec(rank);
+        return base + ThreadLocalRandom.current().nextInt(Math.max(1, base / 4) + 1);
+    }
+
+    private int basePollAfterSec(long rank) {
         if(rank <= 50) return 2;
         if(rank <= 1000) return 5;
         if(rank <= 5000) return 10;
