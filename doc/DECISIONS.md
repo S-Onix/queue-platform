@@ -105,23 +105,6 @@ OS Thread 점유 시간:
   → Tomcat 200개 OS Thread로 수만 rps 처리 가능
 ```
 
-### 운영 반영
-
-이번 결정은 DDL 변경이 아니다. 실 DB(master 3306 / replica 3307)에는 이미
-`issued_at`의 DEFAULT가 없다 — 2026-08-12 세션에 `ALTER`를 실행했으나 커밋되지 않아
-`schema.sql`과 어긋나 있었고, 이번에 `schema.sql`을 실물에 맞췄다.
-
-**신규 환경**은 `schema.sql`이 정본이다. **기존 DB**에 재현이 필요하면 1회 실행:
-
-```sql
--- issued_at의 DEFAULT 제거 (KST 유입 경로 차단)
-ALTER TABLE tokens ALTER COLUMN issued_at DROP DEFAULT;
--- 메타데이터만 바꾸는 INSTANT 연산이다. 테이블 잠금·파티션 재구성 없음(13개 파티션 무영향).
-```
-
-이 프로젝트에는 마이그레이션 도구(Flyway/Liquibase)가 없으므로, DDL 변경은 이렇게
-`schema.sql`에 반영 + DECISIONS에 실행문 기록의 형태로만 추적된다.
-
 ### 면접 포인트
 > "Virtual Thread는 요청마다 생성되지만
 > 처리 시간이 10ms라면 동시에 존재하는 VT는
@@ -1755,7 +1738,8 @@ Pipeline:
 Redis admit-token-by-admit 미스 시:
   DB SELECT WHERE status=ADMIT_ISSUED
                AND admit_token=?
-               AND issued_at > NOW()-60s
+               AND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND
+               -- NOW() 금지: issued_at은 UTC, 세션 TZ는 +09:00이라 조건이 항상 거짓이 된다 (§76)
 
 이유:
   Redis 장애 또는 TTL 경계에서 캐시 미스 가능
@@ -4132,6 +4116,34 @@ AVG(TIMESTAMPDIFF(SECOND, issued_at, completed_at))
 3. `TokenLifecycleConsumer.toToken()` javadoc — 여기가 규약을 실제로 강제하는 유일한 지점임을 명시
 4. 운영 문서 — `NOW()`/`CURDATE()` 대신 `UTC_TIMESTAMP()`/`UTC_DATE()`
 
+### ⚠️ 불변식 — JVM 기본 TZ == JDBC `serverTimezone` == `Asia/Seoul`
+
+**현재 UTC가 보존되는 이유는 두 설정이 서로 상쇄되기 때문이지, 코드가 명시해서가 아니다.**
+
+근거(Hibernate 6.5.3 소스 + 드라이버 실측):
+- `LocalDateTimeJavaType.unwrap(..., Timestamp.class)` → `Timestamp.valueOf(ldt)` — **JVM 기본 TZ로 해석**한다
+- `TimestampJdbcType`은 `hibernate.jdbc.time_zone`이 없으면 `st.setTimestamp(index, timestamp)` 분기를 탄다
+- `hibernate.jdbc.time_zone`은 **어느 yml에도 없다**(확인). JDBC URL은 `serverTimezone=Asia/Seoul`, JVM은 `Asia/Seoul`
+
+mysql-connector-j 8.3.0 직접 바인딩 실측:
+
+| JVM TZ | 바인딩한 값(UTC 벽시계) | 서버가 본 값 |
+|---|---|---|
+| `Asia/Seoul` (현재) | `2026-08-12T06:05` | `2026-08-12 06:05` ✅ |
+| `UTC` (컨테이너 기본) | `2026-08-12T06:05` | `2026-08-12 15:05` ❌ **+9h** |
+
+**이 등식이 깨지는 순간 `tokens.issued_at`이 통째로 9시간 밀린다. 그리고 조용히 일어난다.**
+Docker 이미지 기본 `TZ=UTC`, AWS ECS/EKS 기본 UTC, `-Duser.timezone` 누락이 전부 해당한다 —
+**Sprint 11(Docker + AWS 배포)이 정확히 그 시점이다.**
+
+지킬 것:
+- 컨테이너·인스턴스에 **`TZ=Asia/Seoul` 또는 `-Duser.timezone=Asia/Seoul`을 명시적으로 박는다**
+- JDBC URL의 `serverTimezone`을 바꾸지 않는다
+- **`hibernate.jdbc.time_zone: UTC`로 "고치지" 마라.** `Timestamp.valueOf`가 KST로 해석한 뒤
+  UTC 캘린더로 렌더링해 `2026-08-11 21:05`이 되고, KST 규약 테이블 전체에도 같은 왜곡이 걸린다
+- 근본 해소는 바인딩을 `setObject(LocalDateTime)` 경로로 옮기는 것인데(TZ 무관) Hibernate가
+  그 경로를 쓰지 않는다 → **별도 과제**
+
 ### Alternatives
 
 **A. 전부 UTC로 통일 (기각)**
@@ -4174,34 +4186,6 @@ MySQL은 `TIMESTAMP` 컬럼을 파티션 식에 쓰는 것 자체를 금지한�
 "비용이 커서" 기각이 아니라 **불가능해서** 기각이다.
 (2038 상한도 사실이지만, 파티션 보존이 2달인 이 테이블에선 부차적이다.)
 
-### ⚠️ 불변식 — JVM 기본 TZ == JDBC `serverTimezone` == `Asia/Seoul`
-
-**현재 UTC가 보존되는 이유는 두 설정이 서로 상쇄되기 때문이지, 코드가 명시해서가 아니다.**
-
-근거(Hibernate 6.5.3 소스 + 드라이버 실측):
-- `LocalDateTimeJavaType.unwrap(..., Timestamp.class)` → `Timestamp.valueOf(ldt)` — **JVM 기본 TZ로 해석**한다
-- `TimestampJdbcType`은 `hibernate.jdbc.time_zone`이 없으면 `st.setTimestamp(index, timestamp)` 분기를 탄다
-- `hibernate.jdbc.time_zone`은 **어느 yml에도 없다**(확인). JDBC URL은 `serverTimezone=Asia/Seoul`, JVM은 `Asia/Seoul`
-
-mysql-connector-j 8.3.0 직접 바인딩 실측:
-
-| JVM TZ | 바인딩한 값(UTC 벽시계) | 서버가 본 값 |
-|---|---|---|
-| `Asia/Seoul` (현재) | `2026-08-12T06:05` | `2026-08-12 06:05` ✅ |
-| `UTC` (컨테이너 기본) | `2026-08-12T06:05` | `2026-08-12 15:05` ❌ **+9h** |
-
-**이 등식이 깨지는 순간 `tokens.issued_at`이 통째로 9시간 밀린다. 그리고 조용히 일어난다.**
-Docker 이미지 기본 `TZ=UTC`, AWS ECS/EKS 기본 UTC, `-Duser.timezone` 누락이 전부 해당한다 —
-**Sprint 11(Docker + AWS 배포)이 정확히 그 시점이다.**
-
-지킬 것:
-- 컨테이너·인스턴스에 **`TZ=Asia/Seoul` 또는 `-Duser.timezone=Asia/Seoul`을 명시적으로 박는다**
-- JDBC URL의 `serverTimezone`을 바꾸지 않는다
-- **`hibernate.jdbc.time_zone: UTC`로 "고치지" 마라.** `Timestamp.valueOf`가 KST로 해석한 뒤
-  UTC 캘린더로 렌더링해 `2026-08-11 21:05`이 되고, KST 규약 테이블 전체에도 같은 왜곡이 걸린다
-- 근본 해소는 바인딩을 `setObject(LocalDateTime)` 경로로 옮기는 것인데(TZ 무관) Hibernate가
-  그 경로를 쓰지 않는다 → **별도 과제**
-
 ### Consequences
 
 **긍정**
@@ -4239,6 +4223,23 @@ KST 09:00 이후에는 두 값이 같아져 버그가 사라진다(실측: 15:26
 `WHERE ... AND issued_at > NOW()-60s`였다. `NOW()`는 KST, `issued_at`은 UTC라 조건이 **항상 거짓**이다
 — CLAUDE.md가 "verify DB fallback 무동작"으로 지목한 결함의 원본이 이 명세다.
 Sprint 7이 이대로 구현하면 결함이 코드로 재생산되므로 `UTC_TIMESTAMP(3) - INTERVAL 60 SECOND`로 정정했다.
+
+### 운영 반영
+
+이번 결정은 DDL 변경이 아니다. 실 DB(master 3306 / replica 3307)에는 이미
+`issued_at`의 DEFAULT가 없다 — 2026-08-12 세션에 `ALTER`를 실행했으나 커밋되지 않아
+`schema.sql`과 어긋나 있었고, 이번에 `schema.sql`을 실물에 맞췄다.
+
+**신규 환경**은 `schema.sql`이 정본이다. **기존 DB**에 재현이 필요하면 1회 실행:
+
+```sql
+-- issued_at의 DEFAULT 제거 (KST 유입 경로 차단)
+ALTER TABLE tokens ALTER COLUMN issued_at DROP DEFAULT;
+-- 메타데이터만 바꾸는 INSTANT 연산이다. 테이블 잠금·파티션 재구성 없음(13개 파티션 무영향).
+```
+
+이 프로젝트에는 마이그레이션 도구(Flyway/Liquibase)가 없으므로, DDL 변경은 이렇게
+`schema.sql`에 반영 + DECISIONS에 실행문 기록의 형태로만 추적된다.
 
 ### 면접 포인트
 
