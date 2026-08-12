@@ -17,10 +17,12 @@ alias RR='redis-cli -p 6380'
 
 ### ⚠️ 시각(TZ) 함정 — 이걸 모르면 대조가 통째로 틀린다
 
-`TokenLifecycleConsumer.toToken()`이 `LocalDateTime.ofInstant(instant, ZoneOffset.UTC)`로 변환하므로
-**`tokens.issued_at` 컬럼에는 UTC 벽시계 값이 들어간다.** 그런데 JDBC URL은 `serverTimezone=Asia/Seoul`이고
-MySQL **서버** `default-time-zone`은 여전히 `+09:00`이라, **셸에서 `mysql`로 붙으면**
-`NOW()`/`CURDATE()`가 KST다 → UTC로 저장된 값과 **9시간 어긋난다.**
+**모든 시각 컬럼에는 UTC 값이 들어간다**(DECISIONS §77). 앱의 JDBC는
+`connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true`라 세션 `time_zone`도 `+00:00`이다.
+
+그런데 MySQL **서버** `default-time-zone`은 아직 `+09:00`이라, **셸에서 `mysql`로 붙으면**
+세션이 `+09:00`이 되어 `NOW()`/`CURDATE()`가 KST다 → UTC로 저장된 값과 **9시간 어긋난다.**
+**앱은 문제없고 CLI만 다르다** — 아래 규칙은 사람이 직접 쿼리할 때의 이야기다.
 
 > 앱(JDBC)은 `forceConnectionTimeZoneToSession=true`로 세션이 UTC라 문제가 없다.
 > **CLI만 다르다** — 아래 규칙은 사람이 직접 쿼리할 때의 이야기다. (DECISIONS §77)

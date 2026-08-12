@@ -1739,7 +1739,9 @@ Redis admit-token-by-admit 미스 시:
   DB SELECT WHERE status=ADMIT_ISSUED
                AND admit_token=?
                AND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND
-               -- NOW() 금지: issued_at은 UTC, 세션 TZ는 +09:00이라 조건이 항상 거짓이 된다 (§76)
+               -- UTC_TIMESTAMP()를 쓴다: 시각 컬럼은 전부 UTC다(§77). 앱 세션은 +00:00이라
+               -- NOW()도 UTC지만, 서버 default-time-zone이 아직 +09:00이라 mysql CLI로
+               -- 같은 쿼리를 돌리면 NOW()가 KST다. UTC_TIMESTAMP()는 어느 경로에서도 같다.
 
 이유:
   Redis 장애 또는 TTL 경계에서 캐시 미스 가능
