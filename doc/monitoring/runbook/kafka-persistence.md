@@ -31,8 +31,18 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
   Q=q_xxx
   redis-cli -p 6380 zcard "queue:{$Q}:waiting"; redis-cli -p 6380 hlen "queue:{$Q}:tokens"; redis-cli -p 6380 get "queue:{$Q}:seq"
   mysql -h127.0.0.1 -P3307 -uqueueapp -p queue_platform -N -e \
-    "SELECT COUNT(*) FROM tokens WHERE queue_id='$Q' AND issued_at >= CURDATE()"
+    "SELECT COUNT(*) FROM tokens WHERE queue_id='$Q' AND issued_at >= UTC_DATE()"
   ```
+  > ⚠️ **`CURDATE()`가 아니라 `UTC_DATE()`다.** `tokens`의 시각 컬럼은 UTC인데 MySQL 세션
+  > `time_zone`은 `+09:00`이다.
+  >
+  > **버그는 항상 나는 게 아니라 KST 00:00~09:00 창에서만 난다. 대신 그 창에서는 결과가
+  > 통째로 0건이 된다.** 그 시간대에는 `CURDATE()`가 이미 오늘인데 `UTC_DATE()`는 아직 어제라,
+  > `issued_at >= CURDATE()`가 **UTC로는 오늘 09:00(KST) 이후**를 요구한다 — 아직 오지 않은 시각이다.
+  > (KST 09:00 이후에는 두 값이 같아져 버그가 사라진다. 그래서 낮에 검증하면 재현되지 않는다.)
+  >
+  > 결과가 0이면 Redis보다 DB가 적으니 **유령 토큰이 대량 발생한 것처럼 보인다** —
+  > 이 항목이 잡으려는 바로 그 증상을, 절차가 새벽에만 스스로 만들어낸다.
   **판정 기준 (반드시 이 관계로 읽어라 — 넷이 전부 같은 게 아니다):**
 
   | 관계 | 정상 여부 |

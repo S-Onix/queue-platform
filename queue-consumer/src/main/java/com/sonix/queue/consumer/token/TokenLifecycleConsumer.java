@@ -128,9 +128,23 @@ public class TokenLifecycleConsumer {
     /**
      * 이벤트 → 도메인 토큰.
      *
-     * <p>{@code issuedAt}을 UTC로 고정 변환하는 것이 중요하다. 이 값은
-     * {@code UNIQUE (token_id, issued_at)}의 절반이라 재처리 때 1ms만 어긋나도 다른 행이
-     * 되어 멱등성이 깨진다.
+     * <p>{@code issuedAt}을 UTC로 고정 변환하는 것이 중요하다. 이유가 둘이다.
+     *
+     * <p><b>1) 멱등성.</b> 이 값은 {@code UNIQUE (token_id, issued_at)}의 절반이라
+     * 재처리 때 1ms만 어긋나도 다른 행이 되어 멱등 적재가 깨진다.
+     * {@code ZoneOffset.UTC}는 고정 오프셋이라 어느 서버에서 몇 번을 재처리하든 같은 값이 나온다.
+     * {@code ZoneId.systemDefault()}로 바꾸면 인스턴스별 TZ 설정에 따라 갈리고,
+     * DST가 있는 지역에서는 같은 인스턴스에서도 갈린다.
+     *
+     * <p><b>2) 컬럼 규약.</b> {@code tokens}의 시각 컬럼은 전부 UTC다
+     * ({@code doc/schema.sql}의 [시각 규약] 참조). 이 프로젝트의 다른 테이블
+     * ({@code queues}, {@code tenants}, {@code api_keys}, {@code refresh_tokens})은
+     * 도메인 모델이 {@code LocalDateTime.now()}를 써서 KST가 들어간다 — 둘 다
+     * {@code DATETIME(3)}이라 타입으로 구분되지 않으므로, <b>여기가 tokens 쪽 규약을
+     * 실제로 강제하는 유일한 지점</b>이다.
+     *
+     * <p>따라서 이 줄을 {@code LocalDateTime.now()}나 {@code ofInstant(..., systemDefault())}로
+     * "단순화"하면 안 된다. 멱등성과 컬럼 규약이 동시에 깨진다.
      */
     private static Token toToken(EnqueueEvent e) {
         LocalDateTime issuedAt = LocalDateTime.ofInstant(e.issuedAt(), ZoneOffset.UTC);

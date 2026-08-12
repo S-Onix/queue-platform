@@ -163,7 +163,7 @@ flowchart TD
     --> VERIFY["POST /admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 (상태 변경 없음)"]
 
     VERIFY --> VK{"admit-token-by-admit:{admitToken}\n유효?"}
-    VK -->|"만료 or 무효"| VDB["DB Fallback 시도\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND issued_at > NOW()-60s"]
+    VK -->|"만료 or 무효"| VDB["DB Fallback 시도\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(NOW() 금지 — issued_at은 UTC. DECISIONS §76)"]
     VDB -->|"없음"| E404(["404 TK_002_INVALID_ADMIT_TOKEN"])
     VDB -->|"있음"| VFLAG["SET verified-token:{tokenId} EX 60\n중복 입장 방지 플래그"]
     VK -->|"유효"| VFLAG
