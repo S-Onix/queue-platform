@@ -53,6 +53,15 @@ public class RedisQueueEngine implements QueueEngine {
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
 
+    /**
+     * 이 프로세스가 종료 중인지 여부.
+     *
+     * <p>인스턴스 로컬 상태이며 <b>서버마다 값이 달라도 무해</b>하다. 종료는 인스턴스별로
+     * 일어나고, 이 플래그는 "내 Global Queue를 drain해 줄 주체가 아직 있는가"라는
+     * 자기 프로세스 한정 질문에만 답한다. 다른 인스턴스는 계속 요청을 받으면 된다.
+     */
+    private volatile boolean shuttingDown = false;
+
     public RedisQueueEngine(
             StringRedisTemplate redisTemplate,
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
@@ -65,10 +74,30 @@ public class RedisQueueEngine implements QueueEngine {
 
     @Override
     public EnqueueResult enqueue(String queueId, String identifier) {
+        // fast path. 정합성은 아래 offer→remove 검사가 책임지고, 이 검사는 순전히 비용 방어다.
+        // 두 번 검사하는 이유: ConcurrentLinkedQueue.remove()는 O(n)이다. 종료 표시 이후에도
+        // 커넥터가 멈추기 전까지 Tomcat은 요청을 계속 받으므로, 백로그가 큰 상태(버스트 시
+        // 수만~수십만)에서 모든 요청이 offer→remove를 타면 O(n·m)이 되어 CPU가 포화되고
+        // 정작 마지막 drain이 굶는다. 여기서 대부분을 미리 걷어낸다. — 지우지 말 것.
+        if (shuttingDown) {
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
+        }
+
         String tokenId = IdGenerator.generate("tok_");
         PendingEnqueue pending = new PendingEnqueue(queueId, identifier, tokenId);
 
         globalQueue.offer(pending);
+
+        // 종료 중이면 이 요청을 처리해 줄 주체가 없다(스케줄러는 ContextClosedEvent에서 이미
+        // 멈췄고, BatchProcessor의 마지막 drain도 지나갔을 수 있다). 30초 매달렸다 503이 되느니
+        // 즉시 실패시켜 호출자가 다른 인스턴스로 재시도하게 한다.
+        //
+        // 위의 fast path만으로는 부족하다. 앞 검사만 있으면 "검사 통과 → 마지막 drain 완료 →
+        // offer" 순서가 가능해 그 요청이 아무에게도 처리되지 않는다. offer '뒤'에서 다시 보면
+        // remove 성공 여부가 곧 "아직 아무도 안 가져갔다"는 증거라 경합 구간이 남지 않는다.
+        if (shuttingDown && globalQueue.remove(pending)) {
+            throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
+        }
 
         try {
             return pending.getFuture().get(MAX_WAIT_SECONDS, TimeUnit.SECONDS);
@@ -159,6 +188,16 @@ public class RedisQueueEngine implements QueueEngine {
      */
     public ConcurrentLinkedQueue<PendingEnqueue> getGlobalQueue() {
         return globalQueue;
+    }
+
+    /**
+     * 종료 시작을 알린다 (BatchProcessor의 마지막 drain이 호출).
+     *
+     * <p>호출 이후 도착하는 enqueue는 대기 없이 실패한다. 되돌리는 경로는 없다 —
+     * 컨텍스트가 다시 살아나는 일이 없기 때문이다.
+     */
+    public void markShuttingDown() {
+        this.shuttingDown = true;
     }
 
     /**

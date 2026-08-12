@@ -10,6 +10,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.boot.web.context.WebServerGracefulShutdownLifecycle;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -201,6 +202,95 @@ public class BatchProcessorTest {
         // then: 일부만 성공시키지 않고 전원 예외
         assertThat(p1.getFuture()).isCompletedExceptionally();
         assertThat(p2.getFuture()).isCompletedExceptionally();
+    }
+
+    @Test
+    @DisplayName("종료 훅은 Global Queue에 남은 요청을 마지막으로 drain해 Future를 완결시킨다")
+    void stop_drainsRemainingRequests() throws Exception {
+        // given: 스케줄러가 이미 멈춘 상태에서 큐에 남아 있는 요청
+        ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1", "tok_u1");
+        global.offer(p1);
+
+        when(queueEngine.getGlobalQueue()).thenReturn(global);
+        when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.of(mockQueue(10000)));
+
+        List<Object> raw = List.of("raw");
+        when(queueEngine.executeBulkLua(eq("q_a"), anyList(), anyLong(), any(Instant.class))).thenReturn(raw);
+        when(queueEngine.parseBulkResult(raw)).thenReturn(List.of(
+                EnqueueResult.ok("u1", "tok_u1", 0, 1, 1, T0)
+        ));
+
+        // when
+        batchProcessor.start();
+        batchProcessor.stop();
+
+        // then: 종료 사실을 엔진에 알리고, 남은 요청은 정상 결과로 응답된다(유실 0)
+        verify(queueEngine).markShuttingDown();
+        assertThat(batchProcessor.isRunning()).isFalse();
+        assertThat(result(p1).getStatus()).isEqualTo(EnqueueResult.Status.OK);
+        assertThat(global).isEmpty();
+    }
+
+    @Test
+    @DisplayName("종료 drain 중 큐 조회가 실패하면 그 그룹은 매달리지 않고 예외로 완결된다")
+    void stop_whenCapacityLookupFails_failsThatGroupWithoutHanging() {
+        // given: 큐 조회 실패(예: 종료 중 DB 커넥션 정리)
+        // 이 예외는 processQueueGroup의 catch에서 잡혀 failAllPending으로 끝나므로
+        // stop()의 catch에는 도달하지 않는다. 검증 대상은 "그 그룹이 예외로 완결되는가"다.
+        ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+        PendingEnqueue p1 = new PendingEnqueue("q_a", "u1", "tok_u1");
+        global.offer(p1);
+
+        when(queueEngine.getGlobalQueue()).thenReturn(global);
+        when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.empty());
+
+        // when
+        batchProcessor.start();
+        batchProcessor.stop();
+
+        // then: 30초 타임아웃을 기다리게 두지 않고 즉시 실패로 응답
+        assertThat(p1.getFuture()).isCompletedExceptionally();
+        assertThat(global).isEmpty();
+    }
+
+    @Test
+    @DisplayName("한 큐의 capacity 조회 실패가 같은 사이클의 다른 큐 요청까지 죽이지 않는다")
+    void processBatches_groupFailureIsIsolatedFromOtherGroups() throws Exception {
+        // given: 한 사이클에 큐 A(DB에 없음)와 큐 B(정상)가 섞여 있다.
+        // A의 실패가 사이클 전체를 깨면, 이미 drain된 B의 요청은 다음 사이클에도 보이지 않아
+        // 아무 결과 없이 사라진다(Global Queue에서 이미 빠져나왔으므로).
+        ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+        PendingEnqueue a1 = new PendingEnqueue("q_a", "u1", "tok_u1");
+        PendingEnqueue b1 = new PendingEnqueue("q_b", "u2", "tok_u2");
+        global.offer(a1);
+        global.offer(b1);
+
+        when(queueEngine.getGlobalQueue()).thenReturn(global);
+        when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.empty());
+        when(queueRepository.findByQueueId("q_b")).thenReturn(Optional.of(mockQueue(10000)));
+
+        List<Object> rawB = List.of("raw_b");
+        when(queueEngine.executeBulkLua(eq("q_b"), anyList(), anyLong(), any(Instant.class))).thenReturn(rawB);
+        when(queueEngine.parseBulkResult(rawB)).thenReturn(List.of(
+                EnqueueResult.ok("u2", "tok_u2", 0, 1, 1, T0)
+        ));
+
+        // when
+        batchProcessor.processBatches();
+
+        // then: A만 실패하고 B는 정상 결과를 받는다
+        assertThat(a1.getFuture()).isCompletedExceptionally();
+        assertThat(result(b1).getStatus()).isEqualTo(EnqueueResult.Status.OK);
+    }
+
+    @Test
+    @DisplayName("종료 훅은 웹 graceful shutdown 단계보다 먼저 실행되는 phase를 갖는다")
+    void phase_runsBeforeWebGracefulShutdown() {
+        // 내림차순으로 stop되므로 phase가 클수록 먼저다.
+        // 웹 계층이 in-flight 요청을 기다리기 시작하기 전에 drain이 끝나야 응답을 보낼 수 있다.
+        assertThat(batchProcessor.getPhase())
+                .isGreaterThan(WebServerGracefulShutdownLifecycle.SMART_LIFECYCLE_PHASE);
     }
 
     private EnqueueResult result(PendingEnqueue pending) throws ExecutionException, InterruptedException {
