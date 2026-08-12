@@ -11,6 +11,10 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
 
+    // 이게 없으면 레지스트리 빈이 없어 /actuator/prometheus 엔드포인트 자체가 생기지 않는다.
+    // application.yml이 prometheus를 노출해도 404 — 컨슈머 lag을 PromQL로 볼 수단이 사라진다.
+    implementation 'io.micrometer:micrometer-registry-prometheus'
+
     // @Transactional(spring-tx): spring-kafka가 전이 제공하지만 명시한다.
     // queue-batch가 Kafka 제거 때 이 의존성이 조용히 사라져 컴파일이 깨진 전례가 있다.
     implementation 'org.springframework:spring-tx'

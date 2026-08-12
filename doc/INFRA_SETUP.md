@@ -1018,6 +1018,25 @@ rm prometheus-3.0.1.linux-amd64.tar.gz
 
 `~/prometheus/prometheus.yml`:
 
+> ⚠️ **이 스니펫은 문서일 뿐 실가동 설정이 아니다. 여기를 고쳐도 수집은 켜지지 않는다.**
+>
+> 실가동 파일은 `/home/sonix/queue-platform-infra/monitoring/prometheus/prometheus.yml`이고
+> (실행 중 프로세스가 `--config.file`로 지목하는 경로), 아래 스니펫과 **네 군데가 다르다**:
+>
+> | | 실가동 | 아래 스니펫 |
+> |---|---|---|
+> | 경로 | `~/queue-platform-infra/monitoring/prometheus/` | `~/prometheus/` |
+> | API job명 | `queue-api` | `queue-platform-api` |
+> | 타깃 | `localhost:8080` | `172.19.64.1:8080` |
+> | 라벨 키 | `env` | `environment` (+ `external_labels`) |
+>
+> **job명과 라벨 키가 갈리면 쿼리가 아니라 라벨 셀렉터 자체가 안 맞는다.** 반영할 때는
+> 스니펫을 그대로 복붙하지 말고 **실가동 파일의 기존 job과 이름·라벨 키를 맞춘 뒤**
+> reload할 것: `curl -X POST http://localhost:9090/-/reload` (또는 프로세스 재기동).
+> 반영 확인: `curl -s localhost:9090/api/v1/targets | grep 8082`
+>
+> consumer job은 현재 **실가동 파일에 없다.** 추가는 아직 안 됐다.
+
 ```yaml
 global:
   scrape_interval: 15s
@@ -1041,6 +1060,21 @@ scrape_configs:
         labels:
           application: 'queue-api'
           environment: 'local'
+
+  # Queue Platform Consumer (Kafka lag / 적재량)
+  - job_name: 'queue-platform-consumer'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['172.19.64.1:8082']    # Windows host IP
+        labels:
+          application: 'queue-consumer'
+          environment: 'local'
+
+# queue-batch(8081)는 actuator 의존성이 없어 /actuator/prometheus를 노출하지 않는다.
+# job을 넣으면 항상 DOWN으로 뜨므로, 의존성을 추가한 뒤에 등록할 것.
+# (reconciliation 스위퍼는 queue-batch에 들어갈 예정이므로, batch actuator가
+#  그 관측의 선행 조건이다. 순서를 뒤집으면 스위퍼를 만들고도 지표를 못 낸다.)
 
 # 향후 확장 (Phase 5 — 인프라 Exporter):
 # - job_name: 'mysql'         # mysqld_exporter (9104)

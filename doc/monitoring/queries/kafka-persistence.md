@@ -218,7 +218,9 @@ GROUP BY token_id, issued_at HAVING c > 1 LIMIT 20;
 curl -s -o /dev/null -w 'consumer actuator: %{http_code}\n' http://localhost:8082/actuator/health
 curl -s -o /dev/null -w 'consumer prometheus: %{http_code}\n' http://localhost:8082/actuator/prometheus
 ```
-**prometheus가 404인 것이 현재 정상 상태다** — `queue-consumer/build.gradle`에 `micrometer-registry-prometheus`가 없고, `prometheus.yml`에 8082 job도 없다. 컨슈머 지표는 PromQL로 볼 수 없다(미노출 — 의존성·scrape job 추가 필요).
+**둘 다 200이 정상이다.** `micrometer-registry-prometheus` 의존성과 `prometheus.yml`의 8082 job이 추가되어 컨슈머 지표를 PromQL로 볼 수 있다. 404가 나오면 의존성이 빠진 것이다.
+
+> 단 **커스텀 메트릭은 여전히 0건**이다 — 적재 건수·DLT 유입·발행 성공/실패는 아래 "관측이 비어 있는 것"을 참고하라. 여기서 보이는 건 Spring Kafka·Hikari·JVM의 기본 지표뿐이다.
 
 ```bash
 LOG=<queue-consumer 로그>

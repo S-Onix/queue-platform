@@ -159,18 +159,27 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 
 ---
 
-### [증상] queue-consumer의 `/actuator/prometheus`가 404다
+### [증상] queue-consumer 지표가 Prometheus에 안 뜬다
 
-- **먼저 의심할 것**: **설정 문제가 아니라 의존성 누락이다.** `queue-consumer/build.gradle`에 `io.micrometer:micrometer-registry-prometheus`가 없다. `application.yml`의 `exposure.include: health,info,prometheus`는 있지만 레지스트리 빈이 없어 엔드포인트가 생성되지 않는다.
+- **먼저 의심할 것**: **엔드포인트가 아니라 수집 쪽이다.** `queue-consumer/build.gradle`에
+  `io.micrometer:micrometer-registry-prometheus`가 있고 `application.yml`에
+  `exposure.include: health,info,prometheus`도 있으므로 **8082에서 200이 나오는 것이 정상**이다.
+  안 뜬다면 실가동 `prometheus.yml`에 consumer job이 등록돼 있는지를 먼저 본다
+  (→ [증상] scrape 타깃이 DOWN, 및 `doc/INFRA_SETUP.md`).
 - **1분 안에 확인**:
   ```bash
-  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8082/actuator/prometheus   # 404 예상
-  grep -c "micrometer-registry-prometheus" queue-consumer/build.gradle                  # 0 예상
+  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8082/actuator/prometheus   # 200 예상
+  grep -c "micrometer-registry-prometheus" queue-consumer/build.gradle                  # 1 예상
+  # 수집기가 이 타깃을 알고 있는가 (job명은 실가동 prometheus.yml 기준)
+  curl -s 'http://localhost:9090/api/v1/targets' | grep -o '8082[^,]*' | head
   ```
-- **정상 범위**: 200 + `kafka_consumer_fetch_manager_records_lag_max` 노출. **현재는 미충족.**
-- **원인별 분기**: 404 → 의존성 누락(재배포 필요). 403/401 → Security(consumer엔 Security 없음, 해당 없음). 연결 거부 → 프로세스 미기동.
-- **조치**: 즉시 조치 불가(빌드 변경 필요). 그동안 lag은 `kafka-consumer-groups.sh` CLI로만 본다. 또한 Prometheus의 `scrape_configs`에 **queue-consumer(8082) job 자체가 없다** — `doc/INFRA_SETUP.md` §prometheus.yml에는 `queue-platform-api`(8080)만 있다.
-- **하면 안 되는 것**: consumer가 지표를 안 내니 "lag이 0이다"라고 가정하는 것. 지표가 없는 것과 문제가 없는 것은 다르다.
+- **정상 범위**: 200 + `kafka_consumer_fetch_manager_records_lag_max` 노출. **충족**(실측 200 / 메트릭 213줄).
+- **원인별 분기**:
+  - **200인데 Prometheus에 없다** → 가장 흔한 경우. 실가동 `prometheus.yml`에 consumer job이 없다. `doc/INFRA_SETUP.md`의 스니펫은 **문서일 뿐 실가동 파일이 아니다** — 실제 파일에 반영하고 reload해야 한다.
+  - **404** → 의존성이 빠진 빌드가 배포됐다(재배포 필요). 현재 브랜치 기준으로는 정상 경로가 아니다.
+  - 403/401 → Security(consumer엔 Security 없음, 해당 없음). 연결 거부 → 프로세스 미기동.
+- **조치**: 실가동 `prometheus.yml`에 8082 job을 추가하고 reload. job명·라벨 키는 **기존 job과 통일**할 것 — 문서 스니펫과 실가동 파일이 다르면(`queue-api` vs `queue-platform-api`, `env` vs `environment`) 라벨 셀렉터가 갈려 대시보드 쿼리가 어긋난다. 그래도 안 보이면 lag은 `kafka-consumer-groups.sh` CLI로 확인한다.
+- **하면 안 되는 것**: consumer 지표가 안 보인다고 "lag이 0이다"라고 가정하는 것. **지표가 없는 것과 문제가 없는 것은 다르다.** 특히 컨슈머가 죽으면 `kafka_consumer_*`는 0이 되는 게 아니라 **시계열 자체가 사라져** `rate()` 기반 알림이 전부 침묵한다 — 그때 유일하게 남는 신호가 `up{job=...} == 0`이다.
 
 ---
 
@@ -182,5 +191,5 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 | 발행 지연(publish latency) | **미노출** |
 | 적재 건수 / 배치 크기 분포 | **미노출.** `log.debug`만 (`INFO` 레벨에선 안 찍힘) |
 | DLT 유입 카운터 | **미노출.** Kafka 오프셋을 직접 세야 함 |
-| consumer lag (PromQL) | **불가.** consumer에 prometheus 레지스트리 없음 + scrape job 없음 + kafka_exporter 미설치 |
+| consumer lag (PromQL) | **클라이언트 단위는 가능** — `kafka_consumer_fetch_manager_records_lag_max`. 단 **실가동 `prometheus.yml`에 consumer job 등록이 선행**이다. **그룹 단위 LAG 합계는 여전히 불가**(kafka_exporter 미설치) — 아래 주의 참조 |
 | 유령 토큰 수(reconciliation) | **미구현.** 수동 3자 대조가 유일 |
