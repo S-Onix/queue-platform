@@ -118,7 +118,7 @@ Redis Sorted Set:
 | TTL / Batch | 만료 처리 / 파티션 운영 / 통계 집계 | ✅ |
 | Kafka | Enqueue 버퍼 / 상태 변경 이벤트 | ✅ |
 | Billing | 과금 집계 (Kafka Consumer) | ✅ |
-| SDK | Java SDK / JS SDK | ✅ |
+| SDK | **JS SDK만** (Tenant 서버는 REST API 직접 호출) | ✅ |
 
 ---
 

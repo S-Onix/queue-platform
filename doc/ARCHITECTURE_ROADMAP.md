@@ -678,8 +678,11 @@ class QueueClientSDK {
     }
 }
 
-[Tenant Server SDK (Node.js/Java)]
-class QueuePlatformSDK {
+[Tenant Server — SDK 없음. REST API 직접 호출]
+// ⚠️ 아래는 SSE 재설계 시의 호출 형태를 보이기 위한 의사코드다.
+//    특정 언어의 SDK를 제공한다는 뜻이 아니다 — Tenant 서버용 SDK는 만들지 않는다.
+//    이유: DECISIONS §35
+{
     // 초기 capacity 설정
     async setCapacity(queueId, capacity) {
         await fetch(`/queues/${queueId}/backpressure`, {

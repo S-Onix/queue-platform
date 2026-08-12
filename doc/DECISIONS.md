@@ -1245,18 +1245,26 @@ TokenExpiryJob이 여러 서버에서 동시 실행되면?
 
 ## 28. SDK 제공 계획
 
-### SDK가 필요한 이유
+> ⚠️ **범위가 §35에서 좁혀졌다 (2026-08-12).** 아래는 "SDK가 있으면 좋은 이유"를 나열한
+> 초기 검토이고, **Tenant 서버용 SDK는 만들지 않기로 확정**했다(언어를 하나 고르면 나머지
+> 테넌트를 버리는 결정이 되므로). 브라우저용 JS SDK만 만든다. **현재 결정은 §35를 보라.**
+
+### SDK가 필요한 이유 (초기 검토)
 ```
 Tenant가 직접 구현해야 하는 것들:
   HTTP 클라이언트 설정
   X-API-Key SHA-256 해싱
-  재시도 로직 (verify 순서 강제, complete 재시도)
-  nextPollAfterSec 타이밍 관리, 탭 비활성화 처리
+  재시도 로직 (verify 순서 강제, complete 재시도)      ← 서버 쪽. §35에서 REST 명세 + 서버 방어로 이관
+  nextPollAfterSec 타이밍 관리, 탭 비활성화 처리        ← 브라우저 쪽. JS SDK가 담당
 
 → Tenant마다 직접 구현 → 실수 가능성 높음
 → Platform 정책 변경 시 모든 Tenant가 수정
 → SDK가 정책을 코드 레벨에서 강제
 ```
+
+**§35의 판단**: 위 네 줄 중 **아래 두 줄만 SDK로 강제할 실익이 있다.**
+위 두 줄(서버 쪽)은 순서만 지키면 되는 단순 호출이라 명세로 충분하고,
+대신 **서버가 위반을 방어**한다(verify 없이 complete가 오면 거절).
 
 ---
 
@@ -1609,21 +1617,68 @@ TTL 30초 → 60초:
 
 ---
 
-## 35. SDK 설계
+## 35. SDK 설계 — JS SDK만 만든다. Tenant 서버용 SDK는 안 만든다
 
-### Java SDK 핵심 기능
+**갱신**: 2026-08-12 (Java SDK 폐기 결정의 근거를 명시). `FRS_final.md` v1.10의
+"Java SDK 제거 (REST API 명세로 대체)"가 이 결정이다.
 
-```
-QueueClient.admitAndVerify(queueId, count):
-  verify를 내부 처리 전에 먼저 호출 → SDK가 순서 강제
-  BulkVerifier: admitToken N개 동시 최대 100개 병렬 처리
-  onSuccess: verify 완료 후 Tenant 내부 처리 콜백
-  complete 자동 호출 (3회 backoff 재시도)
+### Decision
 
-QueueClient.complete(token, admitToken):
-  3회 자동 재시도 (100ms → 500ms → 1500ms backoff)
-  admitToken TTL(60초) 내 완료 보장 설계
-```
+| 대상 | 제공 방식 |
+|---|---|
+| **브라우저 (대기자)** | **JS SDK** — 순수 바닐라 JavaScript |
+| **Tenant 서버 (admit/verify/complete 호출자)** | **SDK 없음. REST API 명세만 제공** |
+
+### 왜 Tenant 서버용 SDK를 안 만드나
+
+**언어를 하나 고르는 순간 나머지 테넌트를 버리는 것이 된다.**
+
+Java SDK를 제공하면 Java 테넌트만 편해지고 **Python·Go·PHP 테넌트는 아무 도움을 못 받는다.**
+그렇다고 언어별로 만들면 SDK 수만큼 유지보수가 늘고, 정책이 바뀔 때마다 N개를 동시에 고쳐야 한다.
+그 사이 버전이 어긋나면 **"어느 SDK를 쓰느냐에 따라 동작이 다른"** 최악의 상태가 된다.
+
+REST API는 **언어를 가리지 않는다.** HTTP 클라이언트가 없는 언어는 없다.
+명세를 정확히 쓰는 비용이, 언어별 SDK N개를 만들고 버리지 못하는 비용보다 싸다.
+
+### 왜 브라우저는 SDK를 만드나
+
+**브라우저는 언어가 하나다.** 바닐라 JavaScript 하나로 **모든 브라우저가 대응된다** —
+프레임워크(React/Vue/Angular)에 묶이지 않으므로 테넌트의 프론트 스택과 무관하게 붙는다.
+Tenant 서버 쪽의 "언어를 고르면 나머지를 버린다"는 문제가 여기엔 없다.
+
+그리고 브라우저 쪽에는 **SDK가 아니면 반복될 실수가 실재한다**:
+
+- `nextPollAfterSec` 준수 (안 지키면 Rate Limit 429 → 대기 실패)
+- 탭 비활성화 시 폴링 중단 / 복귀 시 재개 (배터리·서버 부하)
+- 네트워크 offline/online 처리
+- `tokenId` 보관 (소유가 곧 자격이라 유실되면 순번을 잃는다)
+
+이건 각 테넌트가 직접 구현하면 **거의 확실히 틀리는** 종류다. 서버 쪽 admit/verify/complete는
+순서만 지키면 되는 단순한 호출이라 명세로 충분하다.
+
+### Alternatives
+
+**A. 언어별 SDK를 여러 개 제공 (기각)**
+가장 친절하지만 유지보수가 곱해진다. 정책 변경 시 N개 동기화가 필요하고, 하나라도 뒤처지면
+그 SDK 사용자만 다르게 동작한다. 1인 프로젝트가 감당할 범위를 넘는다.
+
+**B. Java SDK만 제공 (기각 — 원래 계획이었다)**
+개발자가 Java에 익숙하다는 이유였는데, **그건 플랫폼 사용자의 사정이 아니다.**
+Python 테넌트가 붙으려는 순간 "SDK가 없으니 알아서 REST로 붙으세요"가 되는데,
+그럴 거면 처음부터 REST 명세를 정본으로 두는 편이 정직하다.
+
+**C. OpenAPI 스펙으로 클라이언트 자동 생성 (후속 검토)**
+언어 중립이면서 코드를 얻는 절충안이다. 생성물 품질과 스펙 유지 비용을 따져봐야 하므로
+지금은 채택하지 않되, REST 명세를 쓸 때 **OpenAPI로 옮기기 쉬운 형태**로 유지한다.
+
+### Consequences
+
+- **Tenant 서버 쪽 정책 강제 수단이 없다.** verify 순서, `complete` 재시도, `admitToken` TTL 60초
+  준수를 SDK가 강제하지 못하므로 **명세에 그 제약이 명시돼야 하고**, 서버가 위반을 방어해야 한다
+  (예: verify 없이 complete가 오면 거절). **SDK가 하던 방어를 서버가 대신한다**는 뜻이다
+- `FRS_final.md`의 API 명세가 **사실상의 SDK**다. 응답 필드·에러 코드·재시도 규칙이 부정확하면
+  그대로 테넌트 장애가 된다
+- JS SDK는 별도 레포(`queue-platform-sdk-js`, Sprint 10)
 
 ### JS SDK 핵심 기능
 
@@ -1636,11 +1691,20 @@ QueueSDK.init() + startPolling():
 ```
 
 ### 면접 포인트
-> "Java SDK의 admitAndVerify()가 verify 호출 순서를 코드 레벨에서 강제합니다.
-> verify를 내부 처리 전에 먼저 호출하지 않으면 TTL 초과 위험이 있는데
-> SDK가 이 순서를 보장합니다.
-> JS SDK는 nextPollAfterSec 타이밍을 자동 적용하고
-> 탭 비활성화 시 Polling을 자동 중단해 서버 부하를 줄입니다."
+
+> "SDK를 왜 JavaScript만 만들었나요?"
+
+**Tenant 서버용 SDK는 언어를 하나 고르는 순간 나머지 테넌트를 버리는 결정**이 됩니다.
+Java SDK를 주면 Python 테넌트는 대응이 안 되고, 언어별로 만들면 정책이 바뀔 때마다
+N개를 동시에 고쳐야 해서 버전이 어긋납니다. REST API는 언어를 가리지 않으니
+명세를 정확히 쓰는 쪽을 택했습니다.
+
+반대로 **브라우저는 언어가 하나**입니다. 바닐라 JS면 프레임워크와 무관하게 모든 브라우저가
+대응되고, 여기엔 SDK가 아니면 반복될 실수가 실재합니다 — `nextPollAfterSec` 미준수로 인한 429,
+탭 비활성화 시 불필요한 폴링, `tokenId` 유실. 그래서 **강제할 실익이 있는 쪽에만** SDK를 뒀습니다.
+
+대신 서버 쪽 정책은 SDK가 아니라 **서버가 방어**해야 합니다. verify 없이 complete가 오면
+거절하는 식으로요 — SDK가 하던 일을 API 계약과 서버 검증이 대신합니다.
 
 ---
 
