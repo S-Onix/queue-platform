@@ -105,6 +105,23 @@ OS Thread 점유 시간:
   → Tomcat 200개 OS Thread로 수만 rps 처리 가능
 ```
 
+### 운영 반영
+
+이번 결정은 DDL 변경이 아니다. 실 DB(master 3306 / replica 3307)에는 이미
+`issued_at`의 DEFAULT가 없다 — 2026-08-12 세션에 `ALTER`를 실행했으나 커밋되지 않아
+`schema.sql`과 어긋나 있었고, 이번에 `schema.sql`을 실물에 맞췄다.
+
+**신규 환경**은 `schema.sql`이 정본이다. **기존 DB**에 재현이 필요하면 1회 실행:
+
+```sql
+-- issued_at의 DEFAULT 제거 (KST 유입 경로 차단)
+ALTER TABLE tokens ALTER COLUMN issued_at DROP DEFAULT;
+-- 메타데이터만 바꾸는 INSTANT 연산이다. 테이블 잠금·파티션 재구성 없음(13개 파티션 무영향).
+```
+
+이 프로젝트에는 마이그레이션 도구(Flyway/Liquibase)가 없으므로, DDL 변경은 이렇게
+`schema.sql`에 반영 + DECISIONS에 실행문 기록의 형태로만 추적된다.
+
 ### 면접 포인트
 > "Virtual Thread는 요청마다 생성되지만
 > 처리 시간이 10ms라면 동시에 존재하는 VT는
@@ -4059,3 +4076,182 @@ Lettuce의 MOVED/ASK 리다이렉트 처리·`ClusterTopologyRefreshOptions`는 
 
 > ⚠️ **D27-3의 전제**: `maxmemory 0`(무제한)이면 "대비 비율" 판정이 성립하지 않는다.
 > 이 방식을 쓰려면 `maxmemory` 설정이 필수다. (현재 로컬 1GB)
+
+---
+
+## §76 — `tokens`는 UTC, 나머지 테이블은 KST (통일하지 않고 명시한다)
+
+**일자**: 2026-08-12 · **관련**: §73(Kafka 적재 경로 — UTC 변환이 여기서 일어난다), §74(폴링 — 복구 절차가 `issued_at`을 판정에 쓴다)
+
+### Context
+
+같은 DB에 **시각 규약 두 개가 공존**한다. 코드로 확인한 현재 상태:
+
+| 대상 | 쓰는 코드 | 실제 값 |
+|---|---|---|
+| `tokens.issued_at` | `BatchProcessor` `Instant.now()` → `TokenLifecycleConsumer.toToken()`의 `LocalDateTime.ofInstant(e.issuedAt(), ZoneOffset.UTC)` | **UTC** |
+| `queues.created_at` / `deleted_at` | `Queue.java` `LocalDateTime.now()` | **KST** |
+| `tenants.created_at` | `Tenant.java` `LocalDateTime.now()` | KST |
+| `api_keys.created_at` / `revoked_at` | `ApiKey.java` `LocalDateTime.now()` | KST |
+| `refresh_tokens.*` | `RefreshToken.java` `LocalDateTime.now()` + `TenantService:117,138` / `TokenRevocationService:31`의 벌크 UPDATE | KST |
+| `admit_requests.created_at` / `completed_at` | DDL `DEFAULT CURRENT_TIMESTAMP(3)` (세션 TZ) | KST |
+| `billing_snapshots.updated_at` | 〃 + `ON DUPLICATE KEY UPDATE updated_at = NOW(3)` | KST |
+| `queue_daily_stats.created_at` | 〃 | KST |
+| `queue_daily_stats.stat_date` | `DATE(issued_at)` | **UTC 날짜** |
+| `billing_snapshots.year_month` | `issued_at` 월 범위 | **UTC 월** |
+
+⚠️ `queue_daily_stats`는 **한 행 안에 UTC(`stat_date`)와 KST(`created_at`)가 공존**한다.
+⚠️ `admit_requests.created_at`(KST)은 Sprint 7에 `tokens.issued_at`(UTC)과 조인될 가장 유력한 후보다.
+
+MySQL 실측: `@@global.time_zone` = `@@session.time_zone` = `+09:00`,
+`NOW()` = `2026-08-12 15:05`, `UTC_TIMESTAMP()` = `2026-08-12 06:05`.
+
+**둘 다 `DATETIME(3)`이라 타입으로 구분되지 않는다.** 각자 자기 컬럼만 볼 때는 무해하고,
+그래서 지금까지 문제가 드러나지 않았다.
+
+**드러날 시점이 정해져 있다.** `tokens`의 `completed_at` / `cancelled_at` / `expired_at`은
+DDL에 이미 있으나 Sprint 7 미구현이라 전부 NULL이다. 구현할 때 이 코드베이스의 다수 관행
+(`LocalDateTime.now()`)이나 `DEFAULT CURRENT_TIMESTAMP(3)`를 그대로 쓰면 **KST가 들어간다**.
+그러면
+
+```sql
+AVG(TIMESTAMPDIFF(SECOND, issued_at, completed_at))
+                          ↑ UTC        ↑ KST
+```
+
+이 **오류가 아니라 그럴듯한 숫자로** 일괄 `+32,400초`(9시간)를 낸다. 30분 대기가 9시간 30분으로 보인다.
+데이터가 섞인 뒤에는 어느 행이 UTC인지 구분할 방법이 없다.
+
+### Decision
+
+**전체 통일을 하지 않는다. "tokens만 UTC"를 현 상태로 확정하고, 그 사실을 코드·DDL·런북에 못 박는다.**
+
+명시한 지점 넷:
+1. `doc/schema.sql` — tokens DDL 위에 [시각 규약] 블록. `DEFAULT CURRENT_TIMESTAMP(3)` 제거
+2. `Token.java` 클래스 javadoc — "시각은 UTC, 상태 전이 메서드에서 `now()` 금지, 주입받는다"
+3. `TokenLifecycleConsumer.toToken()` javadoc — 여기가 규약을 실제로 강제하는 유일한 지점임을 명시
+4. 운영 문서 — `NOW()`/`CURDATE()` 대신 `UTC_TIMESTAMP()`/`UTC_DATE()`
+
+### Alternatives
+
+**A. 전부 UTC로 통일 (기각)**
+가장 "깨끗한" 답이고 장기적으로는 맞다. 그러나 지금 하면 KST 테이블 전부의 기존 행을 옮기는
+마이그레이션이 필요하고, 마이그레이션은 되돌리기 어렵다.
+
+정확한 기각 근거는 **"두 규약의 값을 섞는 계산이 현재 없다"**는 것이다.
+"KST 컬럼이 계산에 안 쓰인다"가 아니다 — 실제로 쓰인다:
+`RefreshToken.java:90`의 `LocalDateTime.now().isAfter(expiresAt)`,
+`RefreshTokenJpaRepository:25`의 `DELETE ... WHERE r.expiresAt < :before`.
+다만 **양쪽 다 KST**라 자기들끼리는 정합하고, UTC 값과 만나지 않는다.
+
+따라서 통일이 필요해지는 시점은 **"KST 컬럼과 UTC 컬럼을 함께 계산하는 쿼리가 처음 생길 때"**이고,
+그때 §를 다시 연다. **가장 유력한 후보는 Sprint 7의 `admit_requests.created_at`(KST) −
+`tokens.issued_at`(UTC)** 이다 — "admit 요청 접수 → 토큰 발행 소요" 지표로 가장 자연스럽게 나올 자리다.
+
+**B. 세션/서버 `time_zone`을 `+00:00`으로 바꾸기 (기각)**
+한 줄로 끝나 보이지만 **기존 KST 데이터의 해석을 바꾼다.** `DATETIME`은 오프셋을 저장하지 않으므로
+이미 들어간 KST 벽시계가 UTC로 재해석되어 조용히 9시간 밀린다. 게다가 로컬·CI·운영이 각각
+설정을 따라가야 해서 "설정을 안 바꾼 곳"이 생기는 순간 규약이 다시 갈린다.
+
+> ⚠️ **여기서 "애플리케이션이 명시하니까 환경에 안 흔들린다"고 쓰면 거짓이다. 지금은 흔들린다.**
+> 아래 [불변식]을 반드시 함께 읽어라.
+
+**C. `TIMESTAMP` 타입으로 변경 (기각 — MySQL이 금지한다)**
+`TIMESTAMP`는 세션 TZ로 자동 변환해줘서 이 문제를 근본적으로 없앤다. 그러나
+**`tokens`에는 애초에 쓸 수 없다.** 실측:
+
+```
+CREATE TABLE _tz_probe_part (id BIGINT NOT NULL AUTO_INCREMENT,
+  issued_at TIMESTAMP(3) NOT NULL, PRIMARY KEY (id, issued_at))
+PARTITION BY RANGE (YEAR(issued_at)*100 + MONTH(issued_at)) (...);
+
+ERROR 1486 (HY000): Constant, random or timezone-dependent expressions in
+                    (sub)partitioning function are not allowed
+```
+
+MySQL은 `TIMESTAMP` 컬럼을 파티션 식에 쓰는 것 자체를 금지한다(`UNIX_TIMESTAMP()` 예외).
+**금지 사유가 정확히 우리가 걱정하는 것** — 세션 TZ에 따라 파티션 경계가 움직이기 때문이다.
+"비용이 커서" 기각이 아니라 **불가능해서** 기각이다.
+(2038 상한도 사실이지만, 파티션 보존이 2달인 이 테이블에선 부차적이다.)
+
+### ⚠️ 불변식 — JVM 기본 TZ == JDBC `serverTimezone` == `Asia/Seoul`
+
+**현재 UTC가 보존되는 이유는 두 설정이 서로 상쇄되기 때문이지, 코드가 명시해서가 아니다.**
+
+근거(Hibernate 6.5.3 소스 + 드라이버 실측):
+- `LocalDateTimeJavaType.unwrap(..., Timestamp.class)` → `Timestamp.valueOf(ldt)` — **JVM 기본 TZ로 해석**한다
+- `TimestampJdbcType`은 `hibernate.jdbc.time_zone`이 없으면 `st.setTimestamp(index, timestamp)` 분기를 탄다
+- `hibernate.jdbc.time_zone`은 **어느 yml에도 없다**(확인). JDBC URL은 `serverTimezone=Asia/Seoul`, JVM은 `Asia/Seoul`
+
+mysql-connector-j 8.3.0 직접 바인딩 실측:
+
+| JVM TZ | 바인딩한 값(UTC 벽시계) | 서버가 본 값 |
+|---|---|---|
+| `Asia/Seoul` (현재) | `2026-08-12T06:05` | `2026-08-12 06:05` ✅ |
+| `UTC` (컨테이너 기본) | `2026-08-12T06:05` | `2026-08-12 15:05` ❌ **+9h** |
+
+**이 등식이 깨지는 순간 `tokens.issued_at`이 통째로 9시간 밀린다. 그리고 조용히 일어난다.**
+Docker 이미지 기본 `TZ=UTC`, AWS ECS/EKS 기본 UTC, `-Duser.timezone` 누락이 전부 해당한다 —
+**Sprint 11(Docker + AWS 배포)이 정확히 그 시점이다.**
+
+지킬 것:
+- 컨테이너·인스턴스에 **`TZ=Asia/Seoul` 또는 `-Duser.timezone=Asia/Seoul`을 명시적으로 박는다**
+- JDBC URL의 `serverTimezone`을 바꾸지 않는다
+- **`hibernate.jdbc.time_zone: UTC`로 "고치지" 마라.** `Timestamp.valueOf`가 KST로 해석한 뒤
+  UTC 캘린더로 렌더링해 `2026-08-11 21:05`이 되고, KST 규약 테이블 전체에도 같은 왜곡이 걸린다
+- 근본 해소는 바인딩을 `setObject(LocalDateTime)` 경로로 옮기는 것인데(TZ 무관) Hibernate가
+  그 경로를 쓰지 않는다 → **별도 과제**
+
+### Consequences
+
+**긍정**
+- 마이그레이션 0. 코드 변경 0(주석·DDL 기본값 제거뿐)
+- Sprint 7이 `completed_at` 등을 구현할 때 **읽을 수밖에 없는 자리 셋**(DDL / 도메인 / consumer)에 규약이 있다
+- 런북의 유령 토큰 탐지가 더 이상 자기 증상을 만들어내지 않는다 (아래 참조)
+
+**부정 / 감수하는 것**
+- **두 규약이 남는다.** 새로 오는 사람이 `queues.created_at`과 `tokens.issued_at`을 같은 것으로 보면 틀린다.
+  이 문서와 DDL 주석이 유일한 방어선이다
+- KST 컬럼과 UTC 컬럼을 함께 쓰는 쿼리가 생기면 **그때는 반드시 통일해야 한다.** 지금은 없다는 것이 전제다
+- **일·월 집계 경계가 UTC다 — 이건 통일 논의와 별개로 이미 사실이다.**
+  `schema.sql`의 파티션 표현식 `YEAR(issued_at)*100 + MONTH(issued_at)`, 일별 집계의 `DATE(issued_at)`,
+  billing의 월 범위(`issued_at >= '2026-04-01'`)가 전부 UTC 기준이다.
+  따라서 **KST 5/1 03:00에 발행된 토큰은 4월 파티션 · 4월 청구 · `stat_date` 4/30에 들어간다.**
+  테넌트가 KST 기준 청구서를 기대하면 월 경계 9시간분이 어긋난다.
+  tokens 내부끼리의 계산이라 이번 규약 위반은 아니지만, **과금 정합성 문제로 별도 판단이 필요하다(미해결).**
+
+**부수적으로 고친 것 (1) — 런북의 `CURDATE()`**
+`doc/monitoring/runbook/kafka-persistence.md`의 유령 토큰 탐지 절차가 `CURDATE()`를 쓰고 있었다.
+
+**버그는 항상 나는 게 아니라 KST 00:00~09:00 창에서만 나고, 그 창에서는 결과가 통째로 0건이 된다.**
+그 시간대에는 `CURDATE()`가 이미 오늘인데 `UTC_DATE()`는 아직 어제라, `issued_at >= CURDATE()`가
+UTC로는 **오늘 09:00(KST) 이후** — 아직 오지 않은 시각 — 를 요구하기 때문이다.
+KST 09:00 이후에는 두 값이 같아져 버그가 사라진다(실측: 15:26 KST에 `CURDATE()` = `UTC_DATE()` = `2026-08-12`).
+**낮에 검증하면 재현되지 않는다는 뜻이라 더 위험하다.**
+
+결과 0은 "Redis에는 있는데 DB에 없다"로 읽혀 **유령 토큰이 대량 발생한 것처럼 보인다** —
+탐지하려는 증상을 절차가 새벽에만 스스로 만들어내고 있었다. `UTC_DATE()`로 정정.
+(`queries/kafka-persistence.md`는 이미 `UTC_DATE()`를 쓰면서 "`CURDATE()`는 틀렸다"고 명시하고 있어,
+같은 주제로 런북과 쿼리 문서가 정면으로 모순된 상태였다.)
+
+**부수적으로 고친 것 (2) — 명세의 `NOW()-60s`**
+`doc/FRS_final.md`와 `doc/FLOW.md`의 verify DB Fallback 명세가
+`WHERE ... AND issued_at > NOW()-60s`였다. `NOW()`는 KST, `issued_at`은 UTC라 조건이 **항상 거짓**이다
+— CLAUDE.md가 "verify DB fallback 무동작"으로 지목한 결함의 원본이 이 명세다.
+Sprint 7이 이대로 구현하면 결함이 코드로 재생산되므로 `UTC_TIMESTAMP(3) - INTERVAL 60 SECOND`로 정정했다.
+
+### 면접 포인트
+
+> "DATETIME과 TIMESTAMP 중 뭘 쓰나요?"
+
+`tokens`는 `DATETIME(3)` + 애플리케이션 UTC 주입을 택했다. `TIMESTAMP`의 자동 변환이 매력적이지만
+이 테이블은 `issued_at` Range 파티션이라 타입 변경 비용이 크고, 2038 상한도 있다.
+대신 **타입이 규약을 강제해주지 않으므로** 그 강제를 사람이 아니라 **코드 한 지점**
+(`toToken()`)에 몰아두고, DDL·도메인 javadoc·런북 세 곳에 근거를 남겼다.
+
+> "왜 통일 안 하고 두 규약을 남겼나요?"
+
+통일은 마이그레이션이고 되돌리기 어렵다. 문제가 되는 조건은 **"두 규약의 값을 함께 계산할 때"**인데
+현재 그런 쿼리가 없다. 실익 없는 위험을 지금 지는 대신, **문제가 실제로 나타날 시점
+(Sprint 7의 `completed_at` 구현)에 방어를 걸었다.** 컬럼이 비어 있는 동안이 규약을 못 박는
+유일하게 싼 시점이었기 때문이다.

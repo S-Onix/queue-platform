@@ -277,7 +277,11 @@ POST /api/v1/admit-tokens/:admitToken/verify
 처리 흐름:
 1. Redis GET admit-token-by-admit:{admitToken} → tokenId
    없으면 → DB Fallback
-     SELECT WHERE status=ADMIT_ISSUED AND admit_token=? AND issued_at > NOW()-60s
+     SELECT WHERE status=ADMIT_ISSUED AND admit_token=?
+            AND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND
+     -- ⚠️ NOW()가 아니라 UTC_TIMESTAMP()다. tokens의 시각 컬럼은 UTC인데 MySQL 세션
+     --    time_zone은 +09:00이라, NOW()-60s로 쓰면 UTC 값과 9시간 어긋나 조건이 항상 거짓이
+     --    되어 DB Fallback이 통째로 무동작한다. (DECISIONS §76)
      없으면 → 404 TK_002_INVALID_ADMIT_TOKEN
 2. DB ADMIT_ISSUED 상태 확인 (Replica)
 3. SET verified-token:{tokenId} EX 60 (중복 입장 방지)
