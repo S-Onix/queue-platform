@@ -41,11 +41,11 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * ({@code ON DUPLICATE KEY UPDATE token_id = token_id}). 오타가 있으면 이 테스트가 잡아낸다.
  */
 @SpringBootTest(classes = TokenJpaTestConfig.class, properties = {
-        "spring.datasource.master.jdbc-url=jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&rewriteBatchedStatements=true",
+        "spring.datasource.master.jdbc-url=jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&rewriteBatchedStatements=true",
         "spring.datasource.master.username=queueapp",
         "spring.datasource.master.password=queueapp1234",
         // Replica는 이 테스트에서 안 쓰지만 DataSourceConfig가 두 빈을 요구 → Master로 지정(3307 미기동이어도 무해)
-        "spring.datasource.replica.jdbc-url=jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul",
+        "spring.datasource.replica.jdbc-url=jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true",
         "spring.datasource.replica.username=queueapp",
         "spring.datasource.replica.password=queueapp1234",
         "spring.jpa.hibernate.ddl-auto=none",

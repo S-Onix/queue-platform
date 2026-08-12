@@ -32,6 +32,13 @@ subprojects {
 
     test {
         useJUnitPlatform()
+
+        // 테스트 JVM도 운영과 같은 UTC로 돌린다.
+        //
+        // @SpringBootTest는 *Application.main()을 타지 않으므로 거기서 건 TimeZone.setDefault(UTC)가
+        // 적용되지 않는다. 이 줄이 없으면 테스트는 호스트 TZ(개발자 KST / CI UTC)로 돌아,
+        // 같은 코드가 환경에 따라 다른 시각을 쓰는데도 아무도 못 잡는다. (DECISIONS §77)
+        systemProperty 'user.timezone', 'UTC'
     }
 }
 

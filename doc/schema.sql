@@ -243,9 +243,9 @@ SELECT
     SUM(status = 3)                                             AS total_cancelled,
     SUM(status = 4)                                             AS total_expired,
     0                                                           AS total_admit_count,
-    -- ⚠️ issued_at·completed_at 둘 다 UTC일 때만 맞다. completed_at은 Sprint 7 미구현이며,
-    --    거기에 LocalDateTime.now()나 DEFAULT CURRENT_TIMESTAMP(3)를 쓰면 KST가 들어가
-    --    이 두 줄이 통째로 +32,400초가 된다. 위 [시각 규약] 참조.
+    -- ⚠️ issued_at·completed_at 둘 다 UTC일 때만 맞다. completed_at은 Sprint 7 미구현이다.
+    --    규약이 어떻게 UTC를 보장하는지(JVM TZ + JDBC 2개)는 위 [시각 규약] 참조 —
+    --    그 셋 중 하나라도 어긋난 채 값이 들어가면 이 두 줄이 통째로 32,400초 어긋난다.
     AVG(TIMESTAMPDIFF(SECOND, issued_at, completed_at))         AS avg_wait_sec,
     MAX(TIMESTAMPDIFF(SECOND, issued_at, completed_at))         AS max_wait_sec
 FROM tokens
