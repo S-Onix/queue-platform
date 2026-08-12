@@ -50,3 +50,6 @@ package-lock.json
 .claude/
 # 블로그 초안 — 로컬 전용, 커밋하지 않음
 doc/blog/
+# 에이전트 작업용 임시 디렉터리 — 로컬 전용
+.serena/
+scratchpad/
