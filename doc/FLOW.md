@@ -304,7 +304,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    TENANT["Tenant 서버\n(Java SDK)\nenqueue() → 대기토큰 발급\ntoken, queueId → 유저에게 전달"]
+    TENANT["Tenant 서버\n(REST 직접 호출, X-API-Key — SDK 아님)\nPOST /enqueue → 대기토큰 발급\n대기 페이지에 tokenId, seq 실어 전달"]
     --> CLIENT["브라우저 (JS SDK)\nqueue.startPolling()"]
 
     CLIENT --> POLL["JS SDK 내부\npoll() 실행"]

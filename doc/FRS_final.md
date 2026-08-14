@@ -603,14 +603,14 @@ nextPollAfterSec 타이밍:
 ### 클라이언트 전체 흐름
 
 ```
-1. 유저 → Tenant 서버: 서비스 접속 (슬롯 여유 확인)
-2. Tenant 서버 → Platform (Java SDK): enqueue()
-3. Tenant 서버 → 유저: token, queueId 전달
+1. 유저 → Tenant 서버: 서비스 접속 (자격 판정 + 슬롯 여유 확인)
+2. Tenant 서버 → Platform (REST, X-API-Key): POST /enqueue     ← SDK 아님 (DECISIONS §78)
+3. Tenant 서버 → 유저: 대기 페이지를 서빙하면서 tokenId, seq, queueId 를 함께 실어 보냄
 4. 유저 (JS SDK): queue.startPolling() 시작
-5. JS SDK → Platform 직접: GET /tokens/:token (nextPollAfterSec 자동)
+5. JS SDK → Platform 직접: GET /tokens/:tokenId (API Key 없음. nextPollAfterSec 자동)
 6. JS SDK → onReady 콜백: admitToken 수신
 7. 유저 → Tenant 서버: admitToken 전달
-8. Tenant 서버 (Java SDK): admitAndVerify() → verify 즉시 → 내부 처리 → complete
+8. Tenant 서버 (REST): verify → 내부 처리 → complete   ← 순서는 SDK가 아니라 서버가 강제 (§35)
 ```
 
 ### 프로젝트 구조
