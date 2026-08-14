@@ -152,3 +152,15 @@ management:
 jwt:
   access-token-expiry: 15m
   refresh-token-expiry: 7d
+
+# 로그 표시 타임존 — 저장은 UTC, 화면은 KST
+#
+# JVM 기본 TZ가 UTC라(main() 참조) 아무 설정도 안 하면 로그도 UTC로 찍힌다.
+# 새벽 대응 때 +9를 암산하게 하지 않으려고 표시만 Asia/Seoul로 돌린다.
+# XXX 토큰이 +09:00 오프셋을 함께 찍으므로 UTC 값과 헷갈릴 여지가 없다.
+#
+# ⚠️ DB에 저장된 값은 UTC다. 로그가 15:34여도 tokens.issued_at은 06:34다.
+#    둘을 대조할 때는 9시간 차이를 감안하라. (DECISIONS §77)
+logging:
+  pattern:
+    dateformat: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX, Asia/Seoul"

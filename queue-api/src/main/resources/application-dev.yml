@@ -10,12 +10,12 @@
 spring:
   datasource:
     master:
-      jdbc-url: jdbc:mysql://${DB_MASTER_HOST:localhost}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST:localhost}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: ${DB_USERNAME:queueapp}
       password: ${DB_PASSWORD}
       maximum-pool-size: 20
     replica:
-      jdbc-url: jdbc:mysql://${DB_MASTER_HOST:localhost}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST:localhost}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: ${DB_USERNAME:queueapp}
       password: ${DB_PASSWORD}
       maximum-pool-size: 20

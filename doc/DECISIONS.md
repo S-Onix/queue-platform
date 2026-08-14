@@ -1739,7 +1739,9 @@ Redis admit-token-by-admit 미스 시:
   DB SELECT WHERE status=ADMIT_ISSUED
                AND admit_token=?
                AND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND
-               -- NOW() 금지: issued_at은 UTC, 세션 TZ는 +09:00이라 조건이 항상 거짓이 된다 (§76)
+               -- UTC_TIMESTAMP()를 쓴다: 시각 컬럼은 전부 UTC다(§77). 앱 세션은 +00:00이라
+               -- NOW()도 UTC지만, 서버 default-time-zone이 아직 +09:00이라 mysql CLI로
+               -- 같은 쿼리를 돌리면 NOW()가 KST다. UTC_TIMESTAMP()는 어느 경로에서도 같다.
 
 이유:
   Redis 장애 또는 TTL 경계에서 캐시 미스 가능
@@ -4065,6 +4067,10 @@ Lettuce의 MOVED/ASK 리다이렉트 처리·`ClusterTopologyRefreshOptions`는 
 
 ## §76 — `tokens`는 UTC, 나머지 테이블은 KST (통일하지 않고 명시한다)
 
+> ⛔ **이 결정은 §77로 대체되었다 (2026-08-12).** 통일하지 않기로 한 판단을 뒤집고
+> **전부 UTC로 통일**했다. 아래 본문은 그때의 판단 근거로 남긴다 — 특히 `[불변식]`(JVM TZ 의존)은
+> §77의 출발점이 된 발견이라 그대로 유효하다. **현재 규약은 §77을 보라.**
+
 **일자**: 2026-08-12 · **관련**: §73(Kafka 적재 경로 — UTC 변환이 여기서 일어난다), §74(폴링 — 복구 절차가 `issued_at`을 판정에 쓴다)
 
 ### Context
@@ -4256,3 +4262,163 @@ ALTER TABLE tokens ALTER COLUMN issued_at DROP DEFAULT;
 현재 그런 쿼리가 없다. 실익 없는 위험을 지금 지는 대신, **문제가 실제로 나타날 시점
 (Sprint 7의 `completed_at` 구현)에 방어를 걸었다.** 컬럼이 비어 있는 동안이 규약을 못 박는
 유일하게 싼 시점이었기 때문이다.
+
+---
+
+## §77 — 시각을 전부 UTC로 통일한다 (§76을 대체)
+
+**일자**: 2026-08-12 · **대체**: §76(통일하지 않고 명시) · **관련**: §73(Kafka 적재), §74(폴링)
+
+### Context
+
+§76은 "`tokens`만 UTC, 나머지는 KST"를 현 상태로 확정하고 통일을 미뤘다. 그 판단을 뒤집는다.
+
+**뒤집은 이유는 §76이 스스로 발견한 것이다.** §76의 `[불변식]`은 UTC 보존이 코드가 아니라
+`JVM TZ == serverTimezone == Asia/Seoul`의 **상쇄**에 의존한다는 것을 밝혔다. 그런데
+
+- 이 지뢰는 **통일해도 사라지지 않는다.** 두 값이 어긋나는 순간 저장값이 밀린다
+- **KST를 저장 규약으로 두면 지뢰가 더 위험해진다.** Docker·AWS ECS/EKS 기본이 `TZ=UTC`라
+  모든 인스턴스에 `Asia/Seoul`을 빠짐없이 박아야 하고, 한 곳이라도 빠지면 그 인스턴스가 쓴
+  데이터만 조용히 어긋난다
+- **UTC로 두면 지뢰의 방향이 뒤집힌다.** 플랫폼 기본값이 곧 정답이 되고, 누가 굳이
+  `Asia/Seoul`을 박아야 깨진다
+
+즉 §76이 "지금 통일할 실익이 없다"고 본 전제가, 같은 문서가 발견한 사실 때문에 무너졌다.
+비용도 지금이 가장 싸다 — `tokens` 0행, KST 테이블 합계 **21행**.
+
+### 실측한 메커니즘
+
+Hibernate는 `LocalDateTime`을 `Timestamp.valueOf`(JVM 기본 TZ 해석) → `setTimestamp`로 바인딩한다.
+드라이버는 그 순간을 **연결 타임존**으로 렌더해 보낸다. mysql-connector-j 8.3.0 직접 실측:
+
+| JVM TZ | URL `serverTimezone` | 서버 저장값 (바인딩 `2026-08-12T06:05`) |
+|---|---|---|
+| Asia/Seoul | Asia/Seoul | `06:05` ✅ 항등 |
+| Asia/Seoul | UTC | `2026-08-11 21:05` ❌ −9h |
+| UTC | Asia/Seoul | `2026-08-12 15:05` ❌ +9h |
+| UTC | UTC | `06:05` ✅ 항등 |
+| 아무거나 | **(없음)** | `06:05` ✅ 항등 (기본 `LOCAL` = JVM TZ) |
+
+**항등은 둘이 같을 때만 성립한다.** 어느 TZ인지가 아니라 같은지가 조건이다.
+
+**그리고 `serverTimezone`은 세션 `time_zone`을 바꾸지 않는다** — 이게 §76이 몰랐던 부분이다:
+
+| 설정 | `@@session.time_zone` | `NOW()` |
+|---|---|---|
+| `connectionTimeZone=UTC` 만 | `+09:00` | KST |
+| `+ forceConnectionTimeZoneToSession=true` | `+00:00` | **UTC** |
+
+`serverTimezone`만 바꾸면 저장은 UTC가 되지만 `NOW()`/`CURDATE()`는 KST로 남아,
+§76이 지적한 verify Fallback 문제가 그대로 남는다.
+(참고: `forceConnectionTimeZoneToSession`에 `Asia/Seoul` 같은 **이름 있는 존은 실패**한다 —
+MySQL에 tz 테이블이 안 실려 있어 `Unknown or incorrect time zone`. 오프셋만 쓸 수 있다.)
+
+### Decision
+
+**저장·`NOW()`·`CURDATE()`는 전부 UTC. 로그 표시만 `Asia/Seoul`.**
+
+```
+JVM TZ  = UTC                       ← main()에서 TimeZone.setDefault
+JDBC    = connectionTimeZone=UTC & forceConnectionTimeZoneToSession=true
+로그    = logging.pattern.dateformat: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX, Asia/Seoul"
+```
+
+`LocalDateTime.now()`가 JVM 기본 TZ를 읽으므로, JVM을 UTC로 두면 **도메인 코드를 한 줄도 안 고치고**
+전 테이블이 UTC가 된다. `LocalDateTime`은 틀린 타입이 아니다 — DB 컬럼이 `DATETIME`이라
+존 정보를 저장하지 않으므로 "존 없는 벽시계"라는 의미가 컬럼과 정확히 대응한다.
+
+**예외 하나 — `ApiResponse.timestamp`는 `Instant`로 바꿨다.**
+이 값만 JSON으로 외부에 나가는데, `LocalDateTime`이면 `2026-08-12T08:12:51`처럼 존 없이
+직렬화돼 클라이언트가 자기 로컬로 읽는다(한국이면 9시간 오해). `Instant`는 `...Z`가 붙어
+UTC임이 값에 드러난다.
+
+### Alternatives
+
+**A. 전부 KST로 통일 (기각)**
+지금은 **가장 싸다** — 21행이 이미 KST고, `tokens`는 0행이라 UTC 규약을 버려도 잃을 데이터가 없다.
+설정 변경 0, 코드 1줄(`toToken()`), 로그도 그대로 읽힌다. 그럼에도 기각한 이유 셋:
+
+1. **플랫폼 기본값과 영원히 싸운다.** 위 Context 참조. 지뢰가 더 위험해진다
+2. **`ZoneOffset.UTC`는 고정 오프셋, `Asia/Seoul`은 tzdata 룰 조회.**
+   `toToken()`의 결과가 `UNIQUE(token_id, issued_at)`의 절반이라 재처리 멱등성이 걸려 있는데,
+   룰 조회는 tzdata 갱신에 따라 이론상 달라질 수 있다. 한국은 지금 DST가 없지만
+   **1987~1988년에 실제로 서머타임을 했다** — KST 벽시계로 저장하면 그런 구간에서
+   같은 시각이 두 번 나오거나 아예 없다. UTC엔 그런 구간이 없다
+3. **B2B SaaS라 테넌트가 한국에만 있지 않을 수 있다.** `billing_snapshots`의 월 경계가
+   "누구의 월인가"가 된다. UTC면 모두에게 일관되게 틀리고 표시 계층에서 테넌트별 변환이 가능하다
+
+**B. 도메인 타입을 전부 `Instant`로 교체 (기각 — 이번 범위 아님)**
+`Instant.now()`는 TZ 무관이라 JVM TZ 지뢰가 **근본적으로** 사라진다. 방향은 맞다.
+그러나 도메인 4 + 엔티티 7 + 어댑터·리포지토리·Mixin·DTO까지 **22파일** 연쇄이고,
+캐시 Mixin(`ApiKeyMixin`, `TenantMixin`)의 직렬화 포맷이 바뀌면 **기존 Redis 캐시 역직렬화가 깨진다**.
+"로직 변경 없는 TZ 전환"과 성격이 달라 섞으면 문제 시 원인을 못 가린다.
+→ **후속**. `Token`은 Sprint 7에서 `completedAt` 등을 추가할 때 함께 가는 것이 자연스럽다.
+
+**C. `serverTimezone`을 URL에서 제거 (기각)**
+없으면 기본이 `LOCAL`(=JVM TZ)이라 항등이 **항상** 성립한다. 얼핏 가장 안전해 보인다.
+그러나 그러면 저장 규약이 **각 인스턴스의 JVM TZ에 좌우된다** — A 인스턴스(KST)는 15:05,
+B 인스턴스(UTC)는 06:05를 같은 컬럼에 쓴다. 불일치가 인스턴스 단위로 갈라져 더 나쁘다.
+**명시적으로 `UTC`를 박아 어긋남이 드러나게 하는 편**을 택했다.
+
+### Consequences
+
+**긍정**
+- 두 규약이 하나가 됐다. §76이 경고한 "Sprint 7의 `admit_requests`(KST) − `tokens`(UTC)" 위험이 소멸
+- `NOW()`/`CURDATE()`가 UTC가 되어 `NOW()-60s` 류 명세가 **그대로 맞는 표현이 됨**
+- 지뢰가 플랫폼 기본값과 같은 방향이 됨 (Docker/AWS 기본 `TZ=UTC`)
+- 도메인 코드 변경 0
+
+**부정 / 감수하는 것**
+- **로그와 DB가 9시간 다르다.** 로그는 KST(`+09:00` 표기), DB는 UTC. 대조 시 감안해야 한다.
+  로그에 오프셋이 찍히므로 헷갈릴 여지는 줄였지만, **이게 이 결정의 실질 비용이다**
+- **`mysql` CLI는 여전히 KST다.** `forceConnectionTimeZoneToSession`은 앱의 JDBC 커넥션에만
+  적용된다. 서버 `default-time-zone`이 `+09:00`이라 셸에서 `mysql -e "..."`로 붙으면
+  `@@session.time_zone = +09:00`이고 `NOW()`/`CURDATE()`가 KST다(실측).
+  → **운영 쿼리는 계속 `UTC_DATE()`/`UTC_TIMESTAMP()`를 쓰거나 `SET time_zone='+00:00'`을 앞에 둔다.**
+  → 근본 해소는 `my.cnf`의 `default-time-zone='+00:00'`인데 **MySQL 재기동이 필요해 미적용**(후속)
+- **`ApiResponse.timestamp`의 형식이 바뀐다.** `2026-08-12T08:12:51` → `2026-08-12T08:12:51.799Z`.
+  API 계약 변경이므로 SDK·클라이언트가 있으면 함께 봐야 한다(현재 없음)
+
+### 운영 반영
+
+이미 실행한 것 (2026-08-12, 로컬 master 3306 / replica 3307):
+
+```sql
+-- KST로 저장돼 있던 21행을 UTC로 이동. tokens/admit_requests/billing_snapshots/
+-- queue_daily_stats 는 0행이라 대상 없음.
+UPDATE tenants        SET created_at = created_at - INTERVAL 9 HOUR;
+UPDATE api_keys       SET created_at = created_at - INTERVAL 9 HOUR,
+                          revoked_at = revoked_at - INTERVAL 9 HOUR;
+UPDATE queues         SET created_at = created_at - INTERVAL 9 HOUR,
+                          deleted_at = deleted_at - INTERVAL 9 HOUR;
+UPDATE refresh_tokens SET issued_at  = issued_at  - INTERVAL 9 HOUR,
+                          expires_at = expires_at - INTERVAL 9 HOUR,
+                          revoked_at = revoked_at - INTERVAL 9 HOUR;
+-- 되돌리기: 위 문장의 - 를 + 로 바꿔 실행
+```
+
+⚠️ `refresh_tokens`는 시각 컬럼이 **3개**다(`issued_at`/`expires_at`/`revoked_at`).
+`created_at`만 보고 옮기면 `isExpired()`가 9시간 어긋나 전원 만료되거나 전원 무만료가 된다.
+
+**아직 안 한 것**: `my.cnf`의 `default-time-zone` 변경(재기동 필요) · Sprint 11의
+Dockerfile `TZ=UTC` 명시 + 기동 fail-fast
+
+### 검증
+
+- **실서버 왕복 실측** (queue-api 8090 기동 → signup):
+  실제 KST 17:12:51 → **로그 `17:12:37.020+09:00`(KST)** / **DB `created_at = 08:12:51.726`(UTC)**
+- 드라이버 프로브: JVM TZ 2종 × `serverTimezone` 3종 = 6조합, 세션 TZ 6조합
+- logback 타임존 패턴: JVM=UTC 상태에서 `%d{...XXX, Asia/Seoul}`이 `+09:00`으로 출력되는 것 실측
+- 전체 스위트 **선언 224 / 실행 220 / 실패 0**
+- **미검증**: 멀티 인스턴스에서 JVM TZ가 어긋났을 때의 실제 증상, `my.cnf` 변경 후 동작
+
+### 면접 포인트
+
+> "타임존을 어떻게 다루나요?"
+
+저장은 UTC, 표시는 KST로 분리했다. 다만 그 전에 **왜 지금까지 UTC가 보존됐는지**를 먼저 실측했다.
+Hibernate가 `LocalDateTime`을 `Timestamp.valueOf` → `setTimestamp`로 바인딩해서, JVM 기본 TZ와
+JDBC 연결 타임존이 **상쇄될 때만** 값이 보존되고 있었다. 즉 코드가 명시해서가 아니라 우연이었다.
+그걸 알고 나니 "어느 TZ로 통일하느냐"보다 **"플랫폼 기본값과 같은 방향으로 두느냐"**가 중요했다.
+Docker·AWS 기본이 UTC라 UTC를 택하면 아무것도 안 하는 게 정답이 되고, KST를 택하면
+모든 인스턴스에 TZ를 빠짐없이 박아야 하며 한 곳만 빠져도 조용히 어긋난다.

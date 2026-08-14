@@ -14,14 +14,14 @@ spring:
     master:
       # rewriteBatchedStatements=true 가 있어야 addBatch()가 실제 multi-row INSERT
       # 한 문장으로 합쳐진다. 빠지면 batch_size 500이 500번 왕복으로 조용히 퇴화한다.
-      jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&rewriteBatchedStatements=true
+      jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&rewriteBatchedStatements=true
       username: queueapp
       password: queueapp1234
       maximum-pool-size: 10
     replica:
       # consumer는 쓰기 전용이라 replica를 쓰지 않지만, DataSourceConfig가 두 개를
       # 모두 요구하므로 설정은 있어야 한다.
-      jdbc-url: jdbc:mysql://127.0.0.1:3307/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+      jdbc-url: jdbc:mysql://127.0.0.1:3307/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: queueapp
       password: queueapp1234
       maximum-pool-size: 5

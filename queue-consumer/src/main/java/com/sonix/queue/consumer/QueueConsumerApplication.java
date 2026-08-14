@@ -2,6 +2,7 @@ package com.sonix.queue.consumer;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import java.util.TimeZone;
 
 /**
  * Kafka 이벤트 소비 전담 서버.
@@ -25,6 +26,10 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 @SpringBootApplication(scanBasePackages = "com.sonix.queue")
 public class QueueConsumerApplication {
     public static void main(String[] args) {
+        // 저장 시각은 전부 UTC다. LocalDateTime.now()가 이 기본 TZ를 읽으므로 여기서 못 박는다.
+        // JDBC의 connectionTimeZone=UTC 와 반드시 같아야 한다 — 어긋나면 저장값이 9시간 밀린다.
+        // 로그 표시만 Asia/Seoul 이다(logging.pattern.dateformat). 상세: DECISIONS §77
+        TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
         SpringApplication.run(QueueConsumerApplication.class, args);
     }
 }

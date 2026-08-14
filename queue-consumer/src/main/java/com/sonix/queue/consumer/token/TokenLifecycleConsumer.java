@@ -136,12 +136,11 @@ public class TokenLifecycleConsumer {
      * {@code ZoneId.systemDefault()}로 바꾸면 인스턴스별 TZ 설정에 따라 갈리고,
      * DST가 있는 지역에서는 같은 인스턴스에서도 갈린다.
      *
-     * <p><b>2) 컬럼 규약.</b> {@code tokens}의 시각 컬럼은 전부 UTC다
-     * ({@code doc/schema.sql}의 [시각 규약] 참조). 이 프로젝트의 다른 테이블
-     * ({@code queues}, {@code tenants}, {@code api_keys}, {@code refresh_tokens})은
-     * 도메인 모델이 {@code LocalDateTime.now()}를 써서 KST가 들어간다 — 둘 다
-     * {@code DATETIME(3)}이라 타입으로 구분되지 않으므로, <b>여기가 tokens 쪽 규약을
-     * 실제로 강제하는 유일한 지점</b>이다.
+     * <p><b>2) 컬럼 규약.</b> 이 프로젝트의 시각 컬럼은 전부 UTC다
+     * ({@code doc/schema.sql}의 [시각 규약], DECISIONS §77). 다른 경로는 JVM 기본 TZ가 UTC라
+     * {@code LocalDateTime.now()}만으로 UTC가 되지만, <b>이 메서드만은 이벤트가 실어 온
+     * {@code Instant}를 변환</b>하므로 존을 명시해야 한다. 여기서 {@code systemDefault()}를 쓰면
+     * JVM TZ 설정에 결과가 좌우돼 (1)의 멱등성이 함께 깨진다.
      *
      * <p>따라서 이 줄을 {@code LocalDateTime.now()}나 {@code ofInstant(..., systemDefault())}로
      * "단순화"하면 안 된다. 멱등성과 컬럼 규약이 동시에 깨진다.
