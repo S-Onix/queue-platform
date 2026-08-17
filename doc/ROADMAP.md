@@ -398,11 +398,11 @@ flowchart TD
   - Bulk Lua Script 호출 + queue-user 역인덱스
   - (Kafka 연동은 Sprint 8, 이 Sprint에서는 동기 DB INSERT 먼저)
 - **Polling API**
-  - `GET /queues/:queueId/tokens/:token`
+  - `GET /queues/:queueId/tokens/:tokenId`
   - nextPollAfterSec 적응형 간격 로직
   - token-info 캐시 + Replica Fallback
 - **Cancel API**
-  - `DELETE /queues/:queueId/tokens/:token` → CANCELLED
+  - `DELETE /queues/:queueId/tokens/:tokenId` → CANCELLED
 
 **완료 기준 (DoD):**
 - [ ] Token 도메인 단위 테스트 (상태 전환 매트릭스 전체)
@@ -425,9 +425,9 @@ flowchart TD
 
 **주요 산출물:**
 - `POST /queues/:queueId/admit` (동기 처리 버전. Kafka는 Sprint 8)
-- `POST /admit-tokens/:admitToken/verify` (DB Fallback 포함)
-- `POST /tokens/:token/complete` (DB 먼저 → ZREM)
-- `admit-idem` 멱등성 체크
+- `POST /queues/:queueId/admit-tokens/:admitToken/verify` (DB Fallback 포함)
+- `POST /queues/:queueId/tokens/:tokenId/complete` (DB 먼저 → ZREM)
+- `queue:{queueId}:admit-idem:{requestId}` 멱등성 체크
 - `verified-token` 중복 입장 방지 플래그
 - avgWaitingTime 직접 갱신 (HINCRBYFLOAT)
 - **ADMIT_TOKEN_TTL 만료 → WAITING 복귀 로직** ← 포트폴리오 차별 포인트

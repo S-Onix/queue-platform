@@ -655,8 +655,12 @@ Body: { "identifier": "user_a" }
 
 ```
 [Client SDK (JavaScript)]
+// ⚠️ 아래 enqueue()는 이 검토안(2026-07-08) 시점의 형태다. **채택하지 않는다.**
+//    DECISIONS §78: JS SDK 범위는 폴링 + 대기 UI 전용이고, enqueue는 SDK에 넣지 않는다.
+//    enqueue는 "줄 설 자격이 있나"를 판정하는 지점이라 Tenant 서버가 X-API-Key로 호출한다.
+//    SSE로 재설계하더라도 이 경계는 그대로다 — 바뀌는 건 "순번을 어떻게 받나"뿐이다.
 class QueueClientSDK {
-    async enqueue(queueId, identifier) {
+    async enqueue(queueId, identifier) {     // ← §78에서 기각. 구독 시작만 남는다
         // 1. Enqueue 요청 (Kafka)
         const response = await fetch('/enqueue', ...);
         

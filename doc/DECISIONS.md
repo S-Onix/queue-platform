@@ -507,7 +507,7 @@ Tenant → Platform POST /queues/:queueId/admit { count: N }
 Platform → 앞 N명 입장 토큰(admitToken) 발급 (TTL 60초)
 유저 → Polling으로 admitToken 수신
 유저 → Tenant에 admitToken 전달
-Tenant → Platform POST /admit-tokens/:admitToken/verify
+Tenant → Platform POST /queues/:queueId/admit-tokens/:admitToken/verify
 → COMPLETED
 ```
 
@@ -720,9 +720,11 @@ Spring MVC에서 Reactor bufferTimeout을 대체하는 방식:
 ### 멱등성 — Redis idempotency key
 ```
 채택: Redis idempotency key
-  SET admit-idem:{requestId} {result} EX 300 NX
+  SET queue:{queueId}:admit-idem:{requestId} {result} EX 300 NX
   → 이미 처리된 requestId → 저장된 결과 반환
   → 멀티 서버 보장
+  ⚠️ requestId는 Tenant가 정하는 값이다. 큐 스코프 없이 전역 네임스페이스에 두면
+     Tenant B의 "req_1"이 Tenant A의 저장된 결과(admitToken 목록)를 받는다.
 ```
 
 ### 비동기 INSERT 유실
@@ -743,10 +745,10 @@ Kafka At-Least-Once 보장:
   Enqueue 시 INCRBY로 받은 seq → DB 저장
 
 복구 흐름:
-  Batch: EXISTS admit-token-by-token:{tokenId} = 0 감지
+  Batch: EXISTS queue:{queueId}:admit-by-token:{tokenId} = 0 감지
   DB SELECT WHERE status=ADMIT_ISSUED AND tokenId=?
   → seq 조회
-  → Redis ZADD queue:{t}:{q}:{slice} {seq} {tokenId}
+  → Redis ZADD queue:{queueId}:waiting {seq} {identifier}
   → DB UPDATE status=WAITING
 ```
 
@@ -802,8 +804,8 @@ admit count=1000 시 세 구간이 병목이 된다.
 **③ admitToken SET 1000건 → Pipeline**
 ```
 문제:
-  SET admit-token-by-token:{tokenId} × 1000
-  SET admit-token-by-admit:{admitToken} × 1000
+  SET queue:{queueId}:admit-by-token:{tokenId} × 1000
+  SET queue:{queueId}:admit-by-admit:{admitToken} × 1000
   → Redis 2,000번 왕복
 
 해결: RedisTemplate.executePipelined()
@@ -816,8 +818,9 @@ admit count=1000 시 세 구간이 병목이 된다.
 // admitToken 1000건 Pipeline SET
 redisTemplate.executePipelined((RedisCallback<?>) conn -> {
     for (AdmitResult r : results) {
-        byte[] tokenKey = ("admit-token-by-token:" + r.tokenId()).getBytes();
-        byte[] admitKey = ("admit-token-by-admit:" + r.admitToken()).getBytes();
+        // 키 조립은 QueueKeys를 거친다 — 해시태그가 빠지면 Cluster에서만 깨진다 (§75 D26)
+        byte[] tokenKey = QueueKeys.admitByToken(queueId, r.tokenId()).getBytes();
+        byte[] admitKey = QueueKeys.admitByAdmit(queueId, r.admitToken()).getBytes();
 
         conn.stringCommands().set(tokenKey, r.admitToken().getBytes(),
             Expiration.seconds(60), SetOption.UPSERT);
@@ -874,7 +877,7 @@ Redis maxmemory: 4GB / maxmemory-policy: noeviction
 ADMIT_ISSUED에서 이탈하려면:
   admitToken TTL 60초 대기
   → WAITING 자동 복귀
-  → DELETE /tokens/:token → CANCELLED
+  → DELETE /api/v1/queues/:queueId/tokens/:tokenId → CANCELLED
 ```
 
 ---
@@ -935,9 +938,9 @@ DB 먼저 이유:
 | `queue-user:{t}:{q}:{userId}` | String | waitingTtl | O(1) 중복 체크. TTL=waitingTtl로 대기 중 자동 보호. CANCELLED 시 즉시 DEL |
 | `token-last-active:{tokenId}` | String | inactiveTtl | Key 존재 여부로 활동 감지. Polling마다 TTL 갱신. EXISTS=0이면 EXPIRED |
 | `token-info:{tokenId}` | String | nextPollAfterSec+2s | Polling DB SELECT 대체. 상태 변경 시 즉시 갱신. 갱신 실패 시 DEL로 폴백 |
-| `admit-token-by-token:{tokenId}` | String | 60s | Polling 응답에 admitToken 포함용. tokenId→admitToken 조회 |
-| `admit-token-by-admit:{admitToken}` | String | 60s | verify/complete 시 admitToken→tokenId 조회 |
-| `admit-idem:{requestId}` | String | 300s | admit 중복 요청 멱등성. NX로 최초 1회만 처리 |
+| `queue:{queueId}:admit-by-token:{tokenId}` | String | 60s | Polling 응답에 admitToken 포함용. tokenId→admitToken 조회 |
+| `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify/complete 시 admitToken→tokenId 조회 |
+| `queue:{queueId}:admit-idem:{requestId}` | String | 300s | admit 중복 요청 멱등성. NX로 최초 1회만 처리. `requestId`가 **Tenant가 정하는 값**이라 큐 스코프 필수 |
 | `verified-token:{tokenId}` | String | 60s | 중복 입장 방지. verify 후 admit 대상 제외. complete 시 DEL |
 | `apikey-cache:{sha256}` | String | 60s | API Key 인증 DB 조회 대체. SHA-256 hash를 Key로 → rawKey 노출 방지 |
 | `batch-lock:{t}:{q}` | String | 15s | Batch 서버 분산 시 큐별 처리 서버 지정. SET NX로 중복 처리 방지 |
@@ -1594,7 +1597,7 @@ verify API 유지 이유:
   → verify 없이 바로 complete → 입장 실패 시 복구 불가
 
 verify DB Fallback 추가 (v1.9):
-  Redis admit-token-by-admit 미스 시
+  Redis queue:{queueId}:admit-by-admit 미스 시
   DB admit_token 컬럼으로 안전하게 조회
   → Redis 장애 상황에서도 verify 정상 동작
 ```
@@ -1718,8 +1721,8 @@ N개를 동시에 고쳐야 해서 버전이 어긋납니다. REST API는 언어
 
 ```
 유지:
-  admit-token-by-token:{tokenId}   → admitToken (Polling 응답용)
-  admit-token-by-admit:{admitToken} → tokenId (verify/complete용)
+  queue:{queueId}:admit-by-token:{tokenId}   → admitToken (Polling 응답용)
+  queue:{queueId}:admit-by-admit:{admitToken} → tokenId (verify/complete용)
   verified-token:{tokenId}          (중복 입장 방지)
 
 DB:
@@ -1762,7 +1765,7 @@ Java 매핑:
 ```
 용도:
   1. Polling ADMIT_ISSUED 응답 시 admitToken 반환
-     Redis admit-token-by-token 미스 시 DB Fallback
+     Redis queue:{queueId}:admit-by-token 미스 시 DB Fallback
   2. verify DB Fallback 시 조회 기준
      (issued_at 60초 이내 + admit_token 일치 확인)
 
@@ -1803,7 +1806,7 @@ Pipeline:
 ### verify DB Fallback
 
 ```
-Redis admit-token-by-admit 미스 시:
+Redis queue:{queueId}:admit-by-admit 미스 시:
   DB SELECT WHERE status=ADMIT_ISSUED
                AND admit_token=?
                AND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND
@@ -3552,9 +3555,13 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
                  → SET queue:{q}:seq {maxSeq}                    (사용된 번호 재발급 방지)
 ③ tokens 해시:   WAITING rows → HSET queue:{q}:tokens {user_id} {token_id}
 ④ admit 키:      status=1(ADMIT_ISSUED) AND admit_token IS NOT NULL AND issued_at > now-60s
-                 → SET admit-token-by-token:{token_id} ... EX {남은 60s}   (양방향)
+                 → SET queue:{queueId}:admit-by-token:{token_id} ... EX {남은 60s}   (양방향)
                  (60s 초과분은 복원 안 함 → 배치가 returnToWaiting 처리)
 ⑤ last-active:   재구성 안 함(비움) → 다음 폴링(ka=1)이 재populate. inactive_ttl 리셋뿐 무해
+⑥ admit-watermark: SELECT MAX(seq) FROM tokens WHERE queue_id=? AND status IN (1,2)
+                 → SET queue:{q}:admit-watermark {maxSeq}   (NULL이면 0. §79)
+                 COMPLETED(2) 포함 필수 — ADMIT_ISSUED만 세면 정상 진행할수록 후퇴한다
+                 빠뜨리면 복구 후 전광판이 0이 되어 전원 순번이 폭증한다
 ```
 
 ### Rationale
@@ -3863,6 +3870,9 @@ Redis 유실 후 복구 전 폴링은 404를 받는데, 이는 §71 복구 과�
 - §63 (Rate Limit — 같은 뿌리의 결함: 신뢰할 수 없는 입력을 권한·한도의 근거로 삼음)
 - §70 D9/D10 (`INCR seq`가 유일성을 보장한다는 전제, Hash Tag로 3키 동일 슬롯)
 - §71 (DB→Redis 복구 — seq 유일성 제약을 여기서 지켜야 한다)
+- **§79 (폴링 응답 계약 — 이 결정이 만든 폴링 경로의 응답·엔드포인트를 변경했다.**
+  `poll_verify.lua`의 소유권 대조는 유지되지만, **"`waiting`에 없으면 실패" 분기는 바뀐다** —
+  admit된 사용자가 404가 되기 때문이다. `?seq=&ka=`는 그대로 필요하다)
 - 리뷰 기록: `doc/reviews/2026-08-11-poll-ownership-xff.md`
 - 후속: `last-active` 정리 로직(Sprint 7/9), 폴링 Rate Limit 키 카디널리티, 폴링 부하 실측
 
@@ -3899,8 +3909,26 @@ Redis 유실 후 복구 전 폴링은 404를 받는데, 이는 §71 복구 과�
 - **cluster1의 (용량) 방어 역할을 cluster2가 맡는다**
 
 **D26 — 라우팅 단위는 "쓰기 1건"이 아니라 "큐 1개"다. (확정)**
-한 큐의 키 4종 — `queue:{q}:waiting` / `:seq` / `:tokens` / `:last-active` — 은 **반드시 같은 클러스터**에 놓인다.
-요청 단위·토큰 단위로 클러스터를 고르는 방식은 **채택하지 않는다.**
+한 큐의 키는 **반드시 같은 클러스터**에 놓인다. 요청 단위·토큰 단위로 클러스터를 고르는 방식은
+**채택하지 않는다.**
+
+**대상 키 (2026-08-17 기준 9종)** — 넷은 원래 있던 것, 다섯은 §79에서 늘었다.
+
+| # | 키 | 출처 |
+|---|---|---|
+| 1 | `queue:{q}:waiting` | §70 |
+| 2 | `queue:{q}:seq` | §70 D9 |
+| 3 | `queue:{q}:tokens` | §70 |
+| 4 | `queue:{q}:last-active` | §74 |
+| 5 | `queue:{q}:admit-watermark` | **§79** |
+| 6 | `queue:{q}:pacing` | **§79** (오버라이드. 없을 수 있다) |
+| 7 | `queue:{q}:admit-by-token:{tokenId}` | **§79** — 구 `admit-token-by-token:{tokenId}` |
+| 8 | `queue:{q}:admit-by-admit:{admitToken}` | **§79** — 구 `admit-token-by-admit:{admitToken}` |
+| 9 | `queue:{q}:admit-idem:{requestId}` | **§79** — 구 `admit-idem:{requestId}`. `requestId`가 Tenant 지정값이라 스코프가 필요했다 |
+
+7·8은 원래 tokenId/admitToken으로 해시돼 **다른 슬롯**이었다. verify·complete URL에 `queueId`를
+넣어(§79) 큐 소속으로 옮긴 것은 **전 구간 원자성의 필요조건**이다. 다만 중간 DB 확인(Lua 밖)과
+`verified-token`의 클러스터 소속 미정 때문에 **충분조건은 아니다** — §79 참조.
 
 > 이것은 선호가 아니라 **Lua 원자성을 유지하려면 강제되는 제약**이다.
 > 해시태그는 *한 클러스터 안의* 슬롯만 정렬한다. **클러스터 경계는 못 넘는다.**
@@ -4522,9 +4550,9 @@ Platform이 검증하는 안을 검토했다. 서명 키 관리·재사용 방�
 | | 요청 수 (30만 대기 기준) | 성격 |
 |---|---|---|
 | Enqueue | 30만 × **1회** | **순간.** 60초에 몰려도 5,000 rps |
-| Polling | 30만 × **대기 내내** (2~25초 간격) | **지속. 1.5만~6만 rps** |
+| Polling | 30만 × **대기 내내** (2~25초 간격) | **지속. 약 15,400 rps** (산식은 §79 "규모") |
 
-폴링이 3~12배이고 **지속된다.** 그리고 폴링은 이미 클라이언트 → Platform 직접이다.
+폴링이 3배이고 **지속된다.** 그리고 폴링은 이미 클라이언트 → Platform 직접이다.
 Tenant가 받는 enqueue는 요청을 Platform으로 넘기고 `tokenId`를 돌려주는 **무상태·무 DB 전달
 엔드포인트** 5,000 rps다. Tenant의 병목은 결제·좌석 확정 같은 실제 트랜잭션이지 HTTP 전달이 아니고,
 **그게 대기열을 쓰는 이유 자체**다.
@@ -4534,13 +4562,40 @@ Tenant가 받는 enqueue는 요청을 Platform으로 넘기고 `tokenId`를 돌�
 `enqueue`는 "줄을 세운다"가 아니라 **"이 사람이 줄 설 자격이 있나"**를 판정하는 지점이고,
 그 판정은 Platform이 **할 수 없다**:
 
-- **`identifier`가 Tenant의 개념이다** (§66 D1: 자유 identifier, Tenant 제공). Platform은 그 값이 진짜 누구인지 모른다
+- **`identifier`가 Tenant의 개념이다** (§66 D1: identifier는 Tenant가 만들어 넘긴다). Platform은 그 값이 진짜 누구인지 모른다
 - **줄 서기 전 규칙이 전부 Tenant 쪽에 있다** — 회원만 / 계정당 1회 / 이미 티켓 보유자 제외 / VIP 별도 큐 / 정지 계정 차단
 - **봇 방어가 Tenant 자산이다** — 로그인, CAPTCHA, 기기 지문. 브라우저 직접 enqueue는 이걸 통째로 우회한다
 
 브라우저 직접 enqueue는 **Platform이 인증할 수 없는 값을 근거로 자리를 내주는 것**이 된다.
 어떤 자격 증명 모델을 붙여도 이 구조적 문제는 사라지지 않는다.
 **Tenant 부담 경감이 아니라 책임 이전이고, Platform이 못 지는 책임이다.**
+
+### 🔴 `identifier` 형식 = UUIDv7. 생성·전달 주체는 Tenant
+
+Platform은 **형식 가이드만 제시**하고, `identifier` 검증 책임은 **전적으로 Tenant**에 있다.
+
+**Tenant는 `userId → identifier(UUIDv7)` 매핑을 저장하고, 같은 사용자·같은 큐에는 항상 같은
+UUID를 재사용한다.** 매 요청 새로 생성하면 `enqueue_bulk.lua`의 `ZADD NX`가 안 걸려
+**한 사람이 자리를 여러 개 차지한다.**
+
+**왜 추측 가능한 값(이메일·순번 ID)이면 안 되나 — enqueue가 조회 오라클이 된다**
+
+`enqueue`는 이미 등록된 identifier면 **기존 `tokenId`와 `seq`를 그대로 반환한다**
+(`enqueue_bulk.lua`의 EXISTS 분기 — 멱등성을 위해 그렇게 설계했다).
+그런데 `tokenId`는 §74에서 **폴링 자격 증명 그 자체**다. 따라서 identifier가 추측 가능하면:
+
+```
+공격자가 남의 identifier(예: victim@example.com)를 알고 있다
+  → 그 값으로 enqueue 호출
+  → EXISTS 분기 → 남의 tokenId·seq 획득
+  → 남의 폴링 자격 증명을 손에 넣는다
+```
+
+이 경로는 **기각한 안(브라우저 직접 enqueue)보다 나쁘다.** 기각안은 최소한 Tenant의 서명을
+요구했지만, 이쪽은 Tenant가 body의 identifier를 **그대로 전달**하기만 하면 성립한다.
+아래 Consequences의 "무상태·무 DB 전달 엔드포인트"를 문자 그대로 읽으면 정확히 그 구현이 나온다.
+
+**UUIDv7이면 이 경로가 죽는다** — 추측이 불가능하므로 남의 identifier를 알 방법이 없다.
 
 ### 갈리는 축
 
@@ -4558,17 +4613,31 @@ Tenant가 받는 enqueue는 요청을 Platform으로 넘기고 `tokenId`를 돌�
 
 | §35의 "SDK 아니면 반복될 실수" | 게임·네이티브에서 |
 |---|---|
-| `nextPollAfterSec` 미준수 → 429 | **서버가 이미 방어한다.** `RateLimitFilter`(cap 5, refill 1.0/s) 백스톱 + **지터를 서버가 응답에 실어 보낸다**(`QueueEngineService.nextPollAfterSec` = `base + rand(0..base/4)`). 클라가 지킬 건 "받은 초만큼 기다린다" 한 줄 |
+| 폴링 간격 미준수 → 429 | **정상 클라이언트의 실수(간격 미준수)만 방어한다.** `RateLimitFilter` 백스톱(tokenId 기준, **cap 5 / refill 1.0per sec**)이 있고, 클라가 지킬 건 "`pacing` 표대로 기다린다" 한 줄이다. ⚠️ 다만 RL 키가 `uri.substring(uri.lastIndexOf('/')+1)` — 즉 **클라이언트가 통제하는 URL 마지막 세그먼트**이고 필터가 소유권 검증보다 **먼저** 돈다. **악의적 클라이언트는 tokenId를 바꿔가며 매번 새 버킷을 얻어 우회**하며, `pacing` 값을 늘려도 그쪽에는 무효다 |
 | 탭 비활성화 시 불필요한 폴링 | 안 지켜도 **플랫폼은 안 아프다.** 폴링을 멈추면 `last-active`가 갱신되지 않아 `inactive_ttl` 회수 대상이 된다. 클라 배터리 문제지 서버 문제가 아니다. ⚠️ **회수 배치는 아직 없다** — `last-active` ZSet은 폴링이 쓰기만 하고 읽는 곳이 0이다(Sprint 7/9 예정). 즉 이 칸은 **설계상 근거이지 현재 동작이 아니다** |
 | `tokenId` 유실 | **게임이 브라우저보다 유리하다** — 계정 로그인 + 확실한 로컬 저장. 새로고침·탭 닫힘이라는 브라우저 고유 사고가 없다 |
 | 대기 UI 제공 | 게임은 자체 UI 엔진이 있어 **어차피 안 쓴다** |
+
+> ⚠️ **첫 칸은 §79(2026-08-14)가 뒤집었다.** 원래 이 칸의 근거는 *"지터를 서버가 응답에 실어
+> 보낸다(`QueueEngineService.nextPollAfterSec`)"* 였는데, **§79가 그 필드를 응답에서 제거**하고
+> 지터를 클라이언트로 옮겼다. 즉 게임·네이티브 클라이언트는 이제 `pacing` 표 해석 + 지터를
+> **직접 구현**해야 한다. 위 칸은 그 사실을 반영해 다시 쓴 것이다. → §79 Related 참조
+
+**폴링 Rate Limit 파라미터 (확정)** — 키는 `tokenId` 기준을 유지한다.
+
+| 항목 | 값 | 근거 |
+|---|---|---|
+| 키 | `tokenId` | IP로 바꿔도 로테이션 우회는 **동일**하다. 바꿔서 얻는 게 없다 |
+| refill | **1.0 per sec** | **최소 폴링 간격의 역수보다 커야 한다.** 최소 간격 2초 → `0.5/s`로 잡으면 여유가 **0**이고, 그건 PR #23이 이미 고쳤던 버그다 |
+| capacity | **5** (현행 유지) | capacity가 정하는 건 정상 여유가 아니라 **버스트 흡수 깊이**다 — 재접속·화면 복귀 시의 연속 요청을 받아내는 몫이다. §79는 `rank<=0`에서 2초 폴링을 유발해 버스트가 **늘어나는** 방향이므로 흡수량을 줄일 근거가 없다 |
 
 **enqueue는 오히려 게임 쪽이 더 자연스럽다.** 클라이언트가 이미 게임 서버와 세션을 갖고 있어
 `클라 → 게임 서버(자격 판정) → Platform enqueue → tokenId 전달`이 그대로 성립한다.
 브라우저의 "페이지 서빙 왕복에 실어 보낸다"의 게임판이고, 왕복이 더 확실히 존재한다.
 
-필요한 건 SDK가 아니라 **명세 한 문단**이다 — 받은 `nextPollAfterSec` 준수 / 429·5xx 백오프 재시도 /
-`tokenId`를 잃으면 순번을 잃는다 / 폴링을 멈추면 자리가 회수된다.
+필요한 건 SDK가 아니라 **명세 한 문단**이다 — `/status`의 `pacing` 표대로 간격 준수(+지터는 클라가
+직접) / 429·5xx 백오프 재시도 / 404는 `errorCode`로 분기(§79) / `tokenId`를 잃으면 순번을 잃는다 /
+폴링을 멈추면 자리가 회수된다.
 언어별 클라이언트가 정말 필요해지면 **§35 Alternatives C(OpenAPI 생성)**가 언어 중립 답이다.
 
 ### Consequences
@@ -4577,8 +4646,23 @@ Tenant가 받는 enqueue는 요청을 Platform으로 넘기고 `tokenId`를 돌�
   그 검증은 §74(폴링 소유권 검증)가 담당한다
 - **Tenant 통합 문서에 "대기 페이지를 서빙할 때 `tokenId`·`seq`를 함께 내려보내라"가 명시돼야 한다.**
   이 한 줄이 빠지면 Tenant가 브라우저에서 enqueue를 시도하게 된다
-- Tenant는 enqueue 전달용 엔드포인트 1개를 직접 만들어야 한다 (무상태·무 DB)
+- Tenant는 enqueue 전달용 엔드포인트 1개를 직접 만들어야 한다 (무상태·무 DB).
+  ⚠️ **단, "전달"이 body의 `identifier`를 그대로 흘려보내는 것이어서는 안 된다.**
+  `identifier`는 **Tenant 서버측 세션에서 도출**하고, 매핑은 Tenant가 저장한다 (위 UUIDv7 절).
+  이 한 줄이 빠지면 위에서 설명한 조회 오라클이 그대로 열린다
 - `enqueue`에는 폴링과 달리 **RL이 tenant 버킷으로 커버**된다 (개별 사용자 식별 불필요)
+- **API Key 스코프는 Tenant 단위(전 큐)를 유지한다.** 큐 단위 스코프는 만들지 않는다 —
+  유출 시나리오가 아직 가정이라 과설계로 판단했다.
+  ⚠️ 다만 **`ApiKeyCache.invalidate` 프로덕션 호출이 0건이라 폐기가 최대 60초 지연**되는 것은
+  사실이다. 이건 스코프와 무관한 별개 결함이며 **후속 코드 수정 대상**이다
+
+### Related
+
+- **§35** (SDK 범위 — "무엇을 만드나". 이 결정은 "누가 어디로 요청하나")
+- **§66 D1** (identifier는 Tenant가 제공 — 이 결정이 **형식을 UUIDv7로 좁혔다**)
+- **§74** (폴링 소유권 검증 — `tokenId` 소유가 자격. identifier 오라클이 위험한 이유)
+- **§79** (폴링 응답 계약 — 이 결정의 게임·네이티브 표 첫 칸을 뒤집었다)
+- **§63** (Rate Limit 신뢰 경계 — 폴링 RL 키가 클라이언트 통제값이라는 같은 뿌리의 문제)
 
 ### 면접 포인트
 
@@ -4611,8 +4695,32 @@ Platform 직접으로 분리돼 있었습니다. **없는 문제를 풀려던 �
 - `total` — `ZCARD`. 큐 크기만큼 부담
 - `nextPollAfterSec` — 서버가 `rank = mySeq − frontSeq`로 등급 판정 (`QueueEngineService`)
 
-30만 대기 × 2~25초 간격 = **1.5만~6만 rps**가 전부 개인화 응답이라 **캐시가 불가능하고**,
-매 폴링이 `ZRANGE` + `ZCARD` + `ZCOUNT`로 Redis를 때린다.
+**규모 (30만 대기 · 현행 사다리 기준)**
+
+```
+50/2 + 950/5 + 4000/10 + 5000/15 + 290000/20 = 25 + 190 + 400 + 333 + 14500
+                                              ≈ 15,448 rps
+```
+
+전부 개인화 응답이라 **캐시가 불가능하다.**
+
+> ⚠️ **초기 서술 정정 (2026-08-17).** 이 절에는 근거 오류 2건이 있었다.
+> ① *"1.5만~6만 rps"* — 6만은 **전원이 5초 구간일 때만** 나오는 값인데 사다리 구조상 도달 불가다.
+>   실제는 위 산식대로 **15,448 rps** 한 값이다.
+> ② *"매 폴링이 `ZRANGE` + `ZCARD` + `ZCOUNT`로 Redis를 때린다"* — **세 항 전부 사실이 아니다.**
+>   `ZCOUNT`는 §74에서 EVAL로 대체되어 **전 소스 0건**이고, `ZRANGE`/`ZCARD`는
+>   `QueueSnapshotCache`(Caffeine 2초) 뒤에 있어 **큐·WAS당 0.5회/초**다.
+
+**정정된 근거 — 현행 폴링당 Redis 왕복은 `poll_verify.lua` EVAL 1회다.**
+그리고 §74가 이미 그 대가를 적어뒀다(§74 Consequences):
+
+> "폴링이 `ZCOUNT`(read 1회) → **EVAL 3키**로 바뀌었다. Lua는 write로 분류되어
+> **replica 라우팅 여지가 사라진다.**"
+
+즉 15,448 rps가 **전부 master로 간다.** 이 결정의 근거는 "Redis 명령 수가 많다"가 아니라
+**"개인화 때문에 캐시가 불가능하고, 그 결과 master에 15k rps가 고정된다"**이다.
+근거를 정정하고 나니 결론은 그대로이고 오히려 강해진다 — 캐시로 걷어낼 수 있는 대상이
+`ZCARD` 같은 부수 조회가 아니라 **경로 전체**이기 때문이다.
 
 ### Decision
 
@@ -4620,11 +4728,15 @@ Platform 직접으로 분리돼 있었습니다. **없는 문제를 풀려던 �
 
 | 엔드포인트 | 응답 | 호출 빈도 | 캐시 |
 |---|---|---|---|
-| `GET /queues/{queueId}/status` | `{lastAdmittedSeq, pacing}` — **30만 명 전원 동일** | 평상시 전부 | ✅ WAS 캐시·CDN |
-| `GET /queues/{queueId}/tokens/{tokenId}` | `{ready, admitToken?}` (§74 검증 유지) | 차례 근처 + keepalive 30~60초 1회 | ❌ 개인화 |
+| `GET /api/v1/queues/{queueId}/status` | `{lastAdmittedSeq, pacing}` — **30만 명 전원 동일** | 평상시 전부 | ✅ WAS 캐시·CDN |
+| `GET /api/v1/queues/{queueId}/tokens/{tokenId}?seq={seq}&ka={0\|1}` | `{ready, admitToken?}` — §74 소유권 검증 유지, 단 **분기 변경 필요**(아래) | 차례 근처 + keepalive 30~60초 1회 | ❌ 개인화 |
+
+> 개인 엔드포인트의 `seq`·`ka`는 **뺄 수 없다.** `poll_verify.lua`가 `ZRANGEBYSCORE waiting seq seq`로
+> 소유권을 대조하므로 `seq`가 없으면 검증 자체가 성립하지 않고, `ka`는 `last-active` 갱신 트리거다.
+> 현행 컨트롤러도 둘 다 `@RequestParam`으로 받고 있다.
 
 ```json
-GET /queues/{queueId}/status
+GET /api/v1/queues/{queueId}/status
 { "lastAdmittedSeq": 47,
   "pacing": [[50,2],[1000,5],[5000,10],[10000,15],[null,20]] }
 ```
@@ -4635,13 +4747,45 @@ SDK:  rank = mySeq − lastAdmittedSeq        (뺄셈 1회, 서버는 계산 안
       mySeq <= lastAdmittedSeq  →  그때만 개인 엔드포인트로 admitToken 확인
 ```
 
-**서버가 하는 일은 키 하나 `GET`이다.** rank 계산·등급 판정을 서버에서 삭제한다.
+**서버가 하는 일은 키 2개 `MGET`이다.** rank 계산·등급 판정을 서버에서 삭제한다.
+단, 그 앞에 **큐 → 클러스터 라우팅 조회가 선행한다.** 매핑은 불변이므로(§75 D27-2)
+**WAS-local 선적재로 충분**하고, 맵에 없는 `queueId`는 그대로 404다.
+
+### `pacing`의 출처 — 코드 상수 기본값 + Redis 오버라이드
+
+| 순위 | 출처 | 비고 |
+|---|---|---|
+| 1 | `queue:{queueId}:pacing` (Redis) | **있으면 이긴다.** 운영 중 즉시 변경용 |
+| 2 | 코드 상수 | 키가 없을 때. 현행 `QueueEngineService`의 사다리와 같은 값 |
+
+- **평상시 큐 대부분은 키가 없다** → 관리 대상이 0이다. 설정 테이블도, 관리 API도 만들지 않는다
+- **추가 부하 ≈ 0.** `/status` 응답 자체가 캐시되므로 Redis 조회는 캐시 미스 때만이고,
+  `admit-watermark`와 **같은 해시태그**라 `MGET` 1왕복이면 된다 (기존 `GET` 1회와 동일)
+- **존재 이유는 장애 시 "전원 간격 2배"를 서버가 즉시 할 수 있다는 것.** 이 키가 없으면
+  남는 수단이 429뿐인데, 이 문서 스스로 "429는 부하 제어가 아니라 사용자 대기 실패"라고 적었다
 
 ### `admitWatermark` 저장·갱신
 
-- 키: `queue:{queueId}:admit-watermark` — **해시태그 필수**(§70 D10). 단일 스칼라
+- 키: `queue:{queueId}:admit-watermark` — **해시태그 필수**(§70 D10). 단일 스칼라.
+  **`QueueKeys.admitWatermark(queueId)`를 신설해 그것만 쓴다.** 문자열 리터럴로 조립하면
+  해시태그가 빠져도 **로컬 Sentinel에서는 절대 안 잡히고 Cluster에서만 `CROSSSLOT`으로 깨진다**
+  (CLAUDE.md 핵심 설계 결정 10)
 - **admit Lua 안에서 갱신한다.** admit은 이미 원자 연산이어야 하고(ZSet에서 N개 pop + 상태 전이),
   그 스크립트가 방금 뽑은 최대 seq를 알고 있다. **왕복 추가 0회**
+- **⚠️ 원자 범위는 아직 "pop + watermark"까지다. 전 구간 원자성은 미해결이다 (Sprint 7 과제).**
+  verify·complete URL에 `queueId`를 넣어 admitToken 키를
+  `queue:{queueId}:admit-by-token:{tokenId}` / `queue:{queueId}:admit-by-admit:{admitToken}` 로
+  옮긴 것은 **필요조건**이다 — 구 표기(`admit-token-by-token:{tokenId}`)는 tokenId로 해시돼
+  다른 슬롯이었으므로 애초에 한 스크립트에 담을 수조차 없었다. **그러나 충분조건이 아니다:**
+
+  | 남은 장애물 | 내용 |
+  |---|---|
+  | ⓐ **중간에 DB가 낀다** | admit 흐름이 `① Lua(pop)` → `② DB WAITING 상태 확인` → `③ 토큰 SET` 순서다(`FLOW.md` admit 다이어그램, `FRS §6.4`). **Lua는 MySQL을 못 만진다.** 슬롯을 정렬해도 ①과 ③은 별개 호출이다 |
+  | ⓑ **`verified-token:{tokenId}` 소속 미정** | ②가 이 키를 본다. 해시태그가 없고 §75 **D27-4의 "큐 비종속 키" 목록**(`rl:*`/`apikey:*`/`tenant:*`/`refresh-token:*`)에도 없다. 이중 라우팅에서 큐가 cluster2에 있으면 이 키는 cluster1 → **크로스 클러스터**다. 같은 클러스터 안의 `CROSSSLOT`보다 나쁘다 |
+
+  **따라서 "pop은 성공했는데 토큰 SET은 실패"하는 창은 여전히 존재한다.**
+  Sprint 7이 admit을 설계할 때 **해결안을 정해야 한다** — 이 절을 근거로 "한 Lua면 된다"고
+  착수하면 성립 불가능한 스크립트를 전제하게 된다
 - ⚠️ **`SET`이 아니라 "현재값보다 클 때만 쓴다".** WAS N대가 동시에 admit하므로 늦게 도착한
   작은 값이 watermark를 **후퇴**시키면 사용자 화면의 순번이 **늘어난다**
 
@@ -4653,7 +4797,17 @@ if maxPoppedSeq > cur then redis.call('SET', KEYS[n], maxPoppedSeq) end
 - **콜드 스타트 폴백 불필요**: 키가 없으면 `0`으로 읽고 `rank = mySeq − 0 = mySeq`인데,
   아무도 입장 안 했으므로 **그게 맞는 값**이다
 - **캐시가 아니라 원본이다.** Redis 유실 시 전광판이 0으로 돌아가 전원 순번이 폭증한다.
-  복구원: `tokens` 테이블 `status = ADMIT_ISSUED`의 **최대 seq**. 유실 감지·복구 설계와 같은 자리
+  복구원: `tokens` 테이블 **`status IN (ADMIT_ISSUED, COMPLETED)`의 최대 seq**. 유실 감지·복구 설계와 같은 자리
+
+  ```sql
+  SELECT MAX(seq) FROM tokens WHERE queue_id = ? AND status IN (1, 2);  -- ADMIT_ISSUED, COMPLETED
+  ```
+
+  ⚠️ `status = ADMIT_ISSUED`만 세면 **정상 진행할수록 watermark가 후퇴한다** — admit된 사람이
+  complete로 넘어갈수록 집합에서 빠지고, 전원이 complete하면 `MAX`가 NULL이라 **0**이 된다.
+  "한 번이라도 admit된 적이 있는가"가 기준이므로 COMPLETED를 포함해야 한다.
+  ⚠️ `schema.sql`의 `tokens` 인덱스에 `seq`가 포함돼 있지 않아 이 `MAX(seq)`는 인덱스로 풀리지
+  않는다. **복구 경로에서만 도는 쿼리라 수용**하되, 상시 조회로 승격하면 인덱스를 다시 봐야 한다
 
 ### 🔴 가드레일 — watermark는 **표시 전용**이다
 
@@ -4669,10 +4823,32 @@ watermark 기준으로 "48번부터 뽑자"고 하면, admitToken TTL(60s) 만�
 | **B. 아직 WAITING** | admitToken TTL 만료 → **seq 보존 복귀** | 계속 대기. rank 음수 → **0으로 clamp**("곧 입장") |
 | **C. 사라짐** | 취소·만료 | `404` |
 
-판정은 **Redis 키 2개의 존재 여부**가 이미 한다 — `admit-token-by-token:{tokenId}` 있으면 A,
-`waiting` ZSet에 `mySeq` 있으면 B, 둘 다 없으면 C. **DB `status` 컬럼은 폴링 경로에서 읽지 않는다**
+판정은 **Redis 키 2개의 존재 여부**가 이미 한다 — `queue:{queueId}:admit-by-token:{tokenId}`
+있으면 A, `waiting` ZSet에 `mySeq` 있으면 B, 둘 다 없으면 C. 두 키가 같은 `{queueId}` 슬롯이므로
+**한 번의 조회로 끝난다**(URL에 `queueId`를 넣은 결과). **DB `status` 컬럼은 폴링 경로에서 읽지 않는다**
 (핫패스에 DB를 넣으면 15k rps가 MySQL로 간다). watermark는 **판정이 아니라 트리거**이고,
 분기를 늘리지 않는다.
+
+**🔴 상태 A 판정 키는 반드시 `tokenId` 기반이어야 한다.** `seq` 기반으로 만들면 §74가 고친 결함
+(추측 가능한 `seq`로 남의 상태를 조회·연장)이 그대로 되돌아온다.
+
+**⚠️ 개인 엔드포인트의 분기를 바꿔야 한다 — 안 바꾸면 admit된 사용자가 404다.**
+현행 `poll_verify.lua`는 `waiting` ZSet에 없으면 `0`을 돌려주고, `QueueEngineService`가 그것을
+`TOKEN_NOT_FOUND`로 던진다. admit되면 ZSet에서 빠지므로 **A가 곧 404**가 된다.
+→ "`waiting`에 없으면 실패"가 아니라 **"`waiting`에 없고 `admit-by-token`도 없을 때만 실패"**로
+바꾼다. `poll_verify.lua`의 소유권 대조(`tokens` Hash의 tokenId 문자열 비교)는 그대로 유지한다.
+
+**404 계약 — SDK는 HTTP 상태가 아니라 `errorCode`로 재시도를 결정한다**
+
+| 실제 상황 | errorCode | SDK 동작 |
+|---|---|---|
+| C. 취소·만료로 진짜 사라짐 | `TK001` (`TOKEN_NOT_FOUND`) | **종료** |
+| B′. admitToken TTL 만료 후 WAITING 복귀 **대기 중**(배치 반영 전) | **신규 ErrorCode (후속)** | **백오프 후 재시도** |
+
+현재 `ErrorCode`에는 `TOKEN_NOT_FOUND` 하나뿐이라 두 상황이 뭉개진다. 그대로 두면 TTL 만료 직후
+~ 복귀 배치 실행 사이의 창에서 **한 코호트 전체가 404를 받고 SDK가 일제히 종료**한다.
+"404 = 즉시 종료"라는 SDK 계약도 함께 폐기한다. **ErrorCode 추가는 코드 변경이라 후속 작업**이며,
+이 표는 그 전까지의 계약 정의다.
 
 **B가 표시상 정직한 이유**: admit이 항상 ZSet 최소 seq부터 뽑으므로 복귀자는 **다음 배치에서 가장
 먼저** 뽑힌다. 화면의 "곧 입장"이 실제와 맞다.
@@ -4722,13 +4898,56 @@ watermark 기준으로 "48번부터 뽑자"고 하면, admitToken TTL(60s) 만�
   JS SDK 미착수라 깨질 클라이언트는 현재 없다
 - **`QueueSnapshotCache`(Caffeine) 존재 이유가 사라진다.** `frontSeq` 스냅샷 전용으로 만든
   것이라 제거 대상이다 — 프로젝트의 유일한 로컬 캐시 의존성도 같이 검토한다
+- **⚠️ "WAS 캐시까지"와 "CDN까지"는 용량이 다르다. 용량 산정 시 어느 쪽을 전제로 하는지 밝혀라**
+
+  | 전제 | WAS가 받는 HTTP 요청 | WAS → Redis 왕복 |
+  |---|---|---|
+  | 캐시 없음(현행) | 15,448 rps | 15,448 EVAL |
+  | **WAS 캐시만** | **15,448 rps 그대로** | 큐·WAS당 `1 ÷ TTL` |
+  | **CDN까지** | 큐·엣지당 `1 ÷ TTL` + 개인화 5,000~7,700 rps | 위와 동일 |
+
+  즉 WAS 캐시만으로는 **Redis 왕복만 줄고 HTTP 요청 수는 그대로**다. 톰캣 스레드·커넥션 산정은
+  여전히 15k rps 기준이어야 한다. **Sprint 7 용량 산정의 입력값이므로 여기서 못 박는다**
 - **⚠️ 캐시와 "살아있음 확인"이 상충한다.** 평상시 폴링이 캐시된 `/status`만 때리면 서버는
   대기자가 아직 살아 있는지 모르고 `last-active`가 갱신되지 않는다.
-  → 기존 결정 **"SDK가 `ka=1`을 30~60초에 1번만"**이 그대로 해법이다. 개인화 비율이 1/15~1/30으로
-  떨어진다. **단, `inactive_ttl` 회수 배치는 아직 없다** — `last-active` ZSet은 폴링이 쓰기만 하고
+  → 기존 결정 **"SDK가 `ka=1`을 30~60초에 1번만"**이 그대로 해법이다.
+  **개인화 비율은 1/2~1/3이다** — 1/15~1/30은 2초 구간(rank≤50 = 50명)에서만 성립하는 수치였고,
+  대다수는 20초 구간이라 `ka` 주기(30~60초)와 폴링 주기가 2~3배밖에 차이 나지 않는다.
+  귀결: 개인화 트래픽은 500 rps가 아니라 **5,000~7,700 rps**다.
+  **단, `inactive_ttl` 회수 배치는 아직 없다** — `last-active` ZSet은 폴링이 쓰기만 하고
   읽는 곳이 0이다(Sprint 7/9)
-- `/status`는 **인증이 필요 없다**(공개 정보, 개인 식별자 없음). `permitAll` + 큐 단위 Rate Limit
-- **미검증**: 캐시 적중률, watermark 후퇴 방지 Lua, 실제 CDN 서빙. 전부 구현 시 검증 대상
+- **⚠️ 장애 시 이 결정의 이득이 사라진다.** 테넌트가 admitToken 소비에 실패해 TTL 만료 →
+  seq 보존 WAITING 복귀가 누적되면 **전원이 `mySeq <= watermark`**가 되어 매 폴링이 개인
+  엔드포인트 + `pacing` 최저 구간(2초)을 탄다. 하필 부하가 가장 높을 때 캐시가 무력화된다.
+  → `pacing` 표에 `rank<=0` 구간을 신설할지는 **관측 후 결정(후속)**. 지금 값을 정하면 근거 없는 상수가 된다
+- `/status`는 **인증이 필요 없다.** 근거는 "개인 식별자가 없어서"가 아니라 **`queueId`가 대기
+  페이지 JS에 박히는 사실상의 공개값이라 인증으로 막을 수 있는 게 없어서**다. 노출되는 것은
+  **admit 진행률(`lastAdmittedSeq`)과 `pacing` 표** 두 가지이며, 둘 다 대기자가 알아야 하는 값이다
+- **Rate Limit은 걸지 않는다.**
+  - 🔴 먼저 사실: `RateLimitFilter`는 **미등록 public 경로를 무조건 통과**시킨다. `/status`에
+    `permitAll`만 추가하면 **인증 0 + 제한 0**이 된다. 이걸 모르고 두는 것과 알고 안 거는 것은 다르다
+  - **캐시가 이미 방어한다. 단, 방어는 두 겹이고 두 번째가 본체다.**
+    ① CDN·WAS 캐시 키에서 **쿼리스트링을 제외**하면 `?x=랜덤` cache-buster가 죽고,
+      **유효한 queueId 1개당** 오리진 부하가 **`1 ÷ 캐시 TTL`로 고정**된다.
+      ⚠️ "요청 수와 무관하게 상수"는 **유효 큐에 대해서만 참**이다. 경로가 `/queues/{queueId}/status`
+      뿐이라 **경로 자체가 cache-buster**가 될 수 있고, 그때는 매번 새 캐시 키라 ①이 안 듣는다
+    ② **미지 queueId는 맵 선적재로 끝낸다.** 큐→클러스터 매핑은 **불변**이므로(§75 D27-2)
+      **맵을 통째로 선적재하고, 맵에 없으면 그대로 404**다. DB 조회가 없으므로 인증 없는 요청이
+      MySQL을 때리는 증폭 경로가 생기지 않는다.
+      **negative cache가 아니다** — 미지 ID는 매번 새 키라 엔트리를 만들어도 재사용이 0이고,
+      만드는 만큼 메모리만 는다.
+      ⚠️ **맵은 주기적으로 통째 리로드한다.** 큐는 런타임에 생성되므로(`POST /queues`) 부팅 시
+      선적재한 맵에는 **그 이후 만들어진 정상 큐가 없다** — §75가 말한 "매핑 불변"은 기존 항목에
+      대한 것이지 항목이 새로 생기는 것을 막지 못한다. 그대로 두면 **새로 만든 큐의 `/status`가
+      WAS 재기동 전까지 404**이고, 티켓팅 큐는 오픈 직전에 만드는 것이 정상 경로라 하필 가장
+      나쁠 때 터진다. 매핑이 불변이라 값 충돌이 없으므로 **통째 교체가 안전**하다.
+      **미스는 DB로 내려보내지 않는다**(증폭 경로 차단이 이 항목의 목적이다).
+      **리로드 주기는 미정** — 큐 생성 후 `/status`가 열리기까지의 지연이 그 값이다
+  - **큐 단위 RL은 오히려 해롭다.** 30만 명이 한 버킷을 공유하므로 남용자 1명이 **정상 대기자
+    전원을 429**시킨다 — 이 문서가 스스로 "429는 부하 제어가 아니라 사용자 대기 실패"라고 적은 상태다
+  - 남는 위험은 **엣지 대역폭**이고, 그건 CDN 소관이지 앱 필터가 할 일이 아니다
+- **미검증**: 캐시 적중률, watermark 후퇴 방지 Lua, 실제 CDN 서빙, 쿼리스트링 제외 캐시 키.
+  전부 구현 시 검증 대상
 
 ### 면접 포인트
 
@@ -4740,10 +4959,34 @@ watermark 기준으로 "48번부터 뽑자"고 하면, admitToken TTL(60s) 만�
 전광판과 같습니다 — 은행이 대기자마다 "당신은 15번째"라고 계산해주지 않고 **"현재 47번 처리 중"**
 한 줄을 띄우면, 62번 손님이 스스로 15명 남았다고 압니다.
 
-전원이 같은 응답이라 **CDN이 대신 서빙**할 수 있고, 서버가 하는 일은 키 하나 `GET`으로 줄었습니다.
+전원이 같은 응답이라 **CDN이 대신 서빙**할 수 있고, 서버가 하는 일은 키 2개 `MGET`으로 줄었습니다.
 대가는 **중간에 포기한 사람을 못 세서 순번이 실제보다 크게 보이는 것**인데, 방향이 항상
 "생각보다 빨리 입장"이라 감수했습니다.
 
 덧붙여 **폴링 간격 사다리를 응답에 실어 보냅니다.** SDK에 박아두면 장애 때 "전원 간격 2배"를
 할 수가 없거든요 — 테넌트들이 각자 SDK를 재배포해야 하니까요. 부하 제어 플랫폼이 부하 제어
 레버를 클라이언트에 넘기면 안 된다고 봤고, 그 레버 값이 응답 필드 하나였습니다.
+
+### Related
+
+- **§74** (폴링 소유권 검증) — 이 결정이 §74가 만든 폴링 경로의 **응답 계약·엔드포인트를 변경**한다.
+  개인 엔드포인트의 `poll_verify.lua` 검증 자체는 그대로 유지된다
+- **§36** (admitToken TTL 만료 → WAITING 복귀) — 🔴 가드레일과 상태 B가 **전적으로 이 결정에 기댄다.**
+  seq 보존 복귀가 없다면 watermark 기준 admit도 안전했을 것이다
+- **§70 D10** (Hash Tag) · **§75 D26** (한 큐의 키는 같은 클러스터) — `admit-watermark`·`pacing`·
+  admitToken 키 2종·`admit-idem`을 `{queueId}` 슬롯으로 모았다. **다만 이것만으로 admit 전 구간이
+  원자가 되지는 않는다** — 중간에 DB 확인이 끼고 `verified-token`의 클러스터 소속이 미정이다
+  (위 "원자 범위" 참조. Sprint 7 과제)
+- **§78** (클라이언트 경계) — 이 결정이 §78 표의 "지터를 서버가 응답에 실어 보낸다"를 **뒤집는다**
+  (해당 칸에 상호 참조 표시함)
+- **§71** (Redis 유실 복구) — watermark는 캐시가 아니라 원본이므로 복구 대상이다
+- 후속: `QueueSnapshotCache` 제거(도메인 포트 시그니처 변경), `ErrorCode` 신규 추가(404 계약),
+  ETA(`estimatedWaitSeconds`) 거처, pacing `rank<=0` 구간, admit 전 구간 원자성(Sprint 7),
+  `verified-token` 클러스터 소속 확정(§75 D27-4 목록에 넣을지)
+- 🔴 **후속 — 큐 상태 키의 회수 경로가 통째로 없다 (같은 유형 2건, 회수 배치는 Sprint 9)**
+  - `queue:{q}:tokens` Hash — `HDEL`이 **전 문서·전 코드 0건**이고 큐 상태 키에 `EXPIRE`도 **0건**이다.
+    admit·complete·cancel·expire가 전부 `ZREM`만 하므로 **누적 enqueue 수만큼 필드가 영구 축적**된다
+  - `queue:{q}:last-active` ZSet — `ZREM`이 0건. 폴링이 쓰기만 하고 읽는 곳이 없다(§74 Consequences)
+  - 역설적으로 **이 누수 덕에 admitToken TTL 만료 후 WAITING 복귀가 `ZADD` 하나로 성립한다**
+    (`tokens` Hash의 identifier→tokenId 매핑이 살아 있어야 복귀한 멤버를 다시 검증할 수 있다).
+    회수 배치를 설계할 때 **"언제 지워도 되는가"가 이 의존과 얽힌다**

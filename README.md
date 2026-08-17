@@ -15,13 +15,13 @@
 
 - 대기열을 서비스 서버에서 분리 → **트래픽 제어를 플랫폼화**
 - **Platform(순서 관리)** vs **Tenant(슬롯·입장 제어)** 책임 분리
-- **유저가 Platform에 직접 Polling** — nextPollAfterSec 적응형 간격
+- **유저가 Platform에 직접 Polling** — `/status` 전광판 + `pacing` 구간표 (전원 동일 응답 → 캐시)
 - **Backpressure Pull** — Tenant가 소화 가능한 인원만 admit 요청
 - **admitToken TTL 60초** → verify(유효성 확인) → complete(COMPLETED+ZREM)
 - **admitToken 만료 시 WAITING 복귀** — seq 유지로 우선순위 보존
 - **Kafka 버퍼** — Enqueue 202 즉시 응답 + DB INSERT 비동기
 - **Virtual Thread** — Spring MVC + JPA blocking I/O를 OS Thread 고갈 없이 처리
-- **SDK 제공** — JS SDK (nextPollAfterSec 적용) + REST API 명세
+- **SDK 제공** — JS SDK(폴링·대기 UI 전용)만. Tenant 서버는 REST 직접 호출 (DECISIONS §35 · §78)
 
 ---
 
@@ -42,16 +42,21 @@ Tenant가 슬롯 여유 감지 → POST /admit 호출
 Platform은 순번 관리만. 세션 관리는 Tenant 책임
 ```
 
-### 2. 유저가 Platform에 직접 Polling (적응형 간격)
+### 2. 유저가 Platform에 직접 Polling (적응형 간격 — DECISIONS §79)
 ```
-nextPollAfterSec:
-  globalRank > 500 → 30s (서버 부하 절약)
-  globalRank > 100 → 10s
-  globalRank > 10  → 5s
-  globalRank ≤ 10  → 2s (곧 입장)
+GET /queues/:queueId/status  → { lastAdmittedSeq, pacing }   ← 전원 동일. 캐시 가능
+  rank = mySeq − lastAdmittedSeq        ← SDK가 뺄셈 (서버는 rank를 계산하지 않는다)
 
-JS SDK: setTimeout(poll, nextPollAfterSec * 1000) 자동 적용
+pacing 기본 구간표 (Redis 키로 오버라이드 가능):
+  rank ≤ 50     → 2s (곧 입장)
+  rank ≤ 1000   → 5s
+  rank ≤ 5000   → 10s
+  rank ≤ 10000  → 15s
+  그 이상        → 20s (서버 부하 절약)
+
+JS SDK: setTimeout(poll, 간격 × 1000 + ±20% 지터) 자동 적용
 탭 비활성화 → Polling 자동 중단
+rank ≤ 0 일 때만 개인 엔드포인트로 admitToken 확인
 ```
 
 ### 3. Backpressure Pull
@@ -179,7 +184,7 @@ flowchart TD
     A["① Queue 생성"]
     --> B["② 유저 접속\nTenant 슬롯 확인"]
     --> C["③ Enqueue\n202 즉시 응답\nKafka → DB INSERT"]
-    --> D["④ Polling\n유저 → Platform 직접\nnextPollAfterSec 적응형"]
+    --> D["④ Polling\n유저 → Platform 직접\n/status 전광판 + pacing 구간표"]
 
     D --> E{"status?"}
     E -- "WAITING" --> D
@@ -213,10 +218,12 @@ Cluster 전환 시 이 파일만 수정 (Hash Tag 추가)
 | `queue-stats:{t}:{q}` | 없음 | avgWaitingTime |
 | `queue-user:{t}:{q}:{userId}` | waitingTtl | 중복 Enqueue 방지 |
 | `token-last-active:{tokenId}` | 300s | 비활동 감지 |
-| `token-info:{tokenId}` | nextPollAfterSec+2s | Polling 캐시 |
-| `admit-token-by-token:{tokenId}` | 60s | Polling 응답용 |
-| `admit-token-by-admit:{admitToken}` | 60s | verify/complete용 |
-| `admit-idem:{requestId}` | 300s | admit 멱등성 |
+| `token-info:{tokenId}` | 폴링 간격+2s | Polling 캐시 (§79 이후 존치 여부 후속 검토) |
+| `queue:{queueId}:admit-by-token:{tokenId}` | 60s | Polling 응답용 |
+| `queue:{queueId}:admit-by-admit:{admitToken}` | 60s | verify/complete용 |
+| `queue:{queueId}:admit-watermark` | 없음 | 마지막 admit seq (`/status` 전광판) |
+| `queue:{queueId}:pacing` | 없음 | 폴링 간격 구간표 오버라이드 (없으면 코드 상수) |
+| `queue:{queueId}:admit-idem:{requestId}` | 300s | admit 멱등성 (requestId는 Tenant 지정값 → 큐 스코프) |
 | `verified-token:{tokenId}` | 60s | 중복 입장 방지 |
 | `batch-lock:{t}:{q}` | 15s | Batch 서버 분산 |
 | `apikey-cache:{sha256}` | 60s | API Key 캐시 |
@@ -290,10 +297,11 @@ Failover: 5~10초 | Circuit Breaker → 503
 
 Queue Engine API (API Key 인증, Sprint 6~7):
   POST   /api/v1/queues/:queueId/tokens  → Enqueue (202)
-  GET    /api/v1/tokens/:tokenId         → Polling
+  GET    /api/v1/queues/:queueId/status  → Polling ① 전광판 (인증 없음, 전원 동일)
+  GET    /api/v1/queues/:queueId/tokens/:tokenId?seq=&ka=  → Polling ② 개인 (tokenId 소유)
   POST   /api/v1/queues/:queueId/admit   → Admit
-  POST   /api/v1/tokens/:tokenId/verify  → Verify
-  POST   /api/v1/tokens/:tokenId/complete → Complete
+  POST   /api/v1/queues/:queueId/admit-tokens/:admitToken/verify → Verify
+  POST   /api/v1/queues/:queueId/tokens/:tokenId/complete → Complete
 ```
 
 ### JS SDK (브라우저용)
@@ -302,13 +310,14 @@ Queue Engine API (API Key 인증, Sprint 6~7):
 const queue = QueueSDK.init({
     baseUrl: 'https://api.queue-platform.com',
     queueId: queueId,  // Tenant 서버에서 받은 값
-    token: token       // Tenant 서버에서 받은 값
+    tokenId: tokenId,  // Tenant 서버에서 받은 값
+    seq: seq           // Tenant 서버에서 받은 값
 });
 
 queue.startPolling({
-    onWaiting: ({ globalRank, estimatedWaitSeconds }) => {
-        updateUI(globalRank, estimatedWaitSeconds);
-        // nextPollAfterSec 타이밍 SDK가 자동 처리
+    onWaiting: ({ rank }) => {
+        updateUI(rank);
+        // rank = seq − lastAdmittedSeq, 간격은 pacing 표로 SDK가 계산 (§79)
     },
     onReady: ({ admitToken }) => {
         sendToTenantServer(admitToken);
@@ -360,7 +369,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | avgWaitingTime 직접 갱신 | StatsConsumer 불필요 → 단순화 | Kafka 재처리 중복 허용 | ETA는 보조 정보 → 허용 범위 |
 | 파티션 1달 유예 DROP | 월말 걸친 토큰 과금 누락 방지 | 스토리지 2배 | B2B 과금 정확도 우선 |
 | ZCARD Pipeline | queue-count 관리 불필요 | N번 ZCARD | 카운터 불일치 위험 제거 |
-| nextPollAfterSec | 서버 부하 절약 | SDK 구현 필요 | 순위 높을수록 Polling 드물게 |
+| `pacing` 구간표 | 서버 부하 절약 + 장애 시 서버가 전원 간격 조정 | SDK 구현 필요 | 순위 높을수록 Polling 드물게 (§79) |
 | Redis R/W 분리 미적용 | 설계 단순 | - | Lua 원자성. In-Memory 충분 |
 | MySQL R/W 분리 | SELECT 2,000 rps 분산 | Replica lag | token-info 캐시로 lag 최소화 |
 | tokens 파티셔닝 | 월별 DROP 빠른 정리 | PK에 파티션 키 | Partition Pruning 효과 |

@@ -86,6 +86,12 @@ Sprint 11-12에서 Kafka 도입 시 흐름 변경:
 
 ## Polling (유저 → Platform 직접, Jitter 적용)
 
+> ⚠️ **이 절은 §79(2026-08-14) 이전의 검토안이다.** 현행 계약은 아래
+> "클라이언트 Polling 구조 (JS SDK)" 절과 `FRS_final.md §6.3`을 보라.
+> §79에서 바뀐 것: 엔드포인트 2분할 / 서버는 rank를 계산하지 않는다 /
+> `QueueSnapshotCache`(Caffeine)는 **제거 대상**이다.
+> 아래 `/rank/:identifier`·`{rank, total, estimatedWaitSeconds}` 표기는 **채택되지 않았다.**
+
 Sprint 5-E 이후 Polling 부하 최적화:
 - **Jitter 적용** (JS SDK): 요청 시점 무작위 분산 (4-6초 랜덤)
 - **Caffeine 캐싱** (Sprint 9+): 서버 측 rank 조회 캐시 (TTL 1-2초)
@@ -145,7 +151,7 @@ flowchart TD
     SLOT(["Tenant\n슬롯 여유 생김"])
     --> ADMIT["POST /queues/:queueId/admit\n{ count: N, requestId }\nTenant → Platform"]
 
-    ADMIT --> IDEM{"admit-idem:{requestId}\n존재?"}
+    ADMIT --> IDEM{"queue:{queueId}:admit-idem:{requestId}\n존재?"}
     IDEM -->|"있음 (중복)"| CACHED(["200 OK\n기존 결과 반환"])
     IDEM -->|"없음"| DBINS["DB admit_requests INSERT\nstatus=PENDING\n← 영속성 기준점"]
 
@@ -153,35 +159,35 @@ flowchart TD
 
     KAFKA --> CONSUMER["Kafka Consumer (Admit Worker)\nDB PENDING 확인 → 멱등 체크\nstatus=PROCESSING 업데이트"]
 
-    CONSUMER --> LUA["Lua Script\n슬라이스별 ZRANGE WITHSCORES\nLua 내부 score 정렬\n상위 N명 선택\nZREM multi-member"]
-    --> FILTER["DB WAITING 상태 확인\n불일치 즉시 ZREM\n부족 시 최대 3회 추가 추출\n추가 추출 시 전체 재정렬 → FIFO 보장"]
-    --> TOKEN["admitToken 발급\nSET admit-token-by-token:{tokenId} EX 60\nSET admit-token-by-admit:{admitToken} EX 60\nDB UPDATE ADMIT_ISSUED (100건씩)\nSET token-info 캐시 갱신\nDB admit_requests status=COMPLETED"]
+    CONSUMER --> LUA["① Lua Script (Redis 전용)\n슬라이스별 ZRANGE WITHSCORES\nLua 내부 score 정렬\n상위 N명 선택\nZREM multi-member"]
+    --> FILTER["② DB WAITING 상태 확인 ← Lua 밖 (Lua는 MySQL을 못 만진다)\n불일치 즉시 ZREM\n부족 시 최대 3회 추가 추출\n추가 추출 시 전체 재정렬 → FIFO 보장"]
+    --> TOKEN["③ admitToken 발급 ← ①과 별개 호출\nSET queue:{queueId}:admit-by-token:{tokenId} EX 60\nSET queue:{queueId}:admit-by-admit:{admitToken} EX 60\nSET queue:{queueId}:admit-watermark = max(현재값, 뽑은 최대 seq)\nDB UPDATE ADMIT_ISSUED (100건씩)\nSET token-info 캐시 갱신\nDB admit_requests status=COMPLETED\n⚠️ ①과 ③ 사이에 'pop 성공 + SET 실패' 창이 있다 (DECISIONS §79 — 미해결)"]
     --> ARESP(["200 OK\n{ admitTokens: [{userId, admitToken}...] }"])
 
     ARESP --> POLL["유저 다음 Polling 시\nadmitToken 수신"]
     --> USER["유저 → Tenant\nadmitToken 전달"]
-    --> VERIFY["POST /admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 (상태 변경 없음)"]
+    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 (상태 변경 없음)"]
 
-    VERIFY --> VK{"admit-token-by-admit:{admitToken}\n유효?"}
+    VERIFY --> VK{"queue:{queueId}:admit-by-admit:{admitToken}\n유효?"}
     VK -->|"만료 or 무효"| VDB["DB Fallback 시도\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(NOW() 금지 — issued_at은 UTC. DECISIONS §76)"]
     VDB -->|"없음"| E404(["404 TK_002_INVALID_ADMIT_TOKEN"])
     VDB -->|"있음"| VFLAG["SET verified-token:{tokenId} EX 60\n중복 입장 방지 플래그"]
     VK -->|"유효"| VFLAG
-    --> VRESP(["200 OK\n{ valid: true, userId }"])
+    --> VRESP(["200 OK\n{ valid: true, identifier }"])
 
     VRESP --> ALLOW["Tenant → 유저 입장 허용"]
-    --> COMPLETE["POST /tokens/:token/complete\n{ admitToken }\nTenant → Platform\n입장 완료 통보"]
+    --> COMPLETE["POST /queues/:queueId/tokens/:tokenId/complete\n{ admitToken }\nTenant → Platform\n입장 완료 통보"]
 
     COMPLETE --> CK{"ADMIT_ISSUED(1)\n상태?"}
     CK -->|"아님"| E409(["409 QE_006_INVALID_STATUS"])
     CK -->|"확인"| DB["DB status = COMPLETED(2)\n← 먼저 (원자성 전략)\nDB UPDATE WHERE status=1 → 1번만 성공"]
-    --> ZREM["Redis ZREM\nDEL admit-token-by-token\nDEL admit-token-by-admit\nDEL token-info 캐시\nDEL verified-token\n← 나중"]
+    --> ZREM["Redis ZREM\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit\nDEL token-info 캐시\nDEL verified-token\n← 나중"]
     --> AVG["avgWaitingTime 직접 갱신\nwaitingSeconds = completedAt - issuedAt\n이상치 필터: > waitingTtl × 0.8 제외\nHINCRBYFLOAT queue-stats waitingTimeSum\nHINCRBY queue-stats waitingTimeCount"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
 
-    TOKEN -->|"admitToken TTL 60초 초과\nBatch 10초 주기 감지"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD {seq} {tokenId}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL admit-token-by-token\nDEL admit-token-by-admit"]
+    TOKEN -->|"admitToken TTL 60초 초과\nBatch 10초 주기 감지"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD queue:{queueId}:waiting {seq} {identifier}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit"]
 ```
 
 > **Kafka Consumer 장애 시**
@@ -194,7 +200,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    DQ(["DELETE /queues/:queueId/tokens/:token\nTenant 서버 호출\n유저 대기 포기"])
+    DQ(["DELETE /queues/:queueId/tokens/:tokenId\nTenant 서버 호출\n유저 대기 포기"])
     --> CHK["상태 확인"]
 
     CHK -->|"ADMIT_ISSUED(1)"| E409A(["409 QE_006_INVALID_STATUS\n입장토큰 발급 후 이탈 불가\nadmitToken TTL 60초 후\nWAITING 복귀 후 이탈 가능"])
@@ -218,12 +224,12 @@ flowchart TD
 
     W1["waitingTtl 체크 (WAITING)\nZRANGEBYSCORE\n0 ~ now_ms - waitingTtl_ms"]
     W2["inactiveTtl 체크 (WAITING)\nEXISTS token-last-active\n= 0 이면 비활동"]
-    W3["admitToken TTL 체크 (ADMIT_ISSUED)\nEXISTS admit-token-by-token:{tokenId}\n= 0 이면 만료"]
+    W3["admitToken TTL 체크 (ADMIT_ISSUED)\nEXISTS queue:{queueId}:admit-by-token:{tokenId}\n= 0 이면 만료"]
 
     W1 -->|"WAITING_TTL(0)"| EXP["DB UPDATE EXPIRED(4)\nexpiredReason 기록\nRedis ZREM\nDEL token-info 캐시\n100건씩 순차 처리\nLIMIT 100 → Gap Lock 방지"]
     W2 -->|"INACTIVE_TTL(1)"| EXP
 
-    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD {seq} {tokenId}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL admit-token-by-token\nDEL admit-token-by-admit"]
+    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD queue:{queueId}:waiting {seq} {identifier}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit"]
 
     EXP --> DONE(["완료\n멱등: 상태 필터로 중복 처리 없음"])
     BACK --> DONE
@@ -308,24 +314,27 @@ flowchart TD
     --> CLIENT["브라우저 (JS SDK)\nqueue.startPolling()"]
 
     CLIENT --> POLL["JS SDK 내부\npoll() 실행"]
-    --> REQ["GET /tokens/:token\nPlatform 직접 호출\n(API Key 없음 — 대기토큰 인증)"]
-    --> PLATFORM["Queue Platform\n순위계산 + TTL갱신 + ETA\nnextPollAfterSec 계산"]
-    --> RESP["응답\n{ globalRank, nextPollAfterSec, ready, admitToken }"]
+    --> REQ["GET /queues/:queueId/status\nPlatform 직접 호출 (인증 없음)\n30만 명 전원 동일 응답 → 캐시"]
+    --> PLATFORM["Queue Platform\nMGET admit-watermark, pacing\n(rank 계산 없음)"]
+    --> RESP["응답\n{ lastAdmittedSeq, pacing }"]
 
-    RESP --> READY{"ready?"}
-    READY -->|"false"| TIMER["JS SDK\nsetTimeout(nextPollAfterSec × 1000)\n→ poll() 재호출\n탭 비활성화 시 자동 중단"]
+    RESP --> CALC["JS SDK 계산\nrank = mySeq − lastAdmittedSeq\n간격 = pacing 표 + ±20% 지터"]
+    CALC -->|"rank > 0"| TIMER["setTimeout(간격 × 1000)\n→ poll() 재호출\n탭 비활성화 시 자동 중단\n30~60초마다 ka=1로 개인 호출"]
     TIMER --> POLL
 
-    READY -->|"true"| CB["onReady 콜백\nadmitToken 수신"]
+    CALC -->|"rank <= 0"| ME["GET /queues/:queueId/tokens/:tokenId?seq=&ka=\n(§74 소유권 검증)"]
+    ME -->|"ready=false"| TIMER
+    ME -->|"ready=true"| CB["onReady 콜백\nadmitToken 수신"]
     --> SEND["유저 → Tenant 서버: admitToken 전달"]
-    --> JAVA["Tenant 서버 (Java SDK)\nadmitAndVerify()\n① verify 즉시 호출\n② valid 확인\n③ Tenant 내부 처리\n④ complete 3회 자동 재시도"]
+    --> TENANT2["Tenant 서버 (REST 직접 호출 — SDK 아님)\n① verify 즉시 호출\n② valid 확인\n③ Tenant 내부 처리\n④ complete 호출 (재시도는 Tenant 몫)"]
 ```
 
 > **역할 분리**
-> nextPollAfterSec 계산: Platform 책임
-> setTimeout / 탭 비활성화 처리: JS SDK 책임
+> `pacing` 구간표·`lastAdmittedSeq` 제공: Platform 책임 (부하 제어 레버는 서버가 쥔다, §79)
+> rank 계산 / setTimeout / 탭 비활성화 처리: JS SDK 책임
 > UI 업데이트: 클라이언트(Tenant) 책임
-> verify 순서 강제 / complete 재시도: Java SDK 책임
+> verify 순서 / complete 재시도: **Tenant 서버 책임** — 강제할 SDK가 없으므로 명세로 규정하고
+> 서버가 위반을 방어한다 (DECISIONS §35)
 
 ---
 
