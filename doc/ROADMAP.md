@@ -1,6 +1,6 @@
 # 🗺 Queue Platform — Sprint Roadmap
 
-> 작성일: 2026-04-16 | Sprint 5 진행 중 최신화 (2026-06-10)
+> 작성일: 2026-04-16 | 최신화: **2026-08-17** (구현 대조 — 진행 현황·Kafka 체계·폐기 DoD 정정)
 
 ---
 
@@ -28,7 +28,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ### 인프라 참조
 
 - **로컬 (Sprint 2~10):** [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 직접 설치
-- **AWS 배포 (Sprint 11):** [AWS_LEARNING_PATH.md](AWS_LEARNING_PATH.md) — 병렬 학습 경로
+- **AWS 배포 (Sprint 11):** `AWS_LEARNING_PATH.md` — **미작성**
 
 | Sprint | 인프라 | 가이드 |
 |:-:|------|:-:|
@@ -40,20 +40,35 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 
 ### 진행 현황
 
+> **Sprint는 순서대로 끝나지 않았다.** 6·8이 부분적으로 먼저 진행됐다 — enqueue를 만들려면
+> 적재 경로가 필요했기 때문이다(§71 → §72 → §73). 아래는 **코드로 확인한 상태**다.
+
 ```
 ✅ Sprint 1   완료 (2026-04-16)
 ✅ Sprint 2   완료 (2026-04-22)
 ✅ Sprint 3   완료 (2026-04-23)
 ✅ Sprint 4   완료 (2026-04-24)
-🔄 Sprint 5   진행 중 (5-A/B/C/D 완료, 5-E 진입, 5-F 예정)
-🎯 Sprint 8 (Cluster 학습) 로컬 실습 완료 (2026-07-08, 병행 학습)
-⬜ Sprint 6
-⬜ Sprint 7
-⬜ Sprint 8   ← Cluster 프로덕션 도입 준비 (로컬 학습은 완료)
-⬜ Sprint 9
+🔄 Sprint 5   5-A/B/C/D/E 완료, 5-F(문서) 진행 중
+🔄 Sprint 6   Token 도메인 + Enqueue + Polling 구현 / Cancel(DELETE) 미착수
+⬜ Sprint 7   admit·verify·complete — 컨트롤러 0건. §79(/status·watermark·pacing)도 여기서 함께
+🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / 상태 전이 이벤트는 Sprint 7과 함께
+⬜ Sprint 9   queue-batch는 Application 클래스 1개뿐 (껍데기)
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
+🎯 Cluster 로컬 실습 완료 (2026-07-08, 병행 학습) — 프로덕션 도입은 §75, 시점 미정
 ```
+
+**판정 근거 (2026-08-17 실측)**
+
+| 확인한 것 | 명령 | 결과 |
+|---|---|---|
+| Queue Engine 엔드포인트 | `grep -rn "Mapping(" queue-api/src/main` | `POST /{queueId}/tokens`, `GET /{queueId}/tokens/{tokenId}` **2개뿐**. admit·verify·complete·DELETE **0건** |
+| `queue-batch` 내용물 | `find queue-batch/src -name "*.java"` | `QueueBatchApplication.java` **1개** |
+| `queue-consumer` 내용물 | `find queue-consumer/src/main -name "*.java"` | Application · KafkaConsumerConfig · `TokenLifecycleConsumer` · `TokenPersistService` **4개** |
+| Lua 스크립트 | `ls .../resources/lua/` | `enqueue_bulk` · `poll_verify` · `token-bucket` · `fixed-window` **4개** |
+| §79 미착수 | `grep "private final" PollResponse.java` | `frontSeq` · `total` · `nextPollAfterSec`가 **아직 있다** |
+| 회수 경로 부재 | `grep -rn "ZREM\|HDEL" queue-*/src/main` | **0건** (Sprint 9 과제) |
+| `queue-batch` actuator | `grep actuator queue-batch/build.gradle` | **없음** — `starter-web`만 (reconciliation 선행 조건) |
 
 **주요 학습 자산 축적**: 총 88개 통찰 (Line Pay Plus 시니어 백엔드 지원 자산)
 
@@ -300,7 +315,7 @@ flowchart TD
   - WAS 3대 분산 10,000건 → 5개 큐에 2,000씩, 순번 중복 0
   - 로컬 Cluster A에서 `enqueue_bulk.lua` 실행 검증 (Hash Tag)
 
-**Phase F ⬜**: 커밋 (working tree 상태)
+**Phase F ✅**: 커밋 완료
 
 **확정 결정** (DECISIONS §66-70 참조):
 - D1: 자유 identifier (Tenant 제공)
@@ -356,10 +371,16 @@ flowchart TD
 - [ ] Refresh Token Redis 조회 우선 → DB fallback 동작 검증
 - [ ] RedisKeyFactory 단위 테스트 (키 포맷 검증)
 
-**5-E (예정) — Queue Engine Lua**
-- [ ] Lua Script 원자성 통합 테스트 (동시 1,000 Enqueue → 순번 중복 없음)
-- [ ] 슬라이스 라운드로빈 분배 확인 (`slice = (seq-1) % sliceCount`)
-- [ ] Ranking Lua Script 정확성 검증
+**5-E — Queue Engine Lua**
+- [x] Lua Script 원자성 통합 테스트 (동시 1,000 Enqueue → 순번 중복 없음)
+- [x] WAS 3대 분산 10,000건 → 5개 큐에 2,000씩, 순번 중복 0
+- [x] 로컬 Cluster A에서 `enqueue_bulk.lua` 실행 검증 (해시태그 — **Sentinel 테스트로는 CROSSSLOT이 안 잡힌다**)
+
+> ~~슬라이스 라운드로빈 분배 확인 (`slice = (seq-1) % sliceCount`)~~ — **§66 D2가 폐기했다.**
+> 대기열은 ZSet 하나(`queue:{queueId}:waiting`)이고 score는 `INCR queue:{queueId}:seq`다(§70 D9).
+> 쪼개지 않으니 분배도 없다.
+> ~~Ranking Lua Script~~ — 별도 스크립트를 만들지 않았다. 순위는 `enqueue_bulk.lua`의 `ZRANK`(응답)와
+> SDK의 `rank = mySeq − lastAdmittedSeq`(폴링, §79)로 나뉘었다.
 
 **참조 문서:**
 - DECISIONS §5 (Redis 장애 복구), §17 (대용량 처리), §30 (Redis Sentinel)
@@ -383,38 +404,41 @@ flowchart TD
 
 ---
 
-### ⬜ Sprint 6 — Token 도메인 + Queue Engine API (Enqueue / Polling)
+### 🔄 Sprint 6 — Token 도메인 + Queue Engine API (Enqueue / Polling) — **Cancel만 남음**
 
 **예상 기간:** 1.5주
 **카테고리:** MVP
 
 **주요 산출물:**
-- **Token 도메인 모델** (분할된 Sprint 3의 후반)
+- ✅ **Token 도메인 모델** (분할된 Sprint 3의 후반)
   - Token Rich Domain (`complete`, `cancel`, `expire`, `returnToWaiting`, `waitingSeconds`)
   - `TokenRepository` Port 인터페이스
-  - JPA Entity 파티셔닝 고려 (PK = id + issued_at)
-- **Enqueue API**
-  - `POST /queues/:queueId/tokens` (202 Accepted 즉시 응답)
-  - Bulk Lua Script 호출 + queue-user 역인덱스
-  - (Kafka 연동은 Sprint 8, 이 Sprint에서는 동기 DB INSERT 먼저)
-- **Polling API**
-  - `GET /queues/:queueId/tokens/:tokenId`
-  - nextPollAfterSec 적응형 간격 로직
-  - token-info 캐시 + Replica Fallback
-- **Cancel API**
-  - `DELETE /queues/:queueId/tokens/:tokenId` → CANCELLED
+  - JPA Entity 파티셔닝 고려 (PK = token_id + issued_at)
+- ✅ **Enqueue API**
+  - `POST /queues/:queueId/tokens` — **200 OK**(순번을 확정한 뒤 응답한다. 202가 아니다)
+  - `enqueue_bulk.lua` 3키 호출 — `waiting` / `seq` / `tokens` Hash
+    - ~~queue-user 역인덱스~~ → `queue:{queueId}:tokens` Hash가 대체 (Lua 안에서 원자 처리, §66 D1)
+  - Kafka 적재는 Sprint 8에서 이미 붙었다 (동기 DB INSERT 단계를 거치지 않았다)
+- ✅ **Polling API**
+  - `GET /queues/:queueId/tokens/:tokenId?seq=&ka=` — `poll_verify.lua` 소유권 검증 (§74)
+- ⬜ **Cancel API**
+  - `DELETE /queues/:queueId/tokens/:tokenId` → CANCELLED **(미착수 — 이 Sprint의 잔여 전부)**
 
 **완료 기준 (DoD):**
-- [ ] Token 도메인 단위 테스트 (상태 전환 매트릭스 전체)
-- [ ] 1,000명 동시 Enqueue → 순번 중복 0건
-- [ ] Polling 응답 시간 p99 < 50ms (로컬 기준)
-- [ ] nextPollAfterSec 4단계(30/10/5/2초) 분기 테스트
-- [ ] token-info 캐시 히트율 로그로 확인
-- [ ] 중복 Enqueue 시 기존 토큰 반환 (멱등 처리)
+- [x] Token 도메인 단위 테스트 (상태 전환 매트릭스 전체)
+- [x] 1,000명 동시 Enqueue → 순번 중복 0건 (실제 Redis)
+- [x] 중복 identifier Enqueue 시 기존 토큰 반환 (멱등 처리)
+- [x] 폴링 소유권 — 남의 `seq` + 내 `tokenId` → 404 (§74)
+- [ ] Cancel 후 같은 identifier 재Enqueue 가능 (맨 뒤로)
+- [ ] Polling 응답 시간 p99 < 50ms — **로컬 수치는 신뢰 구간이 아니다.** Sprint 10(k6)로 이관
 
-**참조 문서:** FRS §6.2 (Enqueue), §6.3 (Polling), FLOW.md Enqueue/Polling 다이어그램
+> ~~`nextPollAfterSec` 4단계(30/10/5/2초) 분기 테스트~~ — **§79가 이 필드를 응답에서 제거**하고
+> `/status`의 `pacing` 구간표 + SDK 계산으로 바꿨다. **다만 현재 코드는 아직 `nextPollAfterSec`를
+> 내려준다**(`PollResponse`에 필드가 살아 있고 등급은 2/5/10/15/20초 + 지터). §79 구현은 **Sprint 7**이므로
+> 그때까지 코드와 이 DoD는 어긋난 채로 둔다 — 지금 지우면 현재 동작을 검증하는 항목이 사라진다.
+> ~~token-info 캐시 히트율~~ — §79는 폴링 경로에서 DB status를 읽지 않는다. **키 존치 여부 자체가 후속 검토**다.
 
-**주의:** 이 Sprint에서는 Enqueue → DB INSERT가 **동기**로 처리됨. Sprint 8에서 Kafka 버퍼로 전환.
+**참조 문서:** FRS §6.2 (Enqueue), §6.3 (Polling), §74 (폴링 소유권), FLOW.md Enqueue/Polling 다이어그램
 
 ---
 
@@ -427,29 +451,48 @@ flowchart TD
 - `POST /queues/:queueId/admit` (동기 처리 버전. Kafka는 Sprint 8)
 - `POST /queues/:queueId/admit-tokens/:admitToken/verify` (DB Fallback 포함)
 - `POST /queues/:queueId/tokens/:tokenId/complete` (DB 먼저 → ZREM)
-- `queue:{queueId}:admit-idem:{requestId}` 멱등성 체크
+- `queue:{queueId}:admit-idem:{requestId}` 멱등성 체크 (`requestId`가 Tenant 지정값이라 큐 스코프 필수)
 - `verified-token` 중복 입장 방지 플래그
 - avgWaitingTime 직접 갱신 (HINCRBYFLOAT)
 - **ADMIT_TOKEN_TTL 만료 → WAITING 복귀 로직** ← 포트폴리오 차별 포인트
+- **admit Lua에서 `queue:{queueId}:admit-watermark` 조건부 갱신 — 현재값보다 클 때만** (§79)
+- **`/status` 엔드포인트 + `pacing` 구간표 (§79 구현)** — Sprint 6이 아니라 여기인 이유: **watermark는 admit이 있어야 존재한다.** admit이 0건이면 `lastAdmittedSeq`가 영원히 0이라 SDK의 `rank = mySeq − lastAdmittedSeq`가 무의미하다
+  - 딸려오는 것: `PollResponse`에서 `frontSeq`·`total`·`nextPollAfterSec` 제거 → **`QueueSnapshotCache`(Caffeine) 제거**(존재 이유가 `frontSeq` 스냅샷뿐이었다. **도메인 포트 시그니처가 바뀌므로 문서로 안 끝난다**) + 404 계약용 `ErrorCode` 신규 추가
 
 **완료 기준 (DoD):**
 - [ ] admit 100명 동시 요청 → FIFO 순서 보장
+- [ ] **WAS N대에서 동시 admit → watermark 단조증가, 후퇴 0건** (조건부 갱신이 없으면 늦게 도착한 작은 seq가 값을 되돌린다)
+- [ ] **TTL 만료로 WAITING 복귀한 토큰이 다음 admit 배치에 포함된다** — 대상 선택은 **watermark가 아니라 실제 `waiting` ZSet 최소 seq 기준**
+  - §79가 "watermark는 **표시 전용**"이라고 🔴 가드레일로 못 박았지만 **강제 수단이 없다.** 이 DoD가 그 수단이다. watermark를 커서로 쓰면 복귀 토큰(seq < watermark)이 영구히 건너뛰어진다
 - [ ] admitToken TTL 60초 경과 → WAITING 복귀 + seq 복원 검증
 - [ ] complete DB 먼저 → ZREM 실패 시뮬레이션 → Batch 재실행(Sprint 9 위임)
 - [ ] verify 호출 순서 규칙 OpenAPI description에 명시
 - [ ] 중복 complete 요청 → 1번만 성공 (DB UPDATE WHERE status=1)
 - [ ] Rich Domain 상태 전환 메서드로 비즈니스 로직 검증
 
-**참조 문서:** FRS §6.4~6.6, DECISIONS §34, §36 (admitToken TTL → WAITING), STATE.md
+**착수 전 결정할 것 (미판정):**
+- **"pop 성공 + admitToken SET 실패" 창** — §79가 "미해결"로만 적었다. 해결안 선택이 이 Sprint의 첫 일
+- `verified-token:{tokenId}`의 **클러스터 소속** — 해시태그가 없고 §75 D27-4의 "큐 비종속 키" 목록에도 없다
+- **admit 요청 전달 수단** (별도 Kafka 명령 토픽 ↔ `admit_requests` + 폴링, Sprint 8 참조)
+- `/status` **캐시 TTL**·**맵 리로드 주기**·`pacing` 반영 지연 — 셋이 서로를 정하므로 한 번에
+
+**참조 문서:** FRS §6.4~6.6, DECISIONS §34·§36 (admitToken TTL → WAITING), **§79 (watermark·pacing)**, STATE.md
 
 **Sprint 핵심 차별 포인트:** admitToken 만료 시 WAITING 복귀 (seq 기반 우선순위 보존)
 
 ---
 
-### ⬜ Sprint 8 — Kafka 연동 (Enqueue 버퍼 + Consumer)
+### 🔄 Sprint 8 — Kafka 연동 (Enqueue 버퍼 + Consumer) — **Enqueue 경로 구현 완료**
 
 **예상 기간:** 2주 (Kafka 3 브로커 설치 + 기존 동기 → 비동기 리팩토링 포함)
 **카테고리:** MVP
+
+> ⚠️ **이 절의 원안(3토픽 체계)은 폐기됐다.** `enqueue-events`/`enqueue-admit`/`token-status-changed`를
+> `queueId`로 파티셔닝하려던 설계는 **§73 D16·D18이 뒤집었다** — 순서 보장은 같은 토픽의 같은 파티션
+> 안에서만 성립하고, `queueId` 키는 한 큐 30만 명이 통째로 한 파티션에 몰려 파티션을 늘려도 소용이 없다.
+> **현행: 단일 토픽 `token-lifecycle` / 파티션 키 `tokenId` / 18 파티션 / RF 3 / min.insync 2**
+> (`scripts/kafka/create-topics.sh`). Enqueue 적재 경로는 **이미 구현·실측 완료**(100만건, §73)이며,
+> 남은 것은 **상태 전이 이벤트**(admit/complete/cancel/expire)로 Sprint 7과 함께 온다.
 
 **선행 인프라:** [INFRA_SETUP.md §3](INFRA_SETUP.md) — Kafka 3 브로커 KRaft 모드 (9092/9192/9292) WSL2 직접 설치
 
@@ -457,26 +500,35 @@ flowchart TD
 - WSL2에 Kafka 3 브로커 KRaft 클러스터 기동 (Zookeeper 미사용)
 - WSL2 메모리 12GB 권장 설정 (`.wslconfig`)
 - `~/.bashrc` 자동 시작 스크립트
-- 토픽 3개 생성: `enqueue-events`, `enqueue-admit`, `token-status-changed` (각 3 파티션, replication-factor 3)
-- Producer 설정 (acks=all, idempotence=true)
-- **Sprint 6의 동기 Enqueue DB INSERT → Kafka 비동기로 전환**
-- **Sprint 7의 동기 admit → Kafka 기반 AdmitConsumer로 전환**
-- `TokenEnqueueConsumer` (1,000건 Bulk INSERT, redis_sync_needed=0)
-- `AdmitConsumer` (admit_requests PENDING → PROCESSING → COMPLETED)
-- `BillingConsumer` 스켈레톤 (실제 집계는 Sprint 9)
+- ✅ 토픽 `token-lifecycle` + `token-lifecycle.DLT` 생성 (**18 파티션** / RF 3 / `min.insync.replicas=2`)
+  - 파티션은 **줄일 수 없고**, 늘리면 `hash % N`이 바뀌어 살아 있는 토큰(최대 `waitingTtl` 2시간)의 순서가 끊긴다 → 처음에 넉넉히 (§73 D17)
+- ✅ Producer 설정 (`acks=all`, `enable.idempotence=true`, 발행 시한 §73 D19)
+- ✅ **Sprint 6의 동기 Enqueue DB INSERT → Kafka 비동기로 전환**
+- ✅ **`queue-consumer` 모듈 신설** — 소비 전담 독립 앱 (§73 D20)
+  - `queue-batch`와 합치지 않는다: 소비는 파티션 수만큼 늘리고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요 → 확장 방향이 반대
+  - `@EnableScheduling` 금지 (붙이면 infra의 `@Scheduled` 빈까지 돌아 이중 적재)
+  - actuator + micrometer-prometheus 포함 (없으면 컨슈머 lag을 PromQL로 볼 수단이 사라진다)
+- ✅ `TokenLifecycleConsumer` (배치 적재 → `tokens` 멱등 INSERT) + `TokenPersistService`
+- ⬜ **상태 전이 이벤트 발행** (admit/complete/cancel/expire) — 같은 토픽·같은 키(`tokenId`). **Sprint 7과 동시**
+- ⬜ admit 요청 전달 수단 — **미판정(Sprint 7).** 구 `enqueue-admit` 토픽은 §73이 다루지 않은 공백이다. 별도 명령 토픽 ↔ `admit_requests` 테이블 + 폴링 중 택일
+- ⬜ `BillingConsumer` 스켈레톤 (실제 집계는 Sprint 9)
 
 **완료 기준 (DoD):**
-- [ ] Kafka 3 브로커 KRaft Quorum 형성 확인 (로그에 LEADER 메시지)
-- [ ] 토픽 3개 생성 완료 (`kafka-topics.sh --list`)
-- [ ] 간단한 Producer/Consumer 수동 테스트 성공
-- [ ] `autoconfigure.exclude`에서 `KafkaAutoConfiguration` 제거
-- [ ] Enqueue p99 < 50ms 복원 (Kafka 버퍼 효과)
+- [x] Kafka 3 브로커 KRaft Quorum 형성 확인 (로그에 LEADER 메시지)
+- [x] 토픽 생성 완료 (`create-topics.sh` — 파티션 수 불일치 감지 포함)
+- [x] `autoconfigure.exclude`에서 `KafkaAutoConfiguration` 제거
+- [x] At-Least-Once 보장 검증 (`tokens` UNIQUE + `ON DUPLICATE KEY`로 중복 INSERT 무해화)
+- [x] **100만건 실측** — Redis `ZCARD` = `seq` = DB `tokens` 전부 일치, seq 중복·결번 0, lag 0, DLT 0, 18 파티션 편차 **1.4%** (§73)
 - [ ] Consumer 재시작 시 미처리 메시지 재처리 확인
-- [ ] At-Least-Once 보장 검증 (UNIQUE KEY로 중복 INSERT 방어)
-- [ ] MANUAL_IMMEDIATE ack 모드 동작 검증
 - [ ] 브로커 1개 강제 종료 시 ISR 유지로 프로듀싱 계속 가능 확인
+- [ ] 상태 전이 이벤트가 같은 토큰에서 순서대로 소비됨 (Sprint 7과 함께)
 
-**참조 문서:** DECISIONS §14 (admit 순서 보장), §32 (Kafka 도입 설계), §40 (Kafka Consumer 설정)
+> ~~MANUAL_IMMEDIATE ack 모드 동작 검증~~ — **수동 ack을 쓰지 않기로 했다.** 컨테이너 기본값
+> `AckMode.BATCH`가 리스너 정상 반환 뒤 커밋하므로 "DB 커밋 후 ack" 의도가 이미 성립한다
+> (`TokenLifecycleConsumer` javadoc).
+> ~~Enqueue p99 < 50ms 복원~~ — 로컬 수치는 신뢰 구간이 아니다. 성능 실측은 Sprint 10(k6)로 미룬다.
+
+**참조 문서:** DECISIONS **§73 (현행 — 토픽·키·모듈 분리)**, §71 (저장 순서·복구), §14·§32·§40 (구 설계 — 배너 확인)
 
 **주의:** 이 Sprint에서 가장 큰 변경은 **기존 동기 흐름을 비동기로 리팩토링**하는 것. 테스트 수트가 대거 수정될 수 있음. WSL2 리소스도 부담이 크니 메모리 할당 확인 필수.
 
@@ -503,8 +555,19 @@ flowchart TD
   - > **실제 월 1회 스케줄 대기 대신 수동 트리거 + dry-run 쿼리로 검증**
 - ShedLock 또는 `batch-lock` 기반 멀티 인스턴스 분산
 
+**후속 과제 배치** (`doc/reviews/2026-08-17-pr26-agent-review.md` §7 등재분 — 새 항목이 아니라 일정에 얹는 것)
+
+| # | 과제 | 왜 지금인가 |
+|---|---|---|
+| 1 | **`queue-batch`에 actuator + micrometer-prometheus 추가** | **reconciliation의 선행 조건.** 현재 `queue-batch/build.gradle`에는 `starter-web`만 있고 actuator·micrometer가 **없다** → 만들어도 유령 토큰 수를 지표로 못 낸다. `queue-consumer`가 같은 이유로 이미 갖고 있다 |
+| 2 | **회수 배치** — `queue:{q}:last-active` ZSet `ZREM` / `queue:{q}:tokens` Hash `HDEL` | 두 명령 모두 **전 프로덕션 코드 0건**이다. 쓰기만 하고 지우지 않아 30만 큐가 한 바퀴 돌 때마다 멤버가 영구 누적된다. TokenExpiryJob이 만료를 판정하는 이 스프린트가 회수를 붙일 자리다 |
+| 3 | **reconciliation 스위퍼** (Redis엔 있고 DB엔 없는 유령 토큰) | §73이 "Redis-Kafka 사이엔 분산 트랜잭션이 없어 발행 갭은 **영구적**"이라며 필수 후속으로 남겼다. 100만건 실측에서 실제로 835건 발생. **1번 다음에 온다** |
+| 4 | `ApiKeyCache.invalidate` 프로덕션 호출 연결 (revoke 경로) | 구현·포트 선언은 있는데 **호출부가 0건**이라 폐기된 키가 최대 60초 살아 있다. 배치가 아니라 revoke 서비스 쪽 한 줄이지만, 다른 정리 작업과 함께 처리 |
+
 **완료 기준 (DoD):**
 - [ ] Batch Server 기동 후 TokenExpiryJob 10초 주기 실행 로그 확인
+- [ ] `queue-batch`의 `/actuator/prometheus`가 200을 반환 (위 1번 — reconciliation 지표의 전제)
+- [ ] 만료 처리 후 `zcard last-active` ≤ `zcard waiting` 유지 (위 2번 — 누적이 멈췄다는 증거)
 - [ ] admitToken TTL 만료 케이스 → WAITING 복귀 동작 (Sprint 7 로직 재사용)
 - [ ] Redis 다운 시뮬레이션 → 복구 후 RedisSyncJob이 미반영 토큰 재삽입
 - [ ] **BillingSnapshotJob 수동 트리거 동작 확인** (예: HTTP endpoint 또는 테스트 프로파일)
@@ -559,7 +622,9 @@ flowchart TD
 - Tenant 구현 가이드라인 (FRS §12.2) → OpenAPI description 반영
 
 **E. JS SDK 구현** (별도 레포 `queue-platform-sdk-js`)
-- `PollingManager` (nextPollAfterSec 자동 적용, setTimeout 관리)
+- `PollingManager` (`/status`의 `pacing` 구간표로 간격 계산 + ±20% 지터, setTimeout 관리 — §79)
+  - `rank = mySeq − lastAdmittedSeq`를 **SDK가** 계산한다. 서버는 rank를 계산하지 않는다
+  - `rank <= 0`일 때만 개인 엔드포인트 호출 + 30~60초에 1회 `ka=1`
 - `RetryHandler` (429 응답 시 Retry-After 헤더 활용)
 - `StateManager` (IDLE → WAITING → READY → COMPLETED → EXPIRED)
 - `VisibilityHandler` (visibilitychange → Polling 중단/재개)
@@ -605,7 +670,7 @@ flowchart TD
 **예상 기간:** 3주
 **카테고리:** 배포 / 운영
 
-**선행 요건:** [AWS_LEARNING_PATH.md](AWS_LEARNING_PATH.md) — Sprint 2~10 동안 병렬 학습 완료. Sprint 11 진입 시점 체크리스트(§5) 전부 ✓
+**선행 요건:** AWS 병렬 학습 완료 (Sprint 2~10 동안). ⚠️ `AWS_LEARNING_PATH.md`는 **아직 없다** — 학습 경로·진입 체크리스트가 문서화되지 않았다.
 
 **주요 산출물:**
 
@@ -728,7 +793,7 @@ ECR, CloudWatch, 기타        : ~$10
 ## 아키텍처 진화 로드맵 (대규모 확장 준비)
 
 Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
-상세: `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (Phase 0-4 + 부록 A-I)
+상세: `doc/ARCHITECTURE_ROADMAP.md` (Phase 0-4 + 부록 A-I)
 
 ### Cluster 학습 병행 (Sprint 5-D 이후 완료)
 
@@ -829,7 +894,7 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 | 2 | ReplicationRoutingDataSource + @Transactional(readOnly) 자동 라우팅 (GTID 복제 기반) |
 | 4 | Refresh Token 버전 기반 재사용 감지 + Rotation |
 | **5** | **Lua Script 원자성 + Sentinel Failover 실증 + Rate Limiter 알고리즘 분리 + Tenant Plan 동적 SLA** ⭐ |
-| 6 | nextPollAfterSec 적응형 간격 (서버 부하 최적화) |
+| 6 | 폴링 소유권 검증을 Lua 원자 1회로 (§74) — seq 존재 판정만으로는 남의 자리를 훔칠 수 있었다 |
 | **7** | **admitToken TTL 만료 → WAITING 복귀 (seq 기반 우선순위 보존)** ⭐ |
 | 8 | Kafka KRaft + At-Least-Once + 동기→비동기 리팩토링 경험 |
 | 9 | 파티션 1달 유예 DROP 전략 (월말 과금 누락 방지) |
@@ -850,26 +915,27 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 - 5-E-F: 커밋 ⬜
 
 ### 단기 (1-2주)
-- 5-E-E: 검증 (Lua Script 동시성 테스트, 1,000 동시 Enqueue → 순번 중복 0)
-- 5-E-F: 커밋 + PR merge
-- 5-F: Sprint 5 마무리 (문서 갱신 완료, 회고 작성)
+- **Sprint 7 착수** — 위 "착수 전 결정할 것" 4건을 먼저 정한다. 특히 "pop 성공 + SET 실패" 창
+- Sprint 6 잔여: Cancel(`DELETE /tokens/:tokenId`)
+- 5-F: Sprint 5 마무리 (문서 갱신 · 회고)
 
 ### 중기 (다음 Sprint)
-- Sprint 6: Token 도메인 + Queue Engine API (Enqueue / Polling)
-- Sprint 8+: Cluster 프로덕션 도입 준비 (로컬 학습 완료)
+- §79 구현(`/status` · watermark · pacing) — **Sprint 7과 한 묶음.** watermark는 admit이 있어야 존재한다
+- Sprint 9: 회수 배치 + reconciliation (**`queue-batch` actuator가 선행**)
+- Sprint 8+: Cluster 프로덕션 도입 준비 (§75, 시점 미정 / 로컬 학습은 완료)
 
 ---
 
 ## 참조 문서
 
 - [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis Sentinel/Cluster/Kafka/k6/Prometheus/Grafana)
-- [AWS_LEARNING_PATH.md](AWS_LEARNING_PATH.md) — Sprint 11 대비 AWS 병렬 학습 경로
-- [FRS v1.10](FRS_final.md) — 기능 정의
-- [DECISIONS](DECISIONS.md) — 69개+ 설계 결정 (§66-69 신규)
+- `AWS_LEARNING_PATH.md` — **미작성.** Sprint 11 대비 AWS 병렬 학습 경로 (파일 없음, 링크 걸지 말 것)
+- [FRS v1.12](FRS_final.md) — 기능 정의
+- [DECISIONS](DECISIONS.md) — 79개 설계 결정 (기능별 목차는 문서 맨 앞)
 - [FLOW](FLOW.md) — 상세 흐름도
 - [STATE](STATE.md) — 상태 머신
 - [CONCURRENCY](CONCURRENCY.md) — 동시성 제어
-- **[queue-domain/docs/ARCHITECTURE_ROADMAP.md](../queue-domain/docs/ARCHITECTURE_ROADMAP.md) — 아키텍처 진화 로드맵 (Phase 0-4 + 부록 A-I) ⭐ 신규**
+- **[ARCHITECTURE_ROADMAP.md](ARCHITECTURE_ROADMAP.md) — 아키텍처 진화 로드맵 (Phase 0-4 + 부록 A-I)**
 - [sprint-5/RATE_LIMITER.md](sprint-5/RATE_LIMITER.md) — Rate Limiter 설계 통합 문서
 - [sprint-5/REDIS_SENTINEL.md](sprint-5/REDIS_SENTINEL.md) — Redis Sentinel 학습 노트
 - [sprint-5/LUA_SCRIPTS.md](sprint-5/LUA_SCRIPTS.md) — Lua Script 학습 노트
@@ -877,5 +943,5 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 ---
 
 <p align="center">
-  <sub>Sprint 5-D 완료 · 2026-07-08 · Sprint 5-E 진입 (Phase A 완료) · Cluster 로컬 학습 완료 · 다음 목표: 5-E Lua Scripts · 통찰 축적: 88개</sub>
+  <sub>2026-08-17 구현 대조 · Sprint 5-E 완료 · Sprint 6·8 부분 구현 · 다음 목표: Sprint 7 (Admit + §79)</sub>
 </p>
