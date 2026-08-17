@@ -1,10 +1,182 @@
 # Queue Platform — 설계 결정 문서
 
-> FRS v1.9 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
+> FRS v1.12 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
 
 ---
 
-## 1. 기술 스택 결정 — Spring MVC + Virtual Thread + JPA
+## 목차 — 기능별 색인
+
+> **§번호는 작성 순서다.** 코드 주석·커밋 메시지·다른 문서가 §번호로 참조하므로 **재배치하지 않는다.**
+> 이 표가 "무엇을 찾을 때 어디를 보는가"와 **"이게 아직 살아 있는 결정인가"**를 대신한다.
+>
+> | 상태 | 뜻 |
+> |---|---|
+> | ✅ | 유효 — 현행 결정 |
+> | ⛔ | 대체됨 — 다른 §가 이 결정을 뒤집었다. 본문은 역사 기록 |
+> | ✏️ | 개정됨 — 일부가 뒤집혔다. **어느 부분인지 각 절 머리 배너 참조** |
+> | 📉 | 축소 — 범위가 좁혀졌다 |
+> | 🚧 | 설계 확정 · 구현 미착수 |
+>
+> `(→§N)` = 교차 참조. 주 카테고리는 한 곳뿐이다.
+
+### Ⅰ. 토큰 생명주기
+
+**1. Enqueue**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §17 | 대용량 처리 — Redis (Bulk Worker 항상 활성) (→8) | ✏️ |
+| §31 | 대용량 Enqueue 시나리오 분석 (rps별) | ✅ |
+| §70 | Bulk 단독 + seq 키 + Hash Tag (D7·D8 개정) | ✅ |
+| §71 | 저장 순서(Redis → DB) + DB → Redis 복구 (→10) | ✅ |
+| §72 | DB 영속화: Kafka 제거 → Redis List outbox (→10) | ⛔ |
+| §73 | 영속화 재개정: List → Stream → **Kafka 복귀** + `queue-consumer` (→10) | ✅ |
+
+**2. Polling**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §38 | FLOW 개선 (`nextPollAfterSec` 적응형) | ✏️ |
+| §74 | 폴링 소유권 검증 — `poll_verify.lua` 원자 1회 (→8) | ✅ |
+| §79 | 폴링 응답 계약 — `admitWatermark` + `pacing`, 엔드포인트 2분할 | 🚧 |
+
+**3. Admit · Verify · Complete**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §9 | Admit = Dequeue + 통계 갱신 | ✏️ |
+| §10 | rank=1 중복 불가 보장 | ✅ |
+| §11 | 재입장 재시도 로직 (Platform 관여 없음) | ✅ |
+| §12 | Admit 방식 전면 변경 (admitToken 도입) | ✅ |
+| §13 | 입장 토큰(admitToken) 설계 — TTL 60초 | ✅ |
+| §14 | admit 요청 순서 보장 — Kafka (→10) | ✏️ |
+| §15 | Token 상태 추가 — ADMIT_ISSUED | ✅ |
+| §22 | verify / complete 분리 | ✅ |
+| §33 | verify API 제거 검토 → 유지로 번복 | ✅ |
+| §34 | admitToken TTL 만료: EXPIRED → WAITING 복귀 | ✅ |
+| §36 | admitToken TTL 만료 → WAITING 복귀 (상세) | ✅ |
+
+**4. 이탈 · 만료 (TTL / CANCELLED / EXPIRED)**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §21 | 이탈(CANCELLED) 정책 — WAITING만 허용 | ✅ |
+
+> TTL 만료는 별도 §가 없다. `ADMIT_TOKEN_TTL` → §34·§36, `waitingTtl`·`inactiveTtl` 판정 → `doc/STATE.md`,
+> 배치 흐름 → `doc/FLOW.md`. **inactive_ttl 배치는 미구현**이다.
+
+### Ⅱ. 플랫폼 기능
+
+**5. Tenant · Queue · API Key 관리**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §4 | API Key 설계 (SHA-256, Revoke) | ✅ |
+| §43 | Queue 삭제 흐름 (DRAINING → DELETED) | ✏️ |
+| §50 | Tenant status 확장 | ✅ |
+| §51 | Queue update 전략 (name만 변경 허용) | ✏️ |
+| §52 | Queue delete는 PAUSED에서만 | ✅ |
+| §55 | API Key prefix `sk_live_` | ✅ |
+
+**6. 인증 · 인가 · 남용 방지**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §42 | JWT 설계 (Access/Refresh, Rotation) | ✅ |
+| §53 | PasswordHasher Port/Adapter 분리 | ✅ |
+| §54 | JWT를 api 계층에 배치 (→12) | ✅ |
+| §60 | Rate Limiter 알고리즘 선택 (Token Bucket) | ✅ |
+| §61 | 알고리즘 분리 (Token Bucket + Fixed Window) | ✅ |
+| §62 | Tenant Plan 도입 (SaaS 등급) (→5) | ✅ |
+| §63 | RateLimitFilter HTTP 통합 | ✅ |
+| §65 | 인증 전 Rate Limit — Burst 불허 | ✅ |
+
+**7. 클라이언트 계약 · SDK**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §28 | SDK 제공 계획 (초기 검토) | 📉 |
+| §35 | SDK 설계 — **JS SDK만**, Tenant 서버용은 안 만든다 | ✅ |
+| §78 | 클라이언트 경계 — enqueue는 Tenant, polling은 Platform 직접 | ✅ |
+
+### Ⅲ. 기반 기술 (횡단)
+
+**8. Redis (키 · Lua · 배포 · 복구)**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §5 | Redis 장애 복구 전략 | ✏️ |
+| §20 | 메모리 압박 해결 | ✅ |
+| §23 | Redis Key 설계 이유 (키표) | ✏️ |
+| §30 | Master/Replica (Sentinel) 설계 | 📉 |
+| §39 | RedisSyncJob 상세 흐름 | ✏️ |
+| §64 | Lua Script Bean 등록 패턴 | ✅ |
+| §66 | Redis Cluster 도입 결정 | ✏️ |
+| §67 | 이중 라우팅 (Cluster + Hash Tag) | ✏️ |
+| §68 | Master 크기 최적화 (Single Thread 병목) | 🚧 |
+| §69 | 극대 분산 (4×4×4GB) | 🚧 |
+| §75 | 배포 방식 확정 — 독립 2 Cluster + 큐 단위 이중 라우팅 | 🚧 |
+
+**9. MySQL (스키마 · 인덱스 · 파티션 · 복제)**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §2 | ID 전략 — 이중 ID 분리 | ✅ |
+| §3 | DATETIME(3) 전체 적용 | ✅ |
+| §6 | tenantId 비정규화 (tokens) | ✅ |
+| §7 | 인덱스 설계 근거 | ✅ |
+| §16 | 대용량 처리 — DB | ✅ |
+| §26 | DB 파티셔닝 전략 (월별 Range) | ✅ |
+| §29 | MySQL Read/Write 분리 | ✅ |
+| §37 | schema/entity 개선사항 | ✅ |
+| §41 | HikariCP 커넥션 풀 계산 | ✅ |
+| §44 | 파티션 유예 전략 (월말 걸친 토큰) | ✅ |
+| §46 | LazyConnectionDataSourceProxy 필수 | ✅ |
+| §48 | schema.sql 수동 관리 | ✅ |
+
+**10. Kafka · 배치 · 비동기**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §32 | Kafka 도입 설계 (버퍼 · 상태 이벤트) | ✏️ |
+| §40 | Kafka Consumer 설정 상세 | ✏️ |
+
+> 적재 경로의 현행 결정은 **§73**(→1)이다. 순서·복구는 §71, 폐기된 중간 세대는 §72.
+
+**11. 동시성 · 확장성**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §18 | 대용량 처리 — 로직 | ✅ |
+| §19 | 대용량 처리 — 병렬 처리 (ZREM 분산 논거 폐기) | ✏️ |
+| §24 | 실서비스 대용량 처리 문제 및 해결 | ✅ |
+| §27 | 수평 확장 설계 (Stateless) | ✅ |
+| §57 | 동시성 제어 우선순위 정책 | ✅ |
+| §58 | Queue 생성 동시성 처리 (→5) | ✅ |
+| §59 | `@DistributedLock` 도입 및 모듈 배치 | ✅ |
+
+**12. 아키텍처 · 모듈 · 기술 스택**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §1 | 기술 스택 — Spring MVC + Virtual Thread + JPA | ✅ |
+| §8 | Rich Domain Model + Hexagonal | ✅ |
+| §25 | WebFlux → MVC + Virtual Thread 전환 | ✅ |
+| §45 | Gradle 멀티모듈 + Virtual Thread 전략 | ✅ |
+| §47 | JpaConfig를 infrastructure에 배치 | ✅ |
+| §49 | Adapter 네이밍 `xxxJpaAdapter` | ✅ |
+| §56 | GlobalExceptionHandler를 api에 배치 | ✅ |
+
+**13. 시각 · 시간대**
+
+| § | 제목 | 상태 |
+|---|---|---|
+| §76 | `tokens`는 UTC, 나머지는 KST (통일 안 함) | ⛔ |
+| §77 | 시각을 전부 UTC로 통일 (§76을 대체) | ✅ |
+
+---
+
+## §1 기술 스택 결정 — Spring MVC + Virtual Thread + JPA
 
 ### 논의 배경
 - 초기: Spring WebFlux + Netty + R2DBC 구성
@@ -117,7 +289,7 @@ OS Thread 점유 시간:
 
 ---
 
-## 2. ID 전략 — 이중 ID 분리
+## §2 ID 전략 — 이중 ID 분리
 
 ### 결정
 
@@ -145,7 +317,7 @@ Long PK 사용 시 DB 마이그레이션 때 Redis Key 구조도 변경 필요 �
 
 ---
 
-## 3. DATETIME(3) 전체 적용
+## §3 DATETIME(3) 전체 적용
 
 ### 결정
 모든 timestamp 컬럼을 `DATETIME(3)` (밀리초 단위) 으로 통일
@@ -174,7 +346,7 @@ double score = token.getIssuedAt()
 
 ---
 
-## 4. API Key 설계
+## §4 API Key 설계
 
 ### 역할
 서버 간 통신 인증 — "이 요청이 인증된 Tenant 서버에서 온 것"을 증명
@@ -227,7 +399,12 @@ Stripe, GitHub, AWS 동일 방식:
 
 ---
 
-## 5. Redis 장애 복구 전략
+## §5 Redis 장애 복구 전략
+
+> ✏️ **복구 절차가 §71 D12·D13에서 재설계됐다.** 아래 표의 `global-seq`(→ `queue:{queueId}:seq`)와
+> `queue-user 역인덱스`(→ `queue:{queueId}:tokens` Hash)는 폐기된 키다. 순서 복구도 `issued_at` 밀리초를
+> score로 쓰는 근사 복구가 아니라 **DB `tokens.seq`를 그대로 score로 복원**한다(§70 D9로 seq가
+> 단조증가·유일해졌기 때문). "DB가 원본" 원칙과 복구 불가 항목(비활동 TTL·avgWaitingTime) 판정은 유효하다.
 
 ### 복구 가능 항목
 
@@ -259,7 +436,7 @@ Stripe, GitHub, AWS 동일 방식:
 
 ---
 
-## 6. tenantId 비정규화 (tokens 테이블)
+## §6 tenantId 비정규화 (tokens 테이블)
 
 ### 결정
 `tokens` 테이블에 `tenant_id` 컬럼 추가 (queues 테이블의 tenant_id 복사)
@@ -279,7 +456,7 @@ Batch가 10초마다 전체 WAITING 토큰을 탐색하는 구조에서 조인 �
 
 ---
 
-## 7. 인덱스 설계 근거
+## §7 인덱스 설계 근거
 
 | 인덱스 | 대상 쿼리 |
 |--------|----------|
@@ -292,7 +469,7 @@ Batch가 10초마다 전체 WAITING 토큰을 탐색하는 구조에서 조인 �
 
 ---
 
-## 8. Rich Domain Model + Hexagonal Architecture
+## §8 Rich Domain Model + Hexagonal Architecture
 
 ### 결정
 ```
@@ -335,7 +512,7 @@ public CompleteResult complete(CompleteCommand command) {
 | `Token` | `waitingSeconds()` | issuedAt ~ completedAt 계산 |
 | `Queue` | `isEnqueueable()` | ACTIVE 상태 판단 |
 | `Queue` | `isCapacityExceeded(count)` | maxCapacity 초과 판단 |
-| `Queue` | `assignSlice(seq)` | seq % sliceCount 계산 |
+| ~~`Queue`~~ | ~~`assignSlice(seq)`~~ | **폐기 (§66 D2 — ZSet 하나).** 존재하지 않는 메서드다 |
 | `ApiKey` | `isActive()` | ACTIVE 상태 판단 |
 | `ApiKey` | `revoke()` | REVOKED 전환 |
 
@@ -423,7 +600,12 @@ queue-common을 각 모듈에서 직접 선언하는 이유:
 
 ---
 
-## 9. Admit = Dequeue + 통계 갱신
+## §9 Admit = Dequeue + 통계 갱신
+
+> ✏️ **§12가 admit 방식을 전면 변경했다.** 아래는 `Admit → DB COMPLETED` 즉, **admit이 곧 입장 완료**이던
+> 시절의 그림이다. 지금은 `admit → ADMIT_ISSUED + admitToken(TTL 60s)` → Tenant `verify` → `complete`에서야
+> COMPLETED가 된다(§12·§13·§22). **"DB 먼저 → ZREM 나중"이라는 순서 원칙은 그대로 유효**하며,
+> 그 근거(잔류가 유실보다 안전)가 이 절의 살아 있는 부분이다.
 
 ### 결정
 별도 Dequeue API 없음. Admit 한 번에 세 가지 처리.
@@ -452,7 +634,7 @@ avgWaitingTime 마지막인 이유:
 
 ---
 
-## 10. rank=1 중복 불가 보장
+## §10 rank=1 중복 불가 보장
 
 ### 정상 흐름
 ```
@@ -477,7 +659,7 @@ ZREM으로 제거 → 다음 score가 자동으로 rank 1
 
 ---
 
-## 11. 재입장 재시도 로직
+## §11 재입장 재시도 로직
 
 ### 결정
 Platform 관여 없음. Tenant ↔ 유저 클라이언트 사이의 문제.
@@ -499,7 +681,7 @@ Tenant가 판단하고 Platform에 Admit 호출:
 
 ---
 
-## 12. Admit 방식 전면 변경
+## §12 Admit 방식 전면 변경
 
 ### 변경 방식
 ```
@@ -521,7 +703,7 @@ Backpressure 패턴 적용:
 
 ---
 
-## 13. 입장 토큰(admitToken) 설계
+## §13 입장 토큰(admitToken) 설계
 
 ### TTL = 60초
 
@@ -550,7 +732,12 @@ admitToken TTL 60초 초과
 
 ---
 
-## 14. admit 요청 순서 보장 — Kafka
+## §14 admit 요청 순서 보장 — Kafka
+
+> ✏️ **`enqueue-admit` 토픽은 현재 미판정이다.** §73 D18이 *생명주기 이벤트*를 단일 토픽
+> `token-lifecycle`로 통합했지만 **admit 요청(명령) 전달 수단은 다루지 않았다.** 별도 명령 토픽을 둘지,
+> `admit_requests` 테이블 + 폴링으로 갈지는 **Sprint 7 착수 시 결정**한다(`FRS_final.md` §7에 미판정으로 표기).
+> **"DB PENDING을 영속성 기준점으로 삼고 멱등 처리"라는 뼈대는 전달 수단과 무관하게 유효하다.**
 
 ### 해결: Kafka enqueue-admit + AdmitConsumer
 
@@ -574,7 +761,7 @@ Kafka Consumer Group:
 
 ---
 
-## 15. Token 상태 추가 — ADMIT_ISSUED
+## §15 Token 상태 추가 — ADMIT_ISSUED
 
 ### 변경
 ```
@@ -591,7 +778,7 @@ Kafka Consumer Group:
 
 ---
 
-## 16. 대용량 처리 — DB
+## §16 대용량 처리 — DB
 
 ### INSERT (Enqueue)
 ```
@@ -633,7 +820,13 @@ Batch UPDATE:
 
 ---
 
-## 17. 대용량 처리 — Redis
+## §17 대용량 처리 — Redis
+
+> ✏️ **"Bulk Worker 항상 활성"(분기 없음)은 유효하며 §70이 재확인했다.** 다만 아래 두 가지는 폐기됐다:
+> **① `슬라이스별 ZADD multi-member`** → 대기열은 ZSet 하나다(§66 D2). **② `INCRBY N → seq 블록 채번`**
+> → 항목마다 `INCR queue:{queueId}:seq`로 발급한다(§70 D9).
+> 상수도 실제와 다르다 — 코드는 `MAX_DRAIN=5000` / `CHUNK_SIZE=500` / `fixedRate=1000ms`
+> (`BatchProcessor.java`). 아래 `500건 / 10ms`는 원안이며 **재조정은 후속 과제**다(§70).
 
 ### Enqueue Lua — Bulk Worker 항상 활성
 
@@ -715,7 +908,7 @@ Spring MVC에서 Reactor bufferTimeout을 대체하는 방식:
 
 ---
 
-## 18. 대용량 처리 — 로직
+## §18 대용량 처리 — 로직
 
 ### 멱등성 — Redis idempotency key
 ```
@@ -754,7 +947,12 @@ Kafka At-Least-Once 보장:
 
 ---
 
-## 19. 대용량 처리 — 병렬 처리
+## §19 대용량 처리 — 병렬 처리
+
+> ✏️ **①의 해결책("슬라이스별 분할 처리 → 슬라이스 3개 → Lua 1회당 ~333건")은 성립하지 않는다.**
+> 대기열은 ZSet 하나다(§66 D2). ZREM 대량 처리의 블로킹 문제는 **여전히 열려 있고**, 분산이 아니라
+> 청크 크기로 다뤄야 한다 — admit 착수(Sprint 7)의 입력값이다.
+> **②(DB UPDATE 100건 청크 + 10ms 양보)는 유효하다.**
 
 ### Batch 병렬화
 ```
@@ -857,7 +1055,7 @@ admitToken TTL 60초 → 150ms 처리 → 충분한 여유
 
 ---
 
-## 20. 메모리 압박 해결
+## §20 메모리 압박 해결
 
 ```
 inactiveTtl 기본값: 300s (5분 무응답 = 사실상 이탈)
@@ -867,7 +1065,7 @@ Redis maxmemory: 4GB / maxmemory-policy: noeviction
 
 ---
 
-## 21. 이탈(CANCELLED) 정책
+## §21 이탈(CANCELLED) 정책
 
 ```
 이탈 허용 상태:
@@ -882,7 +1080,7 @@ ADMIT_ISSUED에서 이탈하려면:
 
 ---
 
-## 22. verify / complete 분리
+## §22 verify / complete 분리
 
 ### 결정
 ```
@@ -912,7 +1110,13 @@ DB 먼저 이유:
 
 ---
 
-## 23. Redis Key 설계 이유
+## §23 Redis Key 설계 이유
+
+> ✏️ **아래 키표의 큐 상태 키는 폐기됐다.** `queue:{t}:{q}:{slice}`·`global-seq:{t}:{q}`(→ §66 D2·§70 D9),
+> `queue-user:{t}:{q}:{userId}`(→ `queue:{queueId}:tokens` Hash), `token-last-active:{tokenId}`(→
+> `queue:{queueId}:last-active` ZSet, §74). **현행 키 목록은 `FRS_final.md` §8**(v1.12)이고 조립은
+> `QueueKeys.java`가 한다. 살아 있는 것은 **설계 원칙**(테넌트 격리·TTL 기준·원자성)과 각 키의 "선택 이유"다.
+> 해시태그 `{queueId}` 요구는 §70 D10·§75 D26에서 추가됐다 — 이 절에는 그 개념이 없다.
 
 ### 설계 원칙
 
@@ -951,7 +1155,7 @@ DB 먼저 이유:
 
 ---
 
-## 24. 실서비스 대용량 처리 문제 및 해결
+## §24 실서비스 대용량 처리 문제 및 해결
 
 ### P0 — 서비스 중단 / 데이터 손실
 
@@ -1059,7 +1263,7 @@ DB 먼저 이유:
 
 ---
 
-## 25. Spring MVC + Virtual Thread 전환 (WebFlux → MVC)
+## §25 Spring MVC + Virtual Thread 전환 (WebFlux → MVC)
 
 ### 결정
 ```
@@ -1188,7 +1392,7 @@ subscribeOn()    → 불필요 (VT가 자동 처리)
 
 ---
 
-## 26. DB 파티셔닝 전략
+## §26 DB 파티셔닝 전략
 
 ### 결정
 ```
@@ -1225,7 +1429,7 @@ Partition Pruning:
 
 ---
 
-## 27. 수평 확장 설계
+## §27 수평 확장 설계
 
 ### 핵심: Stateless 서버 설계
 ```
@@ -1246,7 +1450,7 @@ TokenExpiryJob이 여러 서버에서 동시 실행되면?
 
 ---
 
-## 28. SDK 제공 계획
+## §28 SDK 제공 계획
 
 > ⚠️ **범위가 §35에서 좁혀졌다 (2026-08-12).** 아래는 "SDK가 있으면 좋은 이유"를 나열한
 > 초기 검토이고, **Tenant 서버용 SDK는 만들지 않기로 확정**했다(언어를 하나 고르면 나머지
@@ -1271,7 +1475,7 @@ Tenant가 직접 구현해야 하는 것들:
 
 ---
 
-## 29. MySQL Read/Write 분리 설계
+## §29 MySQL Read/Write 분리 설계
 
 ### 구조
 
@@ -1342,7 +1546,11 @@ public class TokenWriteService {
 
 ---
 
-## 30. Redis Master/Replica (Sentinel) 설계
+## §30 Redis Master/Replica (Sentinel) 설계
+
+> 📉 **Sentinel은 §75 D28에서 학습·로컬 자산으로 격하됐다(폐기는 아니다).** 목표 구성은
+> **독립 2 Cluster + 큐 단위 이중 라우팅**이다(§75, 전환 시점 미정). 아래 쿼럼·`min-replicas-to-write`·
+> Failover 실증은 **현재 로컬 구현 기준으로 여전히 사실**이다.
 
 ### Redis는 Read/Write 분리 적용 안 함
 
@@ -1385,7 +1593,7 @@ spring:
 
 ---
 
-## 31. 대용량 Enqueue 시나리오 분석
+## §31 대용량 Enqueue 시나리오 분석
 
 ### rps별 전략 요약
 
@@ -1484,7 +1692,13 @@ server:
 
 ---
 
-## 32. Kafka 도입 설계
+## §32 Kafka 도입 설계
+
+> ✏️ **토픽 구성이 §73 D16·D18에서 바뀌었다.** `enqueue-events`/`enqueue-admit`/`token-status-changed`
+> 3토픽 · 파티션 키 `queueId` → **단일 `token-lifecycle` · 키 `tokenId` · 18파티션**.
+> `queueId` 키는 명시적으로 **기각**됐다 — 한 큐에 30만 명이 정상 시나리오라 트래픽 99%가 한 파티션에 몰린다.
+> 아래 "202 즉시 응답"도 실제로는 **200**이다(순번을 확정한 뒤 응답한다, `FRS_final.md` §6.2).
+> **Kafka를 쓰는 목적(버퍼 · At-Least-Once · DB 적재 비동기화)은 유효하다.**
 
 ### 도입 용도
 
@@ -1584,7 +1798,7 @@ public class BillingConsumer {
 
 ---
 
-## 33. verify API 제거 검토 (v1.8) → v1.9에서 유지로 번복
+## §33 verify API 제거 검토 (v1.8) → v1.9에서 유지로 번복
 
 ### v1.9 결정: verify 유지
 
@@ -1604,7 +1818,7 @@ verify DB Fallback 추가 (v1.9):
 
 ---
 
-## 34. admitToken TTL 만료 처리 (v1.8 EXPIRED → v1.9 WAITING 복귀)
+## §34 admitToken TTL 만료 처리 (v1.8 EXPIRED → v1.9 WAITING 복귀)
 
 ### v1.9 최종 결정: WAITING 복귀 + seq 유지 + TTL 60초
 
@@ -1620,7 +1834,7 @@ TTL 30초 → 60초:
 
 ---
 
-## 35. SDK 설계 — JS SDK만 만든다. Tenant 서버용 SDK는 안 만든다
+## §35 SDK 설계 — JS SDK만 만든다. Tenant 서버용 SDK는 안 만든다
 
 **갱신**: 2026-08-12 (Java SDK 폐기 결정의 근거를 명시). `FRS_final.md` v1.10의
 "Java SDK 제거 (REST API 명세로 대체)"가 이 결정이다.
@@ -1715,7 +1929,7 @@ N개를 동시에 고쳐야 해서 버전이 어긋납니다. REST API는 언어
 
 ---
 
-## 36. admitToken TTL 만료 → WAITING 복귀 (상세)
+## §36 admitToken TTL 만료 → WAITING 복귀 (상세)
 
 ### Redis Key 최종 구성
 
@@ -1733,7 +1947,7 @@ DB:
 
 ---
 
-## 37. schema/entity 개선사항 (v1.9)
+## §37 schema/entity 개선사항 (v1.9)
 
 ### status TINYINT 매핑
 
@@ -1775,7 +1989,12 @@ complete 후에도 컬럼 값 유지:
 
 ---
 
-## 38. FLOW 개선사항 (v1.9)
+## §38 FLOW 개선사항 (v1.9)
+
+> ✏️ **`nextPollAfterSec`·`globalRank`는 §79(2026-08-14)가 폐기했다.** 서버가 개인별 간격을 계산해
+> 내려주던 방식 → `/status`가 `pacing` 구간표를 내려주고 **SDK가 `rank = mySeq − lastAdmittedSeq`로
+> 계산**한다. 아래 `token-info` TTL(`nextPollAfterSec + 2s`)도 그 필드에 매여 있어 §79 이후 재정의 대상이다.
+> **아래 `ZCARD slice:N` 합산은 §66 D2가 폐기했다** — 대기열은 ZSet 하나(`queue:{queueId}:waiting`)다.
 
 ### nextPollAfterSec 적응형 Polling
 
@@ -1821,7 +2040,11 @@ Redis queue:{queueId}:admit-by-admit 미스 시:
 
 ---
 
-## 39. RedisSyncJob 상세 흐름
+## §39 RedisSyncJob 상세 흐름
+
+> ✏️ **아래 슬라이스 계산·키·멤버는 폐기됐다** (§66 D2 · §70 D9 · §74). 본문의 흐름(①~⑤)과
+> "ZADD NX로 멱등" 원칙은 유효하되, **재삽입 대상 키·멤버는 아래 정정된 표기를 따라라.**
+> `queue-user` 역인덱스 재구성(③)도 `queue:{queueId}:tokens` Hash 재구성으로 읽어야 한다.
 
 ### 역할
 Redis 다운 중 Kafka Consumer가 DB INSERT는 완료했지만
@@ -1836,9 +2059,12 @@ Redis ZADD는 못 한 토큰(redis_sync_needed=1)을 복구한다.
    100건씩 청크 처리 (Replica 조회)
 
 ② 슬라이스 계산 + Redis ZADD
-   slice = (seq - 1) % sliceCount
-   ZADD queue:{t}:{q}:{slice} {seq} {tokenId} NX
+   ZADD queue:{queueId}:waiting {seq} {identifier} NX
    NX: 이미 있으면 무시 (멱등)
+   ⚠️ 정정(2026-08-17): 원문은 `ZADD queue:{t}:{q}:{slice} {seq} {tokenId}` 였다 —
+      키와 멤버가 둘 다 틀렸다. 멤버가 tokenId면 poll_verify.lua의
+      HGET tokens[member]가 nil이라 그 토큰은 폴링에서 항상 404다
+      (enqueue_bulk.lua:65가 identifier를 멤버로 쓴다).
 
 ③ queue-user 역인덱스 재구성
    SET queue-user:{t}:{q}:{userId} {tokenId} EX waitingTtl
@@ -1873,11 +2099,12 @@ public class RedisSyncJob {
         for (TokenEntity token : tokens) {
             try {
                 // ② Redis ZADD (NX: 멱등)
-                int slice = (int) ((token.getSeq() - 1) % token.getSliceCount());
-                String key = RedisKeyFactory.queue(token.getTenantId(),
-                                                   token.getQueueId(), slice);
+                // ⚠️ 정정(2026-08-17): 원문은 token.getSliceCount() 와
+                //    RedisKeyFactory.queue(tenantId, queueId, slice) 를 호출했다 —
+                //    둘 다 존재하지 않는 API다. 큐 키는 QueueKeys가 조립한다.
+                String key = QueueKeys.waiting(token.getQueueId());
                 redisTemplate.opsForZSet()
-                    .addIfAbsent(key, token.getTokenId(), token.getSeq());
+                    .addIfAbsent(key, token.getUserId(), token.getSeq());  // member = identifier
 
                 // ③ queue-user 역인덱스 재구성
                 String userKey = RedisKeyFactory.queueUser(
@@ -1909,7 +2136,13 @@ public class RedisSyncJob {
 
 ---
 
-## 40. Kafka Consumer 설정 상세
+## §40 Kafka Consumer 설정 상세
+
+> ✏️ **소비 주체와 토픽이 §73에서 바뀌었다.** `TokenEnqueueConsumer`(queue-batch 안) → **독립 모듈
+> `queue-consumer`의 `TokenLifecycleConsumer`**(D20), 토픽 `enqueue-events` → `token-lifecycle`.
+> 발행 측 시한(`max.block.ms` 등)은 §73 D19가, 파티션·복제는 D17이 정본이다.
+> **수동 커밋을 쓰지 않는 이유**는 이 절이 아니라 `TokenLifecycleConsumer` javadoc에 있다.
+> 배치 소비·멱등 insert·실패 2분류(제약 위반 vs 일시 장애)라는 골격은 유효하다.
 
 ### Consumer 설정
 
@@ -2005,7 +2238,7 @@ token-status-changed 토픽:
 
 ---
 
-## 41. HikariCP 커넥션 풀 계산 근거
+## §41 HikariCP 커넥션 풀 계산 근거
 
 ### 계산
 
@@ -2068,7 +2301,7 @@ spring:
 
 ---
 
-## 42. JWT 설계
+## §42 JWT 설계
 
 ### 인증 주체별 분리
 
@@ -2180,7 +2413,11 @@ Access Token 즉시 무효화가 필요한 경우:
 
 ---
 
-## 43. Queue 삭제 흐름 (DRAINING → DELETED)
+## §43 Queue 삭제 흐름 (DRAINING → DELETED)
+
+> ✏️ **③의 DEL 대상 키 목록이 낡았다.** `queue:{t}:{q}:0 ~ {sliceCount-1}`·`global-seq:{t}:{q}` →
+> 현행은 `queue:{queueId}:waiting|seq|tokens|last-active` 4종이다(`QueueKeys`, §66 D2·§70 D9·§74).
+> **상태 전이(DRAINING → DELETED)와 "DB 먼저 → Redis 나중" 순서는 유효하다.**
 
 ### 삭제 요청
 
@@ -2281,7 +2518,7 @@ admit 허용으로 빠른 소진:
 
 ---
 
-## 44. 파티션 유예 전략 (월말 걸친 토큰 보호)
+## §44 파티션 유예 전략 (월말 걸친 토큰 보호)
 
 ### 문제
 
@@ -2375,7 +2612,7 @@ queues → queue_daily_stats FK도 미적용:
 
 ---
 
-## 45. Sprint 1 — Gradle 멀티모듈 + Virtual Thread 전략
+## §45 Sprint 1 — Gradle 멀티모듈 + Virtual Thread 전략
 
 ### 결정
 
@@ -2392,7 +2629,7 @@ queues → queue_daily_stats FK도 미적용:
 
 ---
 
-## 46. Sprint 2 — LazyConnectionDataSourceProxy 필수 적용
+## §46 Sprint 2 — LazyConnectionDataSourceProxy 필수 적용
 
 ### 문제
 Spring의 기본 동작: @Transactional 시작 → getConnection() → readOnly 설정 순서.
@@ -2412,7 +2649,7 @@ Bean 구성: masterDS → replicaDS → routingDS → LazyProxy (@Primary)
 
 ---
 
-## 47. Sprint 2 — JpaConfig를 infrastructure 모듈에 배치
+## §47 Sprint 2 — JpaConfig를 infrastructure 모듈에 배치
 
 ### 결정
 @EnableJpaRepositories + @EntityScan을 queue-infrastructure의 JpaConfig.java에 배치.
@@ -2424,7 +2661,7 @@ Bean 구성: masterDS → replicaDS → routingDS → LazyProxy (@Primary)
 
 ---
 
-## 48. Sprint 2 — schema.sql 수동 관리 (ddl-auto 미동작 대응)
+## §48 Sprint 2 — schema.sql 수동 관리 (ddl-auto 미동작 대응)
 
 ### 문제
 LazyConnectionDataSourceProxy 환경에서 Hibernate ddl-auto=update가 테이블을 생성하지 않음.
@@ -2436,7 +2673,7 @@ LazyConnectionDataSourceProxy 환경에서 Hibernate ddl-auto=update가 테이�
 
 ---
 
-## 49. Sprint 3 — Adapter 네이밍 xxxRepositoryImpl → xxxJpaAdapter
+## §49 Sprint 3 — Adapter 네이밍 xxxRepositoryImpl → xxxJpaAdapter
 
 ### 결정
 TenantRepositoryImpl → TenantJpaAdapter로 네이밍 변경.
@@ -2448,7 +2685,7 @@ TenantRepositoryImpl → TenantJpaAdapter로 네이밍 변경.
 
 ---
 
-## 50. Sprint 3 — Tenant status 확장 (FRS에 없는 필드)
+## §50 Sprint 3 — Tenant status 확장 (FRS에 없는 필드)
 
 ### 결정
 FRS의 tenants 테이블에 status 컬럼이 없지만, ACTIVE(0)/DEACTIVATED(1) 상태를 추가.
@@ -2460,7 +2697,11 @@ FRS의 tenants 테이블에 status 컬럼이 없지만, ACTIVE(0)/DEACTIVATED(1)
 
 ---
 
-## 51. Sprint 3 — Queue update 전략 (name만 변경 허용)
+## §51 Sprint 3 — Queue update 전략 (name만 변경 허용)
+
+> ✏️ **근거 하나가 사라졌다.** "maxCapacity 변경 → sliceCount 변경 → 슬라이스 파티셔닝 정합성 붕괴"는
+> §66 D2(ZSet 하나)로 **성립하지 않는다.** 남은 근거는 TTL 소급 적용 문제와 "운영 중 정원 변경은
+> 대기자 기대를 깬다"는 쪽이다. **결정(name만 변경 허용) 자체는 유지**하되 근거는 이 점을 감안해 읽어라.
 
 ### 문제
 운영 중 Queue의 maxCapacity/TTL 변경 시:
@@ -2476,7 +2717,7 @@ FRS의 tenants 테이블에 status 컬럼이 없지만, ACTIVE(0)/DEACTIVATED(1)
 
 ---
 
-## 52. Sprint 3 — Queue delete는 PAUSED 상태에서만 허용
+## §52 Sprint 3 — Queue delete는 PAUSED 상태에서만 허용
 
 ### 결정
 기존 DRAINING/PAUSED 둘 다 허용 → PAUSED에서만 허용으로 변경.
@@ -2488,7 +2729,7 @@ FRS의 tenants 테이블에 status 컬럼이 없지만, ACTIVE(0)/DEACTIVATED(1)
 
 ---
 
-## 53. Sprint 4 — PasswordHasher Port/Adapter 분리 (BCrypt)
+## §53 Sprint 4 — PasswordHasher Port/Adapter 분리 (BCrypt)
 
 ### 결정
 BCrypt를 domain에 직접 두지 않고 Port(domain) + Adapter(infrastructure)로 분리.
@@ -2507,7 +2748,7 @@ domain:         ApiKeyHasher (class)          ← 순수 Java, domain 직접 배
 
 ---
 
-## 54. Sprint 4 — JWT를 api 계층에 배치 (domain 아님)
+## §54 Sprint 4 — JWT를 api 계층에 배치 (domain 아님)
 
 ### 결정
 JwtProvider, JwtAuthenticationFilter, SecurityConfig 전부 queue-api에 배치.
@@ -2525,7 +2766,7 @@ api:            JWT 전부 여기 ✅
 
 ---
 
-## 55. Sprint 4 — API Key prefix "sk_live_" (Stripe 관례)
+## §55 Sprint 4 — API Key prefix "sk_live_" (Stripe 관례)
 
 ### 결정
 API Key 원본 형식: "sk_live_" + SecureRandom 16byte hex (총 40자)
@@ -2538,7 +2779,7 @@ API Key 원본 형식: "sk_live_" + SecureRandom 16byte hex (총 40자)
 
 ---
 
-## 56. Sprint 4 — GlobalExceptionHandler를 api 모듈에 배치
+## §56 Sprint 4 — GlobalExceptionHandler를 api 모듈에 배치
 
 ### 결정
 @RestControllerAdvice를 queue-api에 배치. queue-common이 아님.
@@ -2555,7 +2796,7 @@ queue-api:    GlobalExceptionHandler          ← HTTP 응답 변환
 queue-batch:  BatchExceptionHandler           ← 로그/재시도 (Sprint 9)
 ```
 
-## 57. 동시성 제어 우선순위 정책
+## §57 동시성 제어 우선순위 정책
 
 **Status**: Accepted  
 **Date**: 2026-05  
@@ -2602,7 +2843,7 @@ queue-batch:  BatchExceptionHandler           ← 로그/재시도 (Sprint 9)
 
 ---
 
-## 58. Queue 생성 동시성 처리 방식
+## §58 Queue 생성 동시성 처리 방식
 
 **Status**: Accepted  
 **Date**: 2026-05  
@@ -2674,7 +2915,7 @@ public Queue createQueue(Long tenantId, CreateQueueCommand cmd) {
 
 ---
 
-## 59. `@DistributedLock` 도입 및 모듈 배치
+## §59 `@DistributedLock` 도입 및 모듈 배치
 
 **Status**: Accepted  
 **Date**: 2026-05  
@@ -2743,7 +2984,7 @@ Redisson 기반 `@DistributedLock` 어노테이션을 사내에서 정의해 사
 > "분산 락은 표준 어노테이션이 없어서 Redisson을 AOP로 감싸 `@DistributedLock`을 직접 정의했습니다. 헥사고날 원칙을 지키기 위해 어노테이션은 queue-common, Aspect는 queue-infrastructure에 두었습니다. 가장 큰 함정은 `@Transactional`과의 순서로, 락이 트랜잭션보다 안쪽이면 락 해제 후 커밋 전에 다음 요청이 들어와 보호가 깨집니다. `@Order(HIGHEST_PRECEDENCE)`로 락이 트랜잭션보다 바깥임을 명시했고, 더 안전하게는 락 메서드와 트랜잭션 메서드를 별도 빈으로 분리하는 패턴도 권장합니다."
 
 
-## 60. Sprint 5 — Rate Limiter 알고리즘 선택 (Token Bucket)
+## §60 Sprint 5 — Rate Limiter 알고리즘 선택 (Token Bucket)
 
 **Status**: Accepted
 **Date**: 2026-06
@@ -2796,7 +3037,7 @@ Tenant SLA 한도용 알고리즘으로 **Token Bucket**을 채택.
 
 ---
 
-## 61. Sprint 5 — Rate Limiter 알고리즘 분리 (Token Bucket + Fixed Window)
+## §61 Sprint 5 — Rate Limiter 알고리즘 분리 (Token Bucket + Fixed Window)
 
 **Status**: Accepted
 **Date**: 2026-06
@@ -2865,7 +3106,7 @@ Tenant SLA 한도용 알고리즘으로 **Token Bucket**을 채택.
 
 ---
 
-## 62. Sprint 5 — Tenant Plan 도입 (SaaS 등급)
+## §62 Sprint 5 — Tenant Plan 도입 (SaaS 등급)
 
 **Status**: Accepted
 **Date**: 2026-06
@@ -2930,7 +3171,7 @@ public enum Plan {
 
 ---
 
-## 63. Sprint 5 — RateLimitFilter HTTP 통합
+## §63 Sprint 5 — RateLimitFilter HTTP 통합
 
 **Status**: Accepted
 **Date**: 2026-06
@@ -3003,7 +3244,7 @@ public enum Plan {
 
 ---
 
-## 64. Sprint 5 — Redis Lua Script Bean 등록 패턴
+## §64 Sprint 5 — Redis Lua Script Bean 등록 패턴
 
 **Status**: Accepted
 **Date**: 2026-06
@@ -3071,7 +3312,7 @@ public RedisScript<Long> fixedWindowScript() {
 
 ---
 
-## 65. Sprint 5 — 인증 전 Rate Limit 알고리즘 의도 (Burst 불허)
+## §65 Sprint 5 — 인증 전 Rate Limit 알고리즘 의도 (Burst 불허)
 
 **Status**: Accepted
 **Date**: 2026-06
@@ -3127,7 +3368,7 @@ public RedisScript<Long> fixedWindowScript() {
 
 ---
 
-## 66. Sprint 8+ — Redis Cluster 도입 결정 (Sentinel → Cluster 확장)
+## §66 Sprint 8+ — Redis Cluster 도입 결정 (Sentinel → Cluster 확장)
 
 > ⚠️ **부분 폐기 — §75(2026-08-11)로 대체됨.**
 > Cluster로 간다는 방향은 **확정**되었으나, 이 절의 다음 두 가지는 더 이상 유효하지 않다.
@@ -3211,7 +3452,7 @@ public RedisScript<Long> fixedWindowScript() {
 
 ---
 
-## 67. Sprint 12+ — 이중 라우팅 아키텍처 (Cluster + Hash Tag)
+## §67 Sprint 12+ — 이중 라우팅 아키텍처 (Cluster + Hash Tag)
 
 > ⚠️ **§75(2026-08-11)에서 확정·구체화됨.**
 > 이 절이 "Sprint 12+ 계획"으로 적어둔 Layer 1(Cluster 선택)이 **채택 확정**되었고,
@@ -3294,7 +3535,7 @@ public RedisScript<Long> fixedWindowScript() {
 
 ---
 
-## 68. Sprint 10+ — Master 크기 최적화 (Single Thread 병목 해결)
+## §68 Sprint 10+ — Master 크기 최적화 (Single Thread 병목 해결)
 
 **Date**: 2026-07-08
 **Context**: Redis Single Thread 특성으로 Master 크기가 커도 CPU 코어 1개만 사용. 실무에서 큰 Master 소수보다 작은 Master 다수가 효율적임을 확인.
@@ -3364,7 +3605,7 @@ public RedisScript<Long> fixedWindowScript() {
 
 ---
 
-## 69. Sprint 15+ — 극대 분산 아키텍처 (4x4x4GB 최종 구성)
+## §69 Sprint 15+ — 극대 분산 아키텍처 (4x4x4GB 최종 구성)
 
 **Date**: 2026-07-08
 **Context**: 1억 대기 처리 대비 최종 인프라 구성 확정. SLA 균등 조건, 성능 우선, 실무 관행 반영.
@@ -3448,7 +3689,7 @@ public RedisScript<Long> fixedWindowScript() {
 
 ---
 
-## 70. Sprint 5-E — Bulk 단독 + seq 키 + Hash Tag (D7/D8 개정, CROSSSLOT 선제 대응)
+## §70 Sprint 5-E — Bulk 단독 + seq 키 + Hash Tag (D7/D8 개정, CROSSSLOT 선제 대응)
 
 **Date**: 2026-07-15
 **Context**: 5-E 구현 과정에서 두 가지가 §66-69 수립 시점의 전제를 깼다.
@@ -3529,7 +3770,7 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 
 ---
 
-## 71. Sprint 5-E / 9+ — Enqueue 저장 순서(Redis → DB) 확정 + DB → Redis 복구 설계
+## §71 Sprint 5-E / 9+ — Enqueue 저장 순서(Redis → DB) 확정 + DB → Redis 복구 설계
 
 **Date**: 2026-07-27
 **Context**: enqueue 영속화가 **Redis(순서 부여) → Kafka → DB(비동기 적재)** 순서로 구현돼 있으나, (1) 왜 이 순서인가, (2) Redis 전손 시 DB로 어떻게 복구하는가가 문서화되지 않았다. §70 D9(`INCR seq`)로 seq를 Redis가 부여하고 DB `tokens.seq`에 저장하는데, **이 seq 저장이 복구의 열쇠**이므로 순서와 복구를 함께 확정한다.
@@ -3604,7 +3845,13 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 
 ---
 
-## 72. Sprint 5-E 개정 — Enqueue DB 영속화: Kafka 제거 → Redis List outbox + @Scheduled + ShedLock
+## §72 Sprint 5-E 개정 — Enqueue DB 영속화: Kafka 제거 → Redis List outbox + @Scheduled + ShedLock
+
+> ⛔ **이 결정은 §73(2026-08-10)이 뒤집었다 — Redis List outbox 폐기, Kafka 복귀.**
+> 아래 본문은 "Kafka 제거"를 확정문으로 쓰고 있으니 **여기서 멈추지 마라.** 현행은
+> 단일 토픽 `token-lifecycle` + 파티션 키 `tokenId` + `queue-consumer` 모듈이다.
+> 이 절이 손으로 만들기로 했던 것(`processing` 목록·heartbeat·reaper·ShedLock 리더 선출)은
+> **전부 필요 없어졌다.** 왜 왔다 갔는지는 §73이 세 세대를 한 절에 정리해 두었다.
 
 **Date**: 2026-07-27
 **Context**: 5-E는 enqueue→DB 적재를 Kafka(`enqueue-events` 토픽 + `@KafkaListener` Consumer)로 구현했다(§70, `sprint5-token-kafka-progress`). Kafka 클러스터 운영 부담을 제거하고 **API 서버 내 처리**로 변경한다. 단 "API 서버 내 스케줄러"의 두 함정(**크래시 유실·스파이크 OOM**)을 피하려면 스케줄러가 읽을 소스가 **durable append-only**여야 한다. 이 결정은 §71 D11의 "적재 수단"을 Kafka에서 구체화하는 것으로, §71의 순서(Redis→DB)·복구(DB→Redis)는 그대로 유효하다.
@@ -3653,7 +3900,7 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 
 ---
 
-## 73. Sprint 5-E 재개정 — Enqueue 영속화: List → Stream → **Kafka 복귀** + 소비 전담 모듈 분리
+## §73 Sprint 5-E 재개정 — Enqueue 영속화: List → Stream → **Kafka 복귀** + 소비 전담 모듈 분리
 
 **Date**: 2026-08-10
 **Context**: §72로 Kafka를 걷어내고 Redis List outbox를 도입했으나, 이후 **Redis Stream(Consumer Group)으로 한 번 더 옮겼고 그 전환은 문서화되지 않았다**. 여기에 Sprint 6-7의 상태 전이(admit/complete/cancel/expire)를 설계하면서 **Stream으로는 풀 수 없는 요구**가 드러나 Kafka로 되돌린다. 세 세대(List → Stream → Kafka)를 한 절에 정리해, "왜 왔다 갔는가"가 기록에서 끊기지 않게 한다. §71의 순서(Redis→DB)·복구(DB→Redis)는 그대로 유효하며, 이 결정은 §72와 마찬가지로 **적재 수단만** 바꾼다.
