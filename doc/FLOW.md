@@ -162,8 +162,8 @@ flowchart TD
 
     KAFKA --> CONSUMER["Admit Worker\nDB PENDING 확인 → 멱등 체크\nstatus=PROCESSING 업데이트"]
 
-    CONSUMER --> LUA["① Lua Script (Redis 전용)\n슬라이스별 ZRANGE WITHSCORES\nLua 내부 score 정렬\n상위 N명 선택\nZREM multi-member"]
-    --> FILTER["② DB WAITING 상태 확인 ← Lua 밖 (Lua는 MySQL을 못 만진다)\n불일치 즉시 ZREM\n부족 시 최대 3회 추가 추출\n추가 추출 시 전체 재정렬 → FIFO 보장"]
+    CONSUMER --> LUA["① Lua Script (Redis 전용)\nZRANGE queue:{queueId}:waiting 0 N-1 WITHSCORES\nZREM multi-member\n※ ZSet 하나(§66 D2) + score가 INCR 단조증가(§70 D9)\n   → 이미 FIFO 순. 병합·재정렬 불필요"]
+    --> FILTER["② DB WAITING 상태 확인 ← Lua 밖 (Lua는 MySQL을 못 만진다)\n불일치 즉시 ZREM\n부족하면 다음 구간 추가 추출 (여전히 정렬 불필요)"]
     --> TOKEN["③ admitToken 발급 ← ①과 별개 호출\nSET queue:{queueId}:admit-by-token:{tokenId} EX 60\nSET queue:{queueId}:admit-by-admit:{admitToken} EX 60\nSET queue:{queueId}:admit-watermark = max(현재값, 뽑은 최대 seq)\nDB UPDATE ADMIT_ISSUED (100건씩)\nSET token-info 캐시 갱신\nDB admit_requests status=COMPLETED\n⚠️ ①과 ③ 사이에 'pop 성공 + SET 실패' 창이 있다 (DECISIONS §79 — 미해결)"]
     --> ARESP(["200 OK\n{ admitTokens: [{userId, admitToken}...] }"])
 
