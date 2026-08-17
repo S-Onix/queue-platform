@@ -125,7 +125,11 @@
 11. `ROADMAP` Sprint 6 DoD의 `nextPollAfterSec 적응형 간격 로직` — §79가 제거한 필드
 12. `slice` 표기 4곳(`DECISIONS:1840` 등) — 문서에 두 키 체계 공존. `:1840`은 **키뿐 아니라 멤버도
     `tokenId`로 틀렸다**(B3와 같은 유형)
-13. `doc/entities.java:238` 구 키 표기 / `TK_002` 표기 혼재(`FRS:562` vs `:291`)
+13. ~~`doc/entities.java:238` 구 키 표기~~ → **파일 삭제로 해소**(2026-08-17). 실제 JPA 엔티티가
+    코드에 있는데(`TokenEntity`는 복합 PK·`@SQLInsert`까지) 이 파일은 `slice`·`sliceCount`·
+    `global-seq`·`admit-token-by-*` 등 **폐기된 설계로만** 채워져 있었다. 고치면 정본이 둘이 되어
+    계속 갈라진다 — 코드가 정본이다. 히스토리는 git에 남는다 /
+    `TK_002` 표기 혼재(`FRS:562` vs `:291`)는 **미해소**
 14. `DECISIONS §35`가 아직 `nextPollAfterSec 준수`를 JS SDK의 일로 서술 — §79 뒤집힘 상호참조 필요
 
 **E. 코드 (문서로 안 끝남)**

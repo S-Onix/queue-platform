@@ -12,7 +12,8 @@
 
 ### 핵심 설계 원칙
 1. **Platform**은 순서만 관리, **Tenant**가 슬롯·입장 제어
-2. 유저가 Platform에 직접 Polling (적응형 간격 nextPollAfterSec)
+2. 유저가 Platform에 직접 Polling (`/status`의 `pacing` 구간표 기반 적응형 간격, §79)
+   - ⚠️ 현행 **코드**는 아직 `nextPollAfterSec`를 응답에 담는다. §79는 설계 확정·구현 미착수
 3. Backpressure Pull (Tenant가 admit으로 받을 수 있는 만큼만)
 4. admitToken TTL 만료 → WAITING 복귀 (seq 기반 우선순위 보존)
 5. Spring MVC + Virtual Thread (JPA blocking I/O를 OS Thread 고갈 없이)
@@ -31,7 +32,7 @@ Cache: Redis — 현재 구현 Sentinel (Master + Slave 2 + Sentinel 3)
        목표 확정: 독립 2 Cluster + 큐 단위 이중 라우팅 (DECISIONS §75, 전환 시점 미정)
        Sentinel은 폐기가 아니라 학습·로컬 자산으로 격하 (§75 D28)
 Messaging: Spring Kafka (KRaft)
-Build: Gradle 멀티모듈 (5개)
+Build: Gradle 멀티모듈 (6개 — common/domain/infrastructure/api/batch/consumer)
 Architecture: Hexagonal + DDD
 Auth: JWT (Access 15분 + Refresh 7일) + Spring Security
 패키지: com.sonix.queue
@@ -47,33 +48,44 @@ queue-platform/
 ├── queue-domain/          # Rich Domain Model + Port 인터페이스 (Spring 의존성 없음!)
 ├── queue-infrastructure/  # JPA Adapter, Redis Adapter, Kafka Adapter, AOP Aspect 구현
 ├── queue-api/             # REST Controller + Security + JWT
-└── queue-batch/           # @Scheduled + Spring Kafka Consumer
+├── queue-batch/           # @Scheduled Jobs (현재 껍데기 — Sprint 7·9에서 채움)
+└── queue-consumer/        # Kafka 소비 전담 독립 앱. token-lifecycle → tokens DB 적재
 ```
+
+**`queue-consumer` (§73 D20 — 근거는 그쪽을 봐라, 여기 중복 서술 금지)**
+- `TokenLifecycleConsumer` `@KafkaListener(topics = "${queue.consumer.topic:token-lifecycle}")` → `TokenPersistService` 배치 적재
+- `queue-batch`와 **합치지 않는다**: 소비는 파티션 수만큼 늘리고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요하다 (확장 방향이 반대)
+- `@EnableScheduling`을 붙이지 않는다 — 붙이면 infra의 `@Scheduled` 빈까지 돌아 이중 적재
+- **actuator + micrometer-registry-prometheus 보유**. 레지스트리 빈이 없으면 `/actuator/prometheus` 엔드포인트 자체가 생기지 않아 **컨슈머 lag을 PromQL로 볼 수단이 사라진다**
 
 ### 의존성 방향 (절대 위반 금지)
 ```
 queue-common ← (모든 모듈)
-queue-domain ← queue-infrastructure, queue-api, queue-batch
+queue-domain ← queue-infrastructure, queue-api, queue-batch, queue-consumer
 queue-domain은 Spring 의존성 절대 없음 (순수 Java)
-queue-infrastructure는 queue-api/batch를 모름 (한방향)
+queue-infrastructure는 queue-api/batch/consumer를 모름 (한방향)
+queue-consumer는 아무도 참조하지 않는다 (최말단)
 ```
 
 ---
 
 ## Sprint 진행 현황
 
+> **일정의 정본은 `doc/ROADMAP.md`다.** 여기엔 "지금 어디인지"만 둔다 — 두 곳에 적으면 갈라진다.
+> ⚠️ 단 `ROADMAP.md`는 2026-06-10 최신화라 **이 블록보다 낡았다** (Sprint 6·8을 ⬜로 두고, §73이
+> 폐기한 3토픽 체계를 현재형으로 서술 중). 갱신 전까지는 아래 "코드로 확인되는 상태"가 더 정확하다.
+
 ```
-✅ Sprint 1 (완료): 멀티모듈 스켈레톤 + MVC + Virtual Thread
-✅ Sprint 2 (완료): JPA + MySQL Master/Replica R/W 분리
-✅ Sprint 3 (완료): 관리 도메인 (Tenant + ApiKey + Queue) 헥사고날
-✅ Sprint 4 (완료): JWT 인증 + 관리 API 12개 + 테스트
-🔄 Sprint 5 (진행 중): Redis Sentinel + Lua Script + Rate Limit
-⬜ Sprint 6: Token 도메인 + Queue Engine API
-⬜ Sprint 7: Admit → Verify → Complete
-⬜ Sprint 8: Kafka KRaft 연동
-⬜ Sprint 9: Batch 모듈
-⬜ Sprint 10: 통합 테스트 + k6 + Grafana + JS SDK
-⬜ Sprint 11: Docker + AWS 배포
+현재 위치: Sprint 5 마무리 ~ Sprint 6·8 병행.  다음 큰 덩어리 = Sprint 7 (Admit)
+
+코드로 확인되는 상태 (2026-08-17):
+  구현됨  Redis Sentinel · Rate Limiter(Lua 2종) · ApiKey 캐시            (Sprint 5)
+  구현됨  Token 도메인 + Enqueue(POST /tokens) + Polling(GET /tokens/:id)  (Sprint 6 일부)
+  구현됨  Kafka 적재 경로 — token-lifecycle + queue-consumer 모듈          (Sprint 8 일부)
+  미착수  Cancel(DELETE /tokens/:id)                                       (Sprint 6 잔여)
+  미착수  admit · verify · complete — 컨트롤러 0건                          (Sprint 7)
+  미착수  queue-batch는 Application 클래스만 (껍데기)                       (Sprint 9)
+  설계만  /status 분할 · admitWatermark · pacing — 코드 0줄                 (§79)
 ```
 
 ### Sprint 5 현재 상태 (2026-07-08)
@@ -103,7 +115,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - 동시성 검증 (1,000 동시 요청 → 정확히 capacity개)
 
 **5-D 완료** (2026-07-08): Redis 캐시 적용
-- ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
+- ApiKey Redis 캐시 (`apikey:{keyHash}`, TTL 60s)
 - 캐시 히트율 로그
 - Facade 도입 → Anti-pattern 인식 후 롤백 (중요 학습 자산)
 - Step 1 롤백 완료, Step 2-5 캐시 인프라 완료
@@ -118,7 +130,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
   - 1,000 동시 Enqueue 순번 0~999 유일 (실제 Redis)
   - WAS 3대 분산 10,000건 → 5개 큐에 2,000씩, 순번 중복 0
   - 로컬 Cluster A에서 `enqueue_bulk.lua` 실행 검증 (해시태그)
-- Phase F ⬜: 커밋 (미완 — working tree 상태)
+- Phase F ✅: 커밋 완료
 
 **5-E 확정 결정** (DECISIONS §66-70 참조):
 - D1: 자유 identifier (Tenant 제공)
@@ -132,7 +144,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
   - 현재 상수: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
   - ⚠️ 원안(10ms/1s) 대비 100배/30배 이탈 → **재조정 후속 과제** (단건 경로가 사라져 저부하 요청도 평균 500ms 부담)
 - **D9: score = `INCR queue:{queueId}:seq`** (신설) — ZCARD+1/타임스탬프는 충돌·동점 → INCR만 단조증가·유일
-- **D10: Hash Tag 필수** (신설) — 2-key Lua라 해시태그 없으면 Cluster에서 CROSSSLOT. `queue/QueueKeys.java`에서 관리
+- **D10: Hash Tag 필수** (신설) — `enqueue_bulk.lua` 3키(waiting/seq/tokens) · `poll_verify.lua` 3키(waiting/tokens/last-active). 해시태그 없으면 Cluster에서 CROSSSLOT. `queue/QueueKeys.java`에서 관리
 
 **Cluster 로컬 학습 완료** (2026-07-08 - Sprint 8 병행):
 - Sentinel 유지 + Cluster A (7001-7008) + Cluster B (8001-8008)
@@ -229,8 +241,11 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
    - 0=WAITING, 1=ADMIT_ISSUED, 2=COMPLETED, 3=CANCELLED, 4=EXPIRED
 
 5. **Kafka 비동기 처리**
-   - Enqueue: Redis Lua → 202 응답 → Kafka → DB INSERT (At-Least-Once)
-   - 상태 변경: Kafka token-status-changed 이벤트
+   - Enqueue: Redis Lua(순번 확정) → **Kafka 발행(동기, ack 대기)** → **200 응답** → Consumer가 DB INSERT (At-Least-Once)
+     - ⚠️ 발행이 응답보다 **먼저**다. 실패하면 QE001(503)이고 200이 안 나간다 — "200 먼저, Kafka는 뒤에서"가 아니다
+     - 비동기인 것은 **DB 적재뿐**. 발행 대기는 응답 지연에 포함된다
+   - 토픽은 **`token-lifecycle` 하나**, 파티션 키는 **`tokenId`** (§73 D16·D18)
+     - `queueId` 키는 기각 — 한 큐 30만이면 99%가 한 파티션
 
 6. **tokens 파티셔닝 (Range, 월별)**
    - `YEAR(issued_at) * 100 + MONTH(issued_at)`
@@ -290,7 +305,7 @@ queue-infrastructure는 queue-api/batch를 모름 (한방향)
 - ✅ Rate Limiter (Token Bucket + Fixed Window 분리 적용)
 - ✅ Tenant Plan 도입 (SaaS 등급)
 - ✅ HTTP Filter 통합 (429 + Retry-After)
-- ✅ API Key 캐시 (apikey-cache:{sha256}, TTL 60s) (5-D)
+- ✅ API Key 캐시 (`apikey:{keyHash}`, TTL 60s) (5-D)
 - ✅ Queue Engine Lua Script (enqueue_bulk.lua 단독 + Hash Tag, 5-E / DECISIONS §70)
 - ⬜ Refresh Token 도메인 모델 + DB 저장 + Redis 캐시 (5-E 이후)
 
@@ -400,7 +415,9 @@ mysql -u root -p -P 3307  # Replica
 |------|------|
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
-| `doc/DECISIONS.md` | 69+ 설계 결정 + 근거 + 면접 포인트 (§66-69 신규) |
+| `doc/DECISIONS.md` | 79개 설계 결정 + 근거 + 면접 포인트 (최신 §79 — 폴링 응답 계약) |
+| `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (⚠️ **현행 코드 동작** 서술 — §79 구현 전까지 고치지 말 것) |
+| `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |
 | `doc/STATE.md` | Token, Queue, ApiKey 상태 머신 |
 | `doc/schema.sql` | MySQL DDL + 파티션 운영 쿼리 |

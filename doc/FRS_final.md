@@ -1,6 +1,11 @@
 # 📄 Queue Platform — 기능 정의서 (FRS)
 
-> 버전: v1.11 | 상태: 확정 | 대상: 실제 구현 범위
+> 버전: v1.12 | 상태: 확정 | 대상: 실제 구현 범위
+>
+> v1.12 변경사항: 구현과 어긋난 서술 정정 — Redis 키표를 `QueueKeys` 4종으로 교체(slice·global-seq·
+> queue-user·token-last-active 폐기, §66 D2·§70 D9·§74), Kafka를 단일 `token-lifecycle` + 키 `tokenId`로
+> 정정(§73 D16·D18), 에러 코드표를 `ErrorCode.java`와 1:1로, Enqueue 응답 202 → **200**,
+> `queue-consumer` 모듈 반영
 >
 > v1.11 변경사항: Java SDK 명세 **실제 삭제**(v1.10에서 "제거"라고 적고 §12에 남아 있던 것),
 > 폴링 엔드포인트 2분할(`/status` + 개인, DECISIONS §79), `identifier` = UUIDv7 규약(§78),
@@ -42,9 +47,10 @@ Tenant    → 슬롯 관리 + 입장 제어
 | maxCapacity | 대기열 최대 인원 |
 | waitingTtl | 대기 중 절대 만료 시간 (기본 7200s) |
 | inactiveTtl | 마지막 Polling 이후 비활동 만료 시간 (기본 300s) |
-| sliceCount | Platform 자동 계산. ceil(maxCapacity ÷ 100,000) |
-| global-seq | 슬라이스 간 FIFO 보장을 위한 전체 순번 |
-| seq | 토큰별 global-seq 값. ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
+| ~~sliceCount~~ | 폐기 — 대기열을 여러 ZSet으로 쪼개던 값. ZSet 하나로 확정 (§66 D2) |
+| ~~global-seq~~ | 폐기 — 큐별 `INCR queue:{queueId}:seq`로 대체 (§70 D9) |
+| identifier | Tenant가 만드는 UUIDv7. `waiting` ZSet의 member이자 중복 판정 키 (§66 D1 · §78) |
+| seq | 토큰의 순번(= ZSet score). ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
 | pacing | `/status`가 내려주는 폴링 간격 구간표. rank로 조회 → SDK가 지터를 더해 사용 (§79) |
 | lastAdmittedSeq | 마지막으로 admit된 seq(전광판). `rank = mySeq − lastAdmittedSeq` (§79) |
 | ~~nextPollAfterSec~~ | 폐기 — 서버가 개인별 간격을 계산해 내려주던 필드. `pacing`으로 대체 (§79) |
@@ -60,9 +66,10 @@ DB tokens 테이블:
   → Kafka Consumer가 INSERT 보장 (At-Least-Once)
   → admit_token: Redis 미스 시 DB Fallback용
 
-Redis Sorted Set:
-  Key: queue:{tenantId}:{queueId}:{sliceNumber}
-  member: tokenId, score: global-seq
+Redis (QueueKeys — §8 참조):
+  queue:{queueId}:waiting   Sorted Set. member=identifier, score=seq
+  queue:{queueId}:seq       INCR로 score 발급
+  queue:{queueId}:tokens    Hash. identifier → "tokenId|issuedAt"
   → 순번 관리 전담. FIFO 보장
 ```
 
@@ -80,8 +87,8 @@ Redis Sorted Set:
 
 ③ Tenant → Platform: Enqueue
    POST /queues/:queueId/tokens { identifier }      ← identifier는 UUIDv7 (§6.2 참조)
-   Platform: Redis Lua 처리 후 즉시 응답 (202 Accepted)
-   비동기: Kafka enqueue-events 발행 → DB INSERT
+   Platform: Redis Lua 처리 후 즉시 응답 (200 OK — 순번이 확정된 뒤 응답한다)
+   비동기: Kafka token-lifecycle 발행 (key=tokenId) → DB INSERT
    Tenant → 유저: 대기 페이지를 서빙하면서 tokenId, seq 를 함께 실어 전달
 
 ④ 유저 → Platform: Polling (직접, 적응형 간격) — 엔드포인트 2개 (§6.3)
@@ -195,10 +202,10 @@ Redis Sorted Set:
 stateDiagram-v2
     [*] --> WAITING : POST /tokens (ZADD NX)
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
-    ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-status-changed 발행
+    ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-lifecycle 발행
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
-    WAITING --> CANCELLED : DELETE /token\nKafka token-status-changed 발행
-    WAITING --> EXPIRED : Batch\nKafka token-status-changed 발행
+    WAITING --> CANCELLED : DELETE /token\nKafka token-lifecycle 발행
+    WAITING --> EXPIRED : Batch\nKafka token-lifecycle 발행
     COMPLETED --> [*]
     CANCELLED --> [*]
     EXPIRED --> [*]
@@ -212,20 +219,30 @@ Body: { identifier: string }        ← UUIDv7. 생성·전달 주체는 Tenant 
 
 처리 흐름:
 1. API Key 검증 (Redis 캐시 60s → DB Replica fallback)
-2. Rate limit (per-key 100rps)
-3. 큐 상태 확인 (ACTIVE만 허용)
-4. identifier 중복 체크 (EXISTS → 기존 tokenId·seq 반환)
-5. Bulk Lua Script 원자 실행
-   INCRBY global-seq N → startSeq~endSeq
-   슬라이스별 ZADD multi-member NX
-   slice = (seq-1) % sliceCount
-6. 202 Accepted 즉시 응답
-7. Kafka enqueue-events 발행
-   → TokenEnqueueConsumer: DB INSERT (redis_sync_needed=0)
-   → queue-user 역인덱스 SET
+2. Rate limit (per-key)
+3. 큐 상태 확인 (ACTIVE만 허용) + Tenant 소유권 검증
+4. 요청을 Global Queue에 적재 → BatchProcessor가 주기적으로 drain (FLOW.md Enqueue 참조)
+5. enqueue_bulk.lua 원자 실행 — KEYS 3개 (같은 해시태그)
+   queue:{queueId}:waiting / queue:{queueId}:seq / queue:{queueId}:tokens
+   항목마다: ZCARD ≥ maxCapacity → FULL
+             INCR seq → score 발급 (§70 D9)
+             ZADD NX member=identifier score=seq → 신규 OK / 기존 EXISTS
+             HSET tokens[identifier] = "tokenId|issuedAt"   ← 중복 판정·소유권 대조의 원장
+             ZRANK → rank
+6. Kafka token-lifecycle 발행 (key=tokenId) — **동기**. 브로커 ack까지 최대 12s 대기
+   (`spring.kafka.producer` sendTimeout). 실패하면 QE001(503)이고 200이 안 나간다
+7. 200 OK 응답
+   → 이후 TokenLifecycleConsumer가 tokens INSERT (멱등)
 
-Response 202:
-{ "tokenId": "tok_Kx9mZ3", "seq": 42, "status": "WAITING" }
+Response 200:
+{ "queueId": "q_xyz789", "identifier": "0190e2c1-...", "tokenId": "tok_Kx9mZ3",
+  "seq": 42, "rank": 42, "total": 120, "already": false }
+
+  rank는 1-based다 — Redis ZRANK가 0-based이고 EnqueueResponse가 +1 해서 내보낸다.
+  already=true면 기존 토큰을 그대로 돌려준 것이다.
+  ⚠️ 202가 아니라 200이다 — Lua가 순번을 확정한 뒤 응답하므로 seq·rank가 이미 결정돼 있다.
+  ⚠️ **발행은 응답보다 먼저이고 동기다.** "Redis 쓰고 바로 200, Kafka는 뒤에서"가 아니다.
+     비동기인 것은 **DB 적재(Consumer)뿐**이며, 발행 자체는 응답 지연에 포함된다.
 ```
 
 **identifier 규약 (DECISIONS §66 D1 · §78)**
@@ -325,8 +342,8 @@ Body: { count: N, requestId: "req_abc" }
 처리 흐름:
 1. queue:{queueId}:admit-idem:{requestId} 멱등성 체크
 2. DB admit_requests INSERT (PENDING) — 영속성 기준점
-3. Kafka enqueue-admit 발행
-   → AdmitConsumer: Lua Dequeue + admitToken 발급
+3. admit 요청을 처리 워커로 전달 (전달 수단 미판정 — §7 참조)
+   → Lua Dequeue + admitToken 발급
 
 ① Lua Dequeue (Redis 전용):
   슬라이스별 ZRANGE WITHSCORES → score 정렬 → 상위 N명 ZREM
@@ -409,7 +426,7 @@ Body: { admitToken: "at_xxx" }
    ZREM Sorted Set
    DEL queue:{queueId}:admit-by-token + queue:{queueId}:admit-by-admit
    DEL token-info + verified-token
-5. Kafka token-status-changed 발행
+5. Kafka token-lifecycle 발행 (key=tokenId)
    → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
 6. avgWaitingTime 직접 갱신 (Kafka Consumer 없이)
    waitingSeconds = completedAt - issuedAt
@@ -427,10 +444,10 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 조건: WAITING(0)만. ADMIT_ISSUED(1) → 409
 
 처리:
-  Redis ZREM
+  Redis ZREM queue:{queueId}:waiting {identifier}
   DB status = CANCELLED(3)
-  DEL queue-user + DEL token-info
-  Kafka token-status-changed 발행
+  HDEL queue:{queueId}:tokens {identifier} + DEL token-info
+  Kafka token-lifecycle 발행 (key=tokenId)
 ```
 
 ---
@@ -439,69 +456,80 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 
 ### 토픽
 
-| 토픽 | 파티션 기준 | 보존 | 설명 |
+| 토픽 | 파티션 키 | 파티션 | 설명 |
 |------|------------|------|------|
-| `enqueue-events` | queueId | 7일 | Enqueue → DB INSERT |
-| `enqueue-admit` | queueId | 7일 | admit → Dequeue + admitToken 발급 |
-| `token-status-changed` | queueId | 7일 | 상태 변경 → Billing / Stats |
+| `token-lifecycle` | **`tokenId`** | 18 | 토큰 생명주기 **단일 토픽** — enqueue + 상태 전이(admit/complete/cancel/expire) |
+| `token-lifecycle.DLT` | — | 18 | 격리된 실패 레코드 |
+
+**왜 단일 토픽 + `tokenId` 키인가 (DECISIONS §73 D16·D18)**
+
+- Kafka의 순서 보장은 **같은 토픽의 같은 파티션** 안에서만 성립한다. `enqueue-events` / `token-status-changed`로
+  나누면 키가 같아도 `WAITING → ADMIT_ISSUED` 순서가 보장되지 않는다.
+- ~~`queueId` 키~~는 **기각**됐다. 큐 카디널리티가 낮고 "한 큐에 30만 명"이 정상 시나리오라
+  트래픽 99%가 한 파티션에 몰린다 — 파티션을 늘려도 해결되지 않는다.
+- 컨슈머 그룹은 나누지 않는다. 병렬화는 파티션이 담당하고, "전담 컨슈머"는 한 리스너 안의 핸들러 분기로 표현한다.
+- `replication.factor=3` / `min.insync.replicas=2` / `acks=all` / `enable.idempotence=true`
+  (`scripts/kafka/create-topics.sh`). **파티션은 줄일 수 없고, 늘리면 살아 있는 토큰의 순서 관계가 끊긴다.**
+
+> ⚠️ **admit 요청 전달 수단은 미판정이다.** 구 설계의 `enqueue-admit` 토픽(요청 명령 전달)은 §73이 다루지
+> 않았다 — §73은 *생명주기 이벤트* 토픽만 통합했다. 별도 명령 토픽을 둘지, `admit_requests` 테이블 +
+> 폴링으로 갈지는 **Sprint 7 admit 착수 시 결정**한다.
 
 ### 이벤트 스키마
 
 ```json
-// enqueue-events
+// token-lifecycle — enqueue (queue-domain의 EnqueueEvent record)
 {
   "tokenId": "tok_Kx9mZ3",
   "queueId": "q_xyz789",
-  "tenantId": "t_abc123",
-  "userId": "user123",
+  "tenantId": 12,
+  "userId": "0190e2c1-...",
   "seq": 42500,
   "issuedAt": "2026-03-19T10:00:00.123Z"
 }
-
-// enqueue-admit
-{
-  "requestId": "req_abc",
-  "tenantId": "t_abc123",
-  "queueId": "q_xyz789",
-  "count": 100
-}
-
-// token-status-changed
-{
-  "tokenId": "tok_Kx9mZ3",
-  "queueId": "q_xyz789",
-  "tenantId": "t_abc123",
-  "status": "COMPLETED",
-  "waitingSeconds": 127,
-  "expiredReason": null,
-  "occurredAt": "2026-03-19T10:02:07.456Z"
-}
 ```
+
+> `userId` 필드가 담는 값은 **`identifier`**다 (§6.2). 컬럼명은 `tokens.user_id`.
+> 상태 전이 이벤트 스키마는 Sprint 7에서 확정한다 — 같은 토픽·같은 키(`tokenId`)로 실린다.
 
 ### Consumer
 
-| Consumer | 토픽 | 역할 |
-|----------|------|------|
-| `TokenEnqueueConsumer` | enqueue-events | DB INSERT 1000건 Bulk / redis_sync_needed=0 |
-| `AdmitConsumer` | enqueue-admit | Lua Dequeue + admitToken 발급 |
-| `BillingConsumer` | token-status-changed | COMPLETED → tokens 원본 집계 → billing_snapshots UPSERT |
+| Consumer | 모듈 | 토픽 | 역할 |
+|----------|------|------|------|
+| `TokenLifecycleConsumer` | `queue-consumer` | `token-lifecycle` | 배치 적재(`TokenPersistService`) → `tokens` INSERT (멱등) |
+| `BillingConsumer` | (미구현) | `token-lifecycle` | COMPLETED → tokens 원본 집계 → billing_snapshots UPSERT |
+
+> `queue-consumer`는 **독립 Spring Boot 앱**이다. `queue-batch`와 합치지 않는 이유는 확장 방향이
+> 반대이기 때문이다 — 소비는 파티션 수만큼 늘리고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요해진다
+> (DECISIONS §73 D20). actuator + micrometer-prometheus를 갖는다: 없으면 `/actuator/prometheus`가
+> 아예 생성되지 않아 **컨슈머 lag을 PromQL로 볼 수단이 사라진다**.
 
 ---
 
-## 8. Redis 데이터 구조 (RedisKeyFactory 중앙 관리)
+## 8. Redis 데이터 구조
 
-> ⚠️ 큐 상태 키의 표기(`queue:{t}:{q}:{slice}`, `global-seq:*`)는 Sprint 5-E 구현
-> (`QueueKeys`: `queue:{queueId}:waiting|seq|tokens|last-active`)과 **아직 어긋나 있다** — 후속 정정 대상.
-> 새로 추가되는 큐 키는 반드시 `QueueKeys`를 거치고 `{queueId}` 해시태그를 갖는다 (DECISIONS §70 D10 · §75 D26).
+> **큐 상태 키는 `queue-infrastructure/.../queue/QueueKeys.java`가 조립한다.** 문자열 리터럴로 만들지 마라.
+> 모든 큐 키는 `{queueId}` 해시태그를 갖는다 — 다중 키 Lua(`enqueue_bulk` 3키, `poll_verify` 3키)가
+> 같은 슬롯을 요구하기 때문이다 (DECISIONS §70 D10 · §75 D26). **로컬 Sentinel에선 위반이 안 잡힌다.**
+> 캐시성 키(`apikey:*`, `tenant:*` 등)는 `cache/RedisKeyFactory.java` 소관이다.
+
+**큐 상태 키 (`QueueKeys`, 구현됨)**
 
 | Key 패턴 | 자료구조 | TTL | 역할 |
 |----------|----------|-----|------|
-| `queue:{t}:{q}:{slice}` | Sorted Set | 없음 | 대기열. score=global-seq |
-| `global-seq:{t}:{q}` | String | 없음 | 순번 채번. INCRBY 원자 |
+| `queue:{queueId}:waiting` | Sorted Set | 없음 | 대기열. **member=`identifier`**, score=`seq` |
+| `queue:{queueId}:seq` | String | 없음 | 큐별 순번 카운터. `INCR`이 score를 발급 (§70 D9) |
+| `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `"tokenId\|issuedAt"`. 중복 Enqueue 방지 + 폴링 소유권 대조(§74) |
+| `queue:{queueId}:last-active` | Sorted Set | 없음 | keepalive. member=`seq`, score=epoch ms. `ka=1` 폴링이 갱신 (§74) |
+
+> ⚠️ `:tokens`·`:last-active`에 **회수 경로(`HDEL`/`ZREM`/`EXPIRE`)가 전 코드 0건**이다. 회수 배치는 Sprint 9.
+
+**그 외**
+
+| Key 패턴 | 자료구조 | TTL | 역할 |
+|----------|----------|-----|------|
 | `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 |
 | `queue-stats:{t}:{q}` | Hash | 없음 | avgWaitingTime (complete 시 직접 갱신) |
-| `queue-user:{t}:{q}:{userId}` | String | waitingTtl | 중복 Enqueue 방지 |
-| `token-last-active:{tokenId}` | String | 300s | 비활동 TTL 감지 |
 | `token-info:{tokenId}` | String | 폴링 간격+2s | Polling 캐시 (⚠️ §79는 폴링 경로에서 DB status를 읽지 않으므로 존치 여부 후속 검토) |
 | `queue:{queueId}:admit-by-token:{tokenId}` | String | 60s | Polling 응답용 admitToken |
 | `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify/complete용 tokenId |
@@ -510,12 +538,15 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | `queue:{queueId}:admit-idem:{requestId}` | String | 300s | admit 멱등성. `requestId`는 **Tenant가 정하는 값**이라 큐 스코프 필수 |
 | `verified-token:{tokenId}` | String | 60s | 중복 입장 방지 |
 | `batch-lock:{t}:{q}` | String | 15s | Batch 서버 분산 |
-| `apikey-cache:{sha256}` | String | 60s | API Key 인증 캐시 |
+| `apikey:{keyHash}` | String | 60s | API Key 인증 캐시 |
 
 > 제거된 Key:
-> queue-count → ZCARD Pipeline으로 대체
-> billing-count → Kafka BillingConsumer → tokens 원본 집계로 대체
-> admit-request-queue, admit-processing-queue → Kafka enqueue-admit으로 대체
+> `queue:{t}:{q}:{slice}` · `global-seq:{t}:{q}` → 슬라이스 분할 폐기. ZSet 하나 + `INCR seq` (§66 D2 · §70 D9)
+> `queue-user:{t}:{q}:{userId}` → `queue:{queueId}:tokens` Hash가 대체 (Lua 안에서 원자 처리, §66 D1)
+> `token-last-active:{tokenId}` → `queue:{queueId}:last-active` ZSet이 대체 (§74)
+> queue-count → ZCARD로 대체
+> billing-count → tokens 원본 집계로 대체
+> admit-request-queue, admit-processing-queue → admit 요청 큐잉으로 대체 (§7)
 
 ---
 
@@ -523,11 +554,11 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 
 | 문제 | 해결 |
 |------|------|
-| 중복 Enqueue | queue-user 역인덱스 + ZADD NX |
-| 용량 초과 | ZCARD Pipeline 합산 |
+| 중복 Enqueue | `queue:{queueId}:tokens` Hash(identifier→tokenId) + ZADD NX — 둘 다 `enqueue_bulk.lua` 안 |
+| 용량 초과 | `enqueue_bulk.lua`의 ZCARD ≥ maxCapacity 판정 |
 | Enqueue DB 유실 | Kafka At-Least-Once + UNIQUE KEY 방어 |
 | 대량 Enqueue 병목 | INCRBY + ZADD multi (500건 Adaptive) |
-| admit 순서 보장 | Kafka enqueue-admit → AdmitConsumer (순차 처리) |
+| admit 순서 보장 | admit 요청 큐잉 → 순차 처리 (전달 수단은 §7 참조 — 미판정) |
 | 중복 입장 | verified-token 플래그 + admitToken 교차 확인 |
 | complete 동시성 | DB UPDATE WHERE status=1 (1번만 성공) |
 | ZREM 실패 | DB 먼저 → Batch 10초 내 재실행 |
@@ -549,19 +580,38 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 
 ## 11. 에러 코드
 
-| 코드 | HTTP | 상황 |
-|------|------|------|
-| `AK_001_UNAUTHORIZED` | 401 | API Key 무효 |
-| `TK_001_INVALID_TOKEN` | 401 | 대기토큰 무효 |
-| `TK_002_INVALID_ADMIT_TOKEN` | 404 | 입장토큰 만료 or 무효 |
-| `RL_001_KEY_LIMIT` | 429 | per-key 100rps 초과 |
-| `QM_001_NOT_FOUND` | 404 | 큐 없음 |
-| `QM_004_NOT_ACTIVE` | 503 | 큐 PAUSED / DRAINING |
-| `QE_001_CAPACITY_EXCEEDED` | 429 | maxCapacity 초과 |
-| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 |
-| `CM_001_INVALID_PARAM` | 400 | 파라미터 오류 |
-| `CM_003_INTERNAL_ERROR` | 500 | 서버 내부 오류 |
-| `CM_004_SERVICE_UNAVAILABLE` | 503 | Redis / Kafka 장애 |
+> 정본은 `queue-common/.../exception/ErrorCode.java`다. 응답 body에 나가는 값은 **enum 상수명이 아니라
+> `code` 컬럼**이다(예: `TOKEN_NOT_FOUND` → `"TK001"`). 아래 표는 그 파일과 1:1이다.
+
+**구현됨**
+
+| 상수 | code | HTTP | 상황 |
+|------|------|------|------|
+| `AK_001_UNAUTHORIZED` | `AK001` | 401 | 인증 필요 (API Key 무효) |
+| `AK_002_FORBIDDEN` | `AK002` | 403 | 권한 없음 |
+| `RL_001_KEY_LIMIT` | `RL001` | 429 | 요청 한도 초과 (+ `Retry-After`) |
+| `TOKEN_NOT_FOUND` | `TK001` | 404 | 대기 토큰 없음 (폴링 소유권 실패 포함, §74) |
+| `QUEUE_NOT_FOUND` | `Q001` | 404 | 큐 없음 |
+| `QUEUE_NOT_OWNED` | `Q002` | 403 | 본인 큐 아님 |
+| `DUPLICATE_QUEUE_NAME` | `Q003` | 409 | 큐 이름 중복 |
+| `QUEUE_NOT_ACTIVE` | `Q004` | 503 | 큐 PAUSED / DRAINING |
+| `QUEUE_FULL` | `Q005` | 429 | maxCapacity 초과 |
+| `QUEUE_ENGINE_UNAVAILABLE` | `QE001` | 503 | 대기열 처리 일시 오류 |
+| `DUPLICATE_EMAIL` | `T001` | 409 | 이메일 중복 |
+| `TENANT_NOT_FOUND` | `T002` | 404 | Tenant 없음 |
+| `INVALID_PASSWORD` | `T003` | 401 | 비밀번호 불일치 |
+| `INVALID_TOKEN` | `T004` | 401 | JWT 무효 |
+| `API_KEY_NOT_FOUND` | `A001` | 404 | API Key 없음 |
+| `API_KEY_NOT_OWNED` | `A002` | 403 | 본인 API Key 아님 |
+| `INTERNAL_SERVER_ERROR` | `I004` | 500 | 서버 오류 |
+
+**미정의 (후속)** — 아래 상황을 이 문서가 참조하지만 `ErrorCode`에 아직 없다. 추가는 코드 변경이라 후속 작업이다.
+
+| 가칭 | HTTP | 상황 | 필요해지는 시점 |
+|------|------|------|---|
+| `TK_002_INVALID_ADMIT_TOKEN` | 404 | 입장토큰 만료 or 무효 (§6.5 verify) | Sprint 7 |
+| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 (complete / 이탈) | Sprint 7 |
+| (WAITING 복귀 대기) | 404 | admitToken TTL 만료 → 배치 반영 전 (§6.3 404 계약) | Sprint 7 |
 
 ---
 
@@ -660,8 +710,10 @@ keepalive:
 
 | 레포 | 모듈 수 | 배포 | 역할 |
 |------|--------|------|------|
-| `queue-platform` | 5개 | Docker | 플랫폼 본체 (API, Batch, Domain, Infra, Common) |
+| `queue-platform` | 6개 | Docker | 플랫폼 본체 (API, Batch, **Consumer**, Domain, Infra, Common) |
 | `queue-platform-sdk-js` | 1개 | npm + CDN | 브라우저용 (PollingManager, StateManager) |
+
+> `queue-consumer`는 `token-lifecycle` 소비 전담 독립 앱이다. 분리 근거는 DECISIONS §73 D20.
 
 > Tenant 서버용 SDK 레포는 만들지 않는다 (DECISIONS §35).
 
@@ -673,7 +725,7 @@ keepalive:
 
 | API | p99 목표 | 목표 TPS |
 |-----|----------|----------|
-| Enqueue | < 50ms (202 즉시 응답) | 200 rps (10,000 rps 급증 → Kafka) |
+| Enqueue | < 50ms (200 즉시 응답) | 200 rps (10,000 rps 급증 → Kafka) |
 | Polling | < 50ms | 2,000 rps |
 | admit | < 100ms | 10 rps |
 

@@ -19,7 +19,7 @@
 - **Backpressure Pull** — Tenant가 소화 가능한 인원만 admit 요청
 - **admitToken TTL 60초** → verify(유효성 확인) → complete(COMPLETED+ZREM)
 - **admitToken 만료 시 WAITING 복귀** — seq 유지로 우선순위 보존
-- **Kafka 버퍼** — Enqueue 202 즉시 응답 + DB INSERT 비동기
+- **Kafka 버퍼** — Enqueue는 순번 확정 → Kafka 발행(동기) → 200 응답. **DB INSERT만 비동기**
 - **Virtual Thread** — Spring MVC + JPA blocking I/O를 OS Thread 고갈 없이 처리
 - **SDK 제공** — JS SDK(폴링·대기 UI 전용)만. Tenant 서버는 REST 직접 호출 (DECISIONS §35 · §78)
 
@@ -86,8 +86,8 @@ JPA blocking → OS Thread 점유 없이 대기
 
 ### 6. Kafka Enqueue 버퍼
 ```
-Redis Lua 처리 → 202 즉시 응답
-Kafka enqueue-events → DB INSERT (At-Least-Once)
+Redis Lua 처리 → Kafka 발행(동기) → 200 응답 (seq·rank 확정)
+Kafka token-lifecycle (key=tokenId) → DB INSERT (At-Least-Once)
 → Enqueue p99 50ms 이하 달성
 → redis_sync_needed: Redis 다운 중 INSERT 토큰 추적
 ```
@@ -101,23 +101,25 @@ flowchart TD
     User["👤 유저\n브라우저/앱"]
     Tenant["🖥 Tenant 서버"]
     API["⚡ Queue Platform API\nSpring MVC · Tomcat · Virtual Thread"]
-    Batch["⏱ Batch Server\nSpring MVC + Spring Kafka Consumer"]
-    Kafka["📨 Kafka\nenqueue-events\nenqueue-admit\ntoken-status-changed"]
+    Batch["⏱ Batch Server\n@Scheduled Jobs"]
+    Consumer["📥 queue-consumer\nKafka 소비 전담"]
+    Kafka["📨 Kafka\ntoken-lifecycle (key=tokenId)"]
     Redis["🔴 Redis Sentinel\nMaster + Slave 2 + Sentinel 3"]
     DB_M["🗄 MySQL Master"]
     DB_R["🗄 MySQL Read Replica"]
 
     User -->|"④ Polling (적응형 간격)"| API
     User -->|"⑥ admitToken"| Tenant
-    Tenant -->|"③ Enqueue → 202"| API
+    Tenant -->|"③ Enqueue → 200"| API
     Tenant -->|"⑤ admit"| API
     Tenant -->|"⑦ verify"| API
     Tenant -->|"⑨ complete"| API
     API -->|"Lua Script\n(ZADD, ZREM 등)"| Redis
     API -->|"이벤트 발행\n(produce)"| Kafka
-    Kafka -->|"지속 구독\n(consume)"| Batch
-    Batch -->|"@Scheduled\n(ZRANGEBYSCORE, ZREM\nbatch-lock, EXISTS)"| Redis
-    Batch -->|"DB INSERT (tokens)\nDB UPDATE (expire)\n@Transactional"| DB_M
+    Kafka -->|"지속 구독\n(consume)"| Consumer
+    Consumer -->|"DB INSERT (tokens)\n배치 · 멱등"| DB_M
+    Batch -->|"@Scheduled\n(ZRANGEBYSCORE, ZREM\nbatch-lock)"| Redis
+    Batch -->|"DB UPDATE (expire)\n@Transactional"| DB_M
     API -->|"SELECT\n@Transactional(readOnly)"| DB_R
     API -->|"UPDATE\n(complete, cancel)\n@Transactional"| DB_M
     DB_M -->|"복제"| DB_R
@@ -131,7 +133,8 @@ flowchart TD
 flowchart LR
     subgraph IN["Adapter In"]
         api["queue-api\nMVC Controller"]
-        batch["queue-batch\nSpring Kafka Consumer\n@Scheduled Jobs"]
+        batch["queue-batch\n@Scheduled Jobs"]
+        consumer["queue-consumer\nKafka 소비 전담 (독립 앱)\ntoken-lifecycle → DB 적재"]
     end
 
     subgraph DOMAIN["Domain"]
@@ -139,13 +142,14 @@ flowchart LR
     end
 
     subgraph OUT["Adapter Out"]
-        infra["queue-infrastructure\nRedisKeyFactory\nJPA Repository\nKafka Producer"]
+        infra["queue-infrastructure\nQueueKeys · RedisKeyFactory\nJPA Repository\nKafka Producer"]
     end
 
     common["queue-common\nErrorCode · BusinessException\nIdGenerator · RawKeyGenerator"]
 
     api --> domain & infra & common
     batch --> domain & infra & common
+    consumer --> domain & infra & common
     infra --> domain & common
     domain --> common
 ```
@@ -153,10 +157,16 @@ flowchart LR
 ```
 의존성 원칙:
   queue-common  ← 모든 모듈이 직접 의존 (명시적 선언)
-  queue-domain  ← queue-api, queue-batch, queue-infrastructure
+  queue-domain  ← queue-api, queue-batch, queue-consumer, queue-infrastructure
   queue-domain은 Spring 의존 없음 (순수 Java)
-  queue-infrastructure는 queue-api/batch를 절대 모름
+  queue-infrastructure는 queue-api/batch/consumer를 절대 모름
+  queue-consumer는 아무도 참조하지 않는다 (최말단)
 ```
+
+> **`queue-consumer`를 `queue-batch`와 합치지 않는 이유**: 확장 방향이 반대다. 소비는 파티션 수만큼
+> 늘려야 하고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요해진다 ([DECISIONS §73](doc/DECISIONS.md) D20).
+> actuator + micrometer-prometheus를 갖는다 — 없으면 `/actuator/prometheus`가 아예 생기지 않아
+> **컨슈머 lag을 PromQL로 볼 수단이 사라진다**.
 
 ---
 
@@ -183,7 +193,7 @@ stateDiagram-v2
 flowchart TD
     A["① Queue 생성"]
     --> B["② 유저 접속\nTenant 슬롯 확인"]
-    --> C["③ Enqueue\n202 즉시 응답\nKafka → DB INSERT"]
+    --> C["③ Enqueue\n순번 확정 → Kafka 발행(동기)\n→ 200 응답. DB INSERT만 비동기"]
     --> D["④ Polling\n유저 → Platform 직접\n/status 전광판 + pacing 구간표"]
 
     D --> E{"status?"}
@@ -202,23 +212,22 @@ flowchart TD
 
 ---
 
-## 🗂 Redis Key 구조 (RedisKeyFactory)
+## 🗂 Redis Key 구조
 
 ```
-static 메서드 방식 (Enum X): 동적 인수 타입 안전성
-Cluster 전환 시 이 파일만 수정 (Hash Tag 추가)
-위치: queue-infrastructure/redis/RedisKeyFactory.java
+큐 상태 키: queue-infrastructure/.../queue/QueueKeys.java   ← 해시태그 {queueId} 필수
+캐시성 키: queue-infrastructure/.../cache/RedisKeyFactory.java (static 메서드, Enum X)
 ```
 
-| Key | TTL | 역할 |
-|-----|-----|------|
-| `queue:{t}:{q}:{slice}` | 없음 | 대기열 Sorted Set |
-| `global-seq:{t}:{q}` | 없음 | 순번 채번 |
-| `queue-meta:{t}:{q}` | 없음 | 큐 설정 |
-| `queue-stats:{t}:{q}` | 없음 | avgWaitingTime |
-| `queue-user:{t}:{q}:{userId}` | waitingTtl | 중복 Enqueue 방지 |
-| `token-last-active:{tokenId}` | 300s | 비활동 감지 |
-| `token-info:{tokenId}` | 폴링 간격+2s | Polling 캐시 (§79 이후 존치 여부 후속 검토) |
+| Key | 자료구조 | TTL | 역할 |
+|-----|-----|-----|------|
+| `queue:{queueId}:waiting` | ZSet | 없음 | 대기열. member=`identifier`, score=`seq` |
+| `queue:{queueId}:seq` | String | 없음 | `INCR`로 score 발급 |
+| `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `tokenId\|issuedAt` (중복 방지 + 소유권 대조) |
+| `queue:{queueId}:last-active` | ZSet | 없음 | keepalive. member=`seq`, score=ms |
+| `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 |
+| `queue-stats:{t}:{q}` | Hash | 없음 | avgWaitingTime |
+| `token-info:{tokenId}` | String | 폴링 간격+2s | Polling 캐시 (§79 이후 존치 여부 후속 검토) |
 | `queue:{queueId}:admit-by-token:{tokenId}` | 60s | Polling 응답용 |
 | `queue:{queueId}:admit-by-admit:{admitToken}` | 60s | verify/complete용 |
 | `queue:{queueId}:admit-watermark` | 없음 | 마지막 admit seq (`/status` 전광판) |
@@ -226,7 +235,7 @@ Cluster 전환 시 이 파일만 수정 (Hash Tag 추가)
 | `queue:{queueId}:admit-idem:{requestId}` | 300s | admit 멱등성 (requestId는 Tenant 지정값 → 큐 스코프) |
 | `verified-token:{tokenId}` | 60s | 중복 입장 방지 |
 | `batch-lock:{t}:{q}` | 15s | Batch 서버 분산 |
-| `apikey-cache:{sha256}` | 60s | API Key 캐시 |
+| `apikey:{keyHash}` | 60s | API Key 캐시 |
 
 ---
 
@@ -266,11 +275,13 @@ Failover: 5~10초 | Circuit Breaker → 503
 
 ## 📨 Kafka
 
-| 토픽 | 생산 | 소비 |
-|------|------|------|
-| `enqueue-events` | Enqueue API | TokenEnqueueConsumer (DB INSERT) |
-| `enqueue-admit` | admit API | AdmitConsumer (Dequeue + admitToken) |
-| `token-status-changed` | complete/expire/cancel | BillingConsumer, StatsConsumer |
+| 토픽 | 파티션 키 | 생산 | 소비 |
+|------|------|------|------|
+| `token-lifecycle` (18 파티션) | **`tokenId`** | Enqueue API (+ Sprint 7 상태 전이) | `queue-consumer`의 `TokenLifecycleConsumer` → tokens INSERT |
+
+> **단일 토픽 + `tokenId` 키**인 이유: 순서 보장은 같은 토픽의 같은 파티션 안에서만 성립하고,
+> `queueId`로 잡으면 한 큐 30만 명이 통째로 한 파티션에 몰린다 ([DECISIONS §73](doc/DECISIONS.md) D16·D18).
+> admit 요청 전달 수단은 **미판정**(Sprint 7).
 
 ---
 
@@ -296,7 +307,7 @@ Failover: 5~10초 | Circuit Breaker → 503
   DELETE /api/v1/queues/:queueId         → 대기열 삭제
 
 Queue Engine API (API Key 인증, Sprint 6~7):
-  POST   /api/v1/queues/:queueId/tokens  → Enqueue (202)
+  POST   /api/v1/queues/:queueId/tokens  → Enqueue (200, 순번 확정 후 응답)
   GET    /api/v1/queues/:queueId/status  → Polling ① 전광판 (인증 없음, 전원 동일)
   GET    /api/v1/queues/:queueId/tokens/:tokenId?seq=&ka=  → Polling ② 개인 (tokenId 소유)
   POST   /api/v1/queues/:queueId/admit   → Admit
@@ -359,14 +370,14 @@ Tenant (REST API)       : POST /verify → POST /complete
 | Spring MVC + Virtual Thread | 친숙한 생태계, 코드 단순 | blocking → VT 필요 | spring.threads.virtual.enabled=true 한 줄 적용 |
 | JPA + Virtual Thread | @Transactional 자연스러움 | blocking I/O | VT가 OS Thread 고갈 없이 처리 |
 | admitToken 만료 → WAITING 복귀 | 우선순위 보존. 유저 불이익 없음 | 슬롯 일시 점유 | seq DB 저장으로 score 복원 |
-| Kafka Enqueue 버퍼 | 202 즉시 응답. 급증 흡수 | Eventually Consistent | At-Least-Once 보장 |
+| Kafka Enqueue 버퍼 | DB 적재를 비동기로 흡수 | Eventually Consistent | At-Least-Once 보장 |
 | Kafka admit 처리 | admit 요청 영속성 | Consumer 처리 지연 | DB PENDING → 멱등성 보장 |
 | status TINYINT | 저장공간·비교 성능 | 가독성 (상수로 보완) | 대량 tokens 테이블 최적화 |
 | redis_sync_needed | Redis 다운 중 INSERT 복구 | 컬럼 추가 | 데이터 정합성 보장 |
 | admit_token 컬럼 | Redis 미스 시 DB Fallback | 컬럼 추가 | verify 안정성 향상 |
 | queue_daily_stats | 파티션 DROP 후 과금 근거 보존 | 배치 필요 | 감사/청구 불변 기록 |
 | billing_snapshots 직접 집계 | tokens 원본 → 중복 방지 불필요 | 집계 쿼리 필요 | billing_events 테이블 제거 |
-| avgWaitingTime 직접 갱신 | StatsConsumer 불필요 → 단순화 | Kafka 재처리 중복 허용 | ETA는 보조 정보 → 허용 범위 |
+| avgWaitingTime 직접 갱신 | 별도 통계 Consumer 불필요 → 단순화 | Kafka 재처리 중복 허용 | ETA는 보조 정보 → 허용 범위 |
 | 파티션 1달 유예 DROP | 월말 걸친 토큰 과금 누락 방지 | 스토리지 2배 | B2B 과금 정확도 우선 |
 | ZCARD Pipeline | queue-count 관리 불필요 | N번 ZCARD | 카운터 불일치 위험 제거 |
 | `pacing` 구간표 | 서버 부하 절약 + 장애 시 서버가 전원 간격 조정 | SDK 구현 필요 | 순위 높을수록 Polling 드물게 (§79) |
@@ -390,7 +401,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | Cache | Redis Sentinel (현재) → 독립 2 Cluster (확정, 시점 미정) | FIFO Sorted Set + Lua 원자 · 큐 단위 이중 라우팅 ([DECISIONS §75](doc/DECISIONS.md)) |
 | DB | MySQL 8.0 | Range 파티셔닝 + Replica |
 | Architecture | Hexagonal + DDD | 도메인 단위 테스트 |
-| Build | Gradle 멀티모듈 5개 | 의존성 명확 분리 |
+| Build | Gradle 멀티모듈 6개 | 의존성 명확 분리 |
 
 ---
 
@@ -398,11 +409,12 @@ Tenant (REST API)       : POST /verify → POST /complete
 
 | 문서 | 설명 |
 |------|------|
-| [FRS v1.10](docs/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
-| [STATE](docs/STATE.md) | Token · Queue · ApiKey 상태 머신 |
-| [FLOW](docs/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
-| [DECISIONS](docs/DECISIONS.md) | 56개 설계 결정 + 근거 + 면접 포인트 |
-| [ROADMAP](docs/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
+| [FRS v1.12](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
+| [STATE](doc/STATE.md) | Token · Queue · ApiKey 상태 머신 |
+| [FLOW](doc/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
+| [DECISIONS](doc/DECISIONS.md) | 79개 설계 결정 + 근거 + 면접 포인트 |
+| [ROADMAP](doc/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
+| [CONCURRENCY](doc/CONCURRENCY.md) | 동시성 제어 우선순위 · `@DistributedLock` |
 
 ---
 
@@ -413,17 +425,21 @@ Tenant (REST API)       : POST /verify → POST /complete
 ✅ Sprint 2:  JPA + MySQL Master/Replica R/W 분리
 ✅ Sprint 3:  관리 도메인 (Tenant + ApiKey + Queue) 헥사고날 구현
 ✅ Sprint 4:  JWT 인증 + 관리 API 12개 + Service/Controller 테스트
-⬜ Sprint 5:  Redis + Lua Script + Sentinel + Rate Limit
-⬜ Sprint 6:  Token 도메인 + Queue Engine API
+🔄 Sprint 5:  Redis + Lua Script + Sentinel + Rate Limit
+🔄 Sprint 6:  Token 도메인 + Queue Engine API  (Enqueue·Polling 구현, Cancel 미구현)
 ⬜ Sprint 7:  Admit → Verify → Complete
-⬜ Sprint 8:  Kafka KRaft 연동
+🔄 Sprint 8:  Kafka KRaft 연동  (token-lifecycle 적재 경로 구현)
 ⬜ Sprint 9:  Batch 모듈
 ⬜ Sprint 10: 통합 테스트 + k6 + Grafana + JS SDK + OpenAPI
 ⬜ Sprint 11: Docker + AWS 배포 + 대용량 실측
 ```
 
+> 일정·DoD의 정본은 [ROADMAP](doc/ROADMAP.md)이다.
+> ⚠️ 다만 ROADMAP은 2026-06-10 최신화라 **위 블록보다 낡았다**(Sprint 6·8을 ⬜로 두고 폐기된
+> 3토픽 체계를 현재형으로 서술 중). 갱신 전까지는 위 "코드로 확인되는 상태"가 더 정확하다.
+
 ---
 
 <p align="center">
-  <sub>Queue Platform · Java 21 · Spring Boot 3.3.4 · Redis Sentinel · Kafka · MySQL 8.0</sub>
+  <sub>Queue Platform · Java 21 · Spring Boot 3.3.4 · Redis · Kafka · MySQL 8.0</sub>
 </p>
