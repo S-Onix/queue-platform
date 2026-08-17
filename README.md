@@ -233,7 +233,7 @@ flowchart TD
 | `queue:{queueId}:admit-watermark` | 없음 | 마지막 admit seq (`/status` 전광판) |
 | `queue:{queueId}:pacing` | 없음 | 폴링 간격 구간표 오버라이드 (없으면 코드 상수) |
 | `queue:{queueId}:admit-idem:{requestId}` | 300s | admit 멱등성 (requestId는 Tenant 지정값 → 큐 스코프) |
-| `verified-token:{tokenId}` | 60s | 중복 입장 방지 |
+| `queue:{queueId}:admitted` | 없음 | admit된 토큰의 만료 시각 ZSet. TTL 복귀 claim 대상 ([§80](doc/DECISIONS.md)) |
 | `batch-lock:{t}:{q}` | 15s | Batch 서버 분산 |
 | `apikey:{keyHash}` | 60s | API Key 캐시 |
 

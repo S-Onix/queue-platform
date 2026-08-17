@@ -149,53 +149,57 @@ flowchart LR
 
 ## Admit → Verify → Complete
 
+> **2026-08-17 개정 (§80).** 개정 전 이 절은 `admit_requests` INSERT → 워커 전달 → 3단계 처리
+> (Lua pop → DB WAITING 확인 → 토큰 SET) 흐름이었다. **동기 + Lua 하나**로 바뀌었고
+> `admit_requests` 테이블·Admit Worker·`verified-token`은 **전부 폐기**됐다.
+
 ```mermaid
 flowchart TD
     SLOT(["Tenant\n슬롯 여유 생김"])
     --> ADMIT["POST /queues/:queueId/admit\n{ count: N, requestId }\nTenant → Platform"]
 
-    ADMIT --> IDEM{"queue:{queueId}:admit-idem:{requestId}\n존재?"}
-    IDEM -->|"있음 (중복)"| CACHED(["200 OK\n기존 결과 반환"])
-    IDEM -->|"없음"| DBINS["DB admit_requests INSERT\nstatus=PENDING\n← 영속성 기준점"]
+    ADMIT --> OWN["① queues 행 읽기\nTenant 소유권 검증\n※ tokens 행은 읽지 않는다"]
 
-    DBINS --> KAFKA["admit 요청 전달\n{ requestId, tenantId, queueId, count }\n⚠️ 전달 수단 미판정 (FRS §7 — Sprint 7에서 결정)"]
+    OWN --> LUA["② EVAL admit.lua — 전 구간 원자 (Redis 밖 호출 0회)\n\nadmit-idem:{requestId} 있으면 → REPLAY 반환\n\nZPOPMIN queue:{queueId}:waiting N → (identifier, seq) N쌍\n  ※ ZSet 하나(§66 D2) + score가 INCR 단조증가(§70 D9) → 이미 FIFO\n  ※ 거를 대상이 없어 ZRANGE+ZREM이 ZPOPMIN 한 명령이 됐다\nHGET queue:{queueId}:tokens {identifier} → 'tokenId|issuedAt'\nSET queue:{queueId}:admit-by-token:{tokenId} PX 60000\nSET queue:{queueId}:admit-by-admit:{admitToken} PX 60000\nZADD queue:{queueId}:admitted {만료 epoch ms} '{seq}|{identifier}'\nwatermark 조건부 갱신 (현재값보다 클 때만, §79)\nadmit-idem:{requestId} = 결과 payload"]
 
-    KAFKA --> CONSUMER["Admit Worker\nDB PENDING 확인 → 멱등 체크\nstatus=PROCESSING 업데이트"]
-
-    CONSUMER --> LUA["① Lua Script (Redis 전용)\nZRANGE queue:{queueId}:waiting 0 N-1 WITHSCORES\nZREM multi-member\n※ ZSet 하나(§66 D2) + score가 INCR 단조증가(§70 D9)\n   → 이미 FIFO 순. 병합·재정렬 불필요"]
-    --> FILTER["② DB WAITING 상태 확인 ← Lua 밖 (Lua는 MySQL을 못 만진다)\n불일치 즉시 ZREM\n부족하면 다음 구간 추가 추출 (여전히 정렬 불필요)"]
-    --> TOKEN["③ admitToken 발급 ← ①과 별개 호출\nSET queue:{queueId}:admit-by-token:{tokenId} EX 60\nSET queue:{queueId}:admit-by-admit:{admitToken} EX 60\nSET queue:{queueId}:admit-watermark = max(현재값, 뽑은 최대 seq)\nDB UPDATE ADMIT_ISSUED (100건씩)\nSET token-info 캐시 갱신\nDB admit_requests status=COMPLETED\n⚠️ ①과 ③ 사이에 'pop 성공 + SET 실패' 창이 있다 (DECISIONS §79 — 미해결)"]
-    --> ARESP(["200 OK\n{ admitTokens: [{userId, admitToken}...] }"])
+    LUA --> KAFKA["③ Kafka token-lifecycle 발행\nADMITTED × N (key=tokenId)\n→ Consumer: status 0→1, admit_token, admitted_at"]
+    --> ARESP(["④ 200 OK\n{ admitted: [{tokenId, identifier, seq, admitToken}...] }\n\n보장: 대기열에서 빠졌고 admitToken을 쥐었다 (Redis 사실)\n미보장: tokens.status가 이미 1이다"])
 
     ARESP --> POLL["유저 다음 Polling 시\nadmitToken 수신"]
     --> USER["유저 → Tenant\nadmitToken 전달"]
-    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 (상태 변경 없음)"]
+    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 — Redis·DB 쓰기 0회"]
 
     VERIFY --> VK{"queue:{queueId}:admit-by-admit:{admitToken}\n유효?"}
-    VK -->|"만료 or 무효"| VDB["DB Fallback 시도\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(NOW() 금지 — 시각은 전부 UTC. DECISIONS §77)"]
-    VDB -->|"없음"| E404(["404 TK_002_INVALID_ADMIT_TOKEN"])
-    VDB -->|"있음"| VFLAG["SET verified-token:{tokenId} EX 60\n중복 입장 방지 플래그"]
-    VK -->|"유효"| VFLAG
-    --> VRESP(["200 OK\n{ valid: true, identifier }"])
+    VK -->|"만료 or 무효"| VDB["DB Fallback\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND admitted_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(issued_at 아님 — 줄 선 시각은 2시간 전일 수 있다. §80)"]
+    VDB -->|"없음"| E404(["404 TK_002_INVALID_ADMIT_TOKEN\n※ TTL 만료 후 verify는 404"])
+    VDB -->|"있음"| VRESP
+    VK -->|"유효"| VRESP(["200 OK\n{ valid: true, identifier }"])
 
     VRESP --> ALLOW["Tenant → 유저 입장 허용"]
-    --> COMPLETE["POST /queues/:queueId/tokens/:tokenId/complete\n{ admitToken }\nTenant → Platform\n입장 완료 통보"]
+    --> COMPLETE["POST /queues/:queueId/tokens/:tokenId/complete\n{ admitToken }\nTenant → Platform"]
 
-    COMPLETE --> CK{"ADMIT_ISSUED(1)\n상태?"}
-    CK -->|"아님"| E409(["409 QE_006_INVALID_STATUS"])
-    CK -->|"확인"| DB["DB status = COMPLETED(2)\n← 먼저 (원자성 전략)\nDB UPDATE WHERE status=1 → 1번만 성공"]
-    --> ZREM["Redis ZREM\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit\nDEL token-info 캐시\nDEL verified-token\n← 나중"]
+    COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - {유효 창}\n\n0을 허용하는 이유: TTL 만료로 복귀했지만\nTenant는 이미 입장시킨 경우가 실재한다"]
+    DB -->|"0행"| E404C(["404 / 409"])
+    DB -->|"1행"| ZREM["Redis 정리 (나중)\nZREM queue:{queueId}:waiting\nZREM queue:{queueId}:admitted\nDEL admit-by-token + admit-by-admit\nDEL token-info"]
+    --> KAFKA2["Kafka COMPLETED 발행 (key=tokenId)"]
     --> AVG["avgWaitingTime 직접 갱신\nwaitingSeconds = completedAt - issuedAt\n이상치 필터: > waitingTtl × 0.8 제외\nHINCRBYFLOAT queue-stats waitingTimeSum\nHINCRBY queue-stats waitingTimeCount"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
 
-    TOKEN -->|"admitToken TTL 60초 초과\nBatch 10초 주기 감지"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD queue:{queueId}:waiting {seq} {identifier}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit"]
+    LUA -->|"admitToken TTL 60초 초과"| BACK["WAITING 복귀 — queue-batch (§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다"]
 ```
 
-> **Kafka Consumer 장애 시**
-> Consumer Offset 미커밋 → 재시작 시 미처리 메시지부터 재처리
-> DB admit_requests PENDING 확인으로 멱등성 보장
+> **왜 DB WAITING 확인이 없나 (§80)**
+> 순번은 Redis에 먼저 쓰고 DB에는 Kafka를 거쳐 나중에 들어간다(§71 D11). 그 창에 들어온 정상
+> 대기자를 "DB에 없으니 유령"으로 판정해 `ZREM`하면 **대기열에서도 빠지고 DB에도 없어 복구 근거가
+> 사라진다.** 대기 중인지에 대한 **권위는 Redis**다.
+> 대가는 좀비도 뽑힌다는 것(10자리 → 실입장 9명)이고, 이는 DB를 봐도 해결되지 않아 **관측**으로 다룬다.
+
+> **멱등**
+> `admit-idem:{requestId}`가 결과 payload를 들고 있어 재시도는 **REPLAY**로 답한다.
+> ⚠️ 이 키가 유실되면 **중복 admit을 감지할 수단이 없다** — `admit_requests`의 UNIQUE가
+> 마지막 방어선이었는데 폐기했다(§80이 명시적으로 수용한 대가).
 
 ---
 
@@ -227,12 +231,12 @@ flowchart TD
 
     W1["waitingTtl 체크 (WAITING)\nZRANGEBYSCORE\n0 ~ now_ms - waitingTtl_ms"]
     W2["inactiveTtl 체크 (WAITING)\nZRANGEBYSCORE queue:{queueId}:last-active\n0 ~ now_ms - inactiveTtl_ms\n(member=seq, score=마지막 ka 시각)"]
-    W3["admitToken TTL 체크 (ADMIT_ISSUED)\nEXISTS queue:{queueId}:admit-by-token:{tokenId}\n= 0 이면 만료"]
+    W3["admitToken TTL 체크 (ADMIT_ISSUED) — claim-Lua (§80)\nZRANGEBYSCORE queue:{queueId}:admitted 0 now\n(score=만료 epoch ms, member='seq|identifier')\n※ EXISTS 스캔 폐기 — 만료된 키는 이미 사라져\n   무엇이 만료됐는지 알 수단이 없었다"]
 
     W1 -->|"WAITING_TTL(0)"| EXP["DB UPDATE EXPIRED(4)\nexpiredReason 기록\nRedis ZREM\nDEL token-info 캐시\n100건씩 순차 처리\nLIMIT 100 → Gap Lock 방지"]
     W2 -->|"INACTIVE_TTL(1)"| EXP
 
-    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD queue:{queueId}:waiting {seq} {identifier}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit"]
+    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀 (queue-batch)\nmember에서 seq·identifier 파싱 (DB 조회 불필요)\nZADD queue:{queueId}:waiting {seq} {identifier}\nZREM queue:{queueId}:admitted\nKafka RETURNED 발행 → status 1→0\nDEL token-info 캐시\n※ last-active는 리셋하지 않는다 (§80)"]
 
     EXP --> DONE(["완료\n멱등: 상태 필터로 중복 처리 없음"])
     BACK --> DONE

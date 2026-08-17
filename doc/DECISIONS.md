@@ -48,13 +48,14 @@
 | §10 | rank=1 중복 불가 보장 | ✅ |
 | §11 | 재입장 재시도 로직 (Platform 관여 없음) | ✅ |
 | §12 | Admit 방식 전면 변경 (admitToken 도입) | ✅ |
-| §13 | 입장 토큰(admitToken) 설계 — TTL 60초 | ✅ |
+| §13 | 입장 토큰(admitToken) 설계 — TTL 60초 | ✏️ |
 | §14 | admit 요청 순서 보장 — Kafka (→10) | ✏️ |
 | §15 | Token 상태 추가 — ADMIT_ISSUED | ✅ |
-| §22 | verify / complete 분리 | ✅ |
-| §33 | verify API 제거 검토 → 유지로 번복 | ✅ |
+| §22 | verify / complete 분리 | ✏️ |
+| §33 | verify API 제거 검토 → 유지로 번복 | ✏️ |
 | §34 | admitToken TTL 만료: EXPIRED → WAITING 복귀 | ✅ |
-| §36 | admitToken TTL 만료 → WAITING 복귀 (상세) | ✅ |
+| §36 | admitToken TTL 만료 → WAITING 복귀 (상세) | ✏️ |
+| §80 | **Sprint 7 Admit — 전 구간 원자 Lua + 동기 응답** (`verified-token`·`admit_requests` 폐기) | 🚧 |
 
 **4. 이탈 · 만료 (TTL / CANCELLED / EXPIRED)**
 
@@ -96,7 +97,7 @@
 | § | 제목 | 상태 |
 |---|---|---|
 | §28 | SDK 제공 계획 (초기 검토) | 📉 |
-| §35 | SDK 설계 — **JS SDK만**, Tenant 서버용은 안 만든다 | ✅ |
+| §35 | SDK 설계 — **JS SDK만**, Tenant 서버용은 안 만든다 | ✏️ |
 | §78 | 클라이언트 경계 — enqueue는 Tenant, polling은 Platform 직접 | ✅ |
 
 ### Ⅲ. 기반 기술 (횡단)
@@ -705,6 +706,9 @@ Backpressure 패턴 적용:
 
 ## §13 입장 토큰(admitToken) 설계
 
+> ✏️ **P1-③의 `verified-token` 플래그는 §80이 폐기했다**(아래 해당 절 배너 참조).
+> TTL 60초·발급 구조·admitToken이 곧 입장 자격이라는 성격은 그대로 유효하다.
+
 ### TTL = 60초
 
 ```
@@ -734,10 +738,12 @@ admitToken TTL 60초 초과
 
 ## §14 admit 요청 순서 보장 — Kafka
 
-> ✏️ **`enqueue-admit` 토픽은 현재 미판정이다.** §73 D18이 *생명주기 이벤트*를 단일 토픽
-> `token-lifecycle`로 통합했지만 **admit 요청(명령) 전달 수단은 다루지 않았다.** 별도 명령 토픽을 둘지,
-> `admit_requests` 테이블 + 폴링으로 갈지는 **Sprint 7 착수 시 결정**한다(`FRS_final.md` §7에 미판정으로 표기).
-> **"DB PENDING을 영속성 기준점으로 삼고 멱등 처리"라는 뼈대는 전달 수단과 무관하게 유효하다.**
+> ⛔ **§80(2026-08-17)이 닫았다 — 명령 토픽을 만들지 않는다.** admit은 **동기 처리**이므로
+> 전달할 명령 자체가 없다. `enqueue-admit` 토픽도, `AdmitConsumer`도, `admit_requests` 테이블도
+> 만들지 않는다(§80이 테이블까지 폐기했다).
+> **순서 문제는 여전히 실재하지만 해법이 다르다** — Kafka 파티션이 아니라 **DB의 조건부 UPSERT**
+> (`IF(status = 0, 1, status)` 계열)로 막는다. 프로듀서가 여러 WAS라 브로커 도착 순서 자체를
+> 신뢰할 수 없기 때문이다(§80 Rationale ③). 아래 본문은 그 이전의 설계 기록이다.
 
 ### 해결: Kafka enqueue-admit + AdmitConsumer
 
@@ -1082,6 +1088,11 @@ ADMIT_ISSUED에서 이탈하려면:
 
 ## §22 verify / complete 분리
 
+> ✏️ **분리는 유지된다(§80 확정).** 다만 아래 서술 중 `verified-token` 관련은 폐기됐다.
+> §80이 verify의 Redis 쓰기를 **0으로** 만들었으므로 "verify는 상태 변경 없음"이 이제
+> **문자 그대로 참**이다(이전에는 `SET verified-token`이라는 쓰기가 있었다).
+> complete의 가드도 바뀐다 — `admit_token` + `status IN (0, 1)` + `admitted_at` 유효 창.
+
 ### 결정
 ```
 verify  → 유효성 확인만 (상태 변경 없음, ADMIT_ISSUED 유지)
@@ -1182,11 +1193,17 @@ DB 먼저 이유:
 #### ③ complete 누락 시 중복 입장
 
 ```
-해결: verified-token 플래그
+해결: verified-token 플래그          ← ⛔ 폐기 (§80, 2026-08-17)
   verify 시: SET verified-token:{tokenId} EX 60
-  admit 시: verified 토큰 제외 + ZREM 정리
+  admit 시: verified 토큰 제외 + ZREM 정리     ← 이 줄이 존재 이유였다
   complete 시: DEL verified-token
 ```
+
+> ⛔ **`verified-token`은 §80이 폐기했다.** 위 해결책의 심장은 **"admit이 verified 토큰을
+> 제외한다"**인데, §80이 **admit에서 Redis 밖 조회를 전부 걷어냈다**(중간 DB 확인이 정상 대기자를
+> 지우기 때문 — §71 D11). 읽는 곳이 사라진 플래그는 플래그가 아니다.
+> **대체**: complete를 관대하게 만든다 — `WHERE admit_token = ? AND status IN (0, 1)` +
+> `admitted_at` 유효 창. 중복 입장은 **`admit_token` 자체의 유일성**이 막는다.
 
 #### ④ 용량 초과 (maxCapacity 위반)
 
@@ -1800,6 +1817,10 @@ public class BillingConsumer {
 
 ## §33 verify API 제거 검토 (v1.8) → v1.9에서 유지로 번복
 
+> ✏️ **verify 유지 결론은 §80에서도 그대로다.** 단 아래 근거 중 `verified-token`에 기대는
+> 부분은 폐기됐다(§80). verify가 남는 이유는 **"Tenant가 입장시키기 전에 토큰이 유효한지
+> 물어볼 곳이 필요하다"** 하나로 좁혀졌다.
+
 ### v1.9 결정: verify 유지
 
 ```
@@ -1842,6 +1863,12 @@ TTL 30초 → 60초:
 > 여기는 **"무엇을 만드나"**다. **"누가 어디로 요청하나"(enqueue 호출 주체, 브라우저 직접 enqueue
 > 기각, 게임·네이티브 클라이언트)는 §78**을 보라. JS SDK의 범위가 §78에서 **폴링 + 대기 UI 전용**으로
 > 확정됐다 — enqueue는 SDK에 넣지 않는다.
+
+> ✏️ **§80이 이 절의 예시 하나를 철회했다.** 아래 Consequences의 *"verify 없이 온 complete는
+> 서버가 거절한다"*(괄호 안 예시)는 **더 이상 참이 아니다.** 그 거절은 `verified-token` 플래그에
+> 기대고 있었는데 §80이 그 키를 폐기했고, 애초에 **독립적인 실효가 없었다** — complete 자체가
+> `admit_token`을 검증하므로 verify를 건너뛴 호출도 정당한 토큰을 가진 정당한 호출이다.
+> **"Tenant 책임을 서버가 방어한다"는 이 절의 큰 원칙은 유지된다** — 방어 수단이 하나 줄었을 뿐이다.
 
 ### Decision
 
@@ -1930,6 +1957,13 @@ N개를 동시에 고쳐야 해서 버전이 어긋납니다. REST API는 언어
 ---
 
 ## §36 admitToken TTL 만료 → WAITING 복귀 (상세)
+
+> ✏️ **트리거가 §80에서 확정됐다.** 아래 Redis Key 구성 중 `verified-token:{tokenId}`는 **폐기**다.
+> 그리고 만료 감지를 `EXISTS queue:{q}:admit-by-token:{tokenId}` 스캔으로 하던 것을
+> **`queue:{q}:admitted` ZSet + claim-Lua**로 바꾼다(score = 만료 epoch ms).
+> 스캔은 대상을 **알아야** 도는데, 만료된 키는 이미 사라져서 무엇이 만료됐는지 알 수단이 없었다 —
+> ZSet에 만료 시각을 넣어두면 `ZRANGEBYSCORE 0 now`로 **만료된 것만** 집어낼 수 있다.
+> 실행 주체는 **`queue-batch`**(§80). **seq 보존 복귀와 우선순위 유지라는 본 결정은 그대로다.**
 
 ### Redis Key 최종 구성
 
@@ -2415,6 +2449,9 @@ Access Token 즉시 무효화가 필요한 경우:
 
 ## §43 Queue 삭제 흐름 (DRAINING → DELETED)
 
+> ✏️ **아래 "AdmitConsumer Queue 상태 체크"는 §80이 폐기했다** — AdmitConsumer도 `admit_requests`도
+> 없다(동기 처리). 큐 상태 확인은 admit API가 ①단계에서 `queues` 행을 읽을 때 함께 한다.
+>
 > ✏️ **③의 DEL 대상 키 목록이 낡았다.** `queue:{t}:{q}:0 ~ {sliceCount-1}`·`global-seq:{t}:{q}` →
 > 현행은 `queue:{queueId}:waiting|seq|tokens|last-active` 4종이다(`QueueKeys`, §66 D2·§70 D9·§74).
 > **상태 전이(DRAINING → DELETED)와 "DB 먼저 → Redis 나중" 순서는 유효하다.**
@@ -4159,7 +4196,7 @@ Redis 유실 후 복구 전 폴링은 404를 받는데, 이는 §71 복구 과�
 한 큐의 키는 **반드시 같은 클러스터**에 놓인다. 요청 단위·토큰 단위로 클러스터를 고르는 방식은
 **채택하지 않는다.**
 
-**대상 키 (2026-08-17 기준 9종)** — 넷은 원래 있던 것, 다섯은 §79에서 늘었다.
+**대상 키 (2026-08-17 기준 10종)** — 넷은 원래 있던 것, 다섯은 §79, 하나는 §80에서 늘었다.
 
 | # | 키 | 출처 |
 |---|---|---|
@@ -4172,10 +4209,16 @@ Redis 유실 후 복구 전 폴링은 404를 받는데, 이는 §71 복구 과�
 | 7 | `queue:{q}:admit-by-token:{tokenId}` | **§79** — 구 `admit-token-by-token:{tokenId}` |
 | 8 | `queue:{q}:admit-by-admit:{admitToken}` | **§79** — 구 `admit-token-by-admit:{admitToken}` |
 | 9 | `queue:{q}:admit-idem:{requestId}` | **§79** — 구 `admit-idem:{requestId}`. `requestId`가 Tenant 지정값이라 스코프가 필요했다 |
+| 10 | `queue:{q}:admitted` | **§80** — ZSet. score=만료 epoch ms, member=`"seq\|identifier"`. TTL 만료 복귀의 claim 대상 |
 
 7·8은 원래 tokenId/admitToken으로 해시돼 **다른 슬롯**이었다. verify·complete URL에 `queueId`를
-넣어(§79) 큐 소속으로 옮긴 것은 **전 구간 원자성의 필요조건**이다. 다만 중간 DB 확인(Lua 밖)과
-`verified-token`의 클러스터 소속 미정 때문에 **충분조건은 아니다** — §79 참조.
+넣어(§79) 큐 소속으로 옮긴 것은 **전 구간 원자성의 필요조건**이었고, **§80이 충분조건까지 채웠다** —
+중간 DB 확인을 삭제해 admit 전 구간이 Lua 하나에 들어갔고, `verified-token`(소속 미정이던 그 키)은
+**폐기**됐다. 즉 이 목록에 클러스터 소속이 미정인 키는 더 이상 없다.
+
+> ⚠️ **§80의 admit Lua는 키가 런타임에 정해진다**(7·8의 `{tokenId}`·`{admitToken}` 부분).
+> 해시태그가 `{q}`라 같은 슬롯인 것은 수학적으로 보장되지만, **`KEYS[]`로 선언되지 않은 키를
+> 스크립트가 만지는 형태**라 Cluster에서 실제로 도는지 **로컬 Cluster A에서 실증이 필요하다**(§80).
 
 > 이것은 선호가 아니라 **Lua 원자성을 유지하려면 강제되는 제약**이다.
 > 해시태그는 *한 클러스터 안의* 슬롯만 정렬한다. **클러스터 경계는 못 넘는다.**
@@ -4938,6 +4981,12 @@ Platform 직접으로 분리돼 있었습니다. **없는 문제를 풀려던 �
 
 ## §79 — 폴링 응답 계약: `frontSeq` → `admitWatermark` + `pacing` 구간표 (엔드포인트 2분할)
 
+> ✏️ **§80(2026-08-17)이 이 절의 미해결 2건을 닫았다.** 아래 "원자 범위"의 남은 장애물 표
+> (ⓐ 중간 DB 확인 · ⓑ `verified-token` 소속 미정)는 **더 이상 유효하지 않다** —
+> §80이 중간 DB 확인을 **삭제**했고(대상 선택의 권위는 Redis, §71 D11) `verified-token`을
+> **폐기**했다. 그래서 "pop 성공 + 토큰 SET 실패" 창도 사라졌다(Lua 하나).
+> **watermark 조건부 갱신·🔴 표시 전용 가드레일·A/B/C 판정·404 계약은 그대로 유효하다.**
+
 **결정일**: 2026-08-14. **설계 확정, 구현 미착수.** §74(폴링 소유권 검증)가 만든 폴링 경로의
 **응답 계약**을 바꾼다. Admit(Sprint 7) 착수 전에 닫아야 하는 결정이다 — watermark를 갱신하는
 주체가 admit이고, JS SDK가 이 계약 위에 올라가기 때문이다.
@@ -5082,6 +5131,9 @@ MGET queue:{q}:admit-watermark   queue:{q}:pacing   queue:{q}:seq
   (CLAUDE.md 핵심 설계 결정 10)
 - **admit Lua 안에서 갱신한다.** admit은 이미 원자 연산이어야 하고(ZSet에서 N개 pop + 상태 전이),
   그 스크립트가 방금 뽑은 최대 seq를 알고 있다. **왕복 추가 0회**
+- ⛔ **아래 문단은 이력이다 — §80이 닫았다.** admit 전 구간이 단일 Lua로 원자가 됐다.
+  닫은 방법은 스크립트를 정교하게 만든 게 아니라 **원인(중간 DB 확인)을 삭제한 것**이고,
+  `verified-token`도 폐기됐다. 남은 장애물 표 ⓐ·ⓑ는 **둘 다 해소**됐다.
 - **⚠️ 원자 범위는 아직 "pop + watermark"까지다. 전 구간 원자성은 미해결이다 (Sprint 7 과제).**
   verify·complete URL에 `queueId`를 넣어 admitToken 키를
   `queue:{queueId}:admit-by-token:{tokenId}` / `queue:{queueId}:admit-by-admit:{admitToken}` 로
@@ -5330,9 +5382,9 @@ master 한 대에 몰립니다.**
 - **§36** (admitToken TTL 만료 → WAITING 복귀) — 🔴 가드레일과 상태 B가 **전적으로 이 결정에 기댄다.**
   seq 보존 복귀가 없다면 watermark 기준 admit도 안전했을 것이다
 - **§70 D10** (Hash Tag) · **§75 D26** (한 큐의 키는 같은 클러스터) — `admit-watermark`·`pacing`·
-  admitToken 키 2종·`admit-idem`을 `{queueId}` 슬롯으로 모았다. **다만 이것만으로 admit 전 구간이
-  원자가 되지는 않는다** — 중간에 DB 확인이 끼고 `verified-token`의 클러스터 소속이 미정이다
-  (위 "원자 범위" 참조. Sprint 7 과제)
+  admitToken 키 2종·`admit-idem`을 `{queueId}` 슬롯으로 모았다. 이것은 **필요조건**이었고
+  **§80이 충분조건을 채웠다** — 중간 DB 확인 삭제 + `verified-token` 폐기로 admit 전 구간이
+  Lua 하나에 들어간다
 - **§78** (클라이언트 경계) — 이 결정이 §78 표의 "지터를 서버가 응답에 실어 보낸다"를 **뒤집는다**
   (해당 칸에 상호 참조 표시함)
 - **§71** (Redis 유실 복구) — watermark는 캐시가 아니라 원본이므로 복구 대상이다
@@ -5340,8 +5392,8 @@ master 한 대에 몰립니다.**
   폴링 경로(`/status`·개인)가 DB 행을 안 읽는다는 사실은 §75에 남겼다
 - 후속: `QueueSnapshotCache` 제거(도메인 포트 시그니처 변경 + **위 테스트 4건 재작성**),
   `ErrorCode` 신규 추가(404 계약), ETA(`estimatedWaitSeconds`) 거처,
-  pacing `rank<=0` 구간(관측 후), admit 전 구간 원자성(Sprint 7),
-  `verified-token` 클러스터 소속 확정(§75 D27-4 목록에 넣을지),
+  pacing `rank<=0` 구간(관측 후), ~~admit 전 구간 원자성~~ · ~~`verified-token` 클러스터 소속~~
+  (**둘 다 §80이 닫음** — Lua 하나 / 키 폐기),
   **CDN 도입 시 `Cache-Control max-age` 값 결정**(Sprint 11 — D1이 지금은 안 붙이기로 한 것)
 - **소멸한 후속**(2026-08-17): ~~`/status` 캐시 TTL~~(D1 — 캐시를 안 만든다. CDN 시 `max-age`로 부활) ·
   ~~맵 리로드 주기~~(D2·D3) · ~~`pacing` "즉시 변경" ↔ "캐시 미스 때만" 모순~~(캐시가 없으니 **진짜 즉시**다.
@@ -5353,3 +5405,209 @@ master 한 대에 몰립니다.**
   - 역설적으로 **이 누수 덕에 admitToken TTL 만료 후 WAITING 복귀가 `ZADD` 하나로 성립한다**
     (`tokens` Hash의 identifier→tokenId 매핑이 살아 있어야 복귀한 멤버를 다시 검증할 수 있다).
     회수 배치를 설계할 때 **"언제 지워도 되는가"가 이 의존과 얽힌다**
+
+---
+
+## §80 — Sprint 7 Admit: 전 구간 원자 Lua + 동기 응답 (`verified-token`·`admit_requests` 폐기)
+
+**결정일**: 2026-08-17. **설계 확정, 구현 미착수.** §79가 "pop 성공 + 토큰 SET 실패 창은 미해결"로
+남긴 것과, `FRS §6.4`가 3단계(Lua → DB 확인 → SET)로 적어둔 흐름을 닫는다.
+
+### Decision
+
+**admit은 `queues` 행 하나를 읽고, Lua 하나를 돌리고, Kafka에 알리고 응답한다.**
+
+```
+① queues 행 읽기 (Tenant 소유권 검증)      ← tokens 행은 읽지 않는다
+② EVAL admit.lua                            ← 전 구간 원자. Redis 밖 호출 0회
+     ZPOPMIN queue:{q}:waiting N            → (identifier, seq) N쌍
+     HGET   queue:{q}:tokens identifier     → "tokenId|issuedAt"
+     SET    queue:{q}:admit-by-token:{tokenId}   PX 60000   ← 동적 키
+     SET    queue:{q}:admit-by-admit:{admitToken} PX 60000  ← 동적 키
+     ZADD   queue:{q}:admitted  {만료 epoch ms}  "seq|identifier"
+     watermark 조건부 갱신 (현재값보다 클 때만, §79)
+     admit-idem:{requestId} 에 결과 payload 저장 (재시도 시 REPLAY)
+③ Kafka publishAll — ADMITTED × N (key = tokenId)
+④ 200 { admitted: [...] }
+```
+
+**200이 보장하는 것** = "이 사람들은 대기열에서 빠졌고 admitToken을 쥐었다" (Redis의 사실).
+**보장하지 않는 것** = "`tokens.status`가 이미 1이다" (Kafka 소비 후에 그렇게 된다).
+
+**확정 결정**
+
+| 항목 | 결정 |
+|---|---|
+| verify · complete | **분리 유지** |
+| `verified-token:{tokenId}` | 🔴 **폐기.** 대신 complete를 관대하게 — `WHERE admit_token = ? AND status IN (0, 1)` + `admitted_at` 유효 창 |
+| TTL 만료 후 verify | **404** |
+| `admit_requests` 테이블 | 🔴 **폐기** (`schema.sql`에서 삭제) |
+| TTL 만료 → WAITING 복귀 트리거 | **`queue:{q}:admitted` ZSet + claim-Lua** (score = 만료 시각) |
+| claim-Lua 실행 주체 | **`queue-batch`** — ⚠️ actuator·micrometer가 없어 **추가가 선행**이다(reconciliation과 같은 선행조건) |
+| `tokens.admitted_at` | **추가** |
+| Kafka 이벤트 타입 | **판별 필드**(한 토픽·한 스키마 안에서 분기) |
+| `ADMIT_ISSUED → CANCELLED` | **409 유지** |
+| 복귀가 `last-active`를 리셋하는가 | **안 한다** |
+| `count` 상한 | **존재만 확정.** 값은 실측 후 (임시 1,000) |
+| 포트 rename | **미룬다** (순수 미용) |
+| admit이 `last-active` 정리 | **Sprint 9 회수 배치에서 일괄** |
+
+**상태 전이 = Kafka 소비 측 가드 (전부 key = `tokenId`)**
+
+| 이벤트 | 허용 출발 | SQL |
+|---|---|---|
+| `ENQUEUED` | (신규) | `ON DUPLICATE KEY UPDATE token_id = token_id` (현행 no-op) |
+| `ADMITTED` | 0 | `IF(status = 0, 1, status)` |
+| `RETURNED` | 1 | `IF(status = 1, 0, status)` |
+| `COMPLETED` | 1 | `IF(status = 1, 2, status)` |
+| `CANCELLED` | 0 | `IF(status = 0, 3, status)` |
+| `EXPIRED` | 0 | `IF(status = 0, 4, status)` |
+
+**🔴 이 UPSERT에 함정이 둘 있다. 둘 다 조용히 깨진다.**
+
+1. **MySQL ODKU의 `SET` 절은 좌 → 우로 평가된다.** `status`를 먼저 쓰면 다음 줄이 **이미 갱신된
+   값**을 보므로 `IF(status = 1, VALUES(admit_token), admit_token)` 같은 식이 안 걸려
+   **`admit_token`이 영원히 NULL**로 남는다. → **`status` 갱신을 항상 마지막에 둔다.**
+2. **ODKU 절에 `?` 플레이스홀더를 쓰면 `rewriteBatchedStatements`가 조용히 꺼진다**
+   (Connector/J `QueryInfo.java:168` — ODKU에 파라미터가 있으면 재작성을 포기한다).
+   `VALUES(admit_token)` 형태는 안전하다. **500건 배치가 500왕복으로 퇴화하는데 예외도 로그도 없다.**
+
+**관측 — 8개 후보에서 2개 + 조건부 1개**
+
+| 메트릭 | 라벨 |
+|---|---|
+| `queue_admit_requests_total` | `queueId`, `result` = `ok\|empty\|replay\|error` |
+| `queue_admit_tokens_issued_total` | `queueId` |
+| (조건부) `queue_admit_returned_to_waiting_total` | `queueId` — 복귀 배치 구현 시 |
+
+뺀 것과 이유: **`admit_seconds` 히스토그램** — 기본 `le` 버킷이 **실측 69개**라 큐 100개면
+6,900 시계열이고 이는 현재 전체 시계열 857개의 **8배**다 / **`idem_replay`** — `result=replay`
+라벨이 흡수 / **`last_request_timestamp`** — 카운터 증가율로 같은 알람이 된다 /
+**`orphan`** — 정의가 없다 / **`complete_missing`** — 실시간 계측이 불가능하다.
+
+> 🔴 **메트릭보다 먼저인 것이 있다.** 현재 **알람 규칙 0개, Alertmanager 미실행, 익스포터 0개**다.
+> 즉 **위기 A(Redis 포화)는 admit 메트릭을 몇 개 만들어도 안 보인다.**
+> 우선순위: **redis_exporter > 알람 규칙 > `queue-batch` actuator > access log > 커스텀 메트릭.**
+
+**착수 전 검증 2건**
+
+- **admit Lua의 동적 키가 Cluster에서 도는가.** 키가 런타임에 정해지므로(`{tokenId}`·`{admitToken}`)
+  `KEYS[]` 선언이 불가능하다. 해시태그가 같아 이론상 같은 슬롯이지만 **로컬 Cluster A(7001-7008)에서
+  실제로 돌려봐야 한다. Sentinel로는 절대 안 잡힌다**(§70 D10)
+- **`ALGORITHM=INSTANT`가 파티션 테이블 `ADD COLUMN`에서 되는가.** `admitted_at` 추가가 여기 달렸다.
+  안 되면 13개 파티션 재구축 + replica 지연이다
+
+### Rationale
+
+**① 중간 DB 확인(②단계)을 없앤 것이 이 결정의 전부다.**
+
+개정 전 `FRS §6.4`는 `Lua pop` → `DB WAITING 확인, 불일치 즉시 ZREM` → `토큰 SET` 3단계였다.
+이 중간 단계가 **enqueue의 저장 순서와 정면으로 충돌한다.** §71 D11이 확정한 것은
+**"Redis 먼저, DB 나중"**이고 그 사이에는 Kafka 소비 지연만큼의 창이 있다. admit이 그 창에
+들어온 사람을 "DB에 없으니 불일치"로 판정해 `ZREM`하면 — **아직 적재되지 않았을 뿐인 정상
+대기자를 영구 삭제한다.** 되돌릴 수단도 없다(대기열에서 사라졌고 DB에도 없다).
+
+**대상 선택의 권위는 Redis다**(§71 D11). DB는 그 권위를 검증할 자격이 없다. 이걸 인정하면
+②는 존재할 이유가 없고, 없애면 **거를 게 없어져 `ZRANGE + ZREM`이 `ZPOPMIN N` 한 명령**이 된다.
+그래서 "전 구간 원자"가 목표여서 Lua가 하나가 된 게 아니라, **거르지 않기로 하니 저절로 하나가 됐다.**
+
+**② 동기 응답이 성립한다 — admit은 저빈도다.**
+
+admit은 Backpressure Pull이라 Tenant가 슬롯이 빌 때만 부른다(설계 목표 10 rps). 폴링(15k rps)과
+성격이 다르다. 저빈도이므로 **응답을 기다려도 되고**, 그러면 `admitTokens` 목록을 같은 요청에
+실을 수 있다. 알려진 결함 — **"admit 응답이 목록을 약속하는데 처리는 비동기"** — 이 그대로 소멸한다.
+비동기로 만들 이유가 성능이었는데, 저빈도 경로에 그 대가(멱등 테이블·상태 폴링·응답 계약 모순)를
+치를 필요가 없다.
+
+**③ 순서 역전 방어는 파티션이 아니라 DB의 조건부 쓰기다.**
+
+같은 `tokenId`면 같은 파티션이니 순서가 보장된다 — **고 믿으면 안 된다.** 프로듀서가 여러 WAS라
+브로커 도착 순서가 뒤집힐 수 있다. 특히 **`ZADD`(enqueue Lua)가 Kafka 발행보다 먼저**이므로
+"아직 `ENQUEUED`가 안 실렸는데 그 사람이 admit되는" 창이 실재한다.
+그래서 순서를 **파티션에 기대지 않고** 위 가드 표의 조건부 UPSERT로 막는다.
+`ENQUEUED`의 no-op upsert가 이미 그 역전을 흡수한다 — 늦게 온 `ENQUEUED`는 행을 만들되
+`status`를 건드리지 않는다.
+
+**④ `verified-token` 폐기 — 목적이 이미 사라져 있었다.**
+
+이 키의 원래 목적은 **"admit이 verified 상태인 토큰을 대상에서 제외한다"**였다(§13 P1-③).
+그런데 위 ①에서 **admit이 그 조회를 하지 않기로** 했다. 읽는 곳이 없는 플래그는 플래그가 아니다.
+
+남은 명분은 "verify 없이 complete를 호출하는 것을 서버가 거절한다"인데, 이건 §35의
+**괄호 안 예시**가 `FRS §12` 제약표로 승격된 것이고 **독립적인 실효가 없다** —
+complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출도 **어차피 정당한 토큰을
+가진 정당한 호출**이다. 거절할 근거가 없다.
+
+대신 complete를 **관대하게** 만든다: `WHERE admit_token = ? AND status IN (0, 1)`.
+`0`을 허용하는 이유는 **TTL 만료로 WAITING에 복귀했지만 Tenant는 이미 입장시킨** 경우가 실재하기
+때문이다. `admitted_at` 유효 창으로 무한 소급은 막는다.
+
+**⑤ `admit_requests` 폐기 — 동기 + Lua면 "미실행 상태"가 없다.**
+
+이 테이블의 존재 이유는 "요청은 받았는데 아직 처리 안 됐다(PENDING)"를 기록하는 것이었다.
+동기 처리에는 그 상태가 없다 — 성공했거나 예외가 났거나다. 멱등은 `admit-idem` 키가 payload를
+들고 있어 REPLAY로 답한다.
+
+감사 기록으로서도 **반쪽이다**: 흐름이 `Lua 성공 → INSERT`라 **실패한 요청은 애초에 안 남는다.**
+남는 건 성공 기록뿐인데 그건 Kafka 이벤트와 메트릭이 이미 갖고 있다.
+**과금 근거도 아니다**(과금은 enqueue 수 기준). 장기 이력은 `queue_daily_stats.total_admit_count`다.
+
+### Consequences
+
+- **좀비가 admit 한 자리를 낭비한다.** 브라우저를 닫은 사람도 대기열에 남아 있으므로 뽑힌다.
+  10개 요청하면 토큰 10개가 나가지만 실제 입장은 9명일 수 있다. **탐지는 관측으로 한다** —
+  `tokens_issued_total` 대비 complete 수의 격차가 그 값이다. ②를 없앤 대가이며, 되살려도
+  해결되지 않는다(DB에도 좀비인지는 안 적혀 있다)
+- **Redis 멱등키가 유실되면 중복 admit을 감지할 수단이 없다.** `admit_requests`의
+  `UNIQUE (request_id)`가 마지막 방어선이었는데 폐기했다. Redis 전손 시 같은 `requestId`
+  재시도가 두 번 실행된다 — **T1의 대가로 명시적으로 수용한다**
+- **`count` 상한이 필요하다.** Redis는 단일 스레드이고 `ZPOPMIN N` + `N × (HGET + SET·SET·ZADD)`가
+  한 스크립트 안에서 돈다. `N = 10,000`이면 **수십~100ms 블로킹**이고, 그동안 폴링을 포함한
+  모든 명령이 대기해 **p99가 연쇄로 무너진다.** 값은 실측 후 (임시 1,000)
+- **`0 → 1 → (TTL 만료) → 0` 왕복 뒤에 옛 `ADMITTED` 이벤트가 재전달되면** 낡은 토큰으로 다시
+  `1`이 된다. 가드가 `status = 0`만 보고 **어느 세대의 admit인지는 모르기 때문**이다.
+  60초를 넘겨 재전달돼야 하므로 희박하다. 막으려면 **버전(세대) 컬럼**이 필요하다 —
+  **지금은 만들지 않고 적어만 둔다**(과설계 방지). 관측에 잡히면 그때 판단한다
+- **`tokens` Hash의 레거시 값**(구분자 `|` 없이 `tokenId`만 저장된 항목)은 `issuedAt`을 복원할 수
+  없다. `tokens` 테이블의 PK가 `(token_id, issued_at)`이라 `issuedAt` 없이는 행을 특정하지 못한다.
+  → **건너뛰고 reconciliation에 맡긴다.** admit 경로에서 추측해 만들어 넣으면 중복 행이 생긴다
+- **`queue:{q}:admitted` ZSet이 새로 생긴다** — 큐 상태 키가 4종 → 5종. `QueueKeys` 경유 필수(§70 D10),
+  §75 D26의 "한 큐의 키는 같은 클러스터" 대상에 포함된다
+- **`queue-batch`가 처음으로 Redis Lua를 돌린다.** 지금은 Application 클래스뿐인 껍데기다.
+  actuator·micrometer 추가가 선행이고, 그건 reconciliation의 선행조건과 **같은 작업**이다
+
+### Interview Point
+
+> "대기열에서 사람을 꺼낼 때 DB를 확인하지 않는 이유가 뭔가요?"
+
+확인하면 **정상 대기자를 지웁니다.** 저희는 순번을 Redis에 먼저 쓰고 DB에는 Kafka를 거쳐 나중에
+넣습니다. 그 사이에 admit이 들어와서 "DB에 없네, 유령이네" 하고 대기열에서 빼버리면, 방금 줄 선
+사람이 흔적 없이 사라집니다. 대기열에서도 빠지고 DB에도 없으니 복구할 근거조차 없습니다.
+
+그래서 **누가 대기 중인지에 대한 권위는 Redis 하나로** 정했습니다. DB는 그걸 검증할 자격이 없고,
+검증을 빼고 나니 거를 대상이 없어져서 `ZRANGE` 후 `ZREM` 하던 두 명령이 **`ZPOPMIN` 하나**가 됐고,
+중간에 DB 왕복이 없으니 전체가 **Lua 하나에 들어가 원자**가 됐습니다. 원자성을 목표로 잡아서
+얻은 게 아니라, 잘못된 검증을 걷어내니 따라온 결과입니다.
+
+대신 브라우저를 닫은 좀비도 뽑히는 걸 감수합니다. 10자리를 열면 9명만 들어올 수 있는데,
+이건 DB를 봐도 해결되지 않습니다 — DB에도 그 사람이 좀비인지는 안 적혀 있으니까요.
+그래서 막는 대신 **발급 수와 완료 수의 격차로 관측**하기로 했습니다.
+
+### Related
+
+- **§71 D11** (Redis 먼저 · DB 나중) — 이 결정의 근거. 대상 선택의 권위가 Redis라는 것이 D11의 귀결이다
+- **§79** — "pop 성공 + 토큰 SET 실패 창"을 이 결정이 닫는다(Lua 하나). watermark 조건부 갱신과
+  🔴 표시 전용 가드레일은 그대로 유효하며, admit 대상은 여전히 `waiting` ZSet 최소 seq부터다
+  (`ZPOPMIN`이 곧 그것이다)
+- **§13 P1-③** — `verified-token` 도입 결정. **이 결정이 폐기한다**
+- **§22 · §33** (verify / complete 분리) — 분리는 유지. 다만 verify의 Redis 쓰기가 사라져
+  "상태 변경 없음"이 문자 그대로 참이 된다
+- **§35** — "verify 없이 온 complete는 서버가 거절"이라는 괄호 예시를 **철회한다**
+- **§14** (admit 요청 순서 보장 — Kafka) — 명령 토픽 `enqueue-admit`을 **만들지 않는 것으로 닫는다.**
+  동기 처리라 전달할 명령이 없다
+- **§36** (TTL 만료 → WAITING 복귀) — 트리거를 `EXISTS admit-by-token` 스캔에서
+  **`admitted` ZSet claim-Lua**로 확정한다
+- **§73 D16·D18** — `ADMITTED`·`RETURNED`도 같은 토픽 `token-lifecycle`, key = `tokenId`
+- **§75 D26** — 큐 상태 키 목록에 `admitted` 추가, `verified-token` 제거
+- 후속: `count` 상한 실측, 버전 컬럼(위 왕복 문제), `tokens` Hash 레거시 값 reconciliation,
+  포트 rename
