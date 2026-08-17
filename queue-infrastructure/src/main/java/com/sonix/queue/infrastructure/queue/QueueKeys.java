@@ -17,8 +17,15 @@ package com.sonix.queue.infrastructure.queue;
  * 같은 이상 같은 슬롯(= 같은 마스터)에 저장되는 것이 수학적으로 보장된다.
  * Sentinel 환경에서는 슬롯 개념이 없어 무해하다.
  *
- * <p>Sprint 12+ 이중 라우팅 도입 시 태그를 shard 단위로 옮긴다
- * ({@code queue:{shard_X}:{queueId}:waiting}).
+ * <p><b>⚠️ 이중 라우팅이 들어와도 해시태그는 {@code {queueId}} 그대로다.</b> 예전 주석은
+ * "태그를 shard 단위({@code queue:{shard_X}:{queueId}:waiting})로 옮긴다"고 적혀 있었으나,
+ * 그 안(키에 배정을 인코딩하는 방식)은 <b>기각됐다</b>(§75). 채택된 것은 안 (a″) —
+ * 키는 그대로 두고 <b>클라이언트({@code RedisQueueEngine.route})가 어느 클러스터인지 정한다</b>.
+ *
+ * <p>태그를 shard로 옮기면 그 라우팅이 성립하지 않는다. {@code route()}는 소유자를 모를 때
+ * <b>{@code EXISTS queue:&#123;queueId&#125;:seq}를 양쪽 클러스터에 물어</b> 답한 쪽을 소유자로
+ * 삼는데, 키 이름에 shard가 들어가면 <b>질문을 만들려면 답을 이미 알아야</b> 하기 때문이다.
+ * queueId는 테넌트에 노출된 영구 식별자라 나중에 형식을 바꿀 수도 없다.
  */
 public final class QueueKeys {
     private QueueKeys(){

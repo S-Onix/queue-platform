@@ -28,15 +28,6 @@ spring:
                                    #    어긋나면 JDBC 배치가 중간에 쪼개져 왕복이 늘어난다
         order_inserts: true
 
-  data:
-    redis:
-      sentinel:
-        master: mymaster
-        # 이 서버는 Redis를 쓰지 않지만, scanBasePackages가 com.sonix.queue 전체라
-        # queue-infrastructure의 Redis 빈이 함께 생성된다. Lettuce는 연결을 지연
-        # 생성하므로 실제 통신은 일어나지 않는다.
-        # 스캔 범위를 좁히면 이 블록을 제거할 수 있다(후속 정리 대상).
-
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092,localhost:9094,localhost:9096}
     consumer:
@@ -86,6 +77,16 @@ spring:
 queue:
   consumer:
     topic: token-lifecycle
+
+  # Redis 독립 2 Cluster (DECISIONS §75). 프로파일별 노드 목록은 application-{local,dev,prod}.yml.
+  #
+  # ⚠️ consumer는 코드에서 Redis를 쓰지 않지만, scanBasePackages가 com.sonix.queue 전체라
+  #    queue-infrastructure의 Redis 빈이 함께 생성된다. 이제 클러스터가 둘이므로
+  #    이 프로세스는 Lettuce 클라이언트를 2벌 문다(각각 토폴로지 갱신 타이머 포함).
+  #    Lettuce는 연결을 지연 생성하므로 실제 통신은 첫 사용 때까지 일어나지 않는다.
+  #    스캔 범위를 좁히면 이 블록과 함께 사라진다(별건, 후속 정리 대상).
+  redis:
+    password: ${REDIS_PASSWORD:}
 
 management:
   endpoints:

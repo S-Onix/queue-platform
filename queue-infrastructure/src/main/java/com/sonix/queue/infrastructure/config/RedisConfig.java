@@ -9,13 +9,15 @@ import com.sonix.queue.domain.ratelimit.RateLimiter;
 import com.sonix.queue.infrastructure.cache.mixin.CacheMixinRegistrar;
 import com.sonix.queue.infrastructure.ratelimit.RedisFixedWindowRateLimiter;
 import com.sonix.queue.infrastructure.ratelimit.RedisTokenBucketRateLimiter;
+import io.lettuce.core.cluster.ClusterClientOptions;
+import io.lettuce.core.cluster.ClusterTopologyRefreshOptions;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.connection.RedisSentinelConfiguration;
+import org.springframework.data.redis.connection.RedisClusterConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -23,16 +25,27 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 
 /**
- * Redis 연결 설정 (Sentinel 기반, 최소 구성).
+ * Redis 연결 설정 (독립 2 Cluster, DECISIONS §75).
  *
  * <p>RedisAutoConfiguration은 application.yml에서 여전히 제외 상태이므로,
  * 여기서 명시적으로 {@link LettuceConnectionFactory}를 정의한다 (학습/제어 목적).
  *
- * <p>Sentinel을 통해 현재 Master를 자동 발견하므로, Failover로 Master 포트가
- * 바뀌어도 애플리케이션 코드는 영향받지 않는다 (REDIS_SENTINEL.md 참고).
+ * <p><b>왜 커스텀 프로퍼티({@code queue.redis.cluster1/2.nodes})인가:</b>
+ * Boot 표준 키 {@code spring.data.redis.cluster.nodes}는 <b>클러스터를 하나만</b> 표현한다.
+ * 두 개를 독립으로 띄우는 구성은 표준 키로 표현할 방법이 없다.
+ *
+ * <p><b>Sentinel 설정은 제거했다.</b> 프로파일로 분기하지 않는다 — 해시태그 누락처럼
+ * "Cluster에서만 터지는" 결함이 Sentinel 경로로 숨을 통로를 남기지 않기 위함이다.
+ * Sentinel 인프라·문서 자체는 학습/로컬 자산으로 보존한다(§75 D28).
+ *
+ * <p><b>큐 상태가 아닌 키는 전부 cluster1에 있다.</b> {@code rl:*}(Rate Limit),
+ * {@code apikey-cache:*}, {@code tenant-cache:*}는 queueId가 없어 라우팅 대상이 아니다.
+ * 이들이 WAS마다 다른 클러스터로 가면 버킷·캐시가 갈라지므로, {@code @Primary}(cluster1)에
+ * 고정한다.
  */
 @Configuration
 public class RedisConfig {
@@ -75,28 +88,89 @@ public class RedisConfig {
      */
     private static final Duration COMMAND_TIMEOUT = Duration.ofSeconds(5);
 
-    @Bean
-    public RedisConnectionFactory redisConnectionFactory(
-            @Value("${spring.data.redis.sentinel.master:mymaster}") String master,
-            @Value("${spring.data.redis.sentinel.nodes:127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381}") String nodes) {
+    /**
+     * 클러스터 토폴로지 갱신 주기.
+     *
+     * <p><b>이 설정이 없으면 failover 후 토폴로지가 영영 갱신되지 않는다.</b> Lettuce의
+     * {@code ClusterClientOptions} 기본값은 {@code periodicRefreshEnabled=false} +
+     * {@code adaptiveRefreshTriggers=emptySet()}이라, 기동 시 한 번 읽은 슬롯→노드 지도를
+     * 그대로 들고 간다. Sentinel 구성에서는 Sentinel이 대신하던 일이라 코드가 필요 없었지만,
+     * Cluster에서는 클라이언트가 직접 해야 한다.
+     *
+     * <p>주기 갱신만으로는 최대 이 주기만큼 MOVED/실패가 이어지므로 적응형 트리거
+     * (MOVED/ASK 재지정, 연결 끊김, 재연결 시도 등)를 함께 켠다. 트리거는 즉시가 아니라
+     * {@link #ADAPTIVE_REFRESH_TIMEOUT} 만큼 debounce되어, 대량 MOVED가 몰려도
+     * 토폴로지 조회가 폭주하지 않는다.
+     */
+    private static final Duration TOPOLOGY_REFRESH_PERIOD = Duration.ofSeconds(30);
 
-        RedisSentinelConfiguration sentinel = new RedisSentinelConfiguration().master(master);
-        for (String node : nodes.split(",")) {
-            String[] hostPort = node.trim().split(":");
-            sentinel.sentinel(hostPort[0], Integer.parseInt(hostPort[1]));
+    /** 적응형 토폴로지 갱신의 debounce 간격(이 시간 안의 중복 트리거는 1회로 합쳐진다). */
+    private static final Duration ADAPTIVE_REFRESH_TIMEOUT = Duration.ofSeconds(10);
+
+    /**
+     * cluster1 커넥션 팩토리.
+     *
+     * <p>{@code @Primary}는 필수다. 이 프로젝트에는 {@code StringRedisTemplate} /
+     * {@code RedisConnectionFactory}를 <b>타입으로</b> 주입받는 곳이 프로덕션·테스트 양쪽에
+     * 널려 있어서, 후보가 둘이 되는 순간 전부 컨텍스트 로딩에 실패한다.
+     */
+    @Bean
+    @Primary
+    public LettuceConnectionFactory redisCluster1Factory(
+            @Value("${queue.redis.cluster1.nodes:127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005,127.0.0.1:7006,127.0.0.1:7007,127.0.0.1:7008}") String nodes,
+            @Value("${queue.redis.password:}") String password) {
+        return clusterFactory(nodes, password);
+    }
+
+    /** cluster2 커넥션 팩토리. cluster1과 <b>완전히 독립</b>이며 슬롯을 공유하지 않는다. */
+    @Bean
+    public LettuceConnectionFactory redisCluster2Factory(
+            @Value("${queue.redis.cluster2.nodes:127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003,127.0.0.1:8004,127.0.0.1:8005,127.0.0.1:8006,127.0.0.1:8007,127.0.0.1:8008}") String nodes,
+            @Value("${queue.redis.password:}") String password) {
+        return clusterFactory(nodes, password);
+    }
+
+    private static LettuceConnectionFactory clusterFactory(String nodes, String password) {
+        RedisClusterConfiguration cluster = new RedisClusterConfiguration(
+                Arrays.stream(nodes.split(",")).map(String::trim).toList());
+        if (password != null && !password.isBlank()) {
+            cluster.setPassword(password);
         }
-        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
-                .commandTimeout(COMMAND_TIMEOUT)
+
+        ClusterTopologyRefreshOptions refresh = ClusterTopologyRefreshOptions.builder()
+                .enablePeriodicRefresh(TOPOLOGY_REFRESH_PERIOD)
+                .enableAllAdaptiveRefreshTriggers()
+                .adaptiveRefreshTriggersTimeout(ADAPTIVE_REFRESH_TIMEOUT)
                 .build();
 
-        return new LettuceConnectionFactory(sentinel, clientConfig);
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .commandTimeout(COMMAND_TIMEOUT)
+                .clientOptions(ClusterClientOptions.builder()
+                        .topologyRefreshOptions(refresh)
+                        .build())
+                .build();
+
+        return new LettuceConnectionFactory(cluster, clientConfig);
     }
 
     /**
-     * 문자열 기반 작업용 템플릿. Rate Limiter의 INCR/EXPIRE, Lua EVAL 등에 사용.
+     * cluster1 문자열 템플릿. Rate Limiter의 INCR/EXPIRE, Lua EVAL 등에 사용.
+     *
+     * <p>빈 이름을 {@code stringRedisTemplate}으로 유지한다 — 기존 주입 지점이 전부
+     * 타입 주입이라 {@code @Primary}만으로 해결되지만, 이름까지 바꾸면 이름 기반 주입이
+     * 하나라도 있을 때 조용히 깨진다.
      */
     @Bean
-    public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
+    @Primary
+    public StringRedisTemplate stringRedisTemplate(
+            @Qualifier("redisCluster1Factory") LettuceConnectionFactory connectionFactory) {
+        return new StringRedisTemplate(connectionFactory);
+    }
+
+    /** cluster2 문자열 템플릿. 큐 단위 라우팅({@code RedisQueueEngine})에서만 쓴다. */
+    @Bean
+    public StringRedisTemplate cluster2StringRedisTemplate(
+            @Qualifier("redisCluster2Factory") LettuceConnectionFactory connectionFactory) {
         return new StringRedisTemplate(connectionFactory);
     }
 
@@ -130,7 +204,7 @@ public class RedisConfig {
 
     @Bean
     public RateLimiter rateLimiter(
-            StringRedisTemplate redisTemplate,
+            @Qualifier("stringRedisTemplate") StringRedisTemplate redisTemplate,
             @Qualifier("tokenBucketScript") RedisScript<Long> tokenBucketScript
     ) {
         return new RedisTokenBucketRateLimiter(
@@ -141,7 +215,7 @@ public class RedisConfig {
 
     @Bean
     public FixedWindowRateLimiter fixedWindowRateLimiter(
-            StringRedisTemplate redisTemplate,
+            @Qualifier("stringRedisTemplate") StringRedisTemplate redisTemplate,
             @Qualifier("fixedWindowScript") RedisScript<Long> fixedWindowScript
     ) {
         return new RedisFixedWindowRateLimiter(redisTemplate, fixedWindowScript);

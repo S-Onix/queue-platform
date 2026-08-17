@@ -59,6 +59,13 @@ CREATE TABLE queues (
     status       TINYINT      NOT NULL DEFAULT 0,
     created_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     deleted_at   DATETIME(3)  NULL,
+    -- 이 큐의 Redis 상태(waiting/seq/tokens/last-active)가 사는 클러스터 번호 (DECISIONS §75).
+    --   네 키는 반드시 같은 클러스터에 있다 — 해시태그로 슬롯을 묶어도 클러스터가 갈리면 무의미하다.
+    --   INSERT 시점에 한 번 정해지고 이후 불변이다 (D27-2: 큐는 다른 클러스터로 옮기지 않는다).
+    --   MAX(redis_cluster_no)가 신규 배정의 단조증가 가드로도 쓰인다 (§75 D29).
+    -- ⚠️ 인덱스를 붙이지 않는다. 읽는 쿼리가 queue_id const 조회 하나뿐이라
+    --    SELECT에 공짜로 딸려온다. 인덱스는 쓰기 비용만 늘린다.
+    redis_cluster_no TINYINT  NOT NULL DEFAULT 1,
 
     PRIMARY KEY (id),
     UNIQUE KEY uq_queues_queue_id    (queue_id),

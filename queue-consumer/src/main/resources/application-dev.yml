@@ -3,12 +3,14 @@ logging:
     root: INFO
     com.sonix.queue: INFO
 
+queue:
+  redis:
+    cluster1:
+      nodes: ${REDIS_CLUSTER1_NODES:localhost:7001,localhost:7002,localhost:7003,localhost:7004,localhost:7005,localhost:7006,localhost:7007,localhost:7008}
+    cluster2:
+      nodes: ${REDIS_CLUSTER2_NODES:localhost:8001,localhost:8002,localhost:8003,localhost:8004,localhost:8005,localhost:8006,localhost:8007,localhost:8008}
+
 spring:
-  data:
-    redis:
-      sentinel:
-        nodes: ${REDIS_SENTINEL_NODES:localhost:26379,localhost:26380,localhost:26381}
-        password: ${REDIS_PASSWORD:}
   datasource:
     master:
       # rewriteBatchedStatements=true 누락 시 배치가 조용히 퇴화한다(예외·로그 없음).
