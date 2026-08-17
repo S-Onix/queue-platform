@@ -447,36 +447,65 @@ flowchart TD
 **예상 기간:** 1.5주
 **카테고리:** MVP
 
+> **설계는 닫혔다 — DECISIONS §80.** admit은 **동기 + Lua 하나**다. 구 설계의 3단계
+> (Lua pop → DB WAITING 확인 → 토큰 SET), `admit_requests` 테이블, 명령 토픽, `verified-token`은
+> **전부 폐기**됐다. 착수 전 미판정이던 4건 중 3건이 §80에서 닫혔다(아래 참조).
+
 **주요 산출물:**
-- `POST /queues/:queueId/admit` (동기 처리 버전. Kafka는 Sprint 8)
-- `POST /queues/:queueId/admit-tokens/:admitToken/verify` (DB Fallback 포함)
-- `POST /queues/:queueId/tokens/:tokenId/complete` (DB 먼저 → ZREM)
-- `queue:{queueId}:admit-idem:{requestId}` 멱등성 체크 (`requestId`가 Tenant 지정값이라 큐 스코프 필수)
-- `verified-token` 중복 입장 방지 플래그
+- `POST /queues/:queueId/admit` — **동기 응답.** `queues` 행 1개 읽기 → `EVAL admit.lua` → Kafka → 200
+  - `admit.lua` 하나에 `ZPOPMIN` + `HGET tokens` + 토큰 키 2종 `SET`(PX 60000) + `admitted` ZADD
+    + watermark 조건부 갱신 + `admit-idem` payload 저장이 전부 들어간다 (**Redis 밖 호출 0회**)
+  - `count` 상한 도입 — 값은 실측 후(임시 1,000). N이 크면 단일 스레드 master를 수십~100ms 잡는다
+- `POST /queues/:queueId/admit-tokens/:admitToken/verify` — DB Fallback 술어는 **`admitted_at`** 기준
+  - **Redis·DB 쓰기 0회.** "상태 변경 없음"이 문자 그대로가 된다
+- `POST /queues/:queueId/tokens/:tokenId/complete` — **DB 권위** 조건부 UPDATE
+  (`admit_token = ?` + `status IN (0,1)` + `admitted_at` 유효 창) → Redis 정리는 나중
+- `queue:{queueId}:admitted` ZSet 신설 (score=만료 epoch ms, member=`"seq|identifier"`) — `QueueKeys` 경유
+- `tokens.admitted_at` 컬럼 추가
+- Kafka `ADMITTED`·`RETURNED` 이벤트 + **소비 측 전이 가드**(허용 출발 상태별 조건부 UPSERT)
+- **ADMIT_TOKEN_TTL 만료 → WAITING 복귀** — `admitted` ZSet claim-Lua, 실행 주체 **`queue-batch`**
+  ← 포트폴리오 차별 포인트
+- **`queue-batch`에 actuator + micrometer-prometheus 추가** (claim-Lua 계측. Sprint 9 reconciliation과 **같은 선행 작업**)
+- 관측 메트릭 **2개 + 조건부 1개**: `queue_admit_requests_total{queueId,result}` /
+  `queue_admit_tokens_issued_total{queueId}` / (복귀 구현 시) `queue_admit_returned_to_waiting_total{queueId}`
+  - `admit_seconds` 히스토그램은 **넣지 않는다** — `le` 버킷 실측 69개 × 큐 100개 = 6,900 시계열로
+    현재 전체(857개)의 8배다
 - avgWaitingTime 직접 갱신 (HINCRBYFLOAT)
-- **ADMIT_TOKEN_TTL 만료 → WAITING 복귀 로직** ← 포트폴리오 차별 포인트
-- **admit Lua에서 `queue:{queueId}:admit-watermark` 조건부 갱신 — 현재값보다 클 때만** (§79)
 - **`/status` 엔드포인트 + `pacing` 구간표 (§79 구현)** — Sprint 6이 아니라 여기인 이유: **watermark는 admit이 있어야 존재한다.** admit이 0건이면 `lastAdmittedSeq`가 영원히 0이라 SDK의 `rank = mySeq − lastAdmittedSeq`가 무의미하다
-  - 딸려오는 것: `PollResponse`에서 `frontSeq`·`total`·`nextPollAfterSec` 제거 → **`QueueSnapshotCache`(Caffeine) 제거**(존재 이유가 `frontSeq` 스냅샷뿐이었다. **도메인 포트 시그니처가 바뀌므로 문서로 안 끝난다**) + 404 계약용 `ErrorCode` 신규 추가
+  - 3키 `MGET`(watermark + pacing + **seq**) 직행. **WAS 캐시는 만들지 않는다**(§79 D1)
+  - 딸려오는 것: `PollResponse`에서 `frontSeq`·`total`·`nextPollAfterSec` 제거 → **`QueueSnapshotCache`(Caffeine) 제거**(**도메인 포트 시그니처가 바뀌므로 문서로 안 끝난다**) + 404 계약용 `ErrorCode` 신규 추가 + **`QueueEnginePollTest` 재작성**(5개 중 2개 소멸, 1개 부분 소멸)
 
 **완료 기준 (DoD):**
 - [ ] admit 100명 동시 요청 → FIFO 순서 보장
+- [ ] **`ADMITTED`가 `ENQUEUED`보다 먼저 도착해도 최종 상태가 `ADMIT_ISSUED`** (이벤트 역순 주입 테스트)
+  - `ZADD`가 Kafka 발행보다 먼저라 이 역전은 실재한다. `ENQUEUED`의 no-op upsert가 흡수해야 한다
+- [ ] **`COMPLETED` 행에 `ADMITTED`가 도착해도 되살아나지 않는다** (가드가 허용 출발 상태를 본다)
 - [ ] **WAS N대에서 동시 admit → watermark 단조증가, 후퇴 0건** (조건부 갱신이 없으면 늦게 도착한 작은 seq가 값을 되돌린다)
-- [ ] **TTL 만료로 WAITING 복귀한 토큰이 다음 admit 배치에 포함된다** — 대상 선택은 **watermark가 아니라 실제 `waiting` ZSet 최소 seq 기준**
+- [ ] **TTL 만료로 WAITING 복귀한 토큰이 다음 admit 배치의 맨 앞에 온다** — `ZPOPMIN`이 곧 최소 seq이므로 자동으로 성립해야 한다
   - §79가 "watermark는 **표시 전용**"이라고 🔴 가드레일로 못 박았지만 **강제 수단이 없다.** 이 DoD가 그 수단이다. watermark를 커서로 쓰면 복귀 토큰(seq < watermark)이 영구히 건너뛰어진다
-- [ ] admitToken TTL 60초 경과 → WAITING 복귀 + seq 복원 검증
-- [ ] complete DB 먼저 → ZREM 실패 시뮬레이션 → Batch 재실행(Sprint 9 위임)
-- [ ] verify 호출 순서 규칙 OpenAPI description에 명시
-- [ ] 중복 complete 요청 → 1번만 성공 (DB UPDATE WHERE status=1)
+- [ ] admitToken TTL 60초 경과 → `admitted` ZSet claim → WAITING 복귀 + seq 복원 검증
+- [ ] TTL 만료 후 verify → **404**
+- [ ] complete가 `status = 0`(복귀 후)에도 성공한다 — 유효 창 안이면
+- [ ] 중복 complete 요청 → 1번만 성공 (조건부 UPDATE가 0행)
+- [ ] **`queue-batch`의 `/actuator/prometheus`가 200** (claim-Lua 계측의 전제)
 - [ ] Rich Domain 상태 전환 메서드로 비즈니스 로직 검증
 
-**착수 전 결정할 것 (미판정):**
-- **"pop 성공 + admitToken SET 실패" 창** — §79가 "미해결"로만 적었다. 해결안 선택이 이 Sprint의 첫 일
-- `verified-token:{tokenId}`의 **클러스터 소속** — 해시태그가 없고 §75 D27-4의 "큐 비종속 키" 목록에도 없다
-- **admit 요청 전달 수단** (별도 Kafka 명령 토픽 ↔ `admit_requests` + 폴링, Sprint 8 참조)
-- `/status` **캐시 TTL**·**맵 리로드 주기**·`pacing` 반영 지연 — 셋이 서로를 정하므로 한 번에
+**착수 전 검증 2건 (§80):**
+- [ ] **admit Lua의 동적 키가 Cluster에서 도는가** — 로컬 Cluster A(7001-7008)에서 실증.
+      `{tokenId}`·`{admitToken}`이 런타임에 정해져 `KEYS[]` 선언이 안 된다.
+      **Sentinel로는 절대 안 잡힌다**
+- [ ] **`ALGORITHM=INSTANT`가 파티션 테이블 `ADD COLUMN`에서 되는가** — `admitted_at`이 여기 달렸다.
+      안 되면 13파티션 재구축 + replica 지연
 
-**참조 문서:** FRS §6.4~6.6, DECISIONS §34·§36 (admitToken TTL → WAITING), **§79 (watermark·pacing)**, STATE.md
+**착수 전 결정할 것 (남은 미판정):**
+- `count` 상한값 — 실측 후 (임시 1,000)
+- ~~"pop 성공 + admitToken SET 실패" 창~~ → **§80이 닫음** (Lua 하나 = 창 없음)
+- ~~`verified-token` 클러스터 소속~~ → **§80이 닫음** (키 폐기)
+- ~~admit 요청 전달 수단~~ → **§80이 닫음** (동기라 명령이 없다)
+- `/status` **캐시 TTL** → **§79 D1이 닫음**(안 만든다). CDN 도입 시 `max-age`로 Sprint 11에서 부활
+
+**참조 문서:** **DECISIONS §80 (이 Sprint의 설계 정본)**, §79 (watermark·pacing), §36 (TTL 복귀),
+FRS §6.4~6.6, STATE.md 전이 가드 표
 
 **Sprint 핵심 차별 포인트:** admitToken 만료 시 WAITING 복귀 (seq 기반 우선순위 보존)
 
@@ -510,7 +539,7 @@ flowchart TD
   - actuator + micrometer-prometheus 포함 (없으면 컨슈머 lag을 PromQL로 볼 수단이 사라진다)
 - ✅ `TokenLifecycleConsumer` (배치 적재 → `tokens` 멱등 INSERT) + `TokenPersistService`
 - ⬜ **상태 전이 이벤트 발행** (admit/complete/cancel/expire) — 같은 토픽·같은 키(`tokenId`). **Sprint 7과 동시**
-- ⬜ admit 요청 전달 수단 — **미판정(Sprint 7).** 구 `enqueue-admit` 토픽은 §73이 다루지 않은 공백이다. 별도 명령 토픽 ↔ `admit_requests` 테이블 + 폴링 중 택일
+- ✅ admit 요청 전달 수단 — **명령 토픽을 만들지 않는 것으로 닫혔다(§80).** admit이 동기 처리라 전달할 명령이 없다. 구 `enqueue-admit`·`AdmitConsumer`·`admit_requests`는 전부 폐기
 - ⬜ `BillingConsumer` 스켈레톤 (실제 집계는 Sprint 9)
 
 **완료 기준 (DoD):**

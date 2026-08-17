@@ -1016,90 +1016,78 @@ rm prometheus-3.0.1.linux-amd64.tar.gz
 
 ### 7-4. Prometheus 설정
 
-`~/prometheus/prometheus.yml`:
+> **정본은 레포 밖의 실가동 파일이다.** 이 문서는 그것을 반영할 뿐이다.
+>
+> | | 값 |
+> |---|---|
+> | 실가동 설정 | `/home/sonix/queue-platform-infra/monitoring/prometheus/prometheus.yml` |
+> | 바이너리 | `/home/sonix/queue-platform-infra/monitoring/prometheus/bin/prometheus` |
+> | TSDB | `/home/sonix/queue-platform-infra/monitoring/prometheus/data` (retention 15d = 기본값) |
+> | 기동 방식 | systemd `prometheus.service` (nohup 아님) |
+> | 라벨 키 | `application`, `env` (`environment` 아님, `external_labels` 없음) |
+> | 타깃 표기 | `localhost:PORT` (Windows host IP 아님 — 앱도 WSL2 안에서 돈다) |
+>
+> 실가동 파일을 고친 뒤 **reload는 SIGHUP**이다. `prometheus.service`에
+> `--web.enable-lifecycle`이 없어서 `POST /-/reload`는 405가 난다:
+> ```bash
+> kill -HUP $(pgrep -x prometheus)          # 무중단 reload (sudo 불필요, User=sonix)
+> curl -s localhost:9090/api/v1/targets     # 반영 확인
+> ```
 
-> ⚠️ **이 스니펫은 문서일 뿐 실가동 설정이 아니다. 여기를 고쳐도 수집은 켜지지 않는다.**
->
-> 실가동 파일은 `/home/sonix/queue-platform-infra/monitoring/prometheus/prometheus.yml`이고
-> (실행 중 프로세스가 `--config.file`로 지목하는 경로), 아래 스니펫과 **네 군데가 다르다**:
->
-> | | 실가동 | 아래 스니펫 |
-> |---|---|---|
-> | 경로 | `~/queue-platform-infra/monitoring/prometheus/` | `~/prometheus/` |
-> | API job명 | `queue-api` | `queue-platform-api` |
-> | 타깃 | `localhost:8080` | `172.19.64.1:8080` |
-> | 라벨 키 | `env` | `environment` (+ `external_labels`) |
->
-> **job명과 라벨 키가 갈리면 쿼리가 아니라 라벨 셀렉터 자체가 안 맞는다.** 반영할 때는
-> 스니펫을 그대로 복붙하지 말고 **실가동 파일의 기존 job과 이름·라벨 키를 맞춘 뒤**
-> reload할 것: `curl -X POST http://localhost:9090/-/reload` (또는 프로세스 재기동).
-> 반영 확인: `curl -s localhost:9090/api/v1/targets | grep 8082`
->
-> consumer job은 현재 **실가동 파일에 없다.** 추가는 아직 안 됐다.
+실가동 `prometheus.yml` 구조 (2026-08-17 기준, 타깃 27개):
 
 ```yaml
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
-  external_labels:
-    cluster: 'queue-platform'
-    environment: 'local'
+
+rule_files:                                                 # 정본은 레포 안 (§7-12)
+  - /home/sonix/projects/queue-platform/doc/monitoring/alerts/*.yml   # 현재 파일 0개 → 규칙 0개
+
+# Alertmanager는 의도적으로 미설치 (§7-12). alerting 블록은 주석 처리돼 있다.
 
 scrape_configs:
-  # Prometheus 자기 자신
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
 
-  # Queue Platform API
-  - job_name: 'queue-platform-api'
+  - job_name: 'queue-api'                    # 8080
     metrics_path: '/actuator/prometheus'
-    scrape_interval: 15s
     static_configs:
-      - targets: ['172.19.64.1:8080']    # Windows host IP
-        labels:
-          application: 'queue-api'
-          environment: 'local'
+      - targets: ['localhost:8080']
+        labels: { application: 'queue-api', env: 'local' }
 
-  # Queue Platform Consumer (Kafka lag / 적재량)
-  - job_name: 'queue-platform-consumer'
+  - job_name: 'queue-consumer'               # 8082
     metrics_path: '/actuator/prometheus'
-    scrape_interval: 15s
     static_configs:
-      - targets: ['172.19.64.1:8082']    # Windows host IP
-        labels:
-          application: 'queue-consumer'
-          environment: 'local'
+      - targets: ['localhost:8082']
+        labels: { application: 'queue-consumer', env: 'local' }
 
-# queue-batch(8081)는 actuator 의존성이 없어 /actuator/prometheus를 노출하지 않는다.
-# job을 넣으면 항상 DOWN으로 뜨므로, 의존성을 추가한 뒤에 등록할 것.
-# (reconciliation 스위퍼는 queue-batch에 들어갈 예정이므로, batch actuator가
-#  그 관측의 선행 조건이다. 순서를 뒤집으면 스위퍼를 만들고도 지표를 못 낸다.)
+  # queue-batch(8081)는 actuator 의존성이 없어 /actuator/prometheus를 노출하지 않는다.
+  # job을 넣으면 항상 DOWN이므로 의존성 추가 후에 등록할 것 (Sprint 7 예정).
+  # reconciliation 스위퍼가 queue-batch에 들어가므로 batch actuator가 그 관측의 선행 조건이다.
 
-# 향후 확장 (Phase 5 — 인프라 Exporter):
-# - job_name: 'mysql'         # mysqld_exporter (9104)
-# - job_name: 'redis'         # redis_exporter (9121)
-# - job_name: 'kafka'         # kafka_exporter (9308)
-# - job_name: 'node'          # node_exporter (9100)
+  # redis_exporter 멀티타깃 — 프로세스 1개(9121)가 22개 노드를 커버 (§7-11)
+  - job_name: 'redis'           # 6379, 6380, 6381        (Sentinel 구성 데이터 노드)
+  - job_name: 'redis-sentinel'  # 26379, 26380, 26381     (quorum / config_epoch)
+  - job_name: 'redis-cluster'   # 7001-7008, 8001-8008    (Cluster A/B)
+    # 세 job 모두 metrics_path: '/scrape' + relabel_configs로 __param_target 주입.
+    # targets에 'redis://127.0.0.1:PORT' 형태로 적고 __address__를 127.0.0.1:9121로 치환한다.
+
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['127.0.0.1:9104']
+        labels: { application: 'mysql-master', env: 'local' }
+      - targets: ['127.0.0.1:9105']
+        labels: { application: 'mysql-replica', env: 'local' }
 ```
-
-**핵심 — Windows host IP 확인:**
-
-```bash
-ip route show | grep -i default | awk '{ print $3 }'
-# 출력 예: 172.19.64.1
-
-# 검증
-curl http://172.19.64.1:8080/actuator/prometheus | head -5
-```
-
-⚠️ **주의**: WSL2 재부팅 시 IP가 바뀔 수 있음. §7-7 자동화 스크립트 참조.
 
 **설정 검증:**
 
 ```bash
-~/prometheus/promtool check config ~/prometheus/prometheus.yml
-# SUCCESS: prometheus.yml is valid
+/home/sonix/queue-platform-infra/monitoring/prometheus/bin/promtool check config \
+  /home/sonix/queue-platform-infra/monitoring/prometheus/prometheus.yml
+# SUCCESS: ... is valid prometheus config file syntax
 ```
 
 ### 7-5. Grafana 설치 (APT)
@@ -1165,137 +1153,57 @@ ID: 4701  (JVM Micrometer)
 sudo systemctl stop grafana-server
 ```
 
-### 7-7. 자동 시작/관리 스크립트 (~/.bashrc)
+### 7-7. 기동/관리 (systemd)
 
-`§6-6`의 redis 함수와 같은 패턴으로 추가:
+> ⚠️ **`mon_start` / `mon_stop` / `mon_logs` 같은 bashrc 함수는 존재하지 않는다.**
+> (`grep mon_start ~/.bashrc` → 결과 없음). 이 스택은 **전부 systemd로 관리**된다.
+> Redis Sentinel 계열만 `~/.bashrc`의 `redis_start` 등을 쓴다.
 
 ```bash
-cat >> ~/.bashrc << 'EOF'
+# 상태
+systemctl status prometheus grafana-server
+systemctl status redis-exporter mysqld-exporter-master mysqld-exporter-replica
 
-# ============================================================
-# Queue Platform — Monitoring (Prometheus + Grafana)
-# ============================================================
+# 기동/종료 (sudo 필요)
+sudo systemctl start prometheus grafana-server
 
-QP_PROM_DIR=~/prometheus
+# 설정만 바꿨을 때 — 재시작하지 말고 SIGHUP (무중단, sudo 불필요)
+kill -HUP $(pgrep -x prometheus)
 
-mon_start() {
-    echo "Starting Prometheus + Grafana..."
-    
-    # 1. Windows host IP 자동 갱신 (WSL2 재부팅 대응)
-    local win_host=$(ip route show | grep -i default | awk '{ print $3 }')
-    if [ -n "$win_host" ]; then
-        sed -i.bak -E "s|targets: \['[0-9.]+:8080'\]|targets: ['${win_host}:8080']|" \
-            $QP_PROM_DIR/prometheus.yml
-        echo "  Windows host IP: $win_host"
-    fi
-    
-    # 2. Prometheus 실행
-    if pgrep -f "prometheus --config" > /dev/null; then
-        echo "  Prometheus: already running"
-    else
-        cd $QP_PROM_DIR
-        nohup ./prometheus --config.file=prometheus.yml > prometheus.log 2>&1 &
-        echo "  Prometheus: started (PID: $!)"
-        cd - > /dev/null
-    fi
-    
-    # 3. Grafana 실행
-    if systemctl is-active --quiet grafana-server; then
-        echo "  Grafana: already running"
-    else
-        sudo systemctl start grafana-server
-        echo "  Grafana: started"
-    fi
-    
-    sleep 2
-    echo ""
-    echo "Access:"
-    echo "  Prometheus: http://localhost:9090"
-    echo "  Grafana:    http://localhost:3000"
-}
-
-mon_stop() {
-    echo "Stopping monitoring stack..."
-    pkill -f "prometheus --config"
-    sudo systemctl stop grafana-server
-    sleep 1
-    echo "Done."
-}
-
-mon_status() {
-    echo "=== Monitoring Stack ==="
-    
-    # Prometheus
-    if pgrep -f "prometheus --config" > /dev/null; then
-        echo "  Prometheus: RUNNING (http://localhost:9090)"
-    else
-        echo "  Prometheus: STOPPED"
-    fi
-    
-    # Grafana
-    if systemctl is-active --quiet grafana-server; then
-        echo "  Grafana:    RUNNING (http://localhost:3000)"
-    else
-        echo "  Grafana:    STOPPED"
-    fi
-    
-    echo ""
-    echo "=== Targets (last scrape) ==="
-    curl -s http://localhost:9090/api/v1/targets 2>/dev/null \
-        | grep -oE '"health":"[^"]+","[^"]+":"[^"]+","instance":"[^"]+"' \
-        | head -5 \
-        || echo "  (Prometheus not responding)"
-}
-
-mon_logs() {
-    local target=${1:-prometheus}
-    case $target in
-        prometheus|prom) tail -f $QP_PROM_DIR/prometheus.log ;;
-        grafana)         sudo journalctl -u grafana-server -f ;;
-        *) echo "Usage: mon_logs [prometheus|grafana]" ;;
-    esac
-}
-EOF
-
-source ~/.bashrc
+# 로그
+journalctl -u prometheus -f
+journalctl -u redis-exporter -f
 ```
+
+Windows host IP는 **더 이상 관계없다.** 앱도 WSL2 안에서 돌므로 타깃은 전부 `localhost` /
+`127.0.0.1`이다. (구버전 문서의 `172.19.64.1` 자동 치환 로직은 폐기)
 
 ### 7-8. 정상 동작 검증
 
 ```bash
-# 1. 시작
-mon_start
+# 1. 시작 (systemd — §7-7)
+sudo systemctl start prometheus grafana-server
 
-# 2. 상태 확인
-mon_status
+# 2. 타깃 전수 확인 — "프로세스가 있다"와 "스크레이프된다"는 다르다
+curl -s localhost:9090/api/v1/targets \
+  | python3 -c "import json,sys;[print(t['labels']['job'],t['labels']['instance'],t['health']) \
+      for t in json.load(sys.stdin)['data']['activeTargets']]" | sort
 
-# 기대 결과:
-#   Prometheus: RUNNING (http://localhost:9090)
-#   Grafana:    RUNNING (http://localhost:3000)
+# 기대 (2026-08-17 실측, 총 27개):
+#   prometheus 1 / redis 3 / redis-sentinel 3 / redis-cluster 16 / mysql 2  → 전부 up
+#   queue-api(8080), queue-consumer(8082) → 앱이 안 떠 있으면 down (정상)
 
-# 3. Prometheus Targets 확인
-# 브라우저: http://localhost:9090/targets
-# → queue-platform-api: UP 확인
+# 3. 인프라 지표가 실제로 들어오는지 (앱과 무관하게 확인 가능)
+curl -sG localhost:9090/api/v1/query --data-urlencode 'query=redis_up'      # → 22 series
+curl -sG localhost:9090/api/v1/query --data-urlencode 'query=mysql_up'      # → 2 series, 값 1
+curl -sG localhost:9090/api/v1/query \
+  --data-urlencode 'query=mysql_slave_status_seconds_behind_master'         # → replica 지연
 
-# 4. 메트릭 쿼리 확인
-# 브라우저: http://localhost:9090/graph
-# 쿼리:
-#   up                              → 1 (UP)
-#   jvm_memory_used_bytes{area="heap"}
-#   http_server_requests_seconds_count
+# 4. Grafana 대시보드: http://localhost:3000
 
-# 5. Grafana 대시보드 확인
-# 브라우저: http://localhost:3000
-# → 임포트한 대시보드에서 그래프 보이는지
-
-# 6. API 호출 후 메트릭 변화 관찰
-curl -X POST http://172.19.64.1:8080/api/v1/tenants/signup \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@example.com","password":"password123!","name":"Test"}'
-
-# 15초 대기 후 쿼리:
-# http_server_requests_seconds_count{uri="/api/v1/tenants/signup"}
-# → 카운트 증가 확인
+# 5. 앱 지표 (앱이 떠 있을 때만)
+#   up{job="queue-api"} / jvm_memory_used_bytes{area="heap"}
+#   http_server_requests_seconds_count{uri="/api/v1/tenants/signup"}
 ```
 
 ### 7-9. Grafana 대시보드 N/A 문제
@@ -1351,7 +1259,91 @@ C. 대시보드 변수 수정
   --storage.tsdb.path=./data
 ```
 
-`mon_start` 함수의 nohup 라인 수정해서 반영 가능.
+`prometheus.service`의 `ExecStart`에 플래그를 추가하고 `sudo systemctl daemon-reload && sudo systemctl restart prometheus`.
+
+---
+
+### 7-11. 인프라 Exporter (redis / mysqld)
+
+**왜**: 이 프로젝트의 1차 병목은 **Redis master 단일 스레드**다(폴링 1건 = master EVAL 1회,
+§75 D26으로 한 큐 = 마스터 1대 고정 → 분산 불가). 앱 커스텀 메트릭을 아무리 늘려도
+"Redis가 포화인가"는 안 보인다. 2순위는 **replica 복제 지연** — 읽기 전용 트랜잭션이 replica로
+가고 인증 조회도 그 경로라, 지연이 **앱 401**로 위장해 나타난다.
+
+| | 값 |
+|---|---|
+| 바이너리 | `/home/sonix/queue-platform-infra/monitoring/exporters/{redis,mysqld}_exporter` |
+| 버전 | redis_exporter v1.89.0 / mysqld_exporter 0.20.0 (GitHub release 타르볼) |
+| 유닛 파일 원본 | `/home/sonix/queue-platform-infra/monitoring/systemd/*.service` |
+| 포트 | redis 9121 / mysql-master 9104 / mysql-replica 9105 (전부 127.0.0.1 바인드) |
+| MySQL 자격증명 | `.../exporters/mysqld-{master,replica}.cnf` (0600, `[client]` 섹션) |
+
+**redis_exporter는 프로세스 1개로 22개 노드를 커버한다** — `/scrape?target=redis://host:port`
+멀티타깃. 노드가 늘어도 `prometheus.yml`에 targets 한 줄만 추가하면 되고 프로세스는 그대로다.
+(대안이던 "노드당 익스포터 1개"는 22개 프로세스 + 22개 유닛이 되어 기각)
+
+```bash
+# 유닛 등록 (최초 1회)
+sudo cp /home/sonix/queue-platform-infra/monitoring/systemd/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now redis-exporter mysqld-exporter-master mysqld-exporter-replica
+```
+
+**MySQL 전용 계정** (root 자격을 익스포터에 주지 않는다). Master에서만 실행하면 GTID 복제로
+replica에도 전파된다:
+
+```sql
+-- master(3306)에서 root로
+CREATE USER 'exporter'@'localhost' IDENTIFIED BY 'ExporterOnly!2026' WITH MAX_USER_CONNECTIONS 3;
+GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'localhost';
+-- 되돌리기: DROP USER 'exporter'@'localhost';
+```
+
+> `REPLICATION CLIENT`가 없으면 `SHOW REPLICA STATUS`가 막혀
+> **`mysql_slave_status_seconds_behind_master`가 아예 나오지 않는다.**
+> 증상: `mysql_up 1`인데 `mysql_exporter_collector_success{collector="collect.slave_status"} 0`.
+> (앱 계정 `queueapp`으로 시도했을 때 실제로 재현됨 — 그래서 전용 계정이 필요하다)
+
+**핵심 지표** (임계값은 `monitoring` 소관, 기준선 측정 후 결정):
+
+| 질문 | 쿼리 |
+|---|---|
+| Redis master 단일 스레드 포화? | `rate(redis_cpu_user_main_thread_seconds_total{job="redis"}[1m])` (1.0 = 포화) |
+| EVAL이 그 시간을 얼마나 먹나? | `rate(redis_commands_duration_seconds_total{cmd=~"eval.*"}[1m])` |
+| 대기열이 조용히 사라졌나? | `redis_evicted_keys_total`, `redis_memory_max_bytes` |
+| failover 발생? | `redis_instance_info{job="redis"}` 의 `role` 라벨 변화, `redis_sentinel_master_config_epoch` 증가 |
+| Sentinel quorum 성립? | `redis_sentinel_master_ckquorum_status` |
+| replica 지연 (→ 401 위장 장애) | `mysql_slave_status_seconds_behind_master` |
+
+**미설치 — 안 깔았을 때 안 보이는 것을 답할 수 있을 때만 추가**:
+`node_exporter`(호스트 CPU/디스크), `kafka_exporter`(컨슈머 lag — 단, Spring Kafka가
+`/actuator/prometheus`로 `kafka_consumer_fetch_manager_records_lag`를 이미 낸다 → 중복).
+
+### 7-12. 알람 규칙 + Alertmanager
+
+**알람 규칙 정본은 레포 안이다**: `doc/monitoring/alerts/*.yml`.
+실가동 `prometheus.yml`의 `rule_files`가 이 **절대 경로를 직접 읽는다**(복사본 없음).
+
+> **레포 밖에 규칙 디렉터리를 또 만들지 마라.** `prometheus.yml`이 레포 밖에 있어서
+> 이 문서와 경로·job명·라벨 키가 갈라졌던 바로 그 문제가 규칙에서 반복된다.
+> 규칙은 텍스트이고 리뷰 대상이므로 버전 관리 안에 있어야 한다.
+> 심볼릭 링크가 아니라 절대 경로를 쓴 이유: Prometheus가 `User=sonix`로 돌고
+> `doc/` 소유자도 `sonix`(755)라 **권한 문제가 없어 링크라는 간접층이 불필요**하다.
+
+```bash
+# 규칙 추가 후
+promtool check rules doc/monitoring/alerts/*.yml
+kill -HUP $(pgrep -x prometheus)
+curl -s localhost:9090/api/v1/rules      # 로드 확인
+```
+
+매치되는 `*.yml`이 **0개여도 Prometheus는 정상 기동**한다(별도 인스턴스 cold start로 실증).
+따라서 "배선 먼저, 규칙 나중" 순서로 안전하다.
+
+**Alertmanager는 의도적으로 설치하지 않았다.** 알림 채널(Slack/메일)이 없어서 띄워봐야
+firing을 자기 UI에 다시 보여줄 뿐이고, 그건 Prometheus `/alerts`와 Grafana가 이미 한다.
+로컬 단독 환경에서 **안 만들어서 깨지는 것이 없다.** 채널이 생기면 `prometheus.yml`의
+`alerting` 주석 블록을 해제한다.
 
 ---
 
@@ -1422,14 +1414,15 @@ IntelliJ Settings (Ctrl+Alt+S)
 | 8005-8008 | Cluster B Replica (4개) |
 | 18001-18008 | Cluster B Bus (자동) |
 
-향후 추가 (Phase 5 — 인프라 Exporter):
+### 인프라 Exporter (§7-11, 전부 127.0.0.1 바인드)
 
 | 포트 | 용도 |
 |------|------|
-| 9100 | node_exporter (시스템 리소스) |
-| 9104 | mysqld_exporter |
-| 9121 | redis_exporter |
-| 9308 | kafka_exporter |
+| 9121 | redis_exporter (프로세스 1개가 6379·6380·6381 + 26379~26381 + 7001~7008 + 8001~8008 = 22노드 멀티타깃) |
+| 9104 | mysqld_exporter → MySQL Master 3306 |
+| 9105 | mysqld_exporter → MySQL Replica 3307 |
+
+미설치 (필요 근거가 생기면 추가): 9100 node_exporter, 9308 kafka_exporter
 
 ---
 

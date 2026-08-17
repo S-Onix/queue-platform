@@ -109,6 +109,10 @@ CREATE TABLE queues (
 --
 -- [seq] ADMIT_ISSUED→WAITING 복귀 시 Redis ZADD score 복원 필수
 -- [admit_token] verify DB Fallback + Polling Fallback용
+-- [admitted_at] admit 시각. verify·complete의 유효 창 판정 기준 (DECISIONS §80)
+--   ⚠️ issued_at을 그 판정에 쓰면 안 된다 — 줄을 선 시각이라 두 시간 전일 수 있다.
+--   ⚠️ 파티션 테이블에 ADD COLUMN이므로 ALGORITHM=INSTANT가 되는지 먼저 확인할 것.
+--      안 되면 13개 파티션 재구축 + replica 지연이다 (§80 착수 전 검증)
 -- [redis_sync_needed] Redis 다운 중 INSERT 토큰 추적 → RedisSyncJob
 -- [파티션 키] PRIMARY KEY(id, issued_at) — MySQL 제약
 --
@@ -135,22 +139,26 @@ CREATE TABLE tokens (
     expired_reason    TINYINT      NULL,
     admit_token       VARCHAR(50)  NULL,
     redis_sync_needed TINYINT      NOT NULL DEFAULT 0,
-    -- ⚠️ 아래 4개는 전부 UTC 벽시계다. 위 [시각 규약] 참조. DEFAULT를 붙이지 마라.
+    -- ⚠️ 아래 5개는 전부 UTC 벽시계다. 위 [시각 규약] 참조. DEFAULT를 붙이지 마라.
     issued_at         DATETIME(3)  NOT NULL,
+    admitted_at       DATETIME(3)  NULL,     -- admit 시각 (DECISIONS §80)
     completed_at      DATETIME(3)  NULL,
     cancelled_at      DATETIME(3)  NULL,
     expired_at        DATETIME(3)  NULL,
 
     PRIMARY KEY (id, issued_at),
     UNIQUE KEY uq_tokens_token_id         (token_id, issued_at),
-    INDEX idx_tokens_token_status         (token_id, status),
+    INDEX idx_tokens_token_status         (token_id, status),          -- ⚠️ 삭제 후보: uq_tokens_token_id가 (token_id, ...) 접두로 커버
     INDEX idx_tokens_queue_status_issued  (queue_id, status, issued_at),
-    INDEX idx_tokens_queue_user_status    (queue_id, user_id, status),
-    INDEX idx_tokens_status_admit         (status, issued_at),
-    INDEX idx_tokens_sync_needed          (redis_sync_needed, status),
+    INDEX idx_tokens_queue_user_status    (queue_id, user_id, status), -- ⚠️ 삭제 후보: 중복 판정은 Lua ZADD NX가 한다. 6개 중 가장 넓다
+    INDEX idx_tokens_status_admit         (status, issued_at),         -- ⚠️ 삭제 후보(Sprint 9 확정 후). 이름의 admit은 admit_token과 무관 — 오해를 부른다
+    INDEX idx_tokens_sync_needed          (redis_sync_needed, status)
 
-    CONSTRAINT fk_tokens_queue
-        FOREIGN KEY (queue_id) REFERENCES queues (queue_id)
+    -- 🔴 fk_tokens_queue 삭제 (2026-08-17)
+    --   InnoDB는 파티션 테이블에 FK를 지원하지 않는다. 이 제약이 남아 있으면
+    --   이 파일을 그대로 실행할 때 CREATE TABLE 자체가 실패한다.
+    --   (구: CONSTRAINT fk_tokens_queue FOREIGN KEY (queue_id) REFERENCES queues (queue_id))
+    --   queue_id 정합성은 애플리케이션이 보장한다 — enqueue가 queues 행을 먼저 읽는다.
 )
 PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
     PARTITION p2026_01 VALUES LESS THAN (202602),
@@ -169,21 +177,21 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
 );
 
 
-CREATE TABLE admit_requests (
-    id            BIGINT       NOT NULL AUTO_INCREMENT,
-    request_id    VARCHAR(50)  NOT NULL,
-    tenant_id     BIGINT       NOT NULL,
-    queue_id      VARCHAR(50)  NOT NULL,
-    count         INT          NOT NULL,
-    status        TINYINT      NOT NULL DEFAULT 0,
-    created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    completed_at  DATETIME(3)  NULL,
-
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_admit_request_id        (request_id),
-    INDEX idx_admit_requests_queue_status (queue_id, status),
-    INDEX idx_admit_requests_tenant       (tenant_id, created_at)
-);
+-- ================================================================
+-- 🔴 admit_requests 테이블 삭제 (2026-08-17, DECISIONS §80)
+--
+--   폐기 이유:
+--     ① 존재 이유가 "요청은 받았는데 아직 처리 안 됨(PENDING)"이었는데,
+--        admit이 동기 + Lua 하나가 되어 그 상태 자체가 없다. 성공했거나 예외거나다.
+--     ② 감사 기록으로도 반쪽이다 — 흐름이 'Lua 성공 → INSERT'라
+--        실패한 요청은 애초에 남지 않는다. 성공 기록은 Kafka 이벤트·메트릭이 이미 갖는다.
+--     ③ 과금 근거가 아니다 (과금은 enqueue 수 기준).
+--   대체:
+--     멱등 → Redis queue:{q}:admit-idem:{requestId} (결과 payload 저장 → REPLAY)
+--     장기 이력 → queue_daily_stats.total_admit_count
+--   ⚠️ 대가: Redis 멱등키가 유실되면 중복 admit을 감지할 수단이 없다.
+--      UNIQUE (request_id)가 마지막 방어선이었다. §80이 명시적으로 수용한 비용이다.
+-- ================================================================
 
 
 -- billing_snapshots: Tenant별 월별 과금 집계 (청구 기준)
@@ -272,12 +280,29 @@ ALTER TABLE tokens REORGANIZE PARTITION p_future INTO (
     PARTITION p_future  VALUES LESS THAN MAXVALUE
 );
 
--- Partition Pruning 검증
-EXPLAIN SELECT * FROM tokens
-WHERE queue_id = 'q_xyz'
-  AND issued_at >= '2026-04-01'
-  AND issued_at <  '2026-05-01';
--- partitions: p2026_04 ← Pruning 성공 확인
+-- ================================================================
+-- 🔴 Partition Pruning — 위 Step 1·2의 범위 조건은 프루닝되지 않는다 (2026-08-17 정정)
+-- ================================================================
+--   파티션 표현식이 YEAR(c)*100 + MONTH(c) 인데, MySQL 옵티마이저는 이 식을
+--   issued_at에 대해 단조(monotonic)라고 인식하지 못한다. 그래서
+--   `issued_at >= ... AND issued_at < ...` 같은 범위 조건에서는 프루닝이 안 걸리고
+--   13개 파티션을 전부 훑는다.
+--
+--   실측: 범위 조건·표현식 → partitions: 전체 13개
+--         등치(=)만       → 해당 파티션 1개
+--
+--   ⚠️ 아래는 "성공 확인"이 아니라 반례다. 실행해 보면 partitions 칸에 13개가 나온다:
+--     EXPLAIN SELECT * FROM tokens
+--      WHERE queue_id = 'q_xyz'
+--        AND issued_at >= '2026-04-01' AND issued_at < '2026-05-01';
+--
+--   해결(무료): 월말 집계는 파티션을 직접 지목한다. 어차피 배치가 대상 월을 알고 있다.
+--     SELECT ... FROM tokens PARTITION (p2026_04) WHERE ...
+--   → 위 Step 1·2의 FROM tokens 를 FROM tokens PARTITION (p2026_04) 로 바꾸면
+--     범위 조건을 그대로 두고도 한 파티션만 읽는다.
+--
+--   ※ 파티션 표현식 자체를 바꾸는 것(예: RANGE COLUMNS(issued_at))은 전면 재구축이라
+--     지금 하지 않는다. 집계는 배치 경로뿐이고 PARTITION 절로 해결된다.
 
 
 -- ================================================================
