@@ -3,6 +3,14 @@
 > 작성일: 2026-05 (Sprint 5 Phase 2 진행 예정)
 > 목적: Queue Platform의 핵심 Redis Lua Script 분석
 
+> ⚠️ **이 문서는 §66 D2 이전의 "슬라이스" 설계를 다룬 학습 기록이다.**
+> 여기 나오는 `enqueue.lua` · `rank.lua` · `dequeue.lua`와 `queue:{t}:{q}:{slice}` ·
+> `global-seq` 키는 **존재하지 않는다.** 실제 구현은 `enqueue_bulk.lua`(3키 — waiting/seq/tokens)와
+> `poll_verify.lua`(3키 — waiting/tokens/last-active)이고, 순번은 `INCR queue:{queueId}:seq`로
+> 발급한다(§70 D9). `ZCOUNT` 기반 순위 조회도 §74에서 사라졌다.
+> **Lua 자체를 이해하는 목적으로는 여전히 유효**하므로 본문은 그대로 둔다.
+> 현행 스크립트는 `doc/FRS_final.md` §8 · `DECISIONS §70` · `§74` 참조.
+
 ---
 
 ## 1. 왜 Lua Script인가?

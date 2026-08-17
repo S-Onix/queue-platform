@@ -1,6 +1,6 @@
 # 📊 Queue Platform — 상태 흐름도
 
-> FRS v1.9 기준
+> FRS v1.12 기준
 
 ---
 
@@ -8,17 +8,17 @@
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING : POST /tokens\nEnqueue (Tenant 서버)\nZADD NX, score=global-seq
+    [*] --> WAITING : POST /tokens\nEnqueue (Tenant 서버)\nZADD NX member=identifier\nscore = INCR queue:{queueId}:seq
 
     WAITING --> ADMIT_ISSUED : POST /admit\nTenant 서버 — N명 입장토큰 발급\nadmitToken TTL 60초
 
-    ADMIT_ISSUED --> COMPLETED : POST /tokens/:token/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\nKafka token-status-changed 발행
+    ADMIT_ISSUED --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\nKafka token-lifecycle 발행 (key=tokenId)
 
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nBatch 10초 주기 감지\nWAITING 복귀 (EXPIRED 아님)\nseq 유지 → 우선순위 보존
 
-    WAITING --> CANCELLED : DELETE /token\n유저 자발적 이탈\nWAITING만 허용\nZREM + cancelledAt\nKafka token-status-changed 발행
+    WAITING --> CANCELLED : DELETE /token\n유저 자발적 이탈\nWAITING만 허용\nZREM + cancelledAt\nKafka token-lifecycle 발행 (key=tokenId)
 
-    WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과\nKafka token-status-changed 발행
+    WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과\nKafka token-lifecycle 발행 (key=tokenId)
 
     COMPLETED --> [*]
     CANCELLED --> [*]
@@ -47,8 +47,8 @@ stateDiagram-v2
 | 값 | 원인 | 대상 | Batch 감지 |
 |----|------|------|------------|
 | `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms) |
-| `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | EXISTS token-last-active = 0 |
-| `ADMIT_TOKEN_TTL` | admitToken 60초 초과 → WAITING 복귀 (EXPIRED 아님) | ADMIT_ISSUED | EXISTS admit-token-by-token = 0 |
+| `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) |
+| `ADMIT_TOKEN_TTL` | admitToken 60초 초과 → WAITING 복귀 (EXPIRED 아님) | ADMIT_ISSUED | EXISTS queue:{queueId}:admit-by-token:{tokenId} = 0 |
 
 > ADMIT_TOKEN_TTL은 EXPIRED 아닌 WAITING 복귀
 > DB tokens.seq 기반 Redis ZADD score 복원 → 우선순위 유지

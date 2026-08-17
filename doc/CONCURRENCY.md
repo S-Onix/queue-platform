@@ -98,17 +98,25 @@ return 1
 
 ### 3단계: Kafka partition 순서 보장
 
-같은 entity의 이벤트가 같은 partition으로 가도록 key를 설정한다.
+**순서를 지켜야 하는 그 entity 자신**을 key로 잡는다. 이 프로젝트에서는 `tokenId`다.
 
 ```java
-kafkaTemplate.send("enqueue-events", queueId.toString(), event);
-//                                    ↑ partition key
+kafkaTemplate.send(topic, event.tokenId(), event);
+//                        ↑ partition key — 순서 단위와 같아야 한다
 ```
 
-같은 queueId의 이벤트는 같은 partition → 같은 consumer thread → 순서 보장.
+같은 tokenId의 이벤트는 같은 partition → 그룹 안에서 한 consumer가 독점 → `WAITING → ADMIT_ISSUED → COMPLETED` 순서 보장.
+
+> ⚠️ **key를 상위 묶음(`queueId`)으로 잡지 마라.** 순서는 지켜지지만 **분산이 죽는다** —
+> 큐 카디널리티가 낮고 "한 큐에 30만 명"이 정상 시나리오라 트래픽 99%가 한 파티션에 몰리고,
+> 파티션을 늘려도 해결되지 않는다. 실제로 이 프로젝트는 `queueId` 키를 **기각**했다 (DECISIONS §73 D16).
+> key 선택의 기준은 "묶고 싶은 단위"가 아니라 **"순서가 필요한 최소 단위"**다.
+>
+> 토픽도 마찬가지다. 순서 보장은 **같은 토픽의 같은 파티션** 안에서만 성립하므로,
+> 한 entity의 생명주기를 여러 토픽으로 쪼개면 key가 같아도 순서가 깨진다 (§73 D18 — 단일 `token-lifecycle`).
 
 **장점**: 비동기 흐름 안에서 동시성 자연 해결  
-**언제 한계**: 동기 응답이 필요한 경우
+**언제 한계**: 동기 응답이 필요한 경우 / 리밸런스 재처리·파티션 증설에서는 순서가 깨진다 (§73)
 
 ### 4단계: DB 비관적 락
 
@@ -655,7 +663,7 @@ class QueueCreationConcurrencyTest {
 ## 9. 참조
 
 - CLAUDE.md "동시성 제어" 섹션
-- `queue-domain/docs/ARCHITECTURE_ROADMAP.md` (부록 F: 이중 라우팅, 부록 H: Master 최적화)
+- `doc/ARCHITECTURE_ROADMAP.md` (부록 F: 이중 라우팅, 부록 H: Master 최적화)
 - `doc/INFRA_SETUP.md` §6.5 (Cluster 로컬 실습)
 - Martin Kleppmann, "How to do distributed locking"
 - Redis Documentation, "Distributed Locks with Redis"

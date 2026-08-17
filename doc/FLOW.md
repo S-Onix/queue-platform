@@ -1,7 +1,7 @@
 # 🔄 Queue Platform — 상세 흐름도
 
-> **최종 업데이트**: 2026-07-15 (Sprint 5-E Enqueue 구현 완료 — 하이브리드 폐기, Hash Tag 적용)
-> **관련 문서**: DECISIONS.md §66-70, doc/ARCHITECTURE_ROADMAP.md, FRS v1.10
+> **최종 업데이트**: 2026-08-17 (구현 대조 — Kafka 단일 토픽 §73, 슬라이스 절 폐기 §66 D2, 3-key Lua)
+> **관련 문서**: DECISIONS.md §66-70·§73-§79, doc/ARCHITECTURE_ROADMAP.md, FRS v1.12
 
 ---
 
@@ -31,16 +31,17 @@ flowchart TD
     SCHED["⑥ BatchProcessor (Consumer)\n@Scheduled(fixedRate=1000ms)"]
     --> DRAIN["drain (최대 MAX_DRAIN=5000)\nqueueId별 groupBy"]
     --> CHUNK["CHUNK_SIZE=500씩 분할"]
-    --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\n(Hash Tag — 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity? → FULL\n  INCR seq → score 발급\n  ZADD NX → 신규? OK : EXISTS\n  ZRANK → 순번\n결과 array (입력과 동일 순서)"]
+    --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\nKEYS[3]=queue:{queueId}:tokens\n(Hash Tag — 세 키가 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity? → FULL\n  INCR seq → score 발급\n  ZADD NX member=identifier → 신규? OK : EXISTS\n  HSET tokens[identifier]='tokenId|issuedAt'\n  ZRANK → 순번\n결과 array (입력과 동일 순서)"]
     --> COMPLETE["⑧ 위치(index)로 매칭하여\n각 future.complete(result)\n※ identifier는 중복 가능하므로 key로 쓰면 안 됨"]
 
-    COMPLETE --> OK(["200 OK\n{ status: OK/EXISTS/FULL,\n  rank, total }"])
+    COMPLETE --> PUB["⑨ KafkaEnqueueEventPublisher.publish()\ntoken-lifecycle, key=tokenId (§73 D16)\n**동기** — 브로커 ack까지 최대 12s 대기\n실패 시 QE001(503) — 200이 안 나간다"]
+    --> OK(["200 OK\n{ queueId, identifier, tokenId,\n  seq, rank(1-based), total, already }"])
 
     FILTER -->|"인증 실패"| E401(["401 UNAUTHORIZED"])
     FILTER -->|"Rate 초과"| E429(["429 RL_001 + Retry-After"])
-    SERV -->|"큐 없음"| E404(["404 QM_002 QUEUE_NOT_FOUND"])
-    SERV -->|"소유권 불일치"| E403(["403 QM_003 FORBIDDEN"])
-    SERV -->|"PAUSED/DRAINING"| E503(["503 QM_004 NOT_ACTIVE"])
+    SERV -->|"큐 없음"| E404(["404 Q001 QUEUE_NOT_FOUND"])
+    SERV -->|"소유권 불일치"| E403(["403 Q002 QUEUE_NOT_OWNED"])
+    SERV -->|"PAUSED/DRAINING"| E503(["503 Q004 QUEUE_NOT_ACTIVE"])
 ```
 
 **처리량 상한**: 인스턴스당 `MAX_DRAIN / fixedRate` = **5,000 req/s**. 유입이 이를 넘으면
@@ -49,7 +50,9 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 ### Enqueue 결정 근거
 
 **확정 결정** (DECISIONS §66-70, ARCHITECTURE_ROADMAP 부록 A):
-- D1: 자유 identifier (Tenant 제공, UUID/이메일/고객번호 등)
+- D1: identifier는 Tenant가 제공 — 단 **형식은 UUIDv7로 좁혀졌다(§78)**. 이메일·순번 ID처럼
+  추측 가능한 값은 금지(enqueue가 EXISTS 시 기존 `tokenId`·`seq`를 돌려주므로 자격 증명이 샌다).
+  같은 사용자·같은 큐엔 **항상 같은 UUID를 재사용**해야 `ZADD NX` 중복 방지가 성립한다
 - D2: ZSet 하나 (`queue:{queueId}:waiting`)
 - D3: ZRANK + ZCARD (별도 counter 없음)
 - D4: Java (부하 측정) + Lua (원자 처리) 분리
@@ -68,23 +71,29 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 > D9(seq 키) 도입으로 **2-key가 되어 전제가 깨졌다.**
 
 - Lettuce가 key의 CRC16으로 자동 slot 계산 → 해당 slot 담당 Master로 자동 라우팅
-- `enqueue_bulk.lua`는 **키 2개**(waiting + seq)를 사용 → **해시태그로 동일 slot 강제** (D10)
+- `enqueue_bulk.lua`는 **키 3개**(waiting + seq + tokens)를 사용 → **해시태그로 동일 slot 강제** (D10)
   - 해시태그 없으면: slot 7911 vs 11273 → 다른 Master → `CROSSSLOT` 에러
-  - 해시태그 있으면: 둘 다 slot 10592 → 같은 Master → 정상
+  - 해시태그 있으면: 셋 다 같은 slot → 같은 Master → 정상
+  - `poll_verify.lua`도 3키다 (waiting + tokens + last-active, §74)
 - Sentinel에선 무해하므로 **선제 적용 완료** (로컬 Cluster A에서 실제 스크립트 실행 검증)
 - 이중 라우팅 (Sprint 12+): 태그가 shard로 이동 → `queue:{shard_X}:{queueId}:waiting`
 
-### Kafka 도입 후 (Sprint 11+ 계획)
+### Kafka 적재 (구현 완료 — DECISIONS §73)
 
-Sprint 11-12에서 Kafka 도입 시 흐름 변경:
-- Enqueue 완료 후 Kafka `enqueue-events` 토픽 발행
-- Consumer가 DB INSERT (Bulk, 1000건씩)
+- Enqueue 완료 후 Kafka `token-lifecycle` 발행 (**key = `tokenId`**, 18 파티션)
+- `queue-consumer` 모듈의 `TokenLifecycleConsumer`가 배치로 DB INSERT (멱등)
 - Redis 다운 시 `redis_sync_needed=1` DB INSERT
 - 복구 시 배치가 Sorted Set 재삽입
 
 ---
 
 ## Polling (유저 → Platform 직접, Jitter 적용)
+
+> ⚠️ **이 절은 §79(2026-08-14) 이전의 검토안이다.** 현행 계약은 아래
+> "클라이언트 Polling 구조 (JS SDK)" 절과 `FRS_final.md §6.3`을 보라.
+> §79에서 바뀐 것: 엔드포인트 2분할 / 서버는 rank를 계산하지 않는다 /
+> `QueueSnapshotCache`(Caffeine)는 **제거 대상**이다.
+> 아래 `/rank/:identifier`·`{rank, total, estimatedWaitSeconds}` 표기는 **채택되지 않았다.**
 
 Sprint 5-E 이후 Polling 부하 최적화:
 - **Jitter 적용** (JS SDK): 요청 시점 무작위 분산 (4-6초 랜덤)
@@ -113,7 +122,7 @@ flowchart TD
     CACHE -->|"HIT (80%)"| RESPCACHE(["200 OK 즉시 반환\n소요: 0.0001ms"])
     CACHE -->|"MISS (20%)"| RANK["③ Rank 조회 (Redis)\nZRANK queue:{queueId}:waiting {identifier}\nZCARD queue:{queueId}:waiting\n소요: 1-2ms"]
 
-    RANK -->|"없음"| E404(["404 QE_002 NOT_IN_QUEUE"])
+    RANK -->|"없음"| E404(["404 TK001 TOKEN_NOT_FOUND"])
     RANK -->|"조회됨"| CACHESET["④ Caffeine에 저장\nTTL 1-2s"]
     CACHESET --> ETA["⑤ ETA 계산\navgWaitingTime × rank"]
     --> RESP(["200 OK\n{ rank, total, estimatedWaitSeconds }\nJS SDK가 다음 요청 시점\nsetTimeout(4000~6000ms)로 예약"])
@@ -145,43 +154,43 @@ flowchart TD
     SLOT(["Tenant\n슬롯 여유 생김"])
     --> ADMIT["POST /queues/:queueId/admit\n{ count: N, requestId }\nTenant → Platform"]
 
-    ADMIT --> IDEM{"admit-idem:{requestId}\n존재?"}
+    ADMIT --> IDEM{"queue:{queueId}:admit-idem:{requestId}\n존재?"}
     IDEM -->|"있음 (중복)"| CACHED(["200 OK\n기존 결과 반환"])
     IDEM -->|"없음"| DBINS["DB admit_requests INSERT\nstatus=PENDING\n← 영속성 기준점"]
 
-    DBINS --> KAFKA["Kafka enqueue-admit topic produce\n{ requestId, tenantId, queueId, count }"]
+    DBINS --> KAFKA["admit 요청 전달\n{ requestId, tenantId, queueId, count }\n⚠️ 전달 수단 미판정 (FRS §7 — Sprint 7에서 결정)"]
 
-    KAFKA --> CONSUMER["Kafka Consumer (Admit Worker)\nDB PENDING 확인 → 멱등 체크\nstatus=PROCESSING 업데이트"]
+    KAFKA --> CONSUMER["Admit Worker\nDB PENDING 확인 → 멱등 체크\nstatus=PROCESSING 업데이트"]
 
-    CONSUMER --> LUA["Lua Script\n슬라이스별 ZRANGE WITHSCORES\nLua 내부 score 정렬\n상위 N명 선택\nZREM multi-member"]
-    --> FILTER["DB WAITING 상태 확인\n불일치 즉시 ZREM\n부족 시 최대 3회 추가 추출\n추가 추출 시 전체 재정렬 → FIFO 보장"]
-    --> TOKEN["admitToken 발급\nSET admit-token-by-token:{tokenId} EX 60\nSET admit-token-by-admit:{admitToken} EX 60\nDB UPDATE ADMIT_ISSUED (100건씩)\nSET token-info 캐시 갱신\nDB admit_requests status=COMPLETED"]
+    CONSUMER --> LUA["① Lua Script (Redis 전용)\n슬라이스별 ZRANGE WITHSCORES\nLua 내부 score 정렬\n상위 N명 선택\nZREM multi-member"]
+    --> FILTER["② DB WAITING 상태 확인 ← Lua 밖 (Lua는 MySQL을 못 만진다)\n불일치 즉시 ZREM\n부족 시 최대 3회 추가 추출\n추가 추출 시 전체 재정렬 → FIFO 보장"]
+    --> TOKEN["③ admitToken 발급 ← ①과 별개 호출\nSET queue:{queueId}:admit-by-token:{tokenId} EX 60\nSET queue:{queueId}:admit-by-admit:{admitToken} EX 60\nSET queue:{queueId}:admit-watermark = max(현재값, 뽑은 최대 seq)\nDB UPDATE ADMIT_ISSUED (100건씩)\nSET token-info 캐시 갱신\nDB admit_requests status=COMPLETED\n⚠️ ①과 ③ 사이에 'pop 성공 + SET 실패' 창이 있다 (DECISIONS §79 — 미해결)"]
     --> ARESP(["200 OK\n{ admitTokens: [{userId, admitToken}...] }"])
 
     ARESP --> POLL["유저 다음 Polling 시\nadmitToken 수신"]
     --> USER["유저 → Tenant\nadmitToken 전달"]
-    --> VERIFY["POST /admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 (상태 변경 없음)"]
+    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 (상태 변경 없음)"]
 
-    VERIFY --> VK{"admit-token-by-admit:{admitToken}\n유효?"}
-    VK -->|"만료 or 무효"| VDB["DB Fallback 시도\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(NOW() 금지 — issued_at은 UTC. DECISIONS §76)"]
+    VERIFY --> VK{"queue:{queueId}:admit-by-admit:{admitToken}\n유효?"}
+    VK -->|"만료 or 무효"| VDB["DB Fallback 시도\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(NOW() 금지 — 시각은 전부 UTC. DECISIONS §77)"]
     VDB -->|"없음"| E404(["404 TK_002_INVALID_ADMIT_TOKEN"])
     VDB -->|"있음"| VFLAG["SET verified-token:{tokenId} EX 60\n중복 입장 방지 플래그"]
     VK -->|"유효"| VFLAG
-    --> VRESP(["200 OK\n{ valid: true, userId }"])
+    --> VRESP(["200 OK\n{ valid: true, identifier }"])
 
     VRESP --> ALLOW["Tenant → 유저 입장 허용"]
-    --> COMPLETE["POST /tokens/:token/complete\n{ admitToken }\nTenant → Platform\n입장 완료 통보"]
+    --> COMPLETE["POST /queues/:queueId/tokens/:tokenId/complete\n{ admitToken }\nTenant → Platform\n입장 완료 통보"]
 
     COMPLETE --> CK{"ADMIT_ISSUED(1)\n상태?"}
     CK -->|"아님"| E409(["409 QE_006_INVALID_STATUS"])
     CK -->|"확인"| DB["DB status = COMPLETED(2)\n← 먼저 (원자성 전략)\nDB UPDATE WHERE status=1 → 1번만 성공"]
-    --> ZREM["Redis ZREM\nDEL admit-token-by-token\nDEL admit-token-by-admit\nDEL token-info 캐시\nDEL verified-token\n← 나중"]
+    --> ZREM["Redis ZREM\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit\nDEL token-info 캐시\nDEL verified-token\n← 나중"]
     --> AVG["avgWaitingTime 직접 갱신\nwaitingSeconds = completedAt - issuedAt\n이상치 필터: > waitingTtl × 0.8 제외\nHINCRBYFLOAT queue-stats waitingTimeSum\nHINCRBY queue-stats waitingTimeCount"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
 
-    TOKEN -->|"admitToken TTL 60초 초과\nBatch 10초 주기 감지"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD {seq} {tokenId}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL admit-token-by-token\nDEL admit-token-by-admit"]
+    TOKEN -->|"admitToken TTL 60초 초과\nBatch 10초 주기 감지"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD queue:{queueId}:waiting {seq} {identifier}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit"]
 ```
 
 > **Kafka Consumer 장애 시**
@@ -194,14 +203,14 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    DQ(["DELETE /queues/:queueId/tokens/:token\nTenant 서버 호출\n유저 대기 포기"])
+    DQ(["DELETE /queues/:queueId/tokens/:tokenId\nTenant 서버 호출\n유저 대기 포기"])
     --> CHK["상태 확인"]
 
     CHK -->|"ADMIT_ISSUED(1)"| E409A(["409 QE_006_INVALID_STATUS\n입장토큰 발급 후 이탈 불가\nadmitToken TTL 60초 후\nWAITING 복귀 후 이탈 가능"])
     CHK -->|"WAITING 아님\n(COMPLETED/EXPIRED/CANCELLED)"| E409B(["409 QE_006_INVALID_STATUS"])
     CHK -->|"WAITING(0)"| ZREM["Redis ZREM\n뒤 순위 자동 당겨짐"]
     --> DB["DB status = CANCELLED(3)\ncancelledAt 기록"]
-    --> DEL["DEL queue-user 역인덱스\nDEL token-info 캐시\n같은 userId 재Enqueue 가능 (맨 뒤)"]
+    --> DEL["HDEL queue:{queueId}:tokens {identifier}\nDEL token-info 캐시\n같은 identifier 재Enqueue 가능 (맨 뒤)"]
     --> OK(["200 OK\n{ status: CANCELLED, cancelledAt }"])
 ```
 
@@ -217,13 +226,13 @@ flowchart TD
     ALIST --> W1 & W2 & W3
 
     W1["waitingTtl 체크 (WAITING)\nZRANGEBYSCORE\n0 ~ now_ms - waitingTtl_ms"]
-    W2["inactiveTtl 체크 (WAITING)\nEXISTS token-last-active\n= 0 이면 비활동"]
-    W3["admitToken TTL 체크 (ADMIT_ISSUED)\nEXISTS admit-token-by-token:{tokenId}\n= 0 이면 만료"]
+    W2["inactiveTtl 체크 (WAITING)\nZRANGEBYSCORE queue:{queueId}:last-active\n0 ~ now_ms - inactiveTtl_ms\n(member=seq, score=마지막 ka 시각)"]
+    W3["admitToken TTL 체크 (ADMIT_ISSUED)\nEXISTS queue:{queueId}:admit-by-token:{tokenId}\n= 0 이면 만료"]
 
     W1 -->|"WAITING_TTL(0)"| EXP["DB UPDATE EXPIRED(4)\nexpiredReason 기록\nRedis ZREM\nDEL token-info 캐시\n100건씩 순차 처리\nLIMIT 100 → Gap Lock 방지"]
     W2 -->|"INACTIVE_TTL(1)"| EXP
 
-    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD {seq} {tokenId}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL admit-token-by-token\nDEL admit-token-by-admit"]
+    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀\nDB SELECT seq\nRedis ZADD queue:{queueId}:waiting {seq} {identifier}\nDB UPDATE WAITING(0)\nDEL token-info 캐시\nDEL queue:{queueId}:admit-by-token\nDEL queue:{queueId}:admit-by-admit"]
 
     EXP --> DONE(["완료\n멱등: 상태 필터로 중복 처리 없음"])
     BACK --> DONE
@@ -231,45 +240,12 @@ flowchart TD
 
 ---
 
-## 슬라이스 구조 — 전체 순위 보장
+## ~~슬라이스 구조~~ — 폐기 (§66 D2)
 
-```mermaid
-flowchart LR
-    subgraph GLOBAL["글로벌 순번 (Bulk)"]
-        SEQ["global-seq:{t}:{q}\nINCRBY 500 → 1~500 블록 채번"]
-    end
-
-    subgraph SLICES["슬라이스 (maxCapacity=300,000 → 3개)\nslice = (seq-1) % sliceCount (라운드로빈)"]
-        S0["queue:{t}:{q}:0\nseq 1,4,7,10..."]
-        S1["queue:{t}:{q}:1\nseq 2,5,8,11..."]
-        S2["queue:{t}:{q}:2\nseq 3,6,9,12..."]
-    end
-
-    subgraph RANK["전체 순위 계산 (내 seq=5)"]
-        R["ZCOUNT slice:0 0~4 = 1\nZCOUNT slice:1 0~4 = 2\nZCOUNT slice:2 0~4 = 1\n합산 + 1 = 5등"]
-    end
-
-    subgraph COUNT["현재 인원 조회 (queue-count 제거)"]
-        C["Pipeline ZCARD slice:0\nPipeline ZCARD slice:1\nPipeline ZCARD slice:2\n합산 = 현재 총 인원"]
-    end
-
-    subgraph DEQUEUE["Admit Dequeue (N명)"]
-        D["슬라이스별 ZRANGE WITHSCORES\nLua 내부 score 정렬\n상위 N명 선택\nZREM multi-member"]
-    end
-
-    SEQ --> S0
-    SEQ --> S1
-    SEQ --> S2
-    S0 --> R
-    S1 --> R
-    S2 --> R
-    S0 --> C
-    S1 --> C
-    S2 --> C
-    S0 --> D
-    S1 --> D
-    S2 --> D
-```
+> 대기열을 `queue:{t}:{q}:{0..N}`으로 쪼개고 `ZCOUNT`를 합산해 순위를 내던 설계는 **폐기됐다.**
+> 현행은 **ZSet 하나**(`queue:{queueId}:waiting`) + `INCR queue:{queueId}:seq`로 score를 발급한다
+> (§66 D2 · §70 D9). 쪼개지 않으니 합산도, 슬라이스 간 정렬도 없다.
+> 순위는 `ZRANK`(enqueue 응답) 또는 `rank = mySeq − lastAdmittedSeq`(폴링, §79)로 구한다.
 
 ---
 
@@ -283,20 +259,20 @@ flowchart LR
     end
 
     subgraph TOPICS["Kafka"]
-        T1["enqueue-events\n{ tokenId, queueId, tenantId\nuserId, seq, issuedAt }"]
-        T2["enqueue-admit\n{ requestId, tenantId\nqueueId, count }"]
+        T1["token-lifecycle (18 파티션)\nkey = tokenId\n{ tokenId, queueId, tenantId\nuserId, seq, issuedAt }"]
     end
 
-    subgraph BATCH["Batch Server (Consumer)"]
-        C1["EnqueueConsumer\n1000건씩 buffer\nMySQL Bulk INSERT\nRedis sync_needed=0"]
-        C2["AdmitConsumer\nDB PENDING 확인\nZREM + admitToken 발급\nDB COMPLETED"]
+    subgraph CONSUMER["queue-consumer (독립 앱)"]
+        C1["TokenLifecycleConsumer\n배치 적재 → tokens INSERT (멱등)"]
     end
 
     E1 -->|"produce"| T1
-    E2 -->|"produce"| T2
+    E2 -.->|"admit 요청 전달 수단 미판정\n(Sprint 7)"| T1
     T1 -->|"consume"| C1
-    T2 -->|"consume"| C2
 ```
+
+> **키가 `tokenId`인 이유**: `queueId`로 잡으면 한 큐 30만 명이 통째로 한 파티션에 몰린다 (DECISIONS §73 D16).
+> **토픽을 안 나누는 이유**: 순서 보장은 같은 토픽의 같은 파티션 안에서만 성립한다 (§73 D18).
 
 ---
 
@@ -304,28 +280,31 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    TENANT["Tenant 서버\n(Java SDK)\nenqueue() → 대기토큰 발급\ntoken, queueId → 유저에게 전달"]
+    TENANT["Tenant 서버\n(REST 직접 호출, X-API-Key — SDK 아님)\nPOST /enqueue → 대기토큰 발급\n대기 페이지에 tokenId, seq 실어 전달"]
     --> CLIENT["브라우저 (JS SDK)\nqueue.startPolling()"]
 
     CLIENT --> POLL["JS SDK 내부\npoll() 실행"]
-    --> REQ["GET /tokens/:token\nPlatform 직접 호출\n(API Key 없음 — 대기토큰 인증)"]
-    --> PLATFORM["Queue Platform\n순위계산 + TTL갱신 + ETA\nnextPollAfterSec 계산"]
-    --> RESP["응답\n{ globalRank, nextPollAfterSec, ready, admitToken }"]
+    --> REQ["GET /queues/:queueId/status\nPlatform 직접 호출 (인증 없음)\n30만 명 전원 동일 응답 → 캐시"]
+    --> PLATFORM["Queue Platform\nMGET admit-watermark, pacing\n(rank 계산 없음)"]
+    --> RESP["응답\n{ lastAdmittedSeq, pacing }"]
 
-    RESP --> READY{"ready?"}
-    READY -->|"false"| TIMER["JS SDK\nsetTimeout(nextPollAfterSec × 1000)\n→ poll() 재호출\n탭 비활성화 시 자동 중단"]
+    RESP --> CALC["JS SDK 계산\nrank = mySeq − lastAdmittedSeq\n간격 = pacing 표 + ±20% 지터"]
+    CALC -->|"rank > 0"| TIMER["setTimeout(간격 × 1000)\n→ poll() 재호출\n탭 비활성화 시 자동 중단\n30~60초마다 ka=1로 개인 호출"]
     TIMER --> POLL
 
-    READY -->|"true"| CB["onReady 콜백\nadmitToken 수신"]
+    CALC -->|"rank <= 0"| ME["GET /queues/:queueId/tokens/:tokenId?seq=&ka=\n(§74 소유권 검증)"]
+    ME -->|"ready=false"| TIMER
+    ME -->|"ready=true"| CB["onReady 콜백\nadmitToken 수신"]
     --> SEND["유저 → Tenant 서버: admitToken 전달"]
-    --> JAVA["Tenant 서버 (Java SDK)\nadmitAndVerify()\n① verify 즉시 호출\n② valid 확인\n③ Tenant 내부 처리\n④ complete 3회 자동 재시도"]
+    --> TENANT2["Tenant 서버 (REST 직접 호출 — SDK 아님)\n① verify 즉시 호출\n② valid 확인\n③ Tenant 내부 처리\n④ complete 호출 (재시도는 Tenant 몫)"]
 ```
 
 > **역할 분리**
-> nextPollAfterSec 계산: Platform 책임
-> setTimeout / 탭 비활성화 처리: JS SDK 책임
+> `pacing` 구간표·`lastAdmittedSeq` 제공: Platform 책임 (부하 제어 레버는 서버가 쥔다, §79)
+> rank 계산 / setTimeout / 탭 비활성화 처리: JS SDK 책임
 > UI 업데이트: 클라이언트(Tenant) 책임
-> verify 순서 강제 / complete 재시도: Java SDK 책임
+> verify 순서 / complete 재시도: **Tenant 서버 책임** — 강제할 SDK가 없으므로 명세로 규정하고
+> 서버가 위반을 방어한다 (DECISIONS §35)
 
 ---
 
@@ -355,12 +334,12 @@ flowchart TD
     LB --> B["API Server B\nSpring MVC + Virtual Thread"]
     LB --> C["API Server C\nSpring MVC + Virtual Thread"]
 
-    A & B & C --> REDIS["Redis\nglobal-seq INCRBY 원자\n→ seq 중복 없음"]
-    A & B & C --> KAFKA["Kafka\nenqueue-events\nenqueue-admit"]
+    A & B & C --> REDIS["Redis\nINCR queue:{queueId}:seq 원자\n→ seq 중복 없음"]
+    A & B & C --> KAFKA["Kafka\ntoken-lifecycle (key=tokenId)"]
     A & B & C --> MYSQL["MySQL\nJPA + Virtual Thread"]
 ```
 
-> **순서 보장**: global-seq INCRBY = Redis 싱글스레드 원자 연산
+> **순서 보장**: `INCR queue:{queueId}:seq` = Redis 싱글스레드 원자 연산
 > 서버 여러 대가 동시 호출해도 seq 절대 중복 없음
 > Tenant는 Load Balancer 주소만 알면 됨 (내부 서버 수 몰라도 됨)
 

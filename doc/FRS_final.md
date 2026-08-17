@@ -1,6 +1,15 @@
 # 📄 Queue Platform — 기능 정의서 (FRS)
 
-> 버전: v1.10 | 상태: 확정 | 대상: 실제 구현 범위
+> 버전: v1.12 | 상태: 확정 | 대상: 실제 구현 범위
+>
+> v1.12 변경사항: 구현과 어긋난 서술 정정 — Redis 키표를 `QueueKeys` 4종으로 교체(slice·global-seq·
+> queue-user·token-last-active 폐기, §66 D2·§70 D9·§74), Kafka를 단일 `token-lifecycle` + 키 `tokenId`로
+> 정정(§73 D16·D18), 에러 코드표를 `ErrorCode.java`와 1:1로, Enqueue 응답 202 → **200**,
+> `queue-consumer` 모듈 반영
+>
+> v1.11 변경사항: Java SDK 명세 **실제 삭제**(v1.10에서 "제거"라고 적고 §12에 남아 있던 것),
+> 폴링 엔드포인트 2분할(`/status` + 개인, DECISIONS §79), `identifier` = UUIDv7 규약(§78),
+> verify·complete 경로에 `queueId` 추가 + admitToken 키를 `queue:{queueId}:*` 로 이동
 >
 > v1.10 변경사항: Java SDK 제거 (REST API 명세로 대체), tenants.status 컬럼 추가, Queue update 전략 확정 (name만 변경 허용)
 
@@ -38,10 +47,13 @@ Tenant    → 슬롯 관리 + 입장 제어
 | maxCapacity | 대기열 최대 인원 |
 | waitingTtl | 대기 중 절대 만료 시간 (기본 7200s) |
 | inactiveTtl | 마지막 Polling 이후 비활동 만료 시간 (기본 300s) |
-| sliceCount | Platform 자동 계산. ceil(maxCapacity ÷ 100,000) |
-| global-seq | 슬라이스 간 FIFO 보장을 위한 전체 순번 |
-| seq | 토큰별 global-seq 값. ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
-| nextPollAfterSec | Platform이 클라이언트에 전달하는 권장 Polling 간격 |
+| ~~sliceCount~~ | 폐기 — 대기열을 여러 ZSet으로 쪼개던 값. ZSet 하나로 확정 (§66 D2) |
+| ~~global-seq~~ | 폐기 — 큐별 `INCR queue:{queueId}:seq`로 대체 (§70 D9) |
+| identifier | Tenant가 만드는 UUIDv7. `waiting` ZSet의 member이자 중복 판정 키 (§66 D1 · §78) |
+| seq | 토큰의 순번(= ZSet score). ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
+| pacing | `/status`가 내려주는 폴링 간격 구간표. rank로 조회 → SDK가 지터를 더해 사용 (§79) |
+| lastAdmittedSeq | 마지막으로 admit된 seq(전광판). `rank = mySeq − lastAdmittedSeq` (§79) |
+| ~~nextPollAfterSec~~ | 폐기 — 서버가 개인별 간격을 계산해 내려주던 필드. `pacing`으로 대체 (§79) |
 | avgWaitingTime | 평균 대기 시간 (issuedAt ~ completedAt). ETA 계산에 사용 |
 
 ### Token 저장 구조
@@ -54,9 +66,10 @@ DB tokens 테이블:
   → Kafka Consumer가 INSERT 보장 (At-Least-Once)
   → admit_token: Redis 미스 시 DB Fallback용
 
-Redis Sorted Set:
-  Key: queue:{tenantId}:{queueId}:{sliceNumber}
-  member: tokenId, score: global-seq
+Redis (QueueKeys — §8 참조):
+  queue:{queueId}:waiting   Sorted Set. member=identifier, score=seq
+  queue:{queueId}:seq       INCR로 score 발급
+  queue:{queueId}:tokens    Hash. identifier → "tokenId|issuedAt"
   → 순번 관리 전담. FIFO 보장
 ```
 
@@ -73,14 +86,16 @@ Redis Sorted Set:
    여유 없음 → Enqueue 결정
 
 ③ Tenant → Platform: Enqueue
-   POST /queues/:queueId/tokens { userId }
-   Platform: Redis Lua 처리 후 즉시 응답 (202 Accepted)
-   비동기: Kafka enqueue-events 발행 → DB INSERT
-   Tenant → 유저: 대기토큰 + Polling URL 전달
+   POST /queues/:queueId/tokens { identifier }      ← identifier는 UUIDv7 (§6.2 참조)
+   Platform: Redis Lua 처리 후 즉시 응답 (200 OK — 순번이 확정된 뒤 응답한다)
+   비동기: Kafka token-lifecycle 발행 (key=tokenId) → DB INSERT
+   Tenant → 유저: 대기 페이지를 서빙하면서 tokenId, seq 를 함께 실어 전달
 
-④ 유저 → Platform: Polling (직접, 적응형 간격)
-   GET /queues/:queueId/tokens/:token
-   ← { globalRank, estimatedWaitSeconds, nextPollAfterSec, ready, admitToken }
+④ 유저 → Platform: Polling (직접, 적응형 간격) — 엔드포인트 2개 (§6.3)
+   GET /queues/:queueId/status              ← 평상시. 전원 동일 응답
+   ← { lastAdmittedSeq, pacing }
+   GET /queues/:queueId/tokens/:tokenId?seq=&ka=   ← 차례 근처 + keepalive만
+   ← { ready, admitToken? }
 
 ⑤ Tenant → Platform: admit (슬롯 여유 생길 때마다)
    POST /queues/:queueId/admit { count: N }
@@ -88,17 +103,17 @@ Redis Sorted Set:
    Platform: 앞 N명 → ADMIT_ISSUED + admitToken 발급 (TTL 60초)
 
 ⑥ 유저 Polling 응답에 admitToken 포함 (ADMIT_ISSUED 상태일 때)
-   ← { ready: true, admitToken: "at_xxx", nextPollAfterSec: 2 }
+   ← { ready: true, admitToken: "at_xxx" }
    유저 → Tenant: admitToken 전달
 
 ⑦ Tenant → Platform: verify (유효성 확인만. 상태 변경 없음)
-   POST /admit-tokens/:admitToken/verify
-   ← { valid: true, userId }
+   POST /queues/:queueId/admit-tokens/:admitToken/verify
+   ← { valid: true, identifier }
 
 ⑧ Tenant: 유효한 유저 입장 허용
 
 ⑨ Tenant → Platform: complete (입장 완료 통보)
-   POST /tokens/:token/complete { admitToken }
+   POST /queues/:queueId/tokens/:tokenId/complete { admitToken }
    Platform: COMPLETED + ZREM + Kafka 발행
    ← { status: COMPLETED, completedAt }
 
@@ -118,7 +133,7 @@ Redis Sorted Set:
 | TTL / Batch | 만료 처리 / 파티션 운영 / 통계 집계 | ✅ |
 | Kafka | Enqueue 버퍼 / 상태 변경 이벤트 | ✅ |
 | Billing | 과금 집계 (Kafka Consumer) | ✅ |
-| SDK | Java SDK / JS SDK | ✅ |
+| SDK | **JS SDK만** (Tenant 서버는 REST API 직접 호출) | ✅ |
 
 ---
 
@@ -129,11 +144,18 @@ Redis Sorted Set:
 | Method | Path | 인증 | 호출 주체 | 설명 |
 |--------|------|------|----------|------|
 | `POST` | `/api/v1/queues/:queueId/tokens` | X-API-Key | Tenant 서버 | Enqueue → 대기토큰 발급 |
-| `GET` | `/api/v1/queues/:queueId/tokens/:token` | token | 유저 직접 | Polling |
+| `GET` | `/api/v1/queues/:queueId/status` | 없음 | 유저 직접 | **큐 전광판** — 전원 동일 응답. 캐시 대상 |
+| `GET` | `/api/v1/queues/:queueId/tokens/:tokenId?seq=&ka=` | tokenId 소유 | 유저 직접 | **개인 상태** — ready / admitToken |
 | `POST` | `/api/v1/queues/:queueId/admit` | X-API-Key | Tenant 서버 | N명 입장토큰 발급 |
-| `POST` | `/api/v1/admit-tokens/:admitToken/verify` | X-API-Key | Tenant 서버 | 입장토큰 유효성 확인 |
-| `POST` | `/api/v1/tokens/:token/complete` | X-API-Key | Tenant 서버 | 입장 완료 통보 → COMPLETED |
-| `DELETE` | `/api/v1/queues/:queueId/tokens/:token` | X-API-Key | Tenant 서버 | 이탈 → CANCELLED |
+| `POST` | `/api/v1/queues/:queueId/admit-tokens/:admitToken/verify` | X-API-Key | Tenant 서버 | 입장토큰 유효성 확인 |
+| `POST` | `/api/v1/queues/:queueId/tokens/:tokenId/complete` | X-API-Key | Tenant 서버 | 입장 완료 통보 → COMPLETED |
+| `DELETE` | `/api/v1/queues/:queueId/tokens/:tokenId` | X-API-Key | Tenant 서버 | 이탈 → CANCELLED |
+
+> **verify·complete 경로에 `queueId`가 들어간 이유** (DECISIONS §79):
+> admitToken 관련 Redis 키를 `queue:{queueId}:...` 해시태그로 묶기 위해서다. Tenant 서버는
+> 자기가 admit을 건 큐를 알고 있으므로 URL에 실을 수 있다. Cluster에서 CROSSSLOT은 사라진다.
+> 다만 이는 **전 구간 원자성의 필요조건**이며, 중간 DB 확인(Lua 밖)과 `verified-token`의
+> 클러스터 소속 미정 때문에 **충분조건은 아니다** — DECISIONS §79 참조.
 
 ### 4.2 관리 API
 
@@ -180,10 +202,10 @@ Redis Sorted Set:
 stateDiagram-v2
     [*] --> WAITING : POST /tokens (ZADD NX)
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
-    ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-status-changed 발행
+    ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-lifecycle 발행
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
-    WAITING --> CANCELLED : DELETE /token\nKafka token-status-changed 발행
-    WAITING --> EXPIRED : Batch\nKafka token-status-changed 발행
+    WAITING --> CANCELLED : DELETE /token\nKafka token-lifecycle 발행
+    WAITING --> EXPIRED : Batch\nKafka token-lifecycle 발행
     COMPLETED --> [*]
     CANCELLED --> [*]
     EXPIRED --> [*]
@@ -193,53 +215,123 @@ stateDiagram-v2
 
 ```
 POST /api/v1/queues/:queueId/tokens
-Body: { userId: string }
+Body: { identifier: string }        ← UUIDv7. 생성·전달 주체는 Tenant (아래 규약)
 
 처리 흐름:
 1. API Key 검증 (Redis 캐시 60s → DB Replica fallback)
-2. Rate limit (per-key 100rps)
-3. 큐 상태 확인 (ACTIVE만 허용)
-4. userId 중복 체크 (GET queue-user → 기존 토큰 반환)
-5. Bulk Lua Script 원자 실행
-   INCRBY global-seq N → startSeq~endSeq
-   슬라이스별 ZADD multi-member NX
-   slice = (seq-1) % sliceCount
-6. 202 Accepted 즉시 응답
-7. Kafka enqueue-events 발행
-   → TokenEnqueueConsumer: DB INSERT (redis_sync_needed=0)
-   → queue-user 역인덱스 SET
+2. Rate limit (per-key)
+3. 큐 상태 확인 (ACTIVE만 허용) + Tenant 소유권 검증
+4. 요청을 Global Queue에 적재 → BatchProcessor가 주기적으로 drain (FLOW.md Enqueue 참조)
+5. enqueue_bulk.lua 원자 실행 — KEYS 3개 (같은 해시태그)
+   queue:{queueId}:waiting / queue:{queueId}:seq / queue:{queueId}:tokens
+   항목마다: ZCARD ≥ maxCapacity → FULL
+             INCR seq → score 발급 (§70 D9)
+             ZADD NX member=identifier score=seq → 신규 OK / 기존 EXISTS
+             HSET tokens[identifier] = "tokenId|issuedAt"   ← 중복 판정·소유권 대조의 원장
+             ZRANK → rank
+6. Kafka token-lifecycle 발행 (key=tokenId) — **동기**. 브로커 ack까지 최대 12s 대기
+   (`spring.kafka.producer` sendTimeout). 실패하면 QE001(503)이고 200이 안 나간다
+7. 200 OK 응답
+   → 이후 TokenLifecycleConsumer가 tokens INSERT (멱등)
 
-Response 202:
-{ "token": "tok_Kx9mZ3", "globalRank": 42,
-  "estimatedWaitSeconds": 300, "status": "WAITING" }
+Response 200:
+{ "queueId": "q_xyz789", "identifier": "0190e2c1-...", "tokenId": "tok_Kx9mZ3",
+  "seq": 42, "rank": 42, "total": 120, "already": false }
+
+  rank는 1-based다 — Redis ZRANK가 0-based이고 EnqueueResponse가 +1 해서 내보낸다.
+  already=true면 기존 토큰을 그대로 돌려준 것이다.
+  ⚠️ 202가 아니라 200이다 — Lua가 순번을 확정한 뒤 응답하므로 seq·rank가 이미 결정돼 있다.
+  ⚠️ **발행은 응답보다 먼저이고 동기다.** "Redis 쓰고 바로 200, Kafka는 뒤에서"가 아니다.
+     비동기인 것은 **DB 적재(Consumer)뿐**이며, 발행 자체는 응답 지연에 포함된다.
 ```
 
-### 6.3 Polling (적응형 간격)
+**identifier 규약 (DECISIONS §66 D1 · §78)**
+
+| 항목 | 내용 |
+|---|---|
+| 형식 | **UUIDv7**. Platform은 형식 가이드만 제시하고, 검증 책임은 **전적으로 Tenant** |
+| 생성·저장 | Tenant가 `userId → identifier(UUIDv7)` 매핑을 **저장**한다 |
+| 재사용 | **같은 사용자·같은 큐에는 항상 같은 UUID를 재사용**한다 |
 
 ```
-GET /api/v1/queues/:queueId/tokens/:token
+⚠️ 매 요청 새 UUID를 만들면 enqueue_bulk.lua의 ZADD NX가 안 걸려
+   한 사람이 자리를 여러 개 차지한다.
 
-처리 흐름:
-1. token-info 캐시(TTL=nextPollAfterSec+2s) → DB Replica fallback
-2. 전체 순위 계산 (Lua Script)
-3. SET token-last-active EX inactiveTtl
-4. avgWaitingTime → ETA
-5. nextPollAfterSec 계산:
-   globalRank > 500 → 30s
-   globalRank > 100 → 10s
-   globalRank > 10  → 5s
-   globalRank ≤ 10  → 2s
-
-Response (WAITING):
-{ "status": "WAITING", "ready": false, "admitToken": null,
-  "globalRank": 42, "estimatedWaitSeconds": 300,
-  "nextPollAfterSec": 10 }
-
-Response (ADMIT_ISSUED):
-{ "status": "ADMIT_ISSUED", "ready": true,
-  "admitToken": "at_abc123", "globalRank": 1,
-  "nextPollAfterSec": 2 }
+⚠️ identifier가 추측 가능한 값(이메일 · 순번 ID)이면 안 된다.
+   enqueue는 EXISTS일 때 기존 tokenId·seq를 그대로 반환하므로,
+   남의 identifier를 아는 자가 그 사람의 identifier로 enqueue를 호출하면
+   남의 tokenId·seq — 즉 남의 폴링 자격 증명(§74) — 을 손에 넣는다.
+   UUIDv7이면 이 경로가 죽는다.
 ```
+
+### 6.3 Polling — 엔드포인트 2분할 (DECISIONS §79. 설계 확정, 구현 미착수)
+
+**① 큐 전광판 — 30만 명 전원 동일 응답. 캐시 가능**
+
+```
+GET /api/v1/queues/:queueId/status
+인증: 없음 (permitAll)   Rate Limit: 없음   ← 아래 "가드레일" 참조
+
+처리: 키 2개 MGET (같은 해시태그 → 1왕복)
+  queue:{queueId}:admit-watermark   없으면 0
+  queue:{queueId}:pacing            없으면 코드 상수 기본값
+
+Response:
+{ "lastAdmittedSeq": 47,
+  "pacing": [[50,2],[1000,5],[5000,10],[10000,15],[null,20]] }
+
+pacing = [[rank 상한, 폴링 간격 초], ...]. 마지막 항의 상한 null = 그 이상 전부.
+기본값은 코드 상수(QueueEngineService)와 같다. Redis 키가 있으면 그 값이 이긴다.
+```
+
+```
+SDK 계산 (서버는 rank를 계산하지 않는다):
+  rank  = mySeq − lastAdmittedSeq          ← 뺄셈 1회
+  간격  = pacing 표 조회 + ±20% 지터
+  rank <= 0 → 그때만 ② 개인 엔드포인트로 admitToken 확인
+```
+
+**② 개인 상태 — 차례 근처 + keepalive(30~60초 1회)에만 호출**
+
+```
+GET /api/v1/queues/:queueId/tokens/:tokenId?seq={seq}&ka={0|1}
+인증: tokenId 소유 (permitAll, DECISIONS §74)
+Rate Limit: tokenId 기준 Token Bucket — cap 5 / refill 1.0 per sec
+
+처리: poll_verify.lua 1회 (ZRANGEBYSCORE + HGET 대조 + ka=1이면 ZADD last-active)
+
+Response (아직 대기):     { "ready": false }
+Response (ADMIT_ISSUED):  { "ready": true, "admitToken": "at_abc123" }
+```
+
+**404 계약 — SDK는 HTTP 상태가 아니라 `errorCode`로 재시도를 결정한다**
+
+| 상황 | errorCode | SDK 동작 |
+|---|---|---|
+| 취소·만료로 토큰이 진짜 사라짐 | `TK001` (기존 `TOKEN_NOT_FOUND`) | **종료** |
+| admitToken TTL 만료 → WAITING 복귀 대기 중 (배치 반영 전) | **신규 ErrorCode (후속)** | **백오프 후 재시도** |
+
+> ⚠️ 현재 `ErrorCode`에는 `TOKEN_NOT_FOUND` 하나뿐이라 두 상황이 뭉개진다.
+> ErrorCode 추가는 **후속 작업**이며, 이 표는 그 전까지의 계약 정의다.
+
+**가드레일 — `/status`에 `permitAll`만 추가하면 "인증 0 + 제한 0"이 된다**
+
+`RateLimitFilter`는 미등록 public 경로를 **무조건 통과**시킨다(인증 필요 경로는 SecurityConfig가
+401로 막는다는 전제). `/status`는 인증도 없으므로 필터를 그냥 지나간다.
+→ 방어는 두 가지다.
+① **CDN·WAS 캐시 키에서 쿼리스트링을 제외**한다. `?x=랜덤` cache-buster가 죽고,
+   **유효한 queueId 1개당** 오리진 부하가 `1 ÷ 캐시 TTL`로 고정된다.
+② **미지 queueId는 맵 선적재로 막는다.** 경로 자체(`/queues/{임의}/status`)가 cache-buster라
+   ①만으로는 안 막힌다 — 매번 새 캐시 키다. 큐→클러스터 매핑은 **불변**이므로(DECISIONS §75 D27-2)
+   **맵을 통째로 선적재하고, 맵에 없으면 그대로 404**로 끝낸다. DB 조회도, negative 캐시 엔트리도
+   만들지 않는다(엔트리를 만들면 미지 ID마다 메모리가 는다).
+   ⚠️ **맵은 주기적으로 통째 리로드한다.** 큐는 런타임에 생성되므로 부팅 시 선적재한 맵에는
+   그 이후 만들어진 정상 큐가 없다 → 그대로 두면 **새 큐의 `/status`가 WAS 재기동 전까지 404**다.
+   매핑이 불변이라 값 충돌이 없어 통째 교체가 안전하고, 런타임에 생성된 큐가 그때 들어온다.
+   **미스는 DB로 내려보내지 않는다.** **리로드 주기는 미정** — 큐 생성 후 `/status`가
+   열리기까지의 지연이 그 값이다.
+
+**Rate Limit은 걸지 않는다** (30만 명이 한 버킷을 공유하면 남용자 1명이 정상 대기자 전원을 429시킨다).
 
 ### 6.4 Admit → ADMIT_ISSUED
 
@@ -248,36 +340,44 @@ POST /api/v1/queues/:queueId/admit
 Body: { count: N, requestId: "req_abc" }
 
 처리 흐름:
-1. admit-idem 멱등성 체크
+1. queue:{queueId}:admit-idem:{requestId} 멱등성 체크
 2. DB admit_requests INSERT (PENDING) — 영속성 기준점
-3. Kafka enqueue-admit 발행
-   → AdmitConsumer: Lua Dequeue + admitToken 발급
+3. admit 요청을 처리 워커로 전달 (전달 수단 미판정 — §7 참조)
+   → Lua Dequeue + admitToken 발급
 
-Lua Dequeue:
+① Lua Dequeue (Redis 전용):
   슬라이스별 ZRANGE WITHSCORES → score 정렬 → 상위 N명 ZREM
-  DB WAITING 상태 확인 + verified-token 체크
   부족 시 최대 3회 추가 추출 (전체 재정렬 → FIFO 보장)
 
-admitToken 발급:
-  SET admit-token-by-token:{tokenId} EX 60
-  SET admit-token-by-admit:{admitToken} EX 60
+② DB WAITING 상태 확인 + verified-token 체크   ← Lua 밖. Lua는 MySQL을 못 만진다
+
+③ admitToken 발급 (①과 별개 호출 — 사이에 "pop 성공 + SET 실패" 창이 있다. DECISIONS §79 미해결):
+  SET queue:{queueId}:admit-by-token:{tokenId} EX 60
+  SET queue:{queueId}:admit-by-admit:{admitToken} EX 60
+  SET queue:{queueId}:admit-watermark = max(현재값, 방금 뽑은 최대 seq)   ← DECISIONS §79
   DB tokens.admit_token = admitToken
   DB UPDATE ADMIT_ISSUED (100건씩 / 10ms 대기)
   SET token-info 캐시 즉시 갱신
 
 admitToken TTL: 60초
 만료 시: WAITING 복귀 (seq 유지 → 우선순위 보존)
+
+admitToken 생성: tokenId와 동일하게 UUIDv7(랜덤 74비트). 짧은 랜덤 금지.
+  verify가 이 값 하나만으로 통과하므로 admitToken 자체가 입장 자격이다.
 ```
 
 ### 6.5 Verify (유효성 확인만 — 상태 변경 없음)
 
 ```
-POST /api/v1/admit-tokens/:admitToken/verify
+POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
+  ← 경로에 queueId가 있는 이유: Redis 키를 queue:{queueId}:* 해시태그로 묶기 위해서다 (§4.1 주석)
 
 처리 흐름:
-1. Redis GET admit-token-by-admit:{admitToken} → tokenId
+0. API Key tenant의 queueId 소유 검증 → 아니면 QUEUE_NOT_OWNED   ← enqueue와 동일
+1. Redis GET queue:{queueId}:admit-by-admit:{admitToken} → tokenId
    없으면 → DB Fallback
-     SELECT WHERE status=ADMIT_ISSUED AND admit_token=?
+     SELECT WHERE queue_id=? AND tenant_id=?           ← 술어 필수 (0단계와 같은 이유)
+            AND status=ADMIT_ISSUED AND admit_token=?
             AND issued_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND
      -- ⚠️ UTC_TIMESTAMP()로 쓴다. 시각 컬럼은 전부 UTC다(DECISIONS §77).
      --    앱의 JDBC 세션은 time_zone=+00:00 이라 NOW()도 UTC지만, 서버 default-time-zone은
@@ -288,10 +388,10 @@ POST /api/v1/admit-tokens/:admitToken/verify
 3. SET verified-token:{tokenId} EX 60 (중복 입장 방지)
 4. 상태 변경 없음
 
-Response: { "valid": true, "userId": "user1" }
+Response: { "valid": true, "identifier": "0190e2c1-..." }
 ```
 
-**[중요] verify 호출 순서 (Java SDK admitAndVerify()가 강제)**
+**[중요] verify 호출 순서 — Tenant 책임 (SDK 없음, DECISIONS §35)**
 
 ```
 올바른 순서:
@@ -304,26 +404,29 @@ Response: { "valid": true, "userId": "user1" }
   ① Tenant 내부 처리 (30초 소요)
   ② verify 호출 → TTL 60초 초과 → 404 발생 위험
 
-Java SDK admitAndVerify()를 사용하면 이 순서를 코드 레벨에서 강제
+Tenant 서버용 SDK가 없으므로 이 순서를 코드 레벨에서 강제할 수단이 없다.
+→ OpenAPI description에 명시 + 서버가 위반을 방어 (verify 없이 온 complete는 거절)
 ```
 
 ### 6.6 Complete → COMPLETED
 
 ```
-POST /api/v1/tokens/:token/complete
+POST /api/v1/queues/:queueId/tokens/:tokenId/complete
 Body: { admitToken: "at_xxx" }
 
 처리 흐름:
-1. DB ADMIT_ISSUED 확인 (Master)
+0. API Key tenant의 queueId 소유 검증 → 아니면 QUEUE_NOT_OWNED   ← enqueue와 동일.
+   complete는 DB 상태를 바꾸는 쓰기이므로 검증 없이 통과시키면 안 된다
+1. DB ADMIT_ISSUED 확인 (Master. queue_id·tenant_id 술어 포함)
 2. admitToken 유효성 확인
-   Redis GET admit-token-by-admit:{admitToken}
+   Redis GET queue:{queueId}:admit-by-admit:{admitToken}
    없으면 → 404
 3. DB status = COMPLETED (먼저)
 4. Redis 정리 (나중)
    ZREM Sorted Set
-   DEL admit-token-by-token + admit-token-by-admit
+   DEL queue:{queueId}:admit-by-token + queue:{queueId}:admit-by-admit
    DEL token-info + verified-token
-5. Kafka token-status-changed 발행
+5. Kafka token-lifecycle 발행 (key=tokenId)
    → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
 6. avgWaitingTime 직접 갱신 (Kafka Consumer 없이)
    waitingSeconds = completedAt - issuedAt
@@ -337,14 +440,14 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 ### 6.7 이탈 → CANCELLED
 
 ```
-DELETE /api/v1/queues/:queueId/tokens/:token
+DELETE /api/v1/queues/:queueId/tokens/:tokenId
 조건: WAITING(0)만. ADMIT_ISSUED(1) → 409
 
 처리:
-  Redis ZREM
+  Redis ZREM queue:{queueId}:waiting {identifier}
   DB status = CANCELLED(3)
-  DEL queue-user + DEL token-info
-  Kafka token-status-changed 발행
+  HDEL queue:{queueId}:tokens {identifier} + DEL token-info
+  Kafka token-lifecycle 발행 (key=tokenId)
 ```
 
 ---
@@ -353,77 +456,97 @@ DELETE /api/v1/queues/:queueId/tokens/:token
 
 ### 토픽
 
-| 토픽 | 파티션 기준 | 보존 | 설명 |
+| 토픽 | 파티션 키 | 파티션 | 설명 |
 |------|------------|------|------|
-| `enqueue-events` | queueId | 7일 | Enqueue → DB INSERT |
-| `enqueue-admit` | queueId | 7일 | admit → Dequeue + admitToken 발급 |
-| `token-status-changed` | queueId | 7일 | 상태 변경 → Billing / Stats |
+| `token-lifecycle` | **`tokenId`** | 18 | 토큰 생명주기 **단일 토픽** — enqueue + 상태 전이(admit/complete/cancel/expire) |
+| `token-lifecycle.DLT` | — | 18 | 격리된 실패 레코드 |
+
+**왜 단일 토픽 + `tokenId` 키인가 (DECISIONS §73 D16·D18)**
+
+- Kafka의 순서 보장은 **같은 토픽의 같은 파티션** 안에서만 성립한다. `enqueue-events` / `token-status-changed`로
+  나누면 키가 같아도 `WAITING → ADMIT_ISSUED` 순서가 보장되지 않는다.
+- ~~`queueId` 키~~는 **기각**됐다. 큐 카디널리티가 낮고 "한 큐에 30만 명"이 정상 시나리오라
+  트래픽 99%가 한 파티션에 몰린다 — 파티션을 늘려도 해결되지 않는다.
+- 컨슈머 그룹은 나누지 않는다. 병렬화는 파티션이 담당하고, "전담 컨슈머"는 한 리스너 안의 핸들러 분기로 표현한다.
+- `replication.factor=3` / `min.insync.replicas=2` / `acks=all` / `enable.idempotence=true`
+  (`scripts/kafka/create-topics.sh`). **파티션은 줄일 수 없고, 늘리면 살아 있는 토큰의 순서 관계가 끊긴다.**
+
+> ⚠️ **admit 요청 전달 수단은 미판정이다.** 구 설계의 `enqueue-admit` 토픽(요청 명령 전달)은 §73이 다루지
+> 않았다 — §73은 *생명주기 이벤트* 토픽만 통합했다. 별도 명령 토픽을 둘지, `admit_requests` 테이블 +
+> 폴링으로 갈지는 **Sprint 7 admit 착수 시 결정**한다.
 
 ### 이벤트 스키마
 
 ```json
-// enqueue-events
+// token-lifecycle — enqueue (queue-domain의 EnqueueEvent record)
 {
   "tokenId": "tok_Kx9mZ3",
   "queueId": "q_xyz789",
-  "tenantId": "t_abc123",
-  "userId": "user123",
+  "tenantId": 12,
+  "userId": "0190e2c1-...",
   "seq": 42500,
   "issuedAt": "2026-03-19T10:00:00.123Z"
 }
-
-// enqueue-admit
-{
-  "requestId": "req_abc",
-  "tenantId": "t_abc123",
-  "queueId": "q_xyz789",
-  "count": 100
-}
-
-// token-status-changed
-{
-  "tokenId": "tok_Kx9mZ3",
-  "queueId": "q_xyz789",
-  "tenantId": "t_abc123",
-  "status": "COMPLETED",
-  "waitingSeconds": 127,
-  "expiredReason": null,
-  "occurredAt": "2026-03-19T10:02:07.456Z"
-}
 ```
+
+> `userId` 필드가 담는 값은 **`identifier`**다 (§6.2). 컬럼명은 `tokens.user_id`.
+> 상태 전이 이벤트 스키마는 Sprint 7에서 확정한다 — 같은 토픽·같은 키(`tokenId`)로 실린다.
 
 ### Consumer
 
-| Consumer | 토픽 | 역할 |
-|----------|------|------|
-| `TokenEnqueueConsumer` | enqueue-events | DB INSERT 1000건 Bulk / redis_sync_needed=0 |
-| `AdmitConsumer` | enqueue-admit | Lua Dequeue + admitToken 발급 |
-| `BillingConsumer` | token-status-changed | COMPLETED → tokens 원본 집계 → billing_snapshots UPSERT |
+| Consumer | 모듈 | 토픽 | 역할 |
+|----------|------|------|------|
+| `TokenLifecycleConsumer` | `queue-consumer` | `token-lifecycle` | 배치 적재(`TokenPersistService`) → `tokens` INSERT (멱등) |
+| `BillingConsumer` | (미구현) | `token-lifecycle` | COMPLETED → tokens 원본 집계 → billing_snapshots UPSERT |
+
+> `queue-consumer`는 **독립 Spring Boot 앱**이다. `queue-batch`와 합치지 않는 이유는 확장 방향이
+> 반대이기 때문이다 — 소비는 파티션 수만큼 늘리고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요해진다
+> (DECISIONS §73 D20). actuator + micrometer-prometheus를 갖는다: 없으면 `/actuator/prometheus`가
+> 아예 생성되지 않아 **컨슈머 lag을 PromQL로 볼 수단이 사라진다**.
 
 ---
 
-## 8. Redis 데이터 구조 (RedisKeyFactory 중앙 관리)
+## 8. Redis 데이터 구조
+
+> **큐 상태 키는 `queue-infrastructure/.../queue/QueueKeys.java`가 조립한다.** 문자열 리터럴로 만들지 마라.
+> 모든 큐 키는 `{queueId}` 해시태그를 갖는다 — 다중 키 Lua(`enqueue_bulk` 3키, `poll_verify` 3키)가
+> 같은 슬롯을 요구하기 때문이다 (DECISIONS §70 D10 · §75 D26). **로컬 Sentinel에선 위반이 안 잡힌다.**
+> 캐시성 키(`apikey:*`, `tenant:*` 등)는 `cache/RedisKeyFactory.java` 소관이다.
+
+**큐 상태 키 (`QueueKeys`, 구현됨)**
 
 | Key 패턴 | 자료구조 | TTL | 역할 |
 |----------|----------|-----|------|
-| `queue:{t}:{q}:{slice}` | Sorted Set | 없음 | 대기열. score=global-seq |
-| `global-seq:{t}:{q}` | String | 없음 | 순번 채번. INCRBY 원자 |
+| `queue:{queueId}:waiting` | Sorted Set | 없음 | 대기열. **member=`identifier`**, score=`seq` |
+| `queue:{queueId}:seq` | String | 없음 | 큐별 순번 카운터. `INCR`이 score를 발급 (§70 D9) |
+| `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `"tokenId\|issuedAt"`. 중복 Enqueue 방지 + 폴링 소유권 대조(§74) |
+| `queue:{queueId}:last-active` | Sorted Set | 없음 | keepalive. member=`seq`, score=epoch ms. `ka=1` 폴링이 갱신 (§74) |
+
+> ⚠️ `:tokens`·`:last-active`에 **회수 경로(`HDEL`/`ZREM`/`EXPIRE`)가 전 코드 0건**이다. 회수 배치는 Sprint 9.
+
+**그 외**
+
+| Key 패턴 | 자료구조 | TTL | 역할 |
+|----------|----------|-----|------|
 | `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 |
 | `queue-stats:{t}:{q}` | Hash | 없음 | avgWaitingTime (complete 시 직접 갱신) |
-| `queue-user:{t}:{q}:{userId}` | String | waitingTtl | 중복 Enqueue 방지 |
-| `token-last-active:{tokenId}` | String | 300s | 비활동 TTL 감지 |
-| `token-info:{tokenId}` | String | nextPollAfterSec+2s | Polling 캐시 |
-| `admit-token-by-token:{tokenId}` | String | 60s | Polling 응답용 admitToken |
-| `admit-token-by-admit:{admitToken}` | String | 60s | verify/complete용 tokenId |
-| `admit-idem:{requestId}` | String | 300s | admit 멱등성 |
+| `token-info:{tokenId}` | String | 폴링 간격+2s | Polling 캐시 (⚠️ §79는 폴링 경로에서 DB status를 읽지 않으므로 존치 여부 후속 검토) |
+| `queue:{queueId}:admit-by-token:{tokenId}` | String | 60s | Polling 응답용 admitToken |
+| `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify/complete용 tokenId |
+| `queue:{queueId}:admit-watermark` | String | 없음 | 마지막 admit seq. `/status` 전광판 원본 (§79) |
+| `queue:{queueId}:pacing` | String | 없음 | 폴링 간격 구간표 **오버라이드**. 없으면 코드 상수 (§79) |
+| `queue:{queueId}:admit-idem:{requestId}` | String | 300s | admit 멱등성. `requestId`는 **Tenant가 정하는 값**이라 큐 스코프 필수 |
 | `verified-token:{tokenId}` | String | 60s | 중복 입장 방지 |
 | `batch-lock:{t}:{q}` | String | 15s | Batch 서버 분산 |
-| `apikey-cache:{sha256}` | String | 60s | API Key 인증 캐시 |
+| `apikey:{keyHash}` | String | 60s | API Key 인증 캐시 |
 
 > 제거된 Key:
-> queue-count → ZCARD Pipeline으로 대체
-> billing-count → Kafka BillingConsumer → tokens 원본 집계로 대체
-> admit-request-queue, admit-processing-queue → Kafka enqueue-admit으로 대체
+> `queue:{t}:{q}:{slice}` · `global-seq:{t}:{q}` → 슬라이스 분할 폐기. ZSet 하나 + `INCR seq` (§66 D2 · §70 D9)
+> `queue-user:{t}:{q}:{userId}` → `queue:{queueId}:tokens` Hash가 대체 (Lua 안에서 원자 처리, §66 D1)
+> `token-last-active:{tokenId}` → `queue:{queueId}:last-active` ZSet이 대체 (§74)
+> queue-count → ZCARD로 대체
+> billing-count → tokens 원본 집계로 대체
+> admit-request-queue, admit-processing-queue → admit 요청 큐잉으로 대체 (§7)
 
 ---
 
@@ -431,11 +554,11 @@ DELETE /api/v1/queues/:queueId/tokens/:token
 
 | 문제 | 해결 |
 |------|------|
-| 중복 Enqueue | queue-user 역인덱스 + ZADD NX |
-| 용량 초과 | ZCARD Pipeline 합산 |
+| 중복 Enqueue | `queue:{queueId}:tokens` Hash(identifier→tokenId) + ZADD NX — 둘 다 `enqueue_bulk.lua` 안 |
+| 용량 초과 | `enqueue_bulk.lua`의 ZCARD ≥ maxCapacity 판정 |
 | Enqueue DB 유실 | Kafka At-Least-Once + UNIQUE KEY 방어 |
 | 대량 Enqueue 병목 | INCRBY + ZADD multi (500건 Adaptive) |
-| admit 순서 보장 | Kafka enqueue-admit → AdmitConsumer (순차 처리) |
+| admit 순서 보장 | admit 요청 큐잉 → 순차 처리 (전달 수단은 §7 참조 — 미판정) |
 | 중복 입장 | verified-token 플래그 + admitToken 교차 확인 |
 | complete 동시성 | DB UPDATE WHERE status=1 (1번만 성공) |
 | ZREM 실패 | DB 먼저 → Batch 10초 내 재실행 |
@@ -457,118 +580,80 @@ DELETE /api/v1/queues/:queueId/tokens/:token
 
 ## 11. 에러 코드
 
-| 코드 | HTTP | 상황 |
-|------|------|------|
-| `AK_001_UNAUTHORIZED` | 401 | API Key 무효 |
-| `TK_001_INVALID_TOKEN` | 401 | 대기토큰 무효 |
-| `TK_002_INVALID_ADMIT_TOKEN` | 404 | 입장토큰 만료 or 무효 |
-| `RL_001_KEY_LIMIT` | 429 | per-key 100rps 초과 |
-| `QM_001_NOT_FOUND` | 404 | 큐 없음 |
-| `QM_004_NOT_ACTIVE` | 503 | 큐 PAUSED / DRAINING |
-| `QE_001_CAPACITY_EXCEEDED` | 429 | maxCapacity 초과 |
-| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 |
-| `CM_001_INVALID_PARAM` | 400 | 파라미터 오류 |
-| `CM_003_INTERNAL_ERROR` | 500 | 서버 내부 오류 |
-| `CM_004_SERVICE_UNAVAILABLE` | 503 | Redis / Kafka 장애 |
+> 정본은 `queue-common/.../exception/ErrorCode.java`다. 응답 body에 나가는 값은 **enum 상수명이 아니라
+> `code` 컬럼**이다(예: `TOKEN_NOT_FOUND` → `"TK001"`). 아래 표는 그 파일과 1:1이다.
+
+**구현됨**
+
+| 상수 | code | HTTP | 상황 |
+|------|------|------|------|
+| `AK_001_UNAUTHORIZED` | `AK001` | 401 | 인증 필요 (API Key 무효) |
+| `AK_002_FORBIDDEN` | `AK002` | 403 | 권한 없음 |
+| `RL_001_KEY_LIMIT` | `RL001` | 429 | 요청 한도 초과 (+ `Retry-After`) |
+| `TOKEN_NOT_FOUND` | `TK001` | 404 | 대기 토큰 없음 (폴링 소유권 실패 포함, §74) |
+| `QUEUE_NOT_FOUND` | `Q001` | 404 | 큐 없음 |
+| `QUEUE_NOT_OWNED` | `Q002` | 403 | 본인 큐 아님 |
+| `DUPLICATE_QUEUE_NAME` | `Q003` | 409 | 큐 이름 중복 |
+| `QUEUE_NOT_ACTIVE` | `Q004` | 503 | 큐 PAUSED / DRAINING |
+| `QUEUE_FULL` | `Q005` | 429 | maxCapacity 초과 |
+| `QUEUE_ENGINE_UNAVAILABLE` | `QE001` | 503 | 대기열 처리 일시 오류 |
+| `DUPLICATE_EMAIL` | `T001` | 409 | 이메일 중복 |
+| `TENANT_NOT_FOUND` | `T002` | 404 | Tenant 없음 |
+| `INVALID_PASSWORD` | `T003` | 401 | 비밀번호 불일치 |
+| `INVALID_TOKEN` | `T004` | 401 | JWT 무효 |
+| `API_KEY_NOT_FOUND` | `A001` | 404 | API Key 없음 |
+| `API_KEY_NOT_OWNED` | `A002` | 403 | 본인 API Key 아님 |
+| `INTERNAL_SERVER_ERROR` | `I004` | 500 | 서버 오류 |
+
+**미정의 (후속)** — 아래 상황을 이 문서가 참조하지만 `ErrorCode`에 아직 없다. 추가는 코드 변경이라 후속 작업이다.
+
+| 가칭 | HTTP | 상황 | 필요해지는 시점 |
+|------|------|------|---|
+| `TK_002_INVALID_ADMIT_TOKEN` | 404 | 입장토큰 만료 or 무효 (§6.5 verify) | Sprint 7 |
+| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 (complete / 이탈) | Sprint 7 |
+| (WAITING 복귀 대기) | 404 | admitToken TTL 만료 → 배치 반영 전 (§6.3 404 계약) | Sprint 7 |
 
 ---
 
 ## 12. SDK 설계
 
-### SDK 제공 목적
+> **JS SDK만 만든다. Tenant 서버용 SDK는 만들지 않는다** (DECISIONS §35).
+> 언어를 하나 고르는 순간 나머지 테넌트를 버리는 결정이 되므로, Tenant 서버는 이 문서의
+> **REST 명세를 직접 호출**한다. 즉 **이 명세가 사실상의 SDK**다 — 응답 필드·에러 코드·순서
+> 규칙이 부정확하면 그대로 테넌트 장애가 된다.
+> JS SDK의 범위는 **폴링 + 대기 UI 전용**이며 **enqueue는 포함하지 않는다** (DECISIONS §78).
 
-```
-Tenant가 직접 구현해야 하는 것들:
-  HTTP 클라이언트, SHA-256 해싱, 재시도 로직
-  에러 코드 파싱, requestId 생성
-  verify 호출 순서 강제 (내부 처리 전 먼저 호출)
-  complete 재시도 (TTL 내 보장)
-  Polling 타이밍 관리, 탭 비활성화 처리
+### Tenant 서버 (REST 직접 호출)
 
-SDK로 추상화:
-  Platform 정책 변경 시 SDK 업데이트만
-  Tenant 코드 변경 최소화
-  실수 방지 → 순서/재시도 SDK가 강제
-```
+SDK가 없으므로 아래 제약은 **명세에 명시하고 서버가 방어**한다 (DECISIONS §35 Consequences).
 
-### Java SDK (Tenant 서버용)
-
-| 클래스 | 역할 |
-|--------|------|
-| `QueueClient` | enqueue, admit, verify, complete, cancel API 호출 래퍼 |
-| `BulkVerifier` | admitToken N개를 동시 최대 100개로 병렬 verify |
-| `RetryPolicy` | Exponential Backoff. 404/409 구분 처리 |
-| `ApiKeyManager` | SHA-256 해싱 자동. Key Rotation 지원 |
-
-```java
-QueueClient client = QueueClient.builder()
-    .baseUrl("https://api.queue-platform.com")
-    .apiKey(System.getenv("QUEUE_API_KEY"))
-    .build();
-
-// Enqueue → 202 Accepted
-EnqueueResult result = client.enqueue(queueId, userId);
-
-// admit + 병렬 verify + complete 한번에
-// verify를 내부 처리 전에 먼저 호출 → SDK가 순서 강제
-client.admitAndVerify(queueId, 1000)
-    .concurrency(100)       // 동시 verify 수 (기본값 100)
-    .timeout(50_000)        // 50초 타임아웃
-    .onSuccess((userId, token, admitToken) -> {
-        sessionService.createSession(userId); // Tenant 내부 처리
-        client.complete(token, admitToken);   // 3회 자동 재시도
-    })
-    .onExpired(userId -> log.warn("만료: {}", userId))
-    .execute();
-```
-
-**BulkVerifier concurrency 기준:**
-
-```
-기본값: concurrency = 100
-
-계산식:
-  = admit count × 처리시간(ms) ÷ (TTL(ms) × 안전마진 0.5)
-  예시: 1,000명, TTL 60초, 처리 100ms
-  = 1,000 × 100 ÷ (60,000 × 0.5) ≈ 3.3 → 최소 4 → 안전하게 100
-
-Platform Rate Limit: per-key 100 rps → 100 초과 시 429 주의
-```
-
-**SDK가 강제하는 순서:**
-
-```
-admitAndVerify():
-  1. verify 즉시 호출 (내부 처리 전)
-  2. valid 확인
-  3. onSuccess 콜백 (Tenant 내부 처리)
-  4. complete 자동 호출 (3회 backoff 재시도)
-
-이유:
-  verify를 내부 처리 후 호출하면 TTL 초과 위험
-  Tenant가 직접 구현하면 순서 실수 가능
-  SDK가 올바른 순서를 코드 레벨에서 강제
-```
+| Tenant가 지켜야 할 것 | 위반 시 | Platform의 대응 |
+|---|---|---|
+| verify를 **Tenant 내부 처리 전에** 먼저 호출 | 내부 처리가 길면 admitToken TTL 60초 초과 → `TK_002` 404 | 순서 강제 불가(Tenant 책임). OpenAPI description에 명시 |
+| complete는 admitToken TTL 60초 내 호출 | 만료된 admitToken → 404 | 위와 동일 |
+| verify 없이 complete 호출 금지 | 중복 입장 방지 플래그(`verified-token`)가 안 걸림 | **서버가 거절** |
+| `identifier`는 **UUIDv7**, 사용자·큐당 **같은 값을 재사용** | §6.2 참조 — 자리 중복 점유 / 자격 증명 유출 | 형식 가이드만 제시. 검증은 Tenant 책임 |
 
 ### JS SDK (브라우저용)
 
 | 클래스 | 역할 |
 |--------|------|
-| `PollingManager` | nextPollAfterSec 타이밍 자동 적용. setTimeout 관리 |
+| `PollingManager` | `/status`의 `pacing` 표로 다음 호출 시각 계산 + 지터. setTimeout 관리 |
 | `StateManager` | IDLE → WAITING → READY → COMPLETED → EXPIRED 전환 |
 
 ```javascript
 const queue = QueueSDK.init({
     baseUrl: 'https://api.queue-platform.com',
     queueId: queueId,  // Tenant 서버에서 받은 값
-    token: token       // Tenant 서버에서 받은 값
+    tokenId: tokenId,  // Tenant 서버에서 받은 값
+    seq: seq           // Tenant 서버에서 받은 값 (rank 계산의 기준)
 });
 
 queue.startPolling({
-    onWaiting: ({ globalRank, estimatedWaitSeconds }) => {
-        updateUI(globalRank, estimatedWaitSeconds);
-        // nextPollAfterSec 타이밍은 SDK가 자동 처리
-        // Platform이 계산해서 내려줌 → SDK가 setTimeout에 세팅
+    onWaiting: ({ rank }) => {
+        updateUI(rank);
+        // rank = seq − lastAdmittedSeq  → SDK가 뺄셈으로 계산 (§79)
+        // 다음 호출 간격 = pacing 표 조회 + ±20% 지터 → SDK가 setTimeout에 세팅
     },
     onReady: ({ admitToken }) => {
         sendToTenantServer(admitToken); // Tenant 서버에 전달
@@ -586,40 +671,51 @@ queue.startPolling({
 **JS SDK가 해결하는 것:**
 
 ```
-nextPollAfterSec 타이밍:
-  Platform이 globalRank 기준으로 계산해서 내려줌
+폴링 간격:
+  /status 응답의 pacing 구간표 + rank로 간격 결정, ±20% 지터
   SDK가 setTimeout에 자동 세팅
   → Tenant가 Polling 간격 직접 관리 불필요
+  → 서버는 pacing 값만 바꾸면 전원의 간격을 즉시 조정할 수 있다 (§79)
 
 탭 비활성화 처리:
   visibilitychange 이벤트 자동 감지
   비활성화 → Polling 중단 (서버 부하 절약)
   복귀 → 즉시 재개
 
-과도한 Polling 방지:
-  SDK가 nextPollAfterSec 준수 → 서버 과부하 방지
+keepalive:
+  개인 엔드포인트를 ka=1로 30~60초에 1회만 호출 → last-active 갱신
+  (평상시 /status만 때리면 서버는 대기자가 살아 있는지 알 수 없다)
+
+404 처리:
+  errorCode로 분기 — 진짜 소멸이면 종료, WAITING 복귀 대기면 백오프 후 재시도 (§6.3)
 ```
 
 ### 클라이언트 전체 흐름
 
 ```
-1. 유저 → Tenant 서버: 서비스 접속 (슬롯 여유 확인)
-2. Tenant 서버 → Platform (Java SDK): enqueue()
-3. Tenant 서버 → 유저: token, queueId 전달
+1. 유저 → Tenant 서버: 서비스 접속 (자격 판정 + 슬롯 여유 확인)
+2. Tenant 서버 → Platform (REST, X-API-Key): POST /enqueue     ← SDK 아님 (DECISIONS §78)
+3. Tenant 서버 → 유저: 대기 페이지를 서빙하면서 tokenId, seq, queueId 를 함께 실어 보냄
 4. 유저 (JS SDK): queue.startPolling() 시작
-5. JS SDK → Platform 직접: GET /tokens/:token (nextPollAfterSec 자동)
+5. JS SDK → Platform 직접 (API Key 없음)
+   평상시:      GET /queues/:queueId/status          → rank·간격을 SDK가 계산
+   차례 근처·ka: GET /queues/:queueId/tokens/:tokenId?seq=&ka=
 6. JS SDK → onReady 콜백: admitToken 수신
 7. 유저 → Tenant 서버: admitToken 전달
-8. Tenant 서버 (Java SDK): admitAndVerify() → verify 즉시 → 내부 처리 → complete
+8. Tenant 서버 (REST): verify → 내부 처리 → complete
+   ← 순서를 강제하는 SDK가 없다. 명세로 규정하고 서버가 위반을 방어한다 (§35)
 ```
 
 ### 프로젝트 구조
 
 | 레포 | 모듈 수 | 배포 | 역할 |
 |------|--------|------|------|
-| `queue-platform` | 5개 | Docker | 플랫폼 본체 (API, Batch, Domain, Infra, Common) |
-| `queue-platform-sdk-java` | 3개 | Maven Central | Tenant 서버용 (sdk-core, sdk-http, sdk-bulk) |
+| `queue-platform` | 6개 | Docker | 플랫폼 본체 (API, Batch, **Consumer**, Domain, Infra, Common) |
 | `queue-platform-sdk-js` | 1개 | npm + CDN | 브라우저용 (PollingManager, StateManager) |
+
+> `queue-consumer`는 `token-lifecycle` 소비 전담 독립 앱이다. 분리 근거는 DECISIONS §73 D20.
+
+> Tenant 서버용 SDK 레포는 만들지 않는다 (DECISIONS §35).
 
 ---
 
@@ -629,7 +725,7 @@ nextPollAfterSec 타이밍:
 
 | API | p99 목표 | 목표 TPS |
 |-----|----------|----------|
-| Enqueue | < 50ms (202 즉시 응답) | 200 rps (10,000 rps 급증 → Kafka) |
+| Enqueue | < 50ms (200 즉시 응답) | 200 rps (10,000 rps 급증 → Kafka) |
 | Polling | < 50ms | 2,000 rps |
 | admit | < 100ms | 10 rps |
 
@@ -691,7 +787,7 @@ BCrypt → 별도 스케줄러 격리 불필요
 
 > Platform은 **순서만 관리**한다.
 > 입장 여부는 **Tenant 서버가 결정**한다.
-> 유저는 **Platform에 직접 Polling**한다 (nextPollAfterSec 적응형).
+> 유저는 **Platform에 직접 Polling**한다 (`pacing` 구간표 기반 적응형, §79).
 > verify = 유효성 확인만. complete = COMPLETED + ZREM + Kafka 발행.
 > DB 먼저, ZREM 나중 — **잔류가 유실보다 안전**하다.
 > seq를 DB에 저장 — **ADMIT_ISSUED 복귀 시 순위 복원 가능**하다.
