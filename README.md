@@ -435,8 +435,6 @@ Tenant (REST API)       : POST /verify → POST /complete
 ```
 
 > 일정·DoD의 정본은 [ROADMAP](doc/ROADMAP.md)이다.
-> ⚠️ 다만 ROADMAP은 2026-06-10 최신화라 **위 블록보다 낡았다**(Sprint 6·8을 ⬜로 두고 폐기된
-> 3토픽 체계를 현재형으로 서술 중). 갱신 전까지는 위 "코드로 확인되는 상태"가 더 정확하다.
 
 ---
 
