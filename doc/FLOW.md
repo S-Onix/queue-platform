@@ -50,7 +50,9 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 ### Enqueue 결정 근거
 
 **확정 결정** (DECISIONS §66-70, ARCHITECTURE_ROADMAP 부록 A):
-- D1: 자유 identifier (Tenant 제공, UUID/이메일/고객번호 등)
+- D1: identifier는 Tenant가 제공 — 단 **형식은 UUIDv7로 좁혀졌다(§78)**. 이메일·순번 ID처럼
+  추측 가능한 값은 금지(enqueue가 EXISTS 시 기존 `tokenId`·`seq`를 돌려주므로 자격 증명이 샌다).
+  같은 사용자·같은 큐엔 **항상 같은 UUID를 재사용**해야 `ZADD NX` 중복 방지가 성립한다
 - D2: ZSet 하나 (`queue:{queueId}:waiting`)
 - D3: ZRANK + ZCARD (별도 counter 없음)
 - D4: Java (부하 측정) + Lua (원자 처리) 분리

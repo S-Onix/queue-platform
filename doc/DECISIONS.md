@@ -1146,7 +1146,7 @@ DB 먼저 이유:
 | `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify/complete 시 admitToken→tokenId 조회 |
 | `queue:{queueId}:admit-idem:{requestId}` | String | 300s | admit 중복 요청 멱등성. NX로 최초 1회만 처리. `requestId`가 **Tenant가 정하는 값**이라 큐 스코프 필수 |
 | `verified-token:{tokenId}` | String | 60s | 중복 입장 방지. verify 후 admit 대상 제외. complete 시 DEL |
-| `apikey-cache:{sha256}` | String | 60s | API Key 인증 DB 조회 대체. SHA-256 hash를 Key로 → rawKey 노출 방지 |
+| `apikey:{keyHash}` | String | 60s | API Key 인증 DB 조회 대체. SHA-256 hash를 Key로 → rawKey 노출 방지 |
 | `batch-lock:{t}:{q}` | String | 15s | Batch 서버 분산 시 큐별 처리 서버 지정. SET NX로 중복 처리 방지 |
 
 > **제거된 Key**

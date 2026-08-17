@@ -274,7 +274,7 @@ flowchart TD
 
 ### 5-D. Redis 캐시 적용 ✅
 
-- ✅ ApiKey Redis 캐시 (`apikey-cache:{sha256}`, TTL 60s)
+- ✅ ApiKey Redis 캐시 (`apikey:{keyHash}`, TTL 60s)
 - ✅ 캐시 히트율 로그
 - ✅ `RedisKeyFactory` (static 메서드 방식)
 - ✅ Facade 도입 → Anti-pattern 인식 후 롤백 (중요 학습 자산)
