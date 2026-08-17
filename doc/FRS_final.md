@@ -346,8 +346,10 @@ Body: { count: N, requestId: "req_abc" }
    → Lua Dequeue + admitToken 발급
 
 ① Lua Dequeue (Redis 전용):
-  슬라이스별 ZRANGE WITHSCORES → score 정렬 → 상위 N명 ZREM
-  부족 시 최대 3회 추가 추출 (전체 재정렬 → FIFO 보장)
+  ZRANGE queue:{queueId}:waiting 0 N-1 WITHSCORES → ZREM multi-member
+  ZSet이 하나(§66 D2)이고 score가 INCR 단조증가(§70 D9)라 이미 FIFO 순이다
+  — 슬라이스 병합도 Lua 내부 재정렬도 필요 없다
+  ② 에서 걸러져 부족하면 다음 구간을 추가 추출 (여전히 정렬 불필요)
 
 ② DB WAITING 상태 확인 + verified-token 체크   ← Lua 밖. Lua는 MySQL을 못 만진다
 
