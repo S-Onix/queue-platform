@@ -1,0 +1,236 @@
+# 인프라 알람 규칙 — Queue Platform
+#
+# 이 파일에 있는 규칙은 전부 "임계값이 필요 없는 것"만 골랐다.
+# 이 프로젝트는 아직 부하 기준선이 없다. 근거 없는 숫자를 규칙에 박으면 그 숫자가
+# 나중에 "이미 정해진 값"으로 굳어 아무도 다시 묻지 않는다. 그래서 아래 4종만 쓴다.
+#
+#   1) 프로세스가 죽었다        (up == 0 / redis_up == 0 — 임계값 개념이 없다)
+#   2) 이진 상태가 뒤집혔다      (quorum 실패, 복제 링크 끊김)
+#   3) 구성 사고               (master가 둘)
+#   4) 한도가 명시된 자원의 추세  (maxmemory 1GB가 config에 박혀 있다 → 절대값이 아니라 도달 예측)
+#
+# 기준선이 필요해 "쓰지 않은" 규칙은 파일 맨 아래 <보류> 절에 이유와 함께 남겼다.
+# 주석은 발화하지 않으므로 "규칙이 있다"는 착각을 만들지 않는다.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# severity 체계 (이 레포 첫 규칙이라 여기서 정의한다)
+#
+#   critical : 서비스가 지금 죽었거나, "다음 장애를 복구할 수단"이 사라졌다. 사람을 깨운다.
+#   warning  : 사용자 영향은 아직 없다. 방치하면 critical이 된다. 업무 시간에 본다.
+#   info     : 로컬 환경의 사실 표기. 절대 깨우지 않는다.
+#              (로컬은 앱을 안 띄운 시간이 대부분이라 상시 firing이 정상이다.
+#               이걸 warning에 섞으면 warning 등급 전체가 오염된다 → 등급으로 격리한다)
+#
+# ⚠️ Alertmanager는 미설치다(의도적, 알림 채널 없음). 즉 지금 severity는 라우팅을 하지 않고
+#    문서 라벨로만 존재한다. firing 확인은 http://localhost:9090/alerts 에서 눈으로 한다.
+#
+# ⚠️ 전제: evaluation_interval=15s, scrape_interval=15s (실가동 prometheus.yml 실측)
+#    `for:` 값은 전부 "스크레이프 N회 연속"으로 환산해 근거를 각 규칙에 적었다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+groups:
+
+  # ===========================================================================
+  # 1. 죽었다
+  # ===========================================================================
+  - name: queue-platform-liveness
+    rules:
+
+      # 앱 프로세스가 스크레이프에 응답하지 않는다.
+      #
+      # ⚠️ 로컬에서는 이 규칙이 거의 항상 firing이다 — 앱을 상시 띄우지 않기 때문.
+      #    그래서 severity=info다. "앱이 안 떠 있다"는 사실 표기이지 사고 통보가 아니다.
+      #    prod 타깃(관리 포트 분리 후, Sprint 11)이 job으로 추가되면 그 job만 critical로 올린다.
+      #
+      # queue-batch(8081)는 여기 없다 — actuator 의존성 자체가 없어 스크레이프 대상이 아니다
+      # (prometheus.yml 주석 참조). 의존성이 생기면 job 추가와 함께 이 정규식에 더한다.
+      - alert: AppInstanceDown
+        expr: up{job=~"queue-api|queue-consumer"} == 0
+        for: 2m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.job }} ({{ $labels.instance }}) 스크레이프 실패 2분"
+          action: "로컬이면 앱 미기동이 원인이다. 기동 여부만 확인하고 끝낸다: `ss -lntp | grep 8080`"
+
+      # Redis 인스턴스가 죽었다.
+      #
+      # 🔴 여기서 `up`을 쓰면 안 된다. redis_exporter는 멀티타깃 모드(1 프로세스가 22개 담당)라
+      #    Redis가 죽어도 익스포터는 HTTP 200을 돌려준다 → `up`은 1로 남는다.
+      #    죽음이 드러나는 곳은 익스포터가 내려주는 `redis_up`이다. 실측으로 확인했다.
+      #    (이걸 모르고 `up{job="redis"}==0`으로 쓰면 Redis가 죽어도 영원히 침묵한다)
+      #
+      # job=redis 3대(6379/6380/6381)는 앱이 실제로 붙는 Redis다. job=redis-sentinel 3대가
+      # 죽으면 failover가 불가능해진다. 둘 다 critical.
+      #
+      # for: 1m — Sentinel failover 실측이 5~10초다(doc/INFRA_SETUP.md). 1분이면 failover
+      #           과정은 안 걸리고 진짜 다운만 걸린다.
+      - alert: RedisInstanceDown
+        expr: redis_up{job=~"redis|redis-sentinel"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis {{ $labels.instance }} ({{ $labels.job }}) 응답 없음 1분"
+          action: "`redis_status` 로 프로세스 확인 → 죽었으면 `redis_start`. master(6379)면 Sentinel이 5~10초 내 승격했어야 한다. 승격이 안 됐으면 quorum을 먼저 본다."
+
+      # 익스포터 자체가 죽었다 = 위 RedisInstanceDown 규칙이 침묵한다.
+      #
+      # 시계열이 사라지면 `== 0` 규칙은 발화하지 않는다(빈 벡터). 즉 "감시가 죽은 것"을
+      # 알려주는 규칙이 따로 필요하다. 이게 없으면 Redis 관측 전체가 조용히 눈이 먼다.
+      #
+      # redis/redis-sentinel/redis-cluster는 전부 같은 9121 프로세스라 하나가 죽으면 다 죽는다.
+      # mysql은 인스턴스당 익스포터 1개(9104/9105)이므로 별개 실패다.
+      - alert: ExporterDown
+        expr: up{job=~"redis|redis-sentinel|mysql"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "익스포터 응답 없음 — {{ $labels.job }} {{ $labels.instance }} (해당 인프라 지표 전체 소실)"
+          action: "익스포터 프로세스 확인. 이게 firing인 동안 같은 대상의 다른 규칙은 전부 침묵 중이라고 봐야 한다."
+
+      # mysqld_exporter는 살아 있는데 MySQL에 붙지 못한다.
+      #
+      # 🔴 이 규칙은 지금 firing 상태다. 전용 모니터링 계정이 아직 없다(사용자 조치 대기).
+      #    그 결과 mysql_* 지표가 사실상 전무하고, 특히 복제 지연(seconds_behind_master)이
+      #    아예 수집되지 않는다. 즉 "DB는 살아 있는데 우리가 못 보고 있다"는 상태다.
+      #    DB 자체 장애가 아니므로 critical이 아니라 warning이다 — 이 구분이 중요하다.
+      - alert: MysqlExporterCannotConnect
+        expr: mysql_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mysqld_exporter가 {{ $labels.application }}에 접속 못 함 — MySQL 지표 전체가 비어 있다"
+          action: "모니터링 전용 계정(PROCESS, REPLICATION CLIENT, SELECT) 생성 여부부터 확인. 계정이 생기기 전까지 복제 지연은 관측 불가다."
+
+  # ===========================================================================
+  # 2. 이진 상태가 뒤집혔다 / 구성 사고
+  # ===========================================================================
+  - name: queue-platform-redis-state
+    rules:
+
+      # 복제 링크가 끊겼다. slave가 master를 따라잡지 못하는 게 아니라 "연결 자체가 없다".
+      # 이 상태에서 failover가 나면 승격된 노드가 오래된 데이터를 갖는다 = 대기열 유실.
+      # 값이 0/1뿐이라 임계값 개념이 없다.
+      - alert: RedisReplicationBroken
+        expr: redis_master_link_up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis 복제 끊김 — {{ $labels.instance }} → master {{ $labels.master_host }}:{{ $labels.master_port }}"
+          action: "`redis-cli -p <slave> INFO replication` 의 master_link_status 확인. 이 상태에서 master를 강제 failover 시키지 마라 — 유실된다."
+
+      # Sentinel quorum이 깨졌다 = master가 죽어도 승격이 불가능하다.
+      # "지금 서비스는 멀쩡한데 다음 장애를 복구할 수단이 사라진" 전형적 critical이다.
+      # ckquorum은 Sentinel이 직접 계산해 1/0으로 내려준다 → 임계값 없음.
+      - alert: RedisSentinelQuorumLost
+        expr: redis_sentinel_master_ckquorum_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sentinel quorum 실패 — {{ $labels.instance }} / master={{ $labels.master_name }}"
+          action: "Sentinel 3대 생존 확인(`redis_status`). quorum이 없으면 master 장애 시 자동 승격이 안 된다. 복구 전까지 master 재기동·강제 종료 금지."
+
+      # master가 둘 이상이다 = split-brain 또는 구성 사고.
+      # 앱이 어느 쪽에 쓰느냐에 따라 대기열이 조용히 갈린다. 조용한 실패라 규칙으로만 잡힌다.
+      #
+      # for: 2m — failover 직후 옛 master가 살아 돌아오면 Sentinel이 slaveof로 되돌리기까지
+      #           수 초간 둘로 보인다. 2분이면 그 정상 과도구간을 넘긴다.
+      #
+      # master가 0개인 경우는 넣지 않았다: 시계열이 사라져 `!= 1`이 발화하지 않을뿐더러,
+      # RedisInstanceDown / RedisSentinelQuorumLost가 이미 잡는다. 규칙을 겹쳐 놓지 않는다.
+      - alert: RedisMultipleMasters
+        expr: count(redis_instance_info{job="redis", role="master"}) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sentinel 구성에 master가 {{ $value }}개다 (정상 1개)"
+          action: "`redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster` 로 정본 master 확인 → 나머지를 `SLAVEOF <master> <port>`. 앱 재시작보다 이게 먼저다."
+
+  # ===========================================================================
+  # 3. 한도가 명시된 자원의 추세
+  # ===========================================================================
+  - name: queue-platform-capacity
+    rules:
+
+      # maxmemory 도달 예측.
+      #
+      # 이 규칙만 유일하게 "한도"를 쓰는데, 그 한도가 기준선 추정이 아니라 **config에 박힌 값**이다:
+      #   - maxmemory 가 명시 설정돼 있다 (0 = 무제한이 아니다)
+      #   - maxmemory-policy = noeviction (실측)
+      #   → 한도에 닿는 순간 eviction이 아니라 **쓰기가 OOM으로 거부된다** = enqueue가 죽는다.
+      #
+      # ⚠️ 한도 숫자를 이 파일에 적지 않는다. 규칙이 redis_config_maxmemory를 그때그때 읽으므로
+      #    CONFIG SET으로 값이 바뀌어도 규칙은 따라간다. (실제로 이 규칙을 쓰는 동안 1GiB → 2GiB로
+      #    바뀌었다. 주석에 숫자를 박았다면 그 순간부터 거짓말이 됐을 것이다.)
+      #
+      # 절대값 임계(예: 90%)를 안 쓴 이유:
+      #   증가 속도를 모른다(기준선 없음). 90%가 "3시간 뒤"인지 "3초 뒤"인지
+      #   모르는 상태에서 90%는 아무 정보가 아니다. 게다가 지금 이 시스템은 admit 미구현이라
+      #   `waiting` ZSet에 ZREM 경로가 없다 = 메모리가 **단조 증가**한다. 수준이 아니라 추세가 맞다.
+      #
+      # 6h는 임계값이 아니라 "얼마나 미리 알고 싶은가"(리드타임)다. 새벽에 깨우지 않고
+      # 아침에 조치할 수 있는 여유로 잡았다. 재시작·FLUSH로 메모리가 줄면 기울기가 음수라
+      # 예측값이 내려가므로 오탐이 안 난다.
+      #
+      # `maxmemory > 0` 가드: 한도 미설정(0) 인스턴스가 섞이면 비교가 항상 참이 되어 오탐이 터진다.
+      - alert: RedisMemoryWillHitMaxmemory
+        expr: |
+          predict_linear(redis_memory_used_bytes{job="redis"}[1h], 6 * 3600)
+            > redis_config_maxmemory{job="redis"}
+          and redis_config_maxmemory{job="redis"} > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis {{ $labels.instance }} 현 추세면 6시간 내 maxmemory 도달 — noeviction이라 쓰기(enqueue)가 거부된다"
+          action: "`redis-cli -p 6379 CONFIG GET maxmemory` 로 현재 한도 확인 → `INFO memory`의 used_memory → `--bigkeys`로 어느 큐가 키우는지 본다. ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# <보류> — 지금 쓰지 않은 규칙과 그 이유
+#
+# 규칙을 안 쓴 것에도 근거가 있어야 한다. 나중에 "왜 이건 없지"를 다시 묻지 않도록 남긴다.
+#
+# ● redis-cluster(7001-7008 / 8001-8008) 16노드의 up / redis_cluster_state
+#   → 로컬 학습 자산이다(doc/INFRA_SETUP.md §6.5). 앱이 붙지 않으므로 죽어도 서비스 영향 0이다.
+#     여기에 up==0을 걸면 알람 16개가 소음으로 깔린다. §75(Cluster 전환) 시점에
+#     `redis_cluster_state != 1` / `redis_cluster_slots_fail > 0`을 그때 추가한다.
+#
+# ● MySQL 복제 중단 / 복제 지연 증가
+#   → 시계열이 **지금 존재하지 않는다**(mysql_up == 0, 전용 계정 미생성).
+#     없는 시계열로 규칙을 쓰면 메트릭 이름 오타를 검증할 방법이 없고, 계정이 생겨도
+#     조용히 안 터진다 — "규칙이 있다"는 착각만 남는다. 그건 규칙이 없는 것보다 나쁘다.
+#     계정 생성 후 시계열을 눈으로 확인하고 이름을 확정해서 쓴다. 그때 쓸 두 개:
+#       - 복제 중단: slave_sql_running == 0  (이진값, 임계값 불필요)
+#       - 지연 증가: deriv(seconds_behind_master[15m]) > 0  (절대값이 아니라 추세)
+#     🔴 위 두 표현식의 **메트릭 이름은 미검증인 약칭이다.** 실제는 mysql_slave_status_*
+#        계열일 가능성이 높다(mysql_slave_status_slave_sql_running /
+#        mysql_slave_status_seconds_behind_master). 시계열이 없어 지금은 확인할 수 없다.
+#        **그대로 붙여넣지 마라** — 이 절이 경고하는 그 함정(조용히 안 터짐)을 한 층 위에서
+#        되풀이하게 된다. 계정 생성 후 /api/v1/label/__name__/values 로 실제 이름을 확인할 것.
+#     그때까지는 MysqlExporterCannotConnect가 "우리가 눈이 멀었다"를 대신 말한다.
+#
+# ● Redis master 단일 스레드 포화
+#   rate(redis_cpu_user_main_thread_seconds_total{job="redis"}[1m]) — 1.0이 물리 상한이다.
+#   → 두 가지가 없어서 보류한다.
+#     (1) 기준선 — 평상시 값이 0.02인지 0.6인지 모른다. 경보선을 정할 근거가 없다.
+#     (2) **조치 레버가 없다.** pacing은 아직 Redis 키가 아니고(§79 설계만),
+#         Rate Limit cap/refill은 코드 하드코딩이라 런타임 변경이 불가능하다.
+#         깨워도 할 수 있는 게 없는 알람은 쓰지 않는다.
+#     레버가 생긴 뒤(pacing 키 구현) 부하 테스트로 기준선을 잡고 쓴다.
+#
+# ● 애플리케이션 규칙 전부 (admit 5xx 비율 / B2 판정 시한 / 만료율 / p95 지연)
+#   → 대상 메트릭이 **미구현**이다. 커스텀 메트릭 사용처 0건(MeterRegistry grep 0건).
+#     Sprint 7에서 queue_admit_requests_total / queue_admit_tokens_issued_total이 생기고,
+#     부하로 기준선을 잡은 뒤에 쓴다. 그전까지는 전부 "기준선 수집 필요"다.
+#
+#   ⚠️ 그중 하나는 임계값을 정하기 전에 함정부터 풀어야 한다:
+#      "admit 요청이 안 온다"(B2)를 rate()==0 으로 쓸 수 없다. 카운터는 0을 내지 않는다 —
+#      한 번도 요청이 없던 (queueId, instance) 조합은 **시계열 자체가 없다**. absent_over_time()
+#      이나 "대기자 존재" 조건과의 결합이 필요하다. 이건 임계값이 아니라 설계 문제다.
+# ─────────────────────────────────────────────────────────────────────────────

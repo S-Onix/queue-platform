@@ -1,0 +1,13 @@
+알람 규칙 정본 디렉터리. 실가동 Prometheus가 이 경로를 직접 읽는다.
+
+  실가동 설정: /home/sonix/queue-platform-infra/monitoring/prometheus/prometheus.yml
+  rule_files:  /home/sonix/projects/queue-platform/doc/monitoring/alerts/*.yml
+
+규칙 파일은 여기에 `*.yml`로 추가한다 (내용은 monitoring 담당).
+추가·수정 후 반영:
+
+  promtool check rules doc/monitoring/alerts/*.yml
+  kill -HUP $(pgrep -x prometheus)
+  curl -s localhost:9090/api/v1/rules
+
+이 파일(.gitkeep)은 `*.yml`이 아니므로 Prometheus가 읽지 않는다.
