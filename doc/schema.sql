@@ -118,8 +118,17 @@ CREATE TABLE queues (
 -- [admit_token] verify DB Fallback + Polling Fallback용
 -- [admitted_at] admit 시각. verify·complete의 유효 창 판정 기준 (DECISIONS §80)
 --   ⚠️ issued_at을 그 판정에 쓰면 안 된다 — 줄을 선 시각이라 두 시간 전일 수 있다.
---   ⚠️ 파티션 테이블에 ADD COLUMN이므로 ALGORITHM=INSTANT가 되는지 먼저 확인할 것.
---      안 되면 13개 파티션 재구축 + replica 지연이다 (§80 착수 전 검증)
+--   ✅ 파티션 테이블 ADD COLUMN에서 ALGORITHM=INSTANT 실증 완료 (2026-08-17 22:26:27 KST, MySQL 8.0.46).
+--      실행문: ALTER TABLE tokens ADD COLUMN admitted_at DATETIME(3) NULL AFTER issued_at, ALGORITHM=INSTANT
+--      근거: master binlog master-bin.000427 에 error_code=0 으로 남아 있다. ALGORITHM=INSTANT 는
+--            미지원이면 ER 1845/1846 으로 실패해 binlog에 기록되지 않으므로 기록 자체가 성공의 증명이다.
+--            master 3306 · replica 3307 양쪽에서 컬럼 존재 확인(information_schema.COLUMNS).
+--      → 13개 파티션 재구축·replica 지연은 발생하지 않는다.
+--      ⚠️ 전제 둘: (a) 마지막이 아닌 위치(AFTER issued_at)의 INSTANT ADD COLUMN 은 MySQL 8.0.29+ 다.
+--            8.0.12~8.0.28 서버에서는 이 문장 그대로 실패한다.
+--            (b) 실증 당시 tokens 는 0행이었다. INSTANT 지원 여부는 행 수와 무관하지만,
+--            대용량에서의 MDL 배타 락 대기(장기 트랜잭션 뒤에서 대기)까지 잰 것은 아니다.
+--            테이블당 row version 64 상한을 넘기면 그때는 INSTANT가 아니라 재구축이다.
 -- [redis_sync_needed] Redis 다운 중 INSERT 토큰 추적 → RedisSyncJob
 -- [파티션 키] PRIMARY KEY(id, issued_at) — MySQL 제약
 --

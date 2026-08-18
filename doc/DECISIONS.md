@@ -1202,7 +1202,7 @@ DB 먼저 이유:
 > ⛔ **`verified-token`은 §80이 폐기했다.** 위 해결책의 심장은 **"admit이 verified 토큰을
 > 제외한다"**인데, §80이 **admit에서 Redis 밖 조회를 전부 걷어냈다**(중간 DB 확인이 정상 대기자를
 > 지우기 때문 — §71 D11). 읽는 곳이 사라진 플래그는 플래그가 아니다.
-> **대체**: complete를 관대하게 만든다 — `WHERE admit_token = ? AND status IN (0, 1)` +
+> **대체**: complete를 관대하게 만든다 — `WHERE token_id = ? AND admit_token = ? AND status IN (0, 1)` +
 > `admitted_at` 유효 창. 중복 입장은 **`admit_token` 자체의 유일성**이 막는다.
 
 #### ④ 용량 초과 (maxCapacity 위반)
@@ -5431,11 +5431,12 @@ master 한 대에 몰립니다.**
 ② EVAL admit.lua                            ← 전 구간 원자. Redis 밖 호출 0회
      ZPOPMIN queue:{q}:waiting N            → (identifier, seq) N쌍
      HGET   queue:{q}:tokens identifier     → "tokenId|issuedAt"
-     SET    queue:{q}:admit-by-token:{tokenId}   PX 60000   ← 동적 키
-     SET    queue:{q}:admit-by-admit:{admitToken} PX 60000  ← 동적 키
+       └ 미스/레거시(구분자 없음)면 ZADD로 원래 seq에 되돌리고 건너뛴다
+     SET    queue:{q}:admit-by-token:{tokenId}   PX 60000   ← 동적 키. 접두사는 Java가 ARGV로
+     SET    queue:{q}:admit-by-admit:{admitToken} PX 60000  ← 동적 키. 접두사는 Java가 ARGV로
      ZADD   queue:{q}:admitted  {만료 epoch ms}  "seq|identifier"
      watermark 조건부 갱신 (현재값보다 클 때만, §79)
-     admit-idem:{requestId} 에 결과 payload 저장 (재시도 시 REPLAY)
+     queue:{q}:admit-idem:{requestId} 에 결과 payload 저장 (재시도 시 REPLAY)
 ③ Kafka publishAll — ADMITTED × N (key = tokenId)
 ④ 200 { admitted: [...] }
 ```
@@ -5448,16 +5449,18 @@ master 한 대에 몰립니다.**
 | 항목 | 결정 |
 |---|---|
 | verify · complete | **분리 유지** |
-| `verified-token:{tokenId}` | 🔴 **폐기.** 대신 complete를 관대하게 — `WHERE admit_token = ? AND status IN (0, 1)` + `admitted_at` 유효 창 |
+| `verified-token:{tokenId}` | 🔴 **폐기.** 대신 complete를 관대하게 — `WHERE token_id = ? AND admit_token = ? AND status IN (0, 1)` + `admitted_at` 유효 창 |
 | TTL 만료 후 verify | **404** |
 | `admit_requests` 테이블 | 🔴 **폐기** (`schema.sql`에서 삭제) |
+| `admit.lua` 동적 키 조립 | **Java가 접두사까지 만들어 ARGV로 넘긴다** — `QueueKeys.admitByTokenPrefix(queueId)` 등. Lua는 `prefix .. tokenId`만 한다. Lua 파일에 접두사 리터럴 박기(B안)는 기각 (⑥) |
 | TTL 만료 → WAITING 복귀 트리거 | **`queue:{q}:admitted` ZSet + claim-Lua** (score = 만료 시각) |
 | claim-Lua 실행 주체 | **`queue-batch`** — ⚠️ actuator·micrometer가 없어 **추가가 선행**이다(reconciliation과 같은 선행조건) |
+| claim-Lua의 leader election | **쓰지 않는다.** `EVAL` 자체가 claim이다 — `CLAUDE.md` "`@Scheduled` 단독 금지" 규칙의 **명시적 예외** (⑧) |
 | `tokens.admitted_at` | **추가** |
 | Kafka 이벤트 타입 | **판별 필드**(한 토픽·한 스키마 안에서 분기) |
 | `ADMIT_ISSUED → CANCELLED` | **409 유지** |
 | 복귀가 `last-active`를 리셋하는가 | **안 한다** |
-| `count` 상한 | **존재만 확정.** 값은 실측 후 (임시 1,000) |
+| `count` 상한 | **100.** `@Max(100)` Bean Validation 한 줄 — 전용 검증 클래스를 만들지 않는다 (⑦) |
 | 포트 rename | **미룬다** (순수 미용) |
 | admit이 `last-active` 정리 | **Sprint 9 회수 배치에서 일괄** |
 
@@ -5498,13 +5501,24 @@ master 한 대에 몰립니다.**
 > 즉 **위기 A(Redis 포화)는 admit 메트릭을 몇 개 만들어도 안 보인다.**
 > 우선순위: **redis_exporter > 알람 규칙 > `queue-batch` actuator > access log > 커스텀 메트릭.**
 
-**착수 전 검증 2건**
+**착수 전 검증 2건** — ①은 **미검증**, ②는 **실증 완료(2026-08-17)**
 
-- **admit Lua의 동적 키가 Cluster에서 도는가.** 키가 런타임에 정해지므로(`{tokenId}`·`{admitToken}`)
+- ⬜ **admit Lua의 동적 키가 Cluster에서 도는가.** 키가 런타임에 정해지므로(`{tokenId}`·`{admitToken}`)
   `KEYS[]` 선언이 불가능하다. 해시태그가 같아 이론상 같은 슬롯이지만 **로컬 Cluster A(7001-7008)에서
   실제로 돌려봐야 한다. Sentinel로는 절대 안 잡힌다**(§70 D10)
-- **`ALGORITHM=INSTANT`가 파티션 테이블 `ADD COLUMN`에서 되는가.** `admitted_at` 추가가 여기 달렸다.
-  안 되면 13개 파티션 재구축 + replica 지연이다
+  - **기전은 2026-08-18 실측으로 규명됐다**(Cluster A, Redis 7.0.15): 선언 없는 키 접근은 CROSSSLOT이
+    아니라 `ERR Script attempted to access a non local key`이고, **슬롯이 달라도 같은 노드면 조용히
+    성공한다**(마스터 4대 = 약 25%). 그래서 이 검증의 통과는 **안전의 증거가 아니다** — 진짜 방어는
+    A안(⑥) + `QueueKeysSlotTest`의 슬롯 동일성 단언이다
+  - 남은 것은 **A안으로 조립한 실제 `admit.lua`를 Cluster A에서 돌려보는 것**이다
+- ✅ **`ALGORITHM=INSTANT`는 파티션 테이블 `ADD COLUMN`에서 된다 — 실증 완료(2026-08-17 22:26:27 KST).**
+  `ALTER TABLE tokens ADD COLUMN admitted_at DATETIME(3) NULL AFTER issued_at, ALGORITHM=INSTANT` 가
+  MySQL **8.0.46**(master 3306)에서 성공했다. 근거는 master binlog `master-bin.000427` 의 `error_code=0`
+  기록이다 — `ALGORITHM=INSTANT` 는 미지원이면 **ER 1845/1846으로 실패해 binlog에 남지 않으므로 기록 자체가 증명**이다.
+  master·replica 양쪽에서 컬럼 존재도 확인했다. **13개 파티션 재구축·replica 지연은 발생하지 않는다.**
+  단 (a) 마지막이 아닌 위치의 INSTANT `ADD COLUMN` 은 **MySQL 8.0.29+** 이고,
+  (b) 실증 당시 `tokens` 는 0행이라 대용량에서의 MDL 배타 락 대기까지 잰 것은 아니다.
+  ⚠️ §75의 `ALTER COLUMN ... DROP DEFAULT`(4639행 부근)는 **다른 연산**이다. 그 서술을 이 근거로 쓰지 마라.
 
 ### Rationale
 
@@ -5547,7 +5561,7 @@ admit은 Backpressure Pull이라 Tenant가 슬롯이 빌 때만 부른다(설계
 complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출도 **어차피 정당한 토큰을
 가진 정당한 호출**이다. 거절할 근거가 없다.
 
-대신 complete를 **관대하게** 만든다: `WHERE admit_token = ? AND status IN (0, 1)`.
+대신 complete를 **관대하게** 만든다: `WHERE token_id = ? AND admit_token = ? AND status IN (0, 1)`.
 `0`을 허용하는 이유는 **TTL 만료로 WAITING에 복귀했지만 Tenant는 이미 입장시킨** 경우가 실재하기
 때문이다. `admitted_at` 유효 창으로 무한 소급은 막는다.
 
@@ -5561,6 +5575,71 @@ complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출�
 남는 건 성공 기록뿐인데 그건 Kafka 이벤트와 메트릭이 이미 갖고 있다.
 **과금 근거도 아니다**(과금은 enqueue 수 기준). 장기 이력은 `queue_daily_stats.total_admit_count`다.
 
+**⑥ 동적 키의 접두사는 Java가 만든다 — Lua에 문자열을 박지 않는다.**
+
+`admit.lua`가 건드리는 키 셋(`admit-by-token:{tokenId}` · `admit-by-admit:{admitToken}` ·
+`admit-idem:{requestId}`)은 두 번째 조각이 **런타임에 정해진다.** 그래서 `KEYS[]`에 미리 선언하는
+것이 원리적으로 불가능하다. 그러면 접두사를 누가 만드느냐가 남는데 — **Java가 만들어 ARGV로
+넘기고 Lua는 `prefix .. tokenId`만 한다(A안).** 접두사 문자열을 `.lua` 파일에 박는 B안은 기각한다.
+
+**왜 이게 취향 문제가 아닌가.** 2026-08-18 로컬 Cluster A(Redis **7.0.15**) 실측 두 가지:
+
+1. **`CROSSSLOT` 사전 검사는 선언된 `KEYS`에만 걸린다.** 선언하지 않고 접근한 키는 다른 에러가
+   난다 — `ERR Script attempted to access a non local key`. 즉 런타임 검사는 슬롯이 같은지가
+   아니라 **이 노드가 그 키를 소유하는지**만 본다.
+2. 그래서 **슬롯이 달라도 그 노드가 우연히 소유하고 있으면 조용히 성공한다.** 마스터 4대면
+   약 25%다. 리샤딩이나 failover로 슬롯이 옮겨가는 그날 처음 깨진다.
+
+`enqueue_bulk.lua`는 3키를 `KEYS`로 선언하므로 CROSSSLOT이라는 그물이 있다. **`admit.lua`에는
+그 그물이 없다.** 남는 방어는 `QueueKeysSlotTest`의 슬롯 동일성 단언 하나뿐이고, 그 테스트는
+`QueueKeys`의 public static 팩토리를 **리플렉션으로 전수 열거**해서 새 키가 추가돼도 자동으로
+걸리게 만든 것이다. B안이면 접두사가 Java 밖에 살아 **그 전수 단언이 닿지 않는다** — 해시태그를
+빠뜨린 접두사가 단위 테스트를 통과하고, Sentinel을 통과하고, Cluster에서도 25% 확률로 통과한다.
+**그물 셋이 동시에 샌다.**
+
+대가는 ARGV가 늘고 Lua가 문자열 결합을 한다는 것이다. 접두사 조립 규칙이 `QueueKeys` 한 곳에만
+사는 값이 그보다 크다. 완성된 키가 필요한 경로(폴링의 `admit-by-token` 조회, verify의
+`admit-by-admit` 조회)도 **접두사 메서드를 재사용해서** 만든다 — 두 벌로 만들면 단일 출처가 깨진다.
+
+**⑦ `count` 상한은 100에서 시작한다 — "견딜 수 있는 최대"가 아니라 "필요를 채우는 최소"다.**
+
+**상한 변경은 비대칭이다.** 올리는 것은 하위호환이라 기존 호출자가 그대로 돌지만, **내리는 것은
+파괴적 변경**이다 — 어제 되던 호출이 오늘 400이 된다. 그래서 시작값을 근거 없이 크게 잡으면
+되돌릴 수 없고, 시작값은 수요를 채우는 최소여야 한다.
+
+- **기준점**: `enqueue_bulk.lua`는 `CHUNK_SIZE = 500`으로 총 `redis.call`이 약 2,001회다.
+  임시값 1,000은 `1 + 4N ≈ 4,004`로 **이미 검증된 최대 배치의 2배**였다. 100이면 ≈ 401로 그 1/5.
+- **수요**: 30만 명을 2시간에 소진하면 평균 **42/s**다. cap 100이면 admit 10 rps(설계 목표)로
+  **1,000/s = 필요치의 24배**. 모자랄 이유가 없다.
+- **이중 제어**: admit은 `X-API-Key` 경로라 `RateLimitFilter`의 Tenant Plan 토큰버킷이 함께
+  걸린다. cap은 **한 요청의 크기**를, 토큰버킷은 **요청의 빈도**를 막는다.
+- **구현은 `@Max(100)` 한 줄이다.** 전용 검증 클래스를 만들지 않는다 — 넘으면 400이면 되고
+  그건 Bean Validation의 기본 동작이다.
+
+**실측은 "올릴 근거"로만 쓴다.** 그리고 그때 재야 하는 것은 admit 단독 지연이 아니다 —
+**같은 노드에 폴링 부하를 걸어놓고 폴링 p99가 얼마나 밀리는가**를 봐야 한다. 문제는 admit이
+느린 것이 아니라 **이웃을 밀어내는 것**이기 때문이다.
+
+**⑧ 복귀 claim-Lua는 ShedLock을 쓰지 않는다 — `EVAL` 자체가 claim이다.**
+
+`CLAUDE.md`는 "`@Scheduled` 단독 금지, leader election 필요"라고 적고 있고 `CONCURRENCY.md`
+매트릭스도 스케줄러를 ShedLock 칸에 넣었다. **이 잡은 그 규칙의 명시적 예외다** — 근거를 여기
+남기지 않으면 리뷰에서 규칙 위반으로 지적돼 필요 없는 ShedLock이 들어온다.
+
+`ZRANGEBYSCORE admitted 0 now` + `ZREM`을 **한 Lua 안에** 두면 Redis 단일 스레드가 그 둘을
+쪼개지 않는다. `queue-batch` 3대가 같은 초에 깨어나도 멤버를 가져가는 것은 한 대뿐이고 나머지는
+**빈 배열**을 받는다. 중복 실행의 대가는 낭비된 `EVAL` 한 번이지 중복 복귀가 아니다.
+동시성 사다리에서 **2단(Redis 단일 키 원자 연산)이 5단(분산 락)을 이긴다** — `CLAUDE.md`가 정한
+우선순위 그대로다. 리더 선출을 얹으면 락 획득·갱신·만료라는 실패 모드가 새로 생기고 얻는 것은 없다.
+
+ShedLock이 필요한 잡은 **원자 claim이 불가능한 것들**이다 — 파티션 DROP, 월간 스냅샷처럼 DB
+여러 문장에 걸쳐 있어 "집었다"를 한 명령으로 표현할 수 없는 작업. 그 구분이 기준이다.
+
+⚠️ **단, 큐 목록 열거는 DB `queues`에서 한다.** Cluster에서 `SCAN queue:*:admitted`는 **접속한
+노드만** 훑으므로 마스터마다 따로 돌려야 한다. 단일 노드를 가정하고 짜면 다른 마스터에 사는 큐가
+**조용히 누락되고, 복귀되지 않은 토큰은 아무 에러도 내지 않는다.** DB에서 큐 목록을 읽으면 이
+문제가 원천에서 사라진다.
+
 ### Consequences
 
 - **좀비가 admit 한 자리를 낭비한다.** 브라우저를 닫은 사람도 대기열에 남아 있으므로 뽑힌다.
@@ -5570,18 +5649,33 @@ complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출�
 - **Redis 멱등키가 유실되면 중복 admit을 감지할 수단이 없다.** `admit_requests`의
   `UNIQUE (request_id)`가 마지막 방어선이었는데 폐기했다. Redis 전손 시 같은 `requestId`
   재시도가 두 번 실행된다 — **T1의 대가로 명시적으로 수용한다**
+- **③ Kafka 발행이 실패해도 200을 준다.** Lua는 이미 커밋됐고 되돌릴 수단이 없다. 여기서 5xx를
+  주면 Tenant가 재시도하는데, `admit-idem`이 REPLAY로 같은 답을 돌려줄 뿐 **Kafka는 여전히 안 간다** —
+  상태가 나아지지 않는 무한 반복이다. 미반영의 피해(`tokens.status`가 0에 머무름)는 complete가
+  `status IN (0, 1)`로 관대한 덕에 **이미 흡수하도록 설계돼 있다.** 실패는 로그와
+  `queue_admit_requests_total{result=error}`로 남긴다. enqueue가 발행 실패를 QE001(503)으로 돌리는
+  것과 반대인데, enqueue는 **아직 아무것도 확정되지 않은** 시점이라 거절이 성립하기 때문이다
 - **`count` 상한이 필요하다.** Redis는 단일 스레드이고 `ZPOPMIN N` + `N × (HGET + SET·SET·ZADD)`가
   한 스크립트 안에서 돈다. `N = 10,000`이면 **수십~100ms 블로킹**이고, 그동안 폴링을 포함한
-  모든 명령이 대기해 **p99가 연쇄로 무너진다.** 값은 실측 후 (임시 1,000)
+  모든 명령이 대기해 **p99가 연쇄로 무너진다.** **상한은 100**이다(⑦). 올릴 때 재야 하는 것은
+  admit 단독 지연이 아니라 **폴링 부하를 함께 건 상태의 폴링 p99 증가분**이다
 - **`0 → 1 → (TTL 만료) → 0` 왕복 뒤에 옛 `ADMITTED` 이벤트가 재전달되면** 낡은 토큰으로 다시
   `1`이 된다. 가드가 `status = 0`만 보고 **어느 세대의 admit인지는 모르기 때문**이다.
   60초를 넘겨 재전달돼야 하므로 희박하다. 막으려면 **버전(세대) 컬럼**이 필요하다 —
   **지금은 만들지 않고 적어만 둔다**(과설계 방지). 관측에 잡히면 그때 판단한다
 - **`tokens` Hash의 레거시 값**(구분자 `|` 없이 `tokenId`만 저장된 항목)은 `issuedAt`을 복원할 수
   없다. `tokens` 테이블의 PK가 `(token_id, issued_at)`이라 `issuedAt` 없이는 행을 특정하지 못한다.
-  → **건너뛰고 reconciliation에 맡긴다.** admit 경로에서 추측해 만들어 넣으면 중복 행이 생긴다
+  → **원래 seq로 `ZADD` 되돌린 뒤 건너뛰고, reconciliation에 맡긴다.** admit 경로에서 추측해
+  만들어 넣으면 중복 행이 생긴다.
+  ⚠️ **되돌리지 않으면 그 사람은 대기열에서 빠진 채 admitToken도 못 받아 사라진다.**
+  이 결정이 ②(중간 DB 확인)를 폐기한 이유가 정확히 그 사고인데, 되돌리지 않으면 같은 사고를
+  다른 문에서 다시 여는 셈이다. 되돌린 사람은 admit되지 않은 것이므로 `admitted` ZSet에도
+  들어가지 않고 Kafka 발행도 없다 — TTL 만료 복귀(§36)와는 다른 경로다
 - **`queue:{q}:admitted` ZSet이 새로 생긴다** — 큐 상태 키가 4종 → 5종. `QueueKeys` 경유 필수(§70 D10),
   §75 D26의 "한 큐의 키는 같은 클러스터" 대상에 포함된다
+- **`admit.lua`의 키 안전성은 테스트 하나에 걸려 있다.** `KEYS[]` 선언이 불가능해 CROSSSLOT 그물이
+  없으므로(⑥), `QueueKeys`를 우회해 서비스나 Lua에서 키 문자열을 직접 만들면 **그 순간 방어가 0이 된다.**
+  Cluster에서 돌려봐도 25%는 통과하므로 **초록은 안전의 증거가 아니다**
 - **`queue-batch`가 처음으로 Redis Lua를 돌린다.** 지금은 Application 클래스뿐인 껍데기다.
   actuator·micrometer 추가가 선행이고, 그건 reconciliation의 선행조건과 **같은 작업**이다
 
@@ -5618,5 +5712,9 @@ complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출�
   **`admitted` ZSet claim-Lua**로 확정한다
 - **§73 D16·D18** — `ADMITTED`·`RETURNED`도 같은 토픽 `token-lifecycle`, key = `tokenId`
 - **§75 D26** — 큐 상태 키 목록에 `admitted` 추가, `verified-token` 제거
-- 후속: `count` 상한 실측, 버전 컬럼(위 왕복 문제), `tokens` Hash 레거시 값 reconciliation,
-  포트 rename
+- **`CLAUDE.md` "`@Scheduled` 단독 금지, leader election 필요" · `CONCURRENCY.md` 동시성 매트릭스**
+  — 복귀 claim-Lua는 그 규칙의 **명시적 예외**다(⑧). 매트릭스에도 같은 행을 넣었다
+- **§70 D10** (Hash Tag 필수) — `admit.lua`는 `KEYS[]` 선언이 불가능해 **D10의 그물이 안 걸리는
+  첫 스크립트**다. 그래서 접두사를 Java(`QueueKeys`)가 만든다(⑥)
+- 후속: `count` 상한 **상향** 실측(내리는 것은 파괴적 변경이라 100에서 시작한다),
+  버전 컬럼(위 왕복 문제), `tokens` Hash 레거시 값 reconciliation, 포트 rename
