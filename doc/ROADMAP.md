@@ -494,8 +494,9 @@ flowchart TD
 - [ ] **admit Lua의 동적 키가 Cluster에서 도는가** — 로컬 Cluster A(7001-7008)에서 실증.
       `{tokenId}`·`{admitToken}`이 런타임에 정해져 `KEYS[]` 선언이 안 된다.
       **Sentinel로는 절대 안 잡힌다**
-- [ ] **`ALGORITHM=INSTANT`가 파티션 테이블 `ADD COLUMN`에서 되는가** — `admitted_at`이 여기 달렸다.
-      안 되면 13파티션 재구축 + replica 지연
+- [x] **`ALGORITHM=INSTANT`가 파티션 테이블 `ADD COLUMN`에서 되는가** — **된다. 실증 완료(2026-08-17,
+      MySQL 8.0.46).** `admitted_at` 은 실 DB(master·replica)에 이미 들어가 있다.
+      근거·전제는 `DECISIONS.md` §80 / `schema.sql` tokens 주석
 
 **착수 전 결정할 것 (남은 미판정):**
 - `count` 상한값 — 실측 후 (임시 1,000)

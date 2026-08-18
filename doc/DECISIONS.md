@@ -5490,13 +5490,19 @@ master 한 대에 몰립니다.**
 > 즉 **위기 A(Redis 포화)는 admit 메트릭을 몇 개 만들어도 안 보인다.**
 > 우선순위: **redis_exporter > 알람 규칙 > `queue-batch` actuator > access log > 커스텀 메트릭.**
 
-**착수 전 검증 2건**
+**착수 전 검증 2건** — ①은 **미검증**, ②는 **실증 완료(2026-08-17)**
 
-- **admit Lua의 동적 키가 Cluster에서 도는가.** 키가 런타임에 정해지므로(`{tokenId}`·`{admitToken}`)
+- ⬜ **admit Lua의 동적 키가 Cluster에서 도는가.** 키가 런타임에 정해지므로(`{tokenId}`·`{admitToken}`)
   `KEYS[]` 선언이 불가능하다. 해시태그가 같아 이론상 같은 슬롯이지만 **로컬 Cluster A(7001-7008)에서
   실제로 돌려봐야 한다. Sentinel로는 절대 안 잡힌다**(§70 D10)
-- **`ALGORITHM=INSTANT`가 파티션 테이블 `ADD COLUMN`에서 되는가.** `admitted_at` 추가가 여기 달렸다.
-  안 되면 13개 파티션 재구축 + replica 지연이다
+- ✅ **`ALGORITHM=INSTANT`는 파티션 테이블 `ADD COLUMN`에서 된다 — 실증 완료(2026-08-17 22:26:27 KST).**
+  `ALTER TABLE tokens ADD COLUMN admitted_at DATETIME(3) NULL AFTER issued_at, ALGORITHM=INSTANT` 가
+  MySQL **8.0.46**(master 3306)에서 성공했다. 근거는 master binlog `master-bin.000427` 의 `error_code=0`
+  기록이다 — `ALGORITHM=INSTANT` 는 미지원이면 **ER 1845/1846으로 실패해 binlog에 남지 않으므로 기록 자체가 증명**이다.
+  master·replica 양쪽에서 컬럼 존재도 확인했다. **13개 파티션 재구축·replica 지연은 발생하지 않는다.**
+  단 (a) 마지막이 아닌 위치의 INSTANT `ADD COLUMN` 은 **MySQL 8.0.29+** 이고,
+  (b) 실증 당시 `tokens` 는 0행이라 대용량에서의 MDL 배타 락 대기까지 잰 것은 아니다.
+  ⚠️ §75의 `ALTER COLUMN ... DROP DEFAULT`(4639행 부근)는 **다른 연산**이다. 그 서술을 이 근거로 쓰지 마라.
 
 ### Rationale
 
