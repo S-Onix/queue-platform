@@ -81,6 +81,12 @@ class QueueKeysSlotTest {
                 .as("QueueKeys의 키 팩토리를 하나도 못 찾았다 — 리플렉션 필터가 낡았다")
                 .hasSizeGreaterThanOrEqualTo(4);
 
+        // 필터가 parameterCount == 1로 좁혀지면 admitByToken/admitByAdmit/admitIdem(2인자)이
+        // 조용히 검사에서 빠진다 — admit.lua는 KEYS[] 선언이 불가능해 이 단언이 유일한 방어다.
+        assertThat(factories)
+                .as("2인자 키 팩토리가 열거에서 빠졌다 — 리플렉션 필터가 좁아졌다")
+                .anyMatch(m -> m.getParameterCount() == 2);
+
         for (String queueId : QUEUE_IDS) {
             Map<String, Integer> slotByKey = new LinkedHashMap<>();
             for (Method factory : factories) {
@@ -92,43 +98,6 @@ class QueueKeysSlotTest {
                     .as("queueId=%s 의 키들이 서로 다른 슬롯에 떨어진다 (해시태그 누락 → CROSSSLOT): %s",
                             queueId, slotByKey)
                     .hasSize(1);
-        }
-    }
-
-    /**
-     * §80(Sprint 7 Admit)이 추가할 키 4종. <b>아직 {@link QueueKeys}에 없어</b> 문자열로 만든다.
-     *
-     * <p>구현 전에 못 박는 이유: admit.lua는 이 키들을 {@code KEYS[]} 선언 없이 스크립트 안에서
-     * 조립한다(tokenId·admitToken·requestId가 런타임 값이라 선언이 불가능). 선언이 없으면 Redis의
-     * CROSSSLOT 사전 검사도 걸리지 않고, <b>슬롯이 어긋나도 같은 노드면 조용히 성공</b>한다
-     * (마스터 4대 기준 25%). 즉 실행 검증만으로는 결함이 안 드러나므로 슬롯 동일성을 따로 단언한다.
-     *
-     * <p>{@code QueueKeys}에 팩토리가 들어오면 이 메서드는 지운다 — 그때는 위 전수 열거가 덮는다.
-     */
-    private static List<String> admitKeysOf(String queueId) {
-        String tag = "queue:{" + queueId + "}:";
-        return List.of(
-                tag + "admitted",
-                tag + "admit-by-token:tok_01J8ZXQ7",
-                tag + "admit-by-admit:adm_9f3c1b",
-                tag + "admit-idem:req-tenant-supplied");
-    }
-
-    @Test
-    @DisplayName("§80이 추가할 admit 키 4종도 기존 큐 키와 같은 슬롯이다")
-    void admitKeysShareSlotWithExistingQueueKeys() {
-        for (String queueId : QUEUE_IDS) {
-            int expected = SlotHash.getSlot(QueueKeys.waiting(queueId));
-
-            Map<String, Integer> slotByKey = new LinkedHashMap<>();
-            for (String key : admitKeysOf(queueId)) {
-                slotByKey.put(key, SlotHash.getSlot(key));
-            }
-
-            assertThat(slotByKey.values())
-                    .as("queueId=%s - admit 키가 waiting(slot %d)과 다른 슬롯에 떨어진다: %s",
-                            queueId, expected, slotByKey)
-                    .containsOnly(expected);
         }
     }
 

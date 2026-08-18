@@ -50,4 +50,63 @@ public final class QueueKeys {
     public static String lastActive(String queueId) {
         return "queue:{" + queueId + "}:last-active";
     }
+
+    /**
+     * admit된 토큰의 만료 시각 ZSet (score = 만료 epoch ms, member = {@code "seq|identifier"}).
+     *
+     * <p>TTL 만료 → WAITING 복귀 배치가 {@code ZRANGEBYSCORE 0 now}로 claim하는 대상이다 (§80).
+     */
+    public static String admitted(String queueId) {
+        return "queue:{" + queueId + "}:admitted";
+    }
+
+    /** 마지막 admit seq. {@code /status} 전광판 원본 (§79). admit.lua가 조건부로 올린다. */
+    public static String admitWatermark(String queueId) {
+        return "queue:{" + queueId + "}:admit-watermark";
+    }
+
+    /**
+     * {@code admit-by-token} 접두사 (뒤에 tokenId가 붙는다). Polling 응답용 admitToken 조회.
+     *
+     * <p><b>접두사를 Java가 만드는 이유 (§80 ⑥):</b> admit.lua는 이 키를 {@code KEYS[]}에 선언할 수
+     * 없다 — 두 번째 조각(tokenId)이 런타임 값이다. 선언이 없으면 Redis의 {@code CROSSSLOT} 사전
+     * 검사가 <b>아예 걸리지 않고</b>, 선언 없는 접근은 {@code ERR Script attempted to access a
+     * non local key}로 <b>이 노드가 그 키를 소유하는지</b>만 본다. 즉 <b>슬롯이 달라도 그 노드가
+     * 우연히 소유하면 조용히 성공</b>한다(마스터 4대 = 약 25%). 남는 방어는
+     * {@code QueueKeysSlotTest}의 리플렉션 전수 슬롯 단언 하나뿐이므로, 접두사가 {@code .lua}
+     * 파일에 살면 그 단언이 닿지 못한다.
+     */
+    public static String admitByTokenPrefix(String queueId) {
+        return "queue:{" + queueId + "}:admit-by-token:";
+    }
+
+    /**
+     * 완성된 {@code admit-by-token} 키 (Polling·complete 경로에서 직접 조회할 때).
+     *
+     * <p>반드시 접두사 메서드를 재사용한다 — 따로 조립하면 같은 문자열이 두 군데 살아 갈라진다
+     * (단일 출처 붕괴, §80 ⑥).
+     */
+    public static String admitByToken(String queueId, String tokenId) {
+        return admitByTokenPrefix(queueId) + tokenId;
+    }
+
+    /** {@code admit-by-admit} 접두사 (뒤에 admitToken이 붙는다). verify/complete용 tokenId 역참조. */
+    public static String admitByAdmitPrefix(String queueId) {
+        return "queue:{" + queueId + "}:admit-by-admit:";
+    }
+
+    /** 완성된 {@code admit-by-admit} 키. 접두사 메서드 재사용 (위와 같은 이유). */
+    public static String admitByAdmit(String queueId, String admitToken) {
+        return admitByAdmitPrefix(queueId) + admitToken;
+    }
+
+    /**
+     * admit 멱등 키. 결과 payload를 들고 있어 재시도에 REPLAY로 답한다 (TTL 300s).
+     *
+     * <p>{@code requestId}는 <b>Tenant가 정하는 값</b>이라 큐 스코프가 필수다 — 전역 키로 두면
+     * 다른 테넌트가 같은 requestId를 보냈을 때 남의 결과를 받는다.
+     */
+    public static String admitIdem(String queueId, String requestId) {
+        return "queue:{" + queueId + "}:admit-idem:" + requestId;
+    }
 }
