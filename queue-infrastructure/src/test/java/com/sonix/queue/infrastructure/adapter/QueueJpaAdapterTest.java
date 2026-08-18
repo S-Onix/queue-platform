@@ -7,9 +7,12 @@ import com.sonix.queue.infrastructure.queue.RedisClusterAssigner;
 import com.sonix.queue.infrastructure.repository.QueueJpaRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
+import java.lang.reflect.Field;
 import java.time.LocalDateTime;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -37,7 +40,7 @@ class QueueJpaAdapterTest {
 
     @Test
     @DisplayName("신규 큐를 저장하면 클러스터를 배정한다")
-    void assignsOnInsert() {
+    void assignsOnInsert() throws Exception {
         when(clusterAssigner.assign()).thenReturn(2);
         when(queueJpaRepository.save(any(QueueEntity.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
@@ -45,6 +48,19 @@ class QueueJpaAdapterTest {
         adapter.save(Queue.create(1L, "이름", 1000, null, null));
 
         verify(clusterAssigner, times(1)).assign();
+
+        // 호출 여부만 보면 반환값을 버려도(assign(); 한 줄) 통과한다. 그 상태의 결과가
+        // "신규 큐가 전부 조용히 cluster1" 이므로, 저장된 엔티티에 실제로 실렸는지까지 본다.
+        ArgumentCaptor<QueueEntity> saved = ArgumentCaptor.forClass(QueueEntity.class);
+        verify(queueJpaRepository).save(saved.capture());
+        assertThat(clusterNoOf(saved.getValue())).isEqualTo(2);
+    }
+
+    /** {@code redisClusterNo}는 package-private이고 getter가 없다 (엔티티 밖으로 새는 걸 막는 쪽이 옳다). */
+    private static int clusterNoOf(QueueEntity entity) throws Exception {
+        Field field = QueueEntity.class.getDeclaredField("redisClusterNo");
+        field.setAccessible(true);
+        return field.getInt(entity);
     }
 
     @Test
