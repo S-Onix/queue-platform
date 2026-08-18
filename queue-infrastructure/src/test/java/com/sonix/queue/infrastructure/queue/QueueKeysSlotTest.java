@@ -41,15 +41,34 @@ class QueueKeysSlotTest {
             "q_dev_slot_4", "q_dev_slot_5", "q_dev_slot_6", "q_dev_slot_7",
             "q_dev_slot_8", "q_dev_slot_9", "q_dev_slot_12", "q_dev_slot_13");
 
-    /** {@code String -> String} 형태의 public static 키 팩토리 전부. */
+    /**
+     * {@code String...} -> {@code String} 형태의 public static 키 팩토리 전부.
+     *
+     * <p><b>인자 개수를 1개로 묶지 않는 이유:</b> §80이 추가할 admit 키 4종 중 셋은
+     * {@code admitByToken(queueId, tokenId)}처럼 <b>2인자</b>다(두 번째 인자는 tokenId·
+     * admitToken·requestId 같은 런타임 값). {@code parameterCount == 1}로 거르면 그 셋이
+     * 조용히 검사에서 빠져, "전수 열거라 새 키도 자동으로 걸린다"는 이 테스트의 약속이
+     * 깨진다. 첫 인자가 queueId(= 해시태그)인 규약만 지켜지면 인자가 몇 개든 슬롯은 같다.
+     */
     private static List<Method> keyFactories() {
         return Arrays.stream(QueueKeys.class.getDeclaredMethods())
                 .filter(m -> Modifier.isPublic(m.getModifiers()))
                 .filter(m -> Modifier.isStatic(m.getModifiers()))
                 .filter(m -> m.getReturnType() == String.class)
-                .filter(m -> m.getParameterCount() == 1 && m.getParameterTypes()[0] == String.class)
+                .filter(m -> m.getParameterCount() >= 1)
+                .filter(m -> Arrays.stream(m.getParameterTypes()).allMatch(t -> t == String.class))
                 .sorted((a, b) -> a.getName().compareTo(b.getName()))
                 .toList();
+    }
+
+    /** 첫 인자에 queueId, 나머지 인자에는 런타임 값을 흉내 낸 더미를 채운다. */
+    private static String invoke(Method factory, String queueId) throws Exception {
+        Object[] args = new Object[factory.getParameterCount()];
+        args[0] = queueId;
+        for (int i = 1; i < args.length; i++) {
+            args[i] = "runtime-value-" + i;
+        }
+        return (String) factory.invoke(null, args);
     }
 
     @Test
@@ -65,7 +84,7 @@ class QueueKeysSlotTest {
         for (String queueId : QUEUE_IDS) {
             Map<String, Integer> slotByKey = new LinkedHashMap<>();
             for (Method factory : factories) {
-                String key = (String) factory.invoke(null, queueId);
+                String key = invoke(factory, queueId);
                 slotByKey.put(key, SlotHash.getSlot(key));
             }
 
@@ -73,6 +92,43 @@ class QueueKeysSlotTest {
                     .as("queueId=%s 의 키들이 서로 다른 슬롯에 떨어진다 (해시태그 누락 → CROSSSLOT): %s",
                             queueId, slotByKey)
                     .hasSize(1);
+        }
+    }
+
+    /**
+     * §80(Sprint 7 Admit)이 추가할 키 4종. <b>아직 {@link QueueKeys}에 없어</b> 문자열로 만든다.
+     *
+     * <p>구현 전에 못 박는 이유: admit.lua는 이 키들을 {@code KEYS[]} 선언 없이 스크립트 안에서
+     * 조립한다(tokenId·admitToken·requestId가 런타임 값이라 선언이 불가능). 선언이 없으면 Redis의
+     * CROSSSLOT 사전 검사도 걸리지 않고, <b>슬롯이 어긋나도 같은 노드면 조용히 성공</b>한다
+     * (마스터 4대 기준 25%). 즉 실행 검증만으로는 결함이 안 드러나므로 슬롯 동일성을 따로 단언한다.
+     *
+     * <p>{@code QueueKeys}에 팩토리가 들어오면 이 메서드는 지운다 — 그때는 위 전수 열거가 덮는다.
+     */
+    private static List<String> admitKeysOf(String queueId) {
+        String tag = "queue:{" + queueId + "}:";
+        return List.of(
+                tag + "admitted",
+                tag + "admit-by-token:tok_01J8ZXQ7",
+                tag + "admit-by-admit:adm_9f3c1b",
+                tag + "admit-idem:req-tenant-supplied");
+    }
+
+    @Test
+    @DisplayName("§80이 추가할 admit 키 4종도 기존 큐 키와 같은 슬롯이다")
+    void admitKeysShareSlotWithExistingQueueKeys() {
+        for (String queueId : QUEUE_IDS) {
+            int expected = SlotHash.getSlot(QueueKeys.waiting(queueId));
+
+            Map<String, Integer> slotByKey = new LinkedHashMap<>();
+            for (String key : admitKeysOf(queueId)) {
+                slotByKey.put(key, SlotHash.getSlot(key));
+            }
+
+            assertThat(slotByKey.values())
+                    .as("queueId=%s - admit 키가 waiting(slot %d)과 다른 슬롯에 떨어진다: %s",
+                            queueId, expected, slotByKey)
+                    .containsOnly(expected);
         }
     }
 
