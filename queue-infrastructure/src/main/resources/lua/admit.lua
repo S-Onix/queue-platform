@@ -14,7 +14,7 @@
 -- ARGV[7]: admitByAdmitPrefix — queue:{q}:admit-by-admit:   (QueueKeys.admitByAdmitPrefix)
 -- ARGV[8..]: admitToken 후보 N개 (Java가 UUIDv7로 미리 만든 것. 채택될 때만 쓰고 남으면 버린다)
 
--- Returns: { status, { {identifier, tokenId, seq, admitToken}, ... } }   (원소 4개 고정)
+-- Returns: { status, { {identifier, tokenId, seq, admitToken, issuedAt}, ... } }   (원소 5개 고정)
 --   status = "OK"    정상 처리 (레코드 0건일 수 있다 — 대기열이 비었으면 result=empty)
 --   status = "REPLAY" 같은 requestId의 재시도 — 저장해 둔 payload를 그대로 돌려준다
 --   ※ 빈 문자열/빈 배열은 배열을 자르지 않는다. nil/false만 RESP 변환에서 뒤를 끊으므로
@@ -76,13 +76,19 @@ for i = 1, #popped, 2 do
 		redis.call('ZADD', waitingKey, seq, identifier)
 	else
 		local tokenId = string.sub(stored, 1, sep - 1)
+		-- issuedAt(epoch ms 문자열)도 함께 싣는다. ADMITTED Kafka 이벤트의 멱등 키가
+		-- UNIQUE(token_id, issued_at)이고 tokens 테이블의 파티션 키이기도 해서, 이 값이 없으면
+		-- 컨슈머가 같은 토큰의 두 번째 행을 만든다. 어차피 위에서 HGET으로 읽은 값이라
+		-- 여기서 버리면 Java가 HMGET으로 한 번 더 읽어야 한다(그 우회가 U5의 findIssuedAt이었다).
+		-- 뒷조각이 비어 있어도 nil이 아니라 빈 문자열이라 배열이 잘리지 않는다.
+		local issuedAt = string.sub(stored, sep + 1)
 		local admitToken = ARGV[ADMIT_TOKEN_OFFSET + (i + 1) / 2]
 
 		redis.call('SET', byTokenPrefix .. tokenId, admitToken, 'PX', admitTtl)
 		redis.call('SET', byAdmitPrefix .. admitToken, tokenId, 'PX', admitTtl)
 		redis.call('ZADD', admittedKey, expiresAt, seq .. '|' .. identifier)
 
-		table.insert(records, { identifier, tokenId, seq, admitToken })
+		table.insert(records, { identifier, tokenId, seq, admitToken, issuedAt })
 		maxSeq = seq   -- ZPOPMIN은 오름차순이므로 마지막 성공분이 최대다
 	end
 end

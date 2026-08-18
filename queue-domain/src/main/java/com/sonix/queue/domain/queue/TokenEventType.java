@@ -26,22 +26,45 @@ import java.util.stream.Collectors;
 public enum TokenEventType {
 
     /** 대기열 진입. {@code tokens} 행 생성(멱등). */
-    ENQUEUED,
+    ENQUEUED(TokenStatus.WAITING),
 
     /** admit 발급 — 대기열에서 빠지고 admitToken을 쥐었다. */
-    ADMITTED,
+    ADMITTED(TokenStatus.ADMIT_ISSUED),
 
     /** admitToken TTL 만료 → WAITING 복귀. */
-    RETURNED,
+    RETURNED(TokenStatus.WAITING),
 
     /** Tenant가 입장 완료를 통보. */
-    COMPLETED,
+    COMPLETED(TokenStatus.COMPLETED),
 
     /** 사용자가 대기를 취소. */
-    CANCELLED,
+    CANCELLED(TokenStatus.CANCELED),
 
     /** 대기 TTL 초과로 폐기. */
-    EXPIRED;
+    EXPIRED(TokenStatus.EXPIRED);
+
+    private final TokenStatus targetStatus;
+
+    TokenEventType(TokenStatus targetStatus) {
+        this.targetStatus = targetStatus;
+    }
+
+    /**
+     * 이 이벤트가 도달시키려는 상태 (§80 가드 표의 "도착" 칸).
+     *
+     * <p><b>도달을 보장하지 않는다.</b> 허용 출발 상태를 강제하는 것은 소비 측 UPSERT의
+     * {@code IF(status = ...)} 가드이고, 여기는 "행이 없을 때 새로 넣을 값"이자 그 가드의
+     * 목표값일 뿐이다. 예컨대 이미 {@code COMPLETED}(2)인 행에 {@code ADMITTED}가 재전달돼도
+     * 2가 유지된다 — Kafka가 At-Least-Once라 재전달이 일상이기 때문이다.
+     *
+     * <p>{@code ENQUEUED}와 {@code RETURNED}가 같은 {@code WAITING}을 가리키는 것은 우연이
+     * 아니다(복귀는 대기 상태로 돌아가는 것이다). 그래서 <b>도착 상태만으로는 두 이벤트를
+     * 구분할 수 없고</b>, 소비 측이 타입별로 다른 SQL을 골라야 한다 —
+     * {@code ENQUEUED}는 no-op, {@code RETURNED}는 1에서만 0으로.
+     */
+    public TokenStatus targetStatus() {
+        return targetStatus;
+    }
 
     /**
      * 이름 → 상수. {@code values()}는 호출마다 배열을 복제하므로 한 번만 만들어 둔다

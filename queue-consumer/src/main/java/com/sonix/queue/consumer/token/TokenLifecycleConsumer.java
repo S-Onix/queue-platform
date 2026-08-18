@@ -48,80 +48,70 @@ public class TokenLifecycleConsumer {
     }
 
     /**
-     * 한 번의 poll로 받은 배치를 통째로 적재한다.
+     * 한 번의 poll로 받은 배치를 <b>같은 타입이 연속하는 구간(run)</b>씩 적재한다.
      *
      * <p>배치 안에는 여러 파티션의 레코드가 섞여 오지만 문제되지 않는다. 파티션 사이의
      * 순서는 의미가 없고(서로 다른 토큰이므로), 같은 파티션 안의 상대 순서는 리스트에
      * 그대로 유지된다.
      *
-     * <p><b>재정렬하지 말 것.</b> 타입별로 묶어 처리하면(예: enqueue를 먼저 몰아서)
-     * 파티션이 지켜준 같은 토큰의 순서가 애플리케이션에서 다시 깨진다.
+     * <p><b>🔴 타입별로 모아 처리하지 말 것.</b> 그러면 파티션이 지켜준 같은 토큰의 순서가
+     * 애플리케이션에서 다시 깨진다. 한 배치에 {@code [ADMITTED tok1, COMPLETED tok1]}이 있을 때
+     * COMPLETED를 먼저 적용하면 그 가드({@code status = 1}에서만)가 거짓이라 <b>조용히 no-op</b>이
+     * 되고, 이어서 ADMITTED가 1로 만든다 — 그 토큰은 영원히 완료되지 않는다. 구간을 나누면
+     * 도착 순서가 그대로 보존된다. 정상 운영에서는 대부분 ENQUEUED 하나라 구간도 하나다.
      *
      * <p>제약 위반 외의 예외는 그대로 전파한다 → 에러 핸들러가 재시도한다.
      *
-     * <p><b>지금 처리할 수 있는 타입은 {@code ENQUEUED} 하나다.</b> 그래서 배치를
-     * <b>첫 미처리 타입 앞까지</b> 잘라 적재하고 그 한 건을 격리한다. 잘라내는 순서가 중요하다 —
+     * <p><b>모르는 타입은 그 앞까지 적재한 뒤 한 건만 격리한다.</b> 잘라내는 순서가 중요하다 —
      * 적재보다 먼저 던지면 앞쪽 정상 건들이 <b>적재되지 않은 채 커밋</b>된다
      * ({@link BatchListenerFailedException}은 인덱스 앞을 "성공"으로 간주한다).
      */
     @KafkaListener(topics = "${queue.consumer.topic:token-lifecycle}")
     public void consume(List<EnqueueEvent> events) {
-        if (events.isEmpty()) return;
+        int start = 0;
 
-        int unsupported = indexOfUnsupported(events);
-        List<EnqueueEvent> enqueued = unsupported < 0 ? events : events.subList(0, unsupported);
+        while (start < events.size()) {
+            TokenEventType type = TokenEventType.from(events.get(start).eventType());
+            if (type == null) {
+                throw unknownType(events.get(start), start);   // 앞 구간은 이미 적재된 뒤다
+            }
 
-        if (!enqueued.isEmpty()) {
-            List<Token> tokens = enqueued.stream().map(TokenLifecycleConsumer::toToken).toList();
+            int end = start + 1;
+            while (end < events.size() && TokenEventType.from(events.get(end).eventType()) == type) {
+                end++;
+            }
+
+            List<Token> tokens = events.subList(start, end).stream()
+                    .map(TokenLifecycleConsumer::toToken)
+                    .toList();
             try {
-                tokenPersistService.persist(tokens);
+                tokenPersistService.persist(type, tokens);
             } catch (DataIntegrityViolationException e) {
-                quarantineOffender(tokens, e);          // 던지거나(인덱스 포함), 전 건 적재됐으면 반환
+                quarantineOffender(type, tokens, start, e);   // 던지거나(인덱스 포함), 전 건 적재됐으면 반환
             }
+
+            start = end;
         }
 
-        if (unsupported >= 0) {
-            quarantineUnsupported(events.get(unsupported), unsupported);
-        }
-
-        log.debug("token-lifecycle 적재 완료: {}건", enqueued.size());
+        log.debug("token-lifecycle 적재 완료: {}건", events.size());
     }
 
     /**
-     * 이 컨슈머가 아직 적재할 수 없는 첫 이벤트의 인덱스. 전부 {@code ENQUEUED}면 -1.
-     *
-     * <p>정상 운영에서는 항상 -1이다 — 다른 타입을 발행하는 코드가 아직 없다.
-     */
-    private static int indexOfUnsupported(List<EnqueueEvent> events) {
-        for (int i = 0; i < events.size(); i++) {
-            if (TokenEventType.from(events.get(i).eventType()) != TokenEventType.ENQUEUED) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    /**
-     * 처리할 수 없는 이벤트 <b>한 건</b>을 DLT로 보낸다.
-     *
-     * <p>두 가지를 모두 여기서 처리한다. <b>모르는 타입</b>(구 컨슈머 + 신규 프로듀서, 또는
-     * 잘못된 발행)과 <b>아는데 처리기가 없는 타입</b>({@code ADMITTED} 등, Sprint 7에서 붙는다)이다.
-     * 로그 문구만 다르고 조치는 같다 — 둘 다 <b>지금 적재하면 안 되는</b> 이벤트이기 때문이다.
-     * 예컨대 {@code ADMITTED}를 {@link #toToken}에 넣으면 status 0(WAITING)으로 적재돼
-     * 상태가 거꾸로 간다.
+     * 모르는 타입 <b>한 건</b>을 DLT로 보낸다 (구 컨슈머 + 신규 프로듀서, 또는 잘못된 발행).
      *
      * <p><b>삼키지 않는다.</b> 로그만 남기고 넘어가면 이벤트가 사라지고, 나중에 처리기를 붙여도
      * 되돌릴 원본이 없다. DLT에 있으면 재투입할 수 있다.
      * <b>배치 전체를 보내지도 않는다</b> — 인덱스를 실어 그 한 건만 보낸다
      * ({@link #quarantineOffender}의 설명과 같은 이유).
+     *
+     * <p>여기서 던지는 예외는 <b>cause가 없다.</b> 그래서 에러 핸들러의 재시도 분류가 붙잡을
+     * 것이 없어, {@code BatchListenerFailedException} 자체를 재시도 제외 목록에 넣어야 한다
+     * ({@code KafkaConsumerConfig}). 안 넣으면 한 건마다 백오프를 다 태우고서야 DLT로 간다.
      */
-    private static void quarantineUnsupported(EnqueueEvent event, int index) {
-        boolean known = TokenEventType.from(event.eventType()) != null;
-        String reason = known ? "처리기가 없는 이벤트 타입" : "알 수 없는 이벤트 타입";
-
-        log.error("{} 격리 eventType={} tokenId={} queueId={} index={}",
-                reason, event.eventType(), event.tokenId(), event.queueId(), index);
-        throw new BatchListenerFailedException(reason + ": " + event.eventType(), index);
+    private static BatchListenerFailedException unknownType(EnqueueEvent event, int index) {
+        log.error("알 수 없는 이벤트 타입 격리 eventType={} tokenId={} queueId={} index={}",
+                event.eventType(), event.tokenId(), event.queueId(), index);
+        return new BatchListenerFailedException("알 수 없는 이벤트 타입: " + event.eventType(), index);
     }
 
     /**
@@ -138,15 +128,18 @@ public class TokenLifecycleConsumer {
      * <p>여기서 원래 예외를 다시 올리면 안 된다. {@code DataIntegrityViolationException}은
      * 재시도 대상에서 빠져 있어(에러 핸들러 설정) 곧장 격리로 넘어가는데, 인덱스가 없으니
      * <b>이미 적재를 마친 배치가 통째로 DLT로</b> 간다.
+     *
+     * @param offset 이 구간이 배치에서 시작하는 위치. 인덱스는 <b>배치 전체 기준</b>이어야 한다
      */
-    private void quarantineOffender(List<Token> tokens, DataIntegrityViolationException cause) {
-        int index = findOffendingIndex(tokens, 0);
+    private void quarantineOffender(TokenEventType type, List<Token> tokens, int offset,
+                                    DataIntegrityViolationException cause) {
+        int index = findOffendingIndex(type, tokens, offset);
         if (index < 0) {
             log.warn("제약 위반이 났지만 범인을 특정하지 못했다({}건) — 재시도 중 전 건 적재됨", tokens.size());
             return;
         }
 
-        Token offender = tokens.get(index);
+        Token offender = tokens.get(index - offset);
         log.error("적재 불가 항목 격리 tokenId={} queueId={} index={}",
                 offender.getTokenId(), offender.getQueueId(), index);
         throw new BatchListenerFailedException("적재 불가 항목", cause, index);
@@ -166,24 +159,24 @@ public class TokenLifecycleConsumer {
      * {@link TokenPersistService}를 호출한다. 실패한 트랜잭션 안에서 다음 시도를 하면
      * 롤백 표시가 남아 있어 무엇을 넣든 실패한다.
      *
-     * @return 적재 불가 항목의 인덱스. 이 묶음에 범인이 없으면 -1
+     * @return 적재 불가 항목의 인덱스(배치 전체 기준). 이 묶음에 범인이 없으면 -1
      *         (-1은 곧 <b>이 묶음이 전부 적재됐다</b>는 뜻이다 — 호출자가 이 보장에 기댄다)
      */
-    private int findOffendingIndex(List<Token> tokens, int offset) {
+    private int findOffendingIndex(TokenEventType type, List<Token> tokens, int offset) {
         if (tokens.isEmpty()) return -1;
 
         try {
-            tokenPersistService.persist(tokens);
+            tokenPersistService.persist(type, tokens);
             return -1;                                  // 이 묶음엔 범인이 없다
         } catch (DataIntegrityViolationException e) {
             if (tokens.size() == 1) return offset;      // 혼자 넣어도 실패 → 범인 확정
         }
 
         int mid = tokens.size() / 2;
-        int found = findOffendingIndex(tokens.subList(0, mid), offset);
+        int found = findOffendingIndex(type, tokens.subList(0, mid), offset);
         return found >= 0
                 ? found
-                : findOffendingIndex(tokens.subList(mid, tokens.size()), offset + mid);
+                : findOffendingIndex(type, tokens.subList(mid, tokens.size()), offset + mid);
     }
 
     /**
@@ -208,6 +201,14 @@ public class TokenLifecycleConsumer {
      */
     private static Token toToken(EnqueueEvent e) {
         LocalDateTime issuedAt = LocalDateTime.ofInstant(e.issuedAt(), ZoneOffset.UTC);
-        return Token.issue(e.tokenId(), e.queueId(), e.tenantId(), e.userId(), e.seq(), issuedAt);
+        // admittedAt도 같은 규약으로 변환한다. 이 값은 verify·complete의 유효 창 기준이라
+        // 인스턴스 TZ에 따라 갈리면 60초 창이 서버마다 다른 뜻이 된다.
+        LocalDateTime admittedAt = e.admittedAt() == null
+                ? null
+                : LocalDateTime.ofInstant(e.admittedAt(), ZoneOffset.UTC);
+
+        return Token.transition(TokenEventType.from(e.eventType()).targetStatus(),
+                e.tokenId(), e.queueId(), e.tenantId(), e.userId(), e.seq(),
+                issuedAt, e.admitToken(), admittedAt);
     }
 }

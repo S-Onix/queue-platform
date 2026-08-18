@@ -20,6 +20,27 @@ public interface TokenRepository {
     void saveAllIfAbsent(List<Token> tokens);
 
     /**
+     * {@code ENQUEUED} 외의 생명주기 이벤트를 <b>가드 UPSERT</b>로 적재한다 (§80 / FRS §6.4).
+     *
+     * <p>행이 없으면 {@code type.targetStatus()}로 INSERT하고, 있으면 <b>허용 출발 상태일 때만</b>
+     * 전이한다. 두 성질이 함께 필요하다:
+     * <ul>
+     *   <li><b>INSERT</b> — 프로듀서가 여러 WAS라 도착 순서가 뒤집힌다. 특히 enqueue Lua의
+     *       {@code ZADD}가 Kafka 발행보다 먼저라 {@code ENQUEUED}보다 {@code ADMITTED}가 먼저
+     *       올 수 있다. 그때 행을 만들어 두면 뒤늦은 {@code ENQUEUED}의 no-op UPSERT가 흡수한다.</li>
+     *   <li><b>가드</b> — Kafka는 At-Least-Once라 재전달이 일상이다. {@code COMPLETED}(2)인 행에
+     *       {@code ADMITTED}가 다시 와도 2가 유지돼야 한다. 멱등이 본질이지 예외 처리가 아니다.</li>
+     * </ul>
+     *
+     * <p><b>호출자는 같은 타입이 연속하는 구간 단위로 넘긴다.</b> 타입별로 모아서 넘기면
+     * 같은 토큰의 {@code ADMITTED}→{@code COMPLETED} 순서가 뒤집혀
+     * {@code COMPLETED}가 먼저 no-op이 되고 그 토큰은 영원히 완료되지 않는다.
+     *
+     * @param type {@code ENQUEUED}는 허용하지 않는다 — 그건 {@link #saveAllIfAbsent}의 몫이다
+     */
+    void applyTransition(TokenEventType type, List<Token> tokens);
+
+    /**
      * 신원 조회 — verify가 Redis 히트일 때 identifier를 얻는 경로 (FRS §6.5).
      *
      * <p><b>status·admitted_at 술어를 걸지 않는다.</b> Redis {@code admit-by-admit} 키가 살아 있다는

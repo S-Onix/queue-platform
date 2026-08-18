@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -79,6 +80,9 @@ class RedisQueueEngineAdmitTest {
                 .containsExactly("id-a", "id-b");
         assertThat(result.records()).extracting(AdmitResult.AdmitRecord::seq)
                 .containsExactly(1L, 2L);
+        // issuedAt이 없으면 ADMITTED를 발행할 수 없다(멱등 키의 절반). Lua가 실어 보낸다.
+        assertThat(result.records()).extracting(AdmitResult.AdmitRecord::issuedAt)
+                .containsOnly(Instant.ofEpochMilli(NOW));
 
         // admitToken은 tokenId와 같은 UUIDv7이다. 짧은 랜덤이면 verify가 뚫린다(FRS §6.4).
         String admitToken = result.records().get(0).admitToken();
@@ -109,6 +113,8 @@ class RedisQueueEngineAdmitTest {
         assertThat(second.records()).isEqualTo(first.records());
         assertThat(second.records().get(0).identifier()).isEqualTo("id|a");
         assertThat(second.records().get(0).seq()).isEqualTo(1L);
+        // REPLAY는 cjson 왕복이라 issuedAt이 여기서 잘리거나 숫자로 뭉개질 수 있다
+        assertThat(second.records().get(0).issuedAt()).isEqualTo(Instant.ofEpochMilli(NOW));
 
         // 재시도가 두 번 뽑아갔다면 id-b도 사라졌을 것
         assertThat(redis.opsForZSet().range(WAITING, 0, -1)).containsExactly("id-b");

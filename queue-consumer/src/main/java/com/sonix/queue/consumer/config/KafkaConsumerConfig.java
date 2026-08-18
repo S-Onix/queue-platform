@@ -5,6 +5,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.kafka.core.KafkaOperations;
+import org.springframework.kafka.listener.BatchListenerFailedException;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.util.backoff.FixedBackOff;
@@ -63,6 +64,15 @@ public class KafkaConsumerConfig {
         // 제약 위반은 재시도해도 결과가 같다 → 곧장 DLT.
         // 이 한 줄이 없으면 못 고치는 한 건 때문에 파티션 전체가 멈춘다.
         handler.addNotRetryableExceptions(DataIntegrityViolationException.class);
+
+        // 리스너가 "이 한 건은 지금 처리할 수 없다"고 스스로 판정해 던진 것이다(모르는 이벤트 타입).
+        // 판정에 쓰인 근거가 메시지 본문이라 다시 시도해도 답이 같다.
+        //
+        // 🔴 이 예외는 cause가 없다. 위의 제약 위반과 달리 원인 사슬을 타고 걸릴 것이 없어
+        //    명시하지 않으면 기본값인 '재시도'로 분류된다 → 한 건마다 2초 × 3회를 태우고서야 DLT다.
+        //    오배포로 미지원 타입이 1만 건 흘러들면 1건당 6초 × 1만 = 16시간이고,
+        //    그 사이 같은 파티션 뒤에 줄 선 정상 enqueue가 통째로 멈춘다.
+        handler.addNotRetryableExceptions(BatchListenerFailedException.class);
 
         handler.setLogLevel(org.springframework.kafka.KafkaException.Level.ERROR);
         return handler;

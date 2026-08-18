@@ -11,7 +11,6 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
-import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
 @Slf4j
@@ -101,9 +100,10 @@ public class QueueEngineService {
     public AdmitResult admit(long tenantId, String queueId, int count, String requestId) {
         findQueueAndVerifyOwner(tenantId, queueId);
 
-        AdmitResult result = queueEngine.admit(queueId, requestId, count, clock.millis());
+        long now = clock.millis();
+        AdmitResult result = queueEngine.admit(queueId, requestId, count, now);
 
-        publishAdmitted(tenantId, queueId, result);
+        publishAdmitted(tenantId, queueId, result, Instant.ofEpochMilli(now));
 
         return result;
     }
@@ -121,28 +121,26 @@ public class QueueEngineService {
      *
      * <p><b>REPLAY도 발행한다.</b> 컨슈머 UPSERT가 멱등이라 중복은 무해한 반면, 첫 호출에서
      * 발행이 실패했을 때 재시도가 그것을 <b>복구</b>할 수 있는 유일한 경로다.
+     *
+     * <p>⚠️ <b>REPLAY의 {@code admittedAt}은 첫 admit 시각이 아니라 재시도 시각이다.</b> 멱등
+     * payload에 시각이 없어 알 방법이 없다. 첫 발행이 성공했다면 컨슈머 가드
+     * ({@code IF(status = 0, ...)})가 이미 status 1이라 이 값을 <b>쓰지 않으므로</b> 무해하고,
+     * 첫 발행이 실패한 경우에만 반영되는데 그때는 이 값이 가진 유일한 근거다.
+     * 재시도가 늦은 만큼 유효 창(60초)이 뒤로 밀린다.
      */
-    private void publishAdmitted(long tenantId, String queueId, AdmitResult result) {
-        if (result.records().isEmpty()) {
-            return;
-        }
-
-        // issuedAt은 tokens Hash에서 따로 읽는다 — admit.lua가 그 값을 읽고도 버리기 때문이다.
-        // 근거와 제거 조건은 QueueEngine.findIssuedAt Javadoc 참조.
-        Map<String, Instant> issuedAt = queueEngine.findIssuedAt(queueId,
-                result.records().stream().map(AdmitResult.AdmitRecord::identifier).toList());
-
+    private void publishAdmitted(long tenantId, String queueId, AdmitResult result, Instant admittedAt) {
         for (AdmitResult.AdmitRecord record : result.records()) {
-            Instant at = issuedAt.get(record.identifier());
-            if (at == null) {
+            if (record.issuedAt() == null) {
                 // issuedAt이 없으면 발행할 수 없다. 컨슈머의 멱등 키가 (token_id, issued_at)이라
                 // 아무 값이나 넣으면 같은 토큰의 두 번째 행이 생긴다 — 조용히 틀리느니 빼고 남긴다.
+                // 도달 경로는 롤링 배포 중의 구버전 멱등 payload뿐이다(AdmitRecord.issuedAt 참조).
                 log.error("ADMITTED 발행 생략(issuedAt 미확인) tokenId={} queueId={} identifier={}",
                         record.tokenId(), queueId, record.identifier());
                 continue;
             }
             publishQuietly(new EnqueueEvent(TokenEventType.ADMITTED.name(), record.tokenId(), queueId,
-                    tenantId, record.identifier(), record.seq(), at));
+                    tenantId, record.identifier(), record.seq(), record.issuedAt(),
+                    record.admitToken(), admittedAt));
         }
     }
 
@@ -202,8 +200,11 @@ public class QueueEngineService {
 
         // COMPLETED도 admit과 같은 이유로 조용히 실패한다. DB는 이미 status=2로 확정됐고,
         // 여기서 5xx를 주면 Tenant 재시도가 status IN (0,1)에 걸려 404를 받는다(더 나쁘다).
+        // admittedAt은 싣지 않는다 — COMPLETED의 UPSERT는 status만 만지고, admitted_at은
+        // ADMITTED가 이미 채운 값이다(§80 가드 표).
         publishQuietly(new EnqueueEvent(TokenEventType.COMPLETED.name(), tokenId, queueId, tenantId,
-                token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC)));
+                token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC),
+                admitToken, null));
 
         return completedAt;
     }

@@ -37,7 +37,6 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -45,7 +44,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -119,7 +117,8 @@ class AdmitApiTest {
 
     private static Token token(TokenStatus status, String admitToken) {
         return Token.reconstruct(1L, "tok_a", QUEUE_ID, TENANT_ID, "0190e2c1-user", 42L,
-                status, null, admitToken, false, LocalDateTime.ofEpochSecond(1_700_000, 0, ZoneOffset.UTC));
+                status, null, admitToken, false,
+                LocalDateTime.ofEpochSecond(1_700_000, 0, ZoneOffset.UTC), null);
     }
 
     // ── §6.4 Admit ──
@@ -128,10 +127,8 @@ class AdmitApiTest {
     @DisplayName("admit → 200, admitted 목록 반환 + ADMITTED가 tokenId 키로 발행된다")
     void admit_success() throws Exception {
         when(queueEngine.admit(QUEUE_ID, "req_1", 3, NOW)).thenReturn(new AdmitResult(false, List.of(
-                new AdmitResult.AdmitRecord("u1", "tok_1", 10L, "adm_1"),
-                new AdmitResult.AdmitRecord("u2", "tok_2", 11L, "adm_2"))));
-        when(queueEngine.findIssuedAt(eq(QUEUE_ID), any()))
-                .thenReturn(Map.of("u1", Instant.ofEpochMilli(1_000L), "u2", Instant.ofEpochMilli(2_000L)));
+                new AdmitResult.AdmitRecord("u1", "tok_1", 10L, "adm_1", Instant.ofEpochMilli(1_000L)),
+                new AdmitResult.AdmitRecord("u2", "tok_2", 11L, "adm_2", Instant.ofEpochMilli(2_000L)))));
 
         mockMvc.perform(post("/api/v1/queues/{q}/admit", QUEUE_ID)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -160,8 +157,7 @@ class AdmitApiTest {
     @DisplayName("🔴 Kafka 발행이 실패해도 200이다 — Lua가 이미 커밋돼 되돌릴 수 없다")
     void admit_publishFails_still200() throws Exception {
         when(queueEngine.admit(QUEUE_ID, "req_1", 1, NOW)).thenReturn(new AdmitResult(false,
-                List.of(new AdmitResult.AdmitRecord("u1", "tok_1", 10L, "adm_1"))));
-        when(queueEngine.findIssuedAt(eq(QUEUE_ID), any())).thenReturn(Map.of("u1", Instant.ofEpochMilli(1_000L)));
+                List.of(new AdmitResult.AdmitRecord("u1", "tok_1", 10L, "adm_1", Instant.ofEpochMilli(1_000L)))));
         doThrow(new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE))
                 .when(eventPublisher).publish(any());
 

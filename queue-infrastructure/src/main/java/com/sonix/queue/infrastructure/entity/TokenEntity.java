@@ -11,6 +11,14 @@ import org.springframework.lang.Nullable;
 
 import java.time.LocalDateTime;
 
+/**
+ * ⚠️ 아래 {@code @SQLInsert}는 §80 가드 표의 <b>{@code ENQUEUED} 한 줄</b>이다(허용 출발: 신규,
+ * 충돌 시 no-op). 나머지 다섯 줄은 이벤트마다 SQL이 달라 여기 담을 수 없어
+ * {@code TokenJpaAdapter.applyTransition}에 있다 — {@code @SQLInsert}는 엔티티당 한 문장뿐이다.
+ *
+ * <p>그래서 {@code admit_token}·{@code admitted_at}의 {@code insertable = false}는 그대로 둔다.
+ * 이 경로는 WAITING 삽입 전용이라 두 칸에 넣을 값이 애초에 없다.
+ */
 @Entity
 @Table(name = "tokens")
 @IdClass(TokenEntityId.class)
@@ -93,6 +101,7 @@ public class TokenEntity implements Persistable<TokenEntityId> {
     public Token toDomain() {
         return Token.reconstruct(this.id, this.tokenId, this.queueId, this.tenantId,
                 this.userId, this.seq, TokenStatus.fromCode(this.status),
-                this.expiredReason, this.admitToken, this.redisSyncNeeded, this.issuedAt);
+                this.expiredReason, this.admitToken, this.redisSyncNeeded,
+                this.issuedAt, this.admittedAt);
     }
 }

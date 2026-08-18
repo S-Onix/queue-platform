@@ -103,9 +103,11 @@ class AdmitLuaTest {
 
         assertThat(result.get(0)).isEqualTo("OK");
         List<List<String>> records = (List<List<String>>) result.get(1);
+        // 원소 5번째가 issuedAt이다. 이게 빠지면 Java가 HMGET으로 한 번 더 읽어야 하고,
+        // 그마저 없으면 ADMITTED 이벤트의 멱등 키(token_id, issued_at)가 성립하지 않는다.
         assertThat(records).containsExactly(
-                List.of("id-a", "tok_a", "1", "adm_1"),
-                List.of("id-b", "tok_b", "2", "adm_2"));
+                List.of("id-a", "tok_a", "1", "adm_1", "1700000000000"),
+                List.of("id-b", "tok_b", "2", "adm_2", "1700000000001"));
 
         assertThat(redis.opsForZSet().range(WAITING, 0, -1)).containsExactly("id-c");
         assertThat(redis.opsForZSet().score(WAITING, "id-c")).isEqualTo(3.0);

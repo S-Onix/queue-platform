@@ -1,5 +1,6 @@
 package com.sonix.queue.domain.queue;
 
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -19,7 +20,12 @@ public record AdmitResult(boolean replay, List<AdmitRecord> records) {
      *
      * @param seq        대기 당시 순번. WAITING 복귀 시 score 복원에 쓰인다(§80).
      * @param admitToken 입장 자격 그 자체. verify가 이 값 하나로 통과하므로 UUIDv7이다(FRS §6.4).
+     * @param issuedAt   줄 선 시각. ADMITTED 이벤트의 멱등 키가 {@code UNIQUE(token_id, issued_at)}라
+     *                   필요하다. <b>null일 수 있다</b> — 멱등 payload(TTL 300초)에 이 값이 없던
+     *                   시절의 REPLAY가 롤링 배포 중에 돌아올 수 있어서다. 그때는 발행을 건너뛴다
+     *                   (아무 값이나 넣으면 같은 토큰의 두 번째 행이 생긴다)
      */
-    public record AdmitRecord(String identifier, String tokenId, long seq, String admitToken) {
+    public record AdmitRecord(String identifier, String tokenId, long seq, String admitToken,
+                              Instant issuedAt) {
     }
 }

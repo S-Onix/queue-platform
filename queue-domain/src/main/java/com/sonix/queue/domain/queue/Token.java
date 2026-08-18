@@ -44,6 +44,7 @@ public class Token {
     String admitToken;      // admit 단계에서 생성됨
     boolean redisSyncNeeded;// Redis와 데이터 싱크가 맞는지 확인 (Redis가 강제로 다운될 경우를 대비)
     LocalDateTime issuedAt;
+    LocalDateTime admittedAt;   // admit 시각. verify·complete 유효 창의 기준 (issuedAt이 아니다, §80)
 
     private Token() {
 
@@ -56,24 +57,43 @@ public class Token {
      */
     public static Token issue(String tokenId, String queueId, Long tenantId,
                               String userId, long seq, LocalDateTime issuedAt) {
+        return transition(TokenStatus.WAITING, tokenId, queueId, tenantId, userId, seq,
+                issuedAt, null, null);
+    }
+
+    /**
+     * 상태 전이 이벤트({@code token-lifecycle}) → 적재용 토큰 (Consumer가 사용, §80).
+     *
+     * <p><b>여기서 전이가 확정되는 것이 아니다.</b> 이 객체는 "이 이벤트가 도달시키려는 상태"를
+     * 담을 뿐이고, <b>허용 출발 상태의 강제는 DB UPSERT의 가드</b>가 한다. 그래야 이벤트 순서가
+     * 뒤집혀 도착해도(프로듀서가 여러 WAS라 실제로 뒤집힌다) 최종 상태가 같다.
+     * 도메인에서 미리 검사하면 <b>지금 DB 상태를 모르는 채</b> 판정하게 되어 근거가 없다.
+     *
+     * @param admittedAt ADMITTED에서만 값이 있다. 그 외 타입은 null
+     */
+    public static Token transition(TokenStatus status, String tokenId, String queueId, Long tenantId,
+                                   String userId, long seq, LocalDateTime issuedAt,
+                                   String admitToken, LocalDateTime admittedAt) {
         Token token = new Token();
         token.tokenId = tokenId;
         token.queueId = queueId;
         token.tenantId = tenantId;
         token.userId = userId;
         token.seq = seq;
-        token.status = TokenStatus.WAITING;
+        token.status = status;
         token.expiredReason = null;
-        token.admitToken = null;
+        token.admitToken = admitToken;
         token.redisSyncNeeded = false;
         token.issuedAt = issuedAt;
+        token.admittedAt = admittedAt;
         return token;
     }
 
     public static Token reconstruct(Long id, String tokenId, String queueId, Long tenantId,
                                     String userId, long seq, TokenStatus status,
                                     Integer expiredReason, String admitToken,
-                                    boolean redisSyncNeeded, LocalDateTime issuedAt) {
+                                    boolean redisSyncNeeded, LocalDateTime issuedAt,
+                                    LocalDateTime admittedAt) {
         Token token = new Token();
         token.id = id;
         token.tokenId = tokenId;
@@ -86,6 +106,7 @@ public class Token {
         token.admitToken = admitToken;
         token.redisSyncNeeded = redisSyncNeeded;
         token.issuedAt = issuedAt;
+        token.admittedAt = admittedAt;
         return token;
     }
 

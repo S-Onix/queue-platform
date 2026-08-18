@@ -18,7 +18,6 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -371,30 +370,6 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     @Override
-    public Map<String, Instant> findIssuedAt(String queueId, List<String> identifiers) {
-        if (identifiers.isEmpty()) {
-            return Map.of();
-        }
-
-        // HMGET 한 번. 키가 하나뿐이라 CROSSSLOT 여지도 없다.
-        // routeForWrite인 이유는 admit()과 같다 — 큐 존재가 이미 확인된 뒤 호출되고,
-        // 오배송되면 빈 값이 돌아와 ADMITTED 발행이 통째로 빠진다(조용한 유실).
-        List<Object> raw = routeForWrite(queueId)
-                .opsForHash()
-                .multiGet(QueueKeys.tokens(queueId), List.copyOf(identifiers));
-
-        Map<String, Instant> issuedAt = new HashMap<>(identifiers.size());
-        for (int i = 0; i < identifiers.size(); i++) {
-            String stored = (String) raw.get(i);
-            if (stored == null) continue;
-            int sep = stored.indexOf('|');
-            if (sep < 0) continue;   // 레거시(구분자 없는 값) — admit.lua도 같은 이유로 건너뛴다
-            issuedAt.put(identifiers.get(i), Instant.ofEpochMilli(Long.parseLong(stored.substring(sep + 1))));
-        }
-        return issuedAt;
-    }
-
-    @Override
     public Optional<String> findTokenIdByAdmitToken(String queueId, String admitToken) {
         return Optional.ofNullable(
                 routeForWrite(queueId).opsForValue().get(QueueKeys.admitByAdmit(queueId, admitToken)));
@@ -413,10 +388,17 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-     * admit.lua 결과 파싱: {@code { "OK"|"REPLAY", { {identifier, tokenId, seq, admitToken}, ... } }}
+     * admit.lua 결과 파싱:
+     * {@code { "OK"|"REPLAY", { {identifier, tokenId, seq, admitToken, issuedAt}, ... } }}
      *
-     * <p>seq는 두 경로 모두 <b>문자열</b>이다. OK는 ZPOPMIN score를 문자열 그대로 쓰고(Lua 숫자
-     * 포맷 %.14g를 피하려고), REPLAY는 cjson 왕복을 거치는데 문자열은 문자열로 남기 때문이다.
+     * <p>seq·issuedAt은 두 경로 모두 <b>문자열</b>이다. OK는 ZPOPMIN score와 Hash 값을 문자열
+     * 그대로 쓰고(Lua 숫자 포맷 %.14g를 피하려고), REPLAY는 cjson 왕복을 거치는데 문자열은
+     * 문자열로 남기 때문이다.
+     *
+     * <p><b>원소가 4개인 행을 허용하는 이유:</b> 멱등 payload는 Redis에 300초 남는다. 롤링 배포
+     * 중에는 <b>이전 버전이 저장한 4개짜리 행</b>이 REPLAY로 돌아올 수 있다. 그 경우 issuedAt은
+     * null이고, 호출자가 ADMITTED 발행을 건너뛴다 — 아무 값이나 채우면 컨슈머의 멱등 키가
+     * 어긋나 같은 토큰의 두 번째 행이 생긴다.
      */
     @SuppressWarnings("unchecked")
     private static AdmitResult parseAdmitResult(List<Object> raw) {
@@ -434,7 +416,8 @@ public class RedisQueueEngine implements QueueEngine {
                     (String) f.get(0),
                     (String) f.get(1),
                     Long.parseLong((String) f.get(2)),
-                    (String) f.get(3)
+                    (String) f.get(3),
+                    f.size() > 4 ? parseIssuedAt((String) f.get(4)) : null
             ));
         }
 
