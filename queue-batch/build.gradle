@@ -7,6 +7,11 @@ dependencies {
 
     // Spring MVC (Batch도 내장 Tomcat)
     implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // 이게 없으면 레지스트리 빈이 없어 /actuator/prometheus 엔드포인트 자체가 생기지 않는다.
+    // application.yml이 prometheus를 노출해도 404 — 스케줄 작업의 처리 건수를 볼 수단이 사라진다.
+    implementation 'io.micrometer:micrometer-registry-prometheus'
 
     // @Transactional(spring-tx). infra가 전이 제공하지만 명시한다 —
     // 스케줄 작업(Sprint 9)이 트랜잭션을 직접 쓰게 되므로 남의 의존성에 기대지 않는다.
