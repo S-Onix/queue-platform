@@ -47,9 +47,10 @@ public class EnqueueE2ETestConfig {
     public RedisQueueEngine redisQueueEngine(
             StringRedisTemplate redisTemplate,
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
-            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript
+            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
+            @Qualifier("admitScript") RedisScript<List> admitScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript);
     }
 
     @Bean

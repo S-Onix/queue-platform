@@ -36,9 +36,11 @@ public class QueueEngineRedisTestConfig {
             @org.springframework.beans.factory.annotation.Qualifier("enqueueBulkScript")
             org.springframework.data.redis.core.script.RedisScript<List> enqueueBulkScript,
             @org.springframework.beans.factory.annotation.Qualifier("pollVerifyScript")
-            org.springframework.data.redis.core.script.RedisScript<Long> pollVerifyScript
+            org.springframework.data.redis.core.script.RedisScript<Long> pollVerifyScript,
+            @org.springframework.beans.factory.annotation.Qualifier("admitScript")
+            org.springframework.data.redis.core.script.RedisScript<List> admitScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript);
     }
 
     @Bean

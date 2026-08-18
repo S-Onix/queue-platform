@@ -31,4 +31,18 @@ public interface QueueEngine {
      * @return 검증 통과 여부
      */
     boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis);
+
+    /**
+     * 대기열 앞에서 count명을 꺼내 admitToken을 발급한다. 쓰기(master), 전 구간 원자(§80).
+     *
+     * <p>같은 {@code requestId}로 다시 부르면 대기열을 건드리지 않고 저장된 결과를 그대로 돌려준다
+     * ({@link AdmitResult#replay()}). Tenant의 재시도가 두 번 뽑아가는 것을 막는 유일한 장치다.
+     *
+     * <p>count 상한은 여기서 막지 않는다 — API DTO의 검증이 강제한다(FRS §6.4).
+     *
+     * @param requestId Tenant가 정하는 멱등 키. 큐 스코프로 저장된다.
+     * @param nowMillis 현재 epoch ms(UTC). admitToken 만료 시각의 기준이며 <b>호출자가 넘긴다</b> —
+     *                  Lua에서 시각을 만들면 스크립트가 비결정적이 된다.
+     */
+    AdmitResult admit(String queueId, String requestId, int count, long nowMillis);
 }

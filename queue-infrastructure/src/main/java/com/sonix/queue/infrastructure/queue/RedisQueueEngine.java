@@ -3,6 +3,7 @@ package com.sonix.queue.infrastructure.queue;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.common.util.IdGenerator;
+import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
@@ -51,6 +52,15 @@ public class RedisQueueEngine implements QueueEngine {
 
     private static final long MAX_WAIT_SECONDS = 30L;
 
+    /** admitToken 유효 시간 (FRS §6.4). admit-by-* 키의 PX이자 admitted ZSet score의 기준. */
+    private static final long ADMIT_TTL_MILLIS = 60_000L;
+
+    /** admit 멱등 payload 보관 시간. Tenant 재시도가 끝났을 시점 이후로 잡는다 (§80). */
+    private static final long ADMIT_IDEM_TTL_MILLIS = 300_000L;
+
+    /** admit.lua에서 admitToken 후보가 시작되는 ARGV 위치 직전까지의 고정 인자 수. */
+    private static final int ADMIT_TOKEN_OFFSET = 7;
+
     private final StringRedisTemplate cluster1;
     private final StringRedisTemplate cluster2;
 
@@ -78,6 +88,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     private final RedisScript<List> enqueueBulkScript;
     private final RedisScript<Long> pollVerifyScript;
+    private final RedisScript<List> admitScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
@@ -98,13 +109,15 @@ public class RedisQueueEngine implements QueueEngine {
             @Qualifier("cluster2StringRedisTemplate") StringRedisTemplate cluster2,
             QueueJpaRepository queueJpaRepository,
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
-            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript
+            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
+            @Qualifier("admitScript") RedisScript<List> admitScript
     ) {
         this.cluster1 = cluster1;
         this.cluster2 = cluster2;
         this.queueJpaRepository = queueJpaRepository;
         this.enqueueBulkScript = enqueueBulkScript;
         this.pollVerifyScript = pollVerifyScript;
+        this.admitScript = admitScript;
     }
 
     /**
@@ -116,9 +129,10 @@ public class RedisQueueEngine implements QueueEngine {
     public RedisQueueEngine(
             StringRedisTemplate redisTemplate,
             RedisScript<List> enqueueBulkScript,
-            RedisScript<Long> pollVerifyScript
+            RedisScript<Long> pollVerifyScript,
+            RedisScript<List> admitScript
     ) {
-        this(redisTemplate, redisTemplate, null, enqueueBulkScript, pollVerifyScript);
+        this(redisTemplate, redisTemplate, null, enqueueBulkScript, pollVerifyScript, admitScript);
     }
 
     /**
@@ -322,6 +336,66 @@ public class RedisQueueEngine implements QueueEngine {
         );
 
         return result != null && result == 1L;
+    }
+
+    @Override
+    public AdmitResult admit(String queueId, String requestId, int count, long nowMillis) {
+        // ARGV: count, expiresAt, admitTtlMs, idemKey(완성), idemTtlMs, byTokenPrefix, byAdmitPrefix, admitToken×N
+        List<String> args = new ArrayList<>(ADMIT_TOKEN_OFFSET + count);
+        args.add(Integer.toString(count));
+        args.add(Long.toString(nowMillis + ADMIT_TTL_MILLIS));
+        args.add(Long.toString(ADMIT_TTL_MILLIS));
+        args.add(QueueKeys.admitIdem(queueId, requestId));
+        args.add(Long.toString(ADMIT_IDEM_TTL_MILLIS));
+        args.add(QueueKeys.admitByTokenPrefix(queueId));
+        args.add(QueueKeys.admitByAdmitPrefix(queueId));
+        // admitToken 후보를 미리 count개 만든다. HGET 미스로 되돌아간 사람 몫은 그냥 버려진다 —
+        // Lua가 채택할 때만 쓰기 때문이고, 스크립트 안에서 만들면 EVAL이 비결정적이 된다.
+        for (int i = 0; i < count; i++) {
+            args.add(IdGenerator.generate("adm_"));
+        }
+
+        // ⚠️ routeForWrite 필수. redisTemplate을 직접 쓰면 cluster2에 배정된 큐의 admit이 cluster1로
+        //    가서 빈 대기열에서 0명을 뽑는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
+        //    쓰기 폴백(DB 배정)을 타는 것도 맞다 — admit은 큐 존재가 이미 확인된 뒤 호출된다.
+        @SuppressWarnings("unchecked")
+        List<Object> raw = routeForWrite(queueId).execute(
+                admitScript,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.tokens(queueId),
+                        QueueKeys.admitted(queueId), QueueKeys.admitWatermark(queueId)),
+                args.toArray()
+        );
+
+        return parseAdmitResult(raw);
+    }
+
+    /**
+     * admit.lua 결과 파싱: {@code { "OK"|"REPLAY", { {identifier, tokenId, seq, admitToken}, ... } }}
+     *
+     * <p>seq는 두 경로 모두 <b>문자열</b>이다. OK는 ZPOPMIN score를 문자열 그대로 쓰고(Lua 숫자
+     * 포맷 %.14g를 피하려고), REPLAY는 cjson 왕복을 거치는데 문자열은 문자열로 남기 때문이다.
+     */
+    @SuppressWarnings("unchecked")
+    private static AdmitResult parseAdmitResult(List<Object> raw) {
+        if (raw == null || raw.size() < 2) {
+            throw new IllegalStateException("Invalid admit Lua result: " + raw);
+        }
+
+        boolean replay = "REPLAY".equals(raw.get(0));
+        List<Object> rows = (List<Object>) raw.get(1);
+        List<AdmitResult.AdmitRecord> records = new ArrayList<>(rows.size());
+
+        for (Object row : rows) {
+            List<Object> f = (List<Object>) row;
+            records.add(new AdmitResult.AdmitRecord(
+                    (String) f.get(0),
+                    (String) f.get(1),
+                    Long.parseLong((String) f.get(2)),
+                    (String) f.get(3)
+            ));
+        }
+
+        return new AdmitResult(replay, records);
     }
 
     /**

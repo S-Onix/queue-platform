@@ -203,6 +203,11 @@ public class RedisConfig {
     }
 
     @Bean
+    public RedisScript<List> admitScript() {
+        return loadScript("lua/admit.lua", List.class);
+    }
+
+    @Bean
     public RateLimiter rateLimiter(
             @Qualifier("stringRedisTemplate") StringRedisTemplate redisTemplate,
             @Qualifier("tokenBucketScript") RedisScript<Long> tokenBucketScript
