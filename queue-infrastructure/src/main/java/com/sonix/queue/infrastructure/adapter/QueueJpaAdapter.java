@@ -59,6 +59,22 @@ public class QueueJpaAdapter implements QueueRepository {
                 .toList();
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>{@code SimpleJpaRepository}가 클래스 레벨 {@code @Transactional(readOnly = true)}라
+     * 호출자가 트랜잭션 없이 불러도 <b>읽기 전용 트랜잭션이 열려 replica로 라우팅된다</b>
+     * ({@code ReplicationRoutingDataSource}). 여기에 {@code @Transactional}을 다시 붙이지 않는 것은
+     * 트랜잭션 경계를 Service 계층에만 두는 규칙 때문이다.
+     */
+    @Override
+    public List<Queue> findAll() {
+        return queueJpaRepository.findAll()
+                .stream()
+                .map(QueueEntity::toDomain)
+                .toList();
+    }
+
     @Override
     public boolean existsByTenantIdAndName(Long tenantId, String name) {
         return queueJpaRepository.existsByTenantIdAndName(tenantId, name);

@@ -5,6 +5,7 @@ import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.common.util.IdGenerator;
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
+import com.sonix.queue.domain.queue.ExpiredAdmit;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueSnapshot;
@@ -89,6 +90,7 @@ public class RedisQueueEngine implements QueueEngine {
     private final RedisScript<List> enqueueBulkScript;
     private final RedisScript<Long> pollVerifyScript;
     private final RedisScript<List> admitScript;
+    private final RedisScript<List> admitExpireScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
@@ -110,7 +112,8 @@ public class RedisQueueEngine implements QueueEngine {
             QueueJpaRepository queueJpaRepository,
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
             @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
-            @Qualifier("admitScript") RedisScript<List> admitScript
+            @Qualifier("admitScript") RedisScript<List> admitScript,
+            @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript
     ) {
         this.cluster1 = cluster1;
         this.cluster2 = cluster2;
@@ -118,6 +121,7 @@ public class RedisQueueEngine implements QueueEngine {
         this.enqueueBulkScript = enqueueBulkScript;
         this.pollVerifyScript = pollVerifyScript;
         this.admitScript = admitScript;
+        this.admitExpireScript = admitExpireScript;
     }
 
     /**
@@ -130,9 +134,11 @@ public class RedisQueueEngine implements QueueEngine {
             StringRedisTemplate redisTemplate,
             RedisScript<List> enqueueBulkScript,
             RedisScript<Long> pollVerifyScript,
-            RedisScript<List> admitScript
+            RedisScript<List> admitScript,
+            RedisScript<List> admitExpireScript
     ) {
-        this(redisTemplate, redisTemplate, null, enqueueBulkScript, pollVerifyScript, admitScript);
+        this(redisTemplate, redisTemplate, null,
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
     }
 
     /**
@@ -373,6 +379,38 @@ public class RedisQueueEngine implements QueueEngine {
     public Optional<String> findTokenIdByAdmitToken(String queueId, String admitToken) {
         return Optional.ofNullable(
                 routeForWrite(queueId).opsForValue().get(QueueKeys.admitByAdmit(queueId, admitToken)));
+    }
+
+    @Override
+    public List<ExpiredAdmit> claimExpiredAdmits(String queueId, long nowMillis, int limit) {
+        // ⚠️ routeForWrite 필수. 직접 템플릿을 쓰면 cluster2에 배정된 큐의 복귀가 cluster1에서 돌아
+        //    빈 admitted ZSet을 보고 **조용히 0건**을 반환한다. 단일 클러스터 로컬에서는 무해해
+        //    테스트로 안 잡히고, 만료된 토큰은 아무 에러도 없이 영원히 복귀하지 못한다.
+        //    쓰기 폴백(DB 배정 기록)을 타는 것도 맞다 — 큐 목록 자체를 DB에서 읽어왔으므로
+        //    호출 시점에 큐 존재가 이미 확인돼 있다.
+        @SuppressWarnings("unchecked")
+        List<Object> raw = routeForWrite(queueId).execute(
+                admitExpireScript,
+                List.of(QueueKeys.admitted(queueId), QueueKeys.waiting(queueId), QueueKeys.tokens(queueId)),
+                Long.toString(nowMillis),
+                Integer.toString(limit)
+        );
+
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+
+        List<ExpiredAdmit> claimed = new ArrayList<>(raw.size());
+        for (Object row : raw) {
+            @SuppressWarnings("unchecked")
+            List<String> f = (List<String>) row;
+            // tokens Hash 미스는 빈 문자열로 온다(nil이면 배열 뒤가 잘린다). null로 바꿔
+            // 호출자가 "발행 불가"로 읽게 한다.
+            String tokenId = f.get(2).isEmpty() ? null : f.get(2);
+            claimed.add(new ExpiredAdmit(
+                    f.get(0), Long.parseLong(f.get(1)), tokenId, parseIssuedAt(f.get(3))));
+        }
+        return claimed;
     }
 
     @Override

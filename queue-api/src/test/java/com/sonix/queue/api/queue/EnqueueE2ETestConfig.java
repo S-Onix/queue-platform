@@ -48,9 +48,10 @@ public class EnqueueE2ETestConfig {
             StringRedisTemplate redisTemplate,
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
             @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
-            @Qualifier("admitScript") RedisScript<List> admitScript
+            @Qualifier("admitScript") RedisScript<List> admitScript,
+            @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
     }
 
     @Bean
@@ -134,6 +135,9 @@ public class EnqueueE2ETestConfig {
             }
             @Override public List<Queue> findAllByTenantId(Long tenantId) {
                 return byQueueId.values().stream().filter(q -> tenantId.equals(q.getTenantId())).toList();
+            }
+            @Override public List<Queue> findAll() {
+                return List.copyOf(byQueueId.values());
             }
             @Override public boolean existsByTenantIdAndName(Long tenantId, String name) {
                 return byQueueId.values().stream()
