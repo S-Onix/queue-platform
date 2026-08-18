@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.kafka.support.serializer.JsonDeserializer;
 import org.springframework.kafka.support.serializer.JsonSerializer;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Map;
 
@@ -56,7 +57,8 @@ class EnqueueEventSerdeTest {
     void preservesMillisecondPrecision() {
         // tokens.issued_at 이 DATETIME(3) 이므로 밀리초까지가 저장 대상이다.
         Instant issuedAt = Instant.parse("2026-08-10T12:34:56.789Z");
-        EnqueueEvent original = new EnqueueEvent("tok_a1b2", "q_ticket", 42L, "user-1", 1234L, issuedAt);
+        EnqueueEvent original = new EnqueueEvent(
+                "ENQUEUED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L, issuedAt);
 
         EnqueueEvent restored = roundTrip(original);
 
@@ -64,12 +66,47 @@ class EnqueueEventSerdeTest {
         assertThat(restored).isEqualTo(original);
     }
 
+    /**
+     * <b>하위 호환의 실증.</b> 판별 필드가 생기기 전에 토픽에 쌓인 메시지와, 롤링 배포 중
+     * 구 프로듀서가 보내는 메시지에는 이 필드가 없다. {@code ENQUEUED}로 읽지 못하면
+     * 백로그 전체가 처리 불가가 된다.
+     */
+    @Test
+    @DisplayName("판별 필드가 없는 구 메시지는 ENQUEUED로 역직렬화된다")
+    void readsLegacyMessageAsEnqueued() {
+        byte[] legacy = ("{\"tokenId\":\"tok_old\",\"queueId\":\"q_ticket\",\"tenantId\":42,"
+                + "\"userId\":\"user-1\",\"seq\":7,\"issuedAt\":\"2026-08-10T12:34:56.789Z\"}")
+                .getBytes(StandardCharsets.UTF_8);
+
+        try (JsonDeserializer<EnqueueEvent> deserializer = deserializer()) {
+            EnqueueEvent restored = deserializer.deserialize(TOPIC, legacy);
+
+            assertThat(restored.eventType()).isEqualTo("ENQUEUED");
+            assertThat(restored.seq()).isEqualTo(7L);
+            assertThat(restored.issuedAt()).isEqualTo(Instant.parse("2026-08-10T12:34:56.789Z"));
+        }
+    }
+
+    /**
+     * 모르는 타입 값에서 <b>역직렬화가 터지면 안 된다.</b> 터지면 어느 레코드가 문제인지
+     * (배치 안 인덱스)를 잃어 그 한 건만 격리하는 길이 막힌다.
+     */
+    @Test
+    @DisplayName("모르는 판별 필드 값도 역직렬화되어 소비 측이 격리할 수 있다")
+    void keepsUnknownEventTypeAsIs() {
+        EnqueueEvent original = new EnqueueEvent(
+                "WHAT_IS_THIS", "tok_x", "q_ticket", 1L, "user-1", 1L,
+                Instant.parse("2026-08-10T00:00:00.001Z"));
+
+        assertThat(roundTrip(original).eventType()).isEqualTo("WHAT_IS_THIS");
+    }
+
     @Test
     @DisplayName("큰 seq 값이 정밀도 손실 없이 보존된다")
     void preservesLargeSeq() {
         // 과학표기·double 변환이 끼어들면 큰 정수가 뭉개진다. Long 경계로 확인한다.
         EnqueueEvent original = new EnqueueEvent(
-                "tok_big", "q_ticket", Long.MAX_VALUE, "user-1",
+                "ENQUEUED", "tok_big", "q_ticket", Long.MAX_VALUE, "user-1",
                 Long.MAX_VALUE, Instant.parse("2026-08-10T00:00:00.001Z"));
 
         EnqueueEvent restored = roundTrip(original);

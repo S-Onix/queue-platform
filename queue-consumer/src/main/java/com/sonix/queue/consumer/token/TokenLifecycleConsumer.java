@@ -2,6 +2,7 @@ package com.sonix.queue.consumer.token;
 
 import com.sonix.queue.domain.queue.EnqueueEvent;
 import com.sonix.queue.domain.queue.Token;
+import com.sonix.queue.domain.queue.TokenEventType;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -20,6 +21,16 @@ import java.util.List;
  * 보장은 <b>같은 토픽의 같은 파티션</b> 안에서만 성립하므로, 토픽을 나누면 파티션 키를
  * {@code tokenId}로 잡아도 {@code WAITING → ADMIT_ISSUED} 순서가 보장되지 않는다.
  * 지금은 enqueue 이벤트만 흐르지만 이름을 미리 맞춰 두어 나중에 옮길 일을 없앤다.
+ *
+ * <p><b>🔴 배포 순서: 이 컨슈머가 먼저, 새 이벤트를 발행하는 프로듀서가 나중이다.</b>
+ * 반대로 하면 판별 필드를 모르는 구 컨슈머가 admit 이벤트를 받는데, Spring의
+ * {@code JsonDeserializer}는 모르는 필드를 무시하고 {@code spring.json.value.default.type}으로
+ * 역직렬화하므로 <b>예외 없이</b> enqueue로 해석돼 {@code Token.issue()}로 조용히 적재된다.
+ * 판별 필드를 본문에 둔 이유가 이것이고(§80이 Kafka 헤더 방식을 기각한 이유와 같다),
+ * 필드를 넣는 것만으로는 이 함정을 못 막는다 — <b>읽는 쪽이 먼저 떠 있어야</b> 막힌다.
+ * (판별 필드 도입 자체는 순서 무관하다: 구 컨슈머는 {@code eventType}을 무시하고,
+ * 새 컨슈머는 필드 없는 구 메시지를 {@code ENQUEUED}로 읽는다. 순서가 문제되는 것은
+ * <b>새 타입을 실제로 발행하기 시작하는</b> Sprint 7 배포다.)
  *
  * <p><b>수동 ack을 쓰지 않는 이유:</b> 컨테이너 기본값({@code AckMode.BATCH})은 리스너가
  * <b>정상 반환한 뒤에</b> 오프셋을 커밋한다. 이 메서드는 트랜잭션이 커밋된 뒤에야 반환하므로
@@ -47,20 +58,70 @@ public class TokenLifecycleConsumer {
      * 파티션이 지켜준 같은 토큰의 순서가 애플리케이션에서 다시 깨진다.
      *
      * <p>제약 위반 외의 예외는 그대로 전파한다 → 에러 핸들러가 재시도한다.
+     *
+     * <p><b>지금 처리할 수 있는 타입은 {@code ENQUEUED} 하나다.</b> 그래서 배치를
+     * <b>첫 미처리 타입 앞까지</b> 잘라 적재하고 그 한 건을 격리한다. 잘라내는 순서가 중요하다 —
+     * 적재보다 먼저 던지면 앞쪽 정상 건들이 <b>적재되지 않은 채 커밋</b>된다
+     * ({@link BatchListenerFailedException}은 인덱스 앞을 "성공"으로 간주한다).
      */
     @KafkaListener(topics = "${queue.consumer.topic:token-lifecycle}")
     public void consume(List<EnqueueEvent> events) {
         if (events.isEmpty()) return;
 
-        List<Token> tokens = events.stream().map(TokenLifecycleConsumer::toToken).toList();
-        try {
-            tokenPersistService.persist(tokens);
-        } catch (DataIntegrityViolationException e) {
-            quarantineOffender(tokens, e);
-            return;
+        int unsupported = indexOfUnsupported(events);
+        List<EnqueueEvent> enqueued = unsupported < 0 ? events : events.subList(0, unsupported);
+
+        if (!enqueued.isEmpty()) {
+            List<Token> tokens = enqueued.stream().map(TokenLifecycleConsumer::toToken).toList();
+            try {
+                tokenPersistService.persist(tokens);
+            } catch (DataIntegrityViolationException e) {
+                quarantineOffender(tokens, e);          // 던지거나(인덱스 포함), 전 건 적재됐으면 반환
+            }
         }
 
-        log.debug("token-lifecycle 적재 완료: {}건", events.size());
+        if (unsupported >= 0) {
+            quarantineUnsupported(events.get(unsupported), unsupported);
+        }
+
+        log.debug("token-lifecycle 적재 완료: {}건", enqueued.size());
+    }
+
+    /**
+     * 이 컨슈머가 아직 적재할 수 없는 첫 이벤트의 인덱스. 전부 {@code ENQUEUED}면 -1.
+     *
+     * <p>정상 운영에서는 항상 -1이다 — 다른 타입을 발행하는 코드가 아직 없다.
+     */
+    private static int indexOfUnsupported(List<EnqueueEvent> events) {
+        for (int i = 0; i < events.size(); i++) {
+            if (TokenEventType.from(events.get(i).eventType()) != TokenEventType.ENQUEUED) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 처리할 수 없는 이벤트 <b>한 건</b>을 DLT로 보낸다.
+     *
+     * <p>두 가지를 모두 여기서 처리한다. <b>모르는 타입</b>(구 컨슈머 + 신규 프로듀서, 또는
+     * 잘못된 발행)과 <b>아는데 처리기가 없는 타입</b>({@code ADMITTED} 등, Sprint 7에서 붙는다)이다.
+     * 로그 문구만 다르고 조치는 같다 — 둘 다 <b>지금 적재하면 안 되는</b> 이벤트이기 때문이다.
+     * 예컨대 {@code ADMITTED}를 {@link #toToken}에 넣으면 status 0(WAITING)으로 적재돼
+     * 상태가 거꾸로 간다.
+     *
+     * <p><b>삼키지 않는다.</b> 로그만 남기고 넘어가면 이벤트가 사라지고, 나중에 처리기를 붙여도
+     * 되돌릴 원본이 없다. DLT에 있으면 재투입할 수 있다.
+     * <b>배치 전체를 보내지도 않는다</b> — 인덱스를 실어 그 한 건만 보낸다
+     * ({@link #quarantineOffender}의 설명과 같은 이유).
+     */
+    private static void quarantineUnsupported(EnqueueEvent event, int index) {
+        boolean known = TokenEventType.from(event.eventType()) != null;
+        String reason = known ? "처리기가 없는 이벤트 타입" : "알 수 없는 이벤트 타입";
+
+        log.error("{} 격리 eventType={} tokenId={} queueId={} index={}",
+                reason, event.eventType(), event.tokenId(), event.queueId(), index);
+        throw new BatchListenerFailedException(reason + ": " + event.eventType(), index);
     }
 
     /**
