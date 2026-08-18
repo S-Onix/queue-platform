@@ -544,6 +544,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 ```json
 // token-lifecycle — enqueue (queue-domain의 EnqueueEvent record)
 {
+  "eventType": "ENQUEUED",
   "tokenId": "tok_Kx9mZ3",
   "queueId": "q_xyz789",
   "tenantId": 12,
@@ -554,6 +555,10 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 ```
 
 > `userId` 필드가 담는 값은 **`identifier`**다 (§6.2). 컬럼명은 `tokens.user_id`.
+>
+> `eventType`이 **판별 필드**다(§80, `TokenEventType`). **없으면 `ENQUEUED`로 읽는다** — 이 필드가
+> 생기기 전에 쌓인 메시지와 구 프로듀서 메시지는 전부 enqueue이기 때문이다. 🔴 **새 타입을 발행하는
+> 배포는 컨슈머가 먼저다.** 반대로 하면 구 컨슈머가 모르는 필드를 무시하고 enqueue로 조용히 적재한다.
 
 **이벤트 타입은 판별 필드로 구분한다** (§80). 토픽도 그룹도 나누지 않는다 — 나누면 같은 토큰의
 순서가 깨진다(§73 D18). 소비 측은 한 리스너 안에서 분기하고 **각 타입마다 허용 출발 상태를 강제**한다:

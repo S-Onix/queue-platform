@@ -4,6 +4,7 @@ import com.sonix.queue.domain.queue.EnqueueEvent;
 import com.sonix.queue.domain.queue.Token;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.kafka.listener.BatchListenerFailedException;
 
@@ -28,6 +29,9 @@ import static org.mockito.Mockito.verify;
  * 중복으로는 제약 위반이 나지 않고, 길이 초과 같은 실제 위반은 부하 테스트에 섞여 들어오지
  * 않기 때문이다. 그래서 오동작이 <b>운영에서 데이터가 사라진 뒤에야</b> 드러난다 —
  * 테스트로 못박아 두는 이유다.
+ *
+ * <p>판별 필드({@code eventType})가 붙은 뒤로는 <b>처리할 수 없는 타입</b>도 같은 질문을 만든다 —
+ * 구 메시지는 그대로 적재하고, 처리기 없는 타입은 한 건만 격리한다.
  */
 class TokenLifecycleConsumerTest {
 
@@ -91,11 +95,73 @@ class TokenLifecycleConsumerTest {
         verify(persistService).persist(anyList());
     }
 
+    /**
+     * 판별 필드가 없는 <b>구 메시지</b>는 지금까지와 똑같이 적재돼야 한다.
+     *
+     * <p>토픽에 이미 쌓여 있는 것과 롤링 배포 중 구 프로듀서가 보내는 것이 여기 해당한다.
+     * 미지 타입으로 취급하면 <b>백로그 전체가 DLT로</b> 간다.
+     */
+    @Test
+    @DisplayName("판별 필드가 없는 구 메시지는 ENQUEUED로 읽어 그대로 적재한다")
+    void 판별_필드가_없으면_ENQUEUED로_적재한다() {
+        doNothing().when(persistService).persist(anyList());
+
+        List<EnqueueEvent> legacy = List.of(
+                new EnqueueEvent(null, "tok_0", "q_test", 1L, "u0", 1L, Instant.ofEpochMilli(1L)));
+
+        assertThatCode(() -> consumer.consume(legacy)).doesNotThrowAnyException();
+
+        verify(persistService).persist(anyList());
+    }
+
+    /**
+     * 아직 처리기가 없는 타입(Sprint 7에서 붙는다)을 enqueue처럼 적재하면
+     * <b>ADMIT_ISSUED가 WAITING으로 되감긴다</b> — 조용히 삼키지 말고 격리한다.
+     */
+    @Test
+    @DisplayName("처리기가 없는 타입은 앞쪽 정상 건을 적재한 뒤 그 한 건만 격리한다")
+    void 처리기가_없는_타입은_한_건만_격리한다() {
+        doNothing().when(persistService).persist(anyList());
+
+        List<EnqueueEvent> events = new ArrayList<>(events(4));
+        events.set(2, withType("ADMITTED", events.get(2)));
+
+        assertThatThrownBy(() -> consumer.consume(events))
+                .isInstanceOf(BatchListenerFailedException.class)
+                .extracting(e -> ((BatchListenerFailedException) e).getIndex())
+                .isEqualTo(2);
+
+        // 앞쪽 2건은 적재하고 던진다. 던진 뒤에 적재하면 인덱스 앞이 "성공"으로 커밋돼 사라진다.
+        ArgumentCaptor<List<Token>> captor = ArgumentCaptor.forClass(List.class);
+        verify(persistService).persist(captor.capture());
+        assertThat(captor.getValue()).hasSize(2);
+    }
+
+    /** 모르는 타입도 같은 조치다 — 인덱스를 실어 그 한 건만. */
+    @Test
+    @DisplayName("모르는 타입은 persist 없이 그 한 건만 격리한다")
+    void 모르는_타입은_한_건만_격리한다() {
+        List<EnqueueEvent> events = List.of(withType("WHAT_IS_THIS", events(1).get(0)));
+
+        assertThatThrownBy(() -> consumer.consume(events))
+                .isInstanceOf(BatchListenerFailedException.class)
+                .extracting(e -> ((BatchListenerFailedException) e).getIndex())
+                .isEqualTo(0);
+
+        verify(persistService, org.mockito.Mockito.never()).persist(anyList());
+    }
+
+    private static EnqueueEvent withType(String eventType, EnqueueEvent e) {
+        return new EnqueueEvent(
+                eventType, e.tokenId(), e.queueId(), e.tenantId(), e.userId(), e.seq(), e.issuedAt());
+    }
+
     private static List<EnqueueEvent> events(int count) {
         List<EnqueueEvent> events = new ArrayList<>();
         for (int i = 0; i < count; i++) {
             events.add(new EnqueueEvent(
-                    "tok_" + i, "q_test", 1L, "u" + i, i + 1, Instant.ofEpochMilli(1_700_000_000_000L + i)));
+                    "ENQUEUED", "tok_" + i, "q_test", 1L, "u" + i, i + 1,
+                    Instant.ofEpochMilli(1_700_000_000_000L + i)));
         }
         assertThat(events).hasSize(count);
         return events;
