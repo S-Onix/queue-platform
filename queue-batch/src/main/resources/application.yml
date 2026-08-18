@@ -45,6 +45,15 @@ queue:
   redis:
     password: ${REDIS_PASSWORD:}
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: queue-batch
+
 # 로그 표시 타임존 — 저장은 UTC, 화면은 KST
 #
 # JVM 기본 TZ가 UTC라(main() 참조) 아무 설정도 안 하면 로그도 UTC로 찍힌다.
