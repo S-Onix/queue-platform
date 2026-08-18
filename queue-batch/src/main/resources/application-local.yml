@@ -5,11 +5,14 @@ logging:
     org.hibernate.sql: DEBUG
     org.hibernate.orm.jdbc.bind: TRACE
 
+queue:
+  redis:
+    cluster1:
+      nodes: 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005,127.0.0.1:7006,127.0.0.1:7007,127.0.0.1:7008
+    cluster2:
+      nodes: 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003,127.0.0.1:8004,127.0.0.1:8005,127.0.0.1:8006,127.0.0.1:8007,127.0.0.1:8008
+
 spring:
-  data:
-    redis:
-      sentinel:
-        nodes: 127.0.0.1:26379,127.0.0.1:26380,127.0.0.1:26381
   datasource:
     master:
       jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&rewriteBatchedStatements=true

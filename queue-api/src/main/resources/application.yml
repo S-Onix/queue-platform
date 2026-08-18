@@ -40,11 +40,6 @@ spring:
     exclude:
       - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
-  data:
-    redis:
-      sentinel:
-        master: mymaster      # Sentinel Master 이름 (공통)
-
   jpa:
     # 요청이 끝날 때까지 DB 커넥션을 붙들지 않는다.
     #
@@ -92,8 +87,24 @@ spring:
         # 요청 수가 한 자릿수 배로 줄고, 그만큼 지연 상한도 안정된다.
         linger.ms: 5
 
-# 토큰 생명주기 이벤트 발행 설정
 queue:
+  # Redis 독립 2 Cluster (DECISIONS §75)
+  #
+  # spring.data.redis.cluster.nodes(Boot 표준)는 클러스터를 하나만 표현한다. 두 개를 독립으로
+  # 두는 구성은 표준 키로 쓸 방법이 없어 커스텀 네임스페이스를 쓴다. RedisAutoConfiguration은
+  # 이미 exclude돼 있고, 연결은 RedisConfig가 직접 만든다.
+  #
+  # 노드 목록은 시드일 뿐이다 — 실제 슬롯 지도는 접속 후 받고, 이후 주기·적응형으로
+  # 갱신된다(RedisConfig.TOPOLOGY_REFRESH_PERIOD).
+  # 프로파일별 노드 목록은 application-{local,prod}.yml에 있다.
+  #
+  # ⚠️ Sentinel 설정은 제거했다. 프로파일로 분기하지 않는다 — 해시태그 누락처럼
+  #    Cluster에서만 터지는 결함이 Sentinel 경로로 숨을 통로를 남기지 않기 위함이다.
+  #    Sentinel 인프라·문서 자체는 학습/로컬 자산으로 남아 있다(§75 D28).
+  redis:
+    password: ${REDIS_PASSWORD:}
+
+  # 토큰 생명주기 이벤트 발행 설정
   event:
     topic: token-lifecycle
     # 프로듀서의 최악 시한(max.block 4s + delivery 8s)보다 크게 잡는다.

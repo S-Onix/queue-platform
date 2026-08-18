@@ -64,8 +64,10 @@ public class BatchProcessor implements SmartLifecycle {
      * <p><b>⚠️ ≈10s는 MySQL이 응답한다는 전제 위에서만 성립한다.</b> 이 사이클에는
      * Redis 말고 DB 호출({@link #getMaxCapacity}, 캐시 없는 {@code findByQueueId})도 있는데,
      * JDBC URL에 {@code socketTimeout}이 설정돼 있지 않다(Connector/J 기본 0 = 무기한).
-     * 그룹 진입 데드라인 검사가 <b>데드라인을 넘겨서까지 실행되는</b> 호출을 최대 1회로 묶어 그룹 수 비례는
-     * 없앴지만, <b>그 1회의 길이는 여전히 무한</b>이다. 즉 DB가 무응답이면 {@code stop()}에
+     * 그룹 진입 데드라인 검사가 <b>데드라인을 넘겨서까지 실행되는</b> 호출을 최대 2회로 묶어 그룹 수 비례는
+     * 없앴지만, <b>그 길이는 여전히 무한</b>이다.
+     * (2회인 이유와 상각 조건은 {@link #processQueueGroup} javadoc 참조 — §75 이중 라우팅 이후
+     *  {@code routeForWrite}의 {@code redis_cluster_no} 조회가 하나 더 붙는다.) 즉 DB가 무응답이면 {@code stop()}에
      * 상한이 없다. 길이를 유한화하려면 {@code socketTimeout}이 필요하며, 그 값은 종료 경로
      * 밖 전 구간(특히 queue-batch의 대량 write)에 영향이 있어 부하 검증과 함께 별도로 다룬다
      * — <b>후속 과제</b>.
@@ -303,9 +305,16 @@ public class BatchProcessor implements SmartLifecycle {
      * <b>이 호출 자체에는 시한이 없다</b>. 검사가 청크 루프에만 있으면 그룹마다 이 시한 없는
      * 호출을 한 번씩 물어 {@code stop()} 경과가 <b>그룹 수에 선형 비례</b>한다
      * (실측: DB 3s 가정 · 그룹 3개 → 9,016ms). 여기서 끊으면 시한 없는 DB 호출은
-     * 최대 1회로 묶인다(데드라인 전에 시작한 호출은 개수 제한이 없다 — 총 경과는
-     * 데드라인 + 넘긴 호출 1회의 길이). 그 1회의 <b>길이</b>는 여전히 무한이다 — 길이를 줄이는 건
+     * 최대 <b>2회</b>로 묶인다(데드라인 전에 시작한 호출은 개수 제한이 없다 — 총 경과는
+     * 데드라인 + 넘긴 호출들의 길이). 그 호출의 <b>길이</b>는 여전히 무한이다 — 길이를 줄이는 건
      * {@code socketTimeout}의 몫이고, 그건 별도 과제다.
+     *
+     * <p><b>왜 1회가 아니라 2회인가(§75 이중 라우팅 도입 후):</b> 이 그룹이 지나는 DB 호출은
+     * {@link #getMaxCapacity} 하나가 아니다. 아래 {@code executeBulkLua}가 소유 클러스터를
+     * 모를 때 {@code queues.redis_cluster_no}를 한 번 더 읽는다
+     * ({@code RedisQueueEngine.routeForWrite}). 다만 그 조회는 <b>(WAS, queueId)당 평생 1회</b>다 —
+     * 결과가 인스턴스 로컬 맵에 남아 같은 큐의 이후 사이클에는 0회로 상각된다. 반면
+     * {@code getMaxCapacity}는 캐시가 없어 매 그룹마다 든다.
      */
     private void processQueueGroup(String queueId, List<PendingEnqueue> pendings) {
         if (drainDeadlineExceeded()) {
