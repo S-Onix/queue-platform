@@ -3,24 +3,55 @@ package com.sonix.queue.api.queue;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.*;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
+@Slf4j
 @Service
 public class QueueEngineService {
 
+    /**
+     * admitToken 유효 시간(초). {@code RedisQueueEngine.ADMIT_TTL_MILLIS}(60_000)와 같은 값이며,
+     * verify의 DB fallback이 {@code admitted_at} 신선도를 재는 창이다 (FRS §6.4·§6.5).
+     */
+    private static final int ADMIT_TTL_SECONDS = 60;
+
+    /**
+     * complete를 받아 주는 유효 창(초). <b>admitToken TTL 60초보다 반드시 길다</b> —
+     * TTL이 만료돼 WAITING으로 복귀했는데 Tenant는 이미 유저를 입장시킨 경우를 덮어야 하기
+     * 때문이다(FRS §6.6이 {@code status IN (0,1)}로 관대한 것과 같은 이유).
+     *
+     * <p><b>왜 300인가</b>: 이 값은 "Tenant가 얼마나 늦어도 봐줄 것인가"라는 SLA 판단이라
+     * 시스템 상수에서 유도되지 않는다. 그래서 <b>이미 있는 숫자</b>에 맞췄다 —
+     * {@code RedisQueueEngine.ADMIT_IDEM_TTL_MILLIS}(300_000)가 "Tenant 재시도가 끝났을 시점"으로
+     * 잡은 값이고, 그 창이 닫힌 뒤 도착한 complete는 대응할 admit 재시도가 이미 없다.
+     * 큐 기본 {@code inactiveTtl}(300초)과도 같아 외울 숫자가 하나로 준다.
+     *
+     * <p>60초에 대해 5배 여유 = TTL 만료 후 복귀·재입장 처리에 4분을 준다는 뜻이다.
+     * 늘리는 건 하위호환, 줄이는 건 파괴적 변경이므로 여기서도 "필요를 채우는 최소"를 잡았다.
+     */
+    private static final int COMPLETE_VALID_WINDOW_SECONDS = 300;
+
     private final QueueRepository queueRepository;
+    private final TokenRepository tokenRepository;
     private final QueueEngine queueEngine;
     private final EnqueueEventPublisher eventPublisher;
     private final QueueSnapshotCache snapshotCache;   // ②
     private final Clock clock;                        // 시간 주입(테스트 제어)
 
-    public QueueEngineService(QueueRepository queueRepository, QueueEngine queueEngine,
-                              EnqueueEventPublisher eventPublisher,
+    public QueueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
+                              QueueEngine queueEngine, EnqueueEventPublisher eventPublisher,
                               QueueSnapshotCache snapshotCache, Clock clock) {
         this.queueRepository = queueRepository;
+        this.tokenRepository = tokenRepository;
         this.queueEngine = queueEngine;
         this.eventPublisher = eventPublisher;
         this.snapshotCache = snapshotCache;
@@ -55,6 +86,136 @@ public class QueueEngineService {
         }
 
         return result;
+    }
+
+    /**
+     * Admit — 대기열 앞에서 count명을 꺼내 admitToken을 발급한다 (FRS §6.4).
+     *
+     * <p>{@code admit.lua} 하나로 전 구간이 원자다. 중간에 DB를 보지 않는다 — 순번은 Redis에
+     * 먼저 쓰이고 DB에는 Kafka를 거쳐 나중에 들어가므로(§71 D11), 그 창의 정상 대기자를
+     * "DB에 없으니 유령"으로 지우면 대기열에서도 빠지고 복구 근거도 사라진다 (§80).
+     *
+     * <p><b>@Transactional을 붙이지 않는다.</b> DB 쓰기가 없고, 붙이면 Redis EVAL과 Kafka 발행
+     * (최대 {@code send-timeout}까지 블록)이 통째로 커넥션을 잡는다.
+     */
+    public AdmitResult admit(long tenantId, String queueId, int count, String requestId) {
+        findQueueAndVerifyOwner(tenantId, queueId);
+
+        AdmitResult result = queueEngine.admit(queueId, requestId, count, clock.millis());
+
+        publishAdmitted(tenantId, queueId, result);
+
+        return result;
+    }
+
+    /**
+     * ADMITTED 발행 — <b>실패해도 예외를 올리지 않는다</b> (FRS §6.4).
+     *
+     * <p>enqueue와 정반대다. enqueue는 발행 실패에 503을 주는데, 그 시점엔 <b>아직 아무것도
+     * 확정되지 않아</b> 거절이 성립하기 때문이다. admit은 Lua가 이미 커밋됐다 — 대기열에서
+     * 빠졌고 admitToken도 나갔다. 되돌릴 수 없다.
+     *
+     * <p>여기서 5xx를 주면 Tenant 재시도가 {@code admit-idem} REPLAY로 <b>같은 답만</b> 받고
+     * Kafka는 여전히 안 간다. 무한 반복이다. 미반영의 피해는 complete가 {@code status IN (0,1)}로
+     * 관대해 이미 흡수한다.
+     *
+     * <p><b>REPLAY도 발행한다.</b> 컨슈머 UPSERT가 멱등이라 중복은 무해한 반면, 첫 호출에서
+     * 발행이 실패했을 때 재시도가 그것을 <b>복구</b>할 수 있는 유일한 경로다.
+     */
+    private void publishAdmitted(long tenantId, String queueId, AdmitResult result) {
+        if (result.records().isEmpty()) {
+            return;
+        }
+
+        // issuedAt은 tokens Hash에서 따로 읽는다 — admit.lua가 그 값을 읽고도 버리기 때문이다.
+        // 근거와 제거 조건은 QueueEngine.findIssuedAt Javadoc 참조.
+        Map<String, Instant> issuedAt = queueEngine.findIssuedAt(queueId,
+                result.records().stream().map(AdmitResult.AdmitRecord::identifier).toList());
+
+        for (AdmitResult.AdmitRecord record : result.records()) {
+            Instant at = issuedAt.get(record.identifier());
+            if (at == null) {
+                // issuedAt이 없으면 발행할 수 없다. 컨슈머의 멱등 키가 (token_id, issued_at)이라
+                // 아무 값이나 넣으면 같은 토큰의 두 번째 행이 생긴다 — 조용히 틀리느니 빼고 남긴다.
+                log.error("ADMITTED 발행 생략(issuedAt 미확인) tokenId={} queueId={} identifier={}",
+                        record.tokenId(), queueId, record.identifier());
+                continue;
+            }
+            publishQuietly(new EnqueueEvent(TokenEventType.ADMITTED.name(), record.tokenId(), queueId,
+                    tenantId, record.identifier(), record.seq(), at));
+        }
+    }
+
+    /**
+     * Verify — admitToken이 지금 유효한지만 답한다 (FRS §6.5). <b>Redis 쓰기 0회, DB 쓰기 0회.</b>
+     *
+     * @return identifier (Tenant가 어느 사용자인지 알아야 하므로)
+     * @throws BusinessException 유효하지 않으면 404 {@code INVALID_ADMIT_TOKEN}
+     */
+    @Transactional(readOnly = true)
+    public String verify(long tenantId, String queueId, String admitToken) {
+        findQueueAndVerifyOwner(tenantId, queueId);
+
+        // Redis 히트 = "60초 안에 admit됐다"가 이미 증명된 것(키의 PX가 그 증명이다).
+        // 그래서 신원만 읽는다. 여기에 status=1을 걸면 ADMITTED 이벤트를 아직 소비하지 않은
+        // 구간의 정상 토큰이 404가 된다 (§6.4 — 200이 보장하지 않는 것).
+        Token token = queueEngine.findTokenIdByAdmitToken(queueId, admitToken)
+                .flatMap(tokenId -> tokenRepository.findByTokenId(queueId, tenantId, tokenId))
+                // Redis 미스 → DB fallback. 기준 컬럼은 issued_at이 아니라 admitted_at이다.
+                .or(() -> tokenRepository.findAdmittedByAdmitToken(
+                        queueId, tenantId, admitToken, ADMIT_TTL_SECONDS))
+                .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN));
+
+        return token.getUserId();
+    }
+
+    /**
+     * Complete — Tenant가 입장 완료를 통보한다 (FRS §6.6).
+     *
+     * <p><b>판정 권위는 DB다.</b> Redis {@code admit-by-admit}은 60초면 사라지므로 그걸 기준으로
+     * 삼으면 정상 입장이 만료 직후 거절된다 (§80이 구 설계를 폐기한 이유).
+     *
+     * <p><b>@Transactional인 이유</b>: {@code @Modifying} 네이티브 UPDATE가 트랜잭션을 요구한다.
+     * 뒤따르는 조회는 방금 갱신한 행을 읽어야 해서(read-your-write) {@code readOnly}가 아니다.
+     * ⚠️ 그 대가로 Redis 정리·Kafka 발행이 트랜잭션 안에 들어온다 — complete는 Tenant 호출이라
+     * 저빈도지만, 브로커가 느리면 그만큼 DB 커넥션을 쥔다.
+     *
+     * @return completedAt (UTC)
+     */
+    @Transactional
+    public LocalDateTime complete(long tenantId, String queueId, String tokenId, String admitToken) {
+        findQueueAndVerifyOwner(tenantId, queueId);
+
+        LocalDateTime completedAt = LocalDateTime.now(clock);
+
+        int updated = tokenRepository.markCompleted(
+                queueId, tenantId, tokenId, admitToken, completedAt, COMPLETE_VALID_WINDOW_SECONDS);
+        if (updated == 0) {
+            throw new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN);
+        }
+
+        // 정리·발행에 identifier·seq·issuedAt이 필요하다. UPDATE가 1행을 갱신했으므로 반드시 있다.
+        Token token = tokenRepository.findByTokenId(queueId, tenantId, tokenId)
+                .orElseThrow(() -> new IllegalStateException("completed row vanished: " + tokenId));
+
+        queueEngine.cleanupCompleted(queueId, token.getUserId(), tokenId, admitToken, token.getSeq());
+
+        // COMPLETED도 admit과 같은 이유로 조용히 실패한다. DB는 이미 status=2로 확정됐고,
+        // 여기서 5xx를 주면 Tenant 재시도가 status IN (0,1)에 걸려 404를 받는다(더 나쁘다).
+        publishQuietly(new EnqueueEvent(TokenEventType.COMPLETED.name(), tokenId, queueId, tenantId,
+                token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC)));
+
+        return completedAt;
+    }
+
+    /** 발행 실패를 삼키고 로그만 남긴다. 호출자 주석에 "왜 삼켜도 되는가"가 있다. */
+    private void publishQuietly(EnqueueEvent event) {
+        try {
+            eventPublisher.publish(event);
+        } catch (RuntimeException e) {
+            log.error("{} 이벤트 발행 실패 tokenId={} queueId={} — 상태는 이미 확정됐으므로 응답은 200이다",
+                    event.eventType(), event.tokenId(), event.queueId(), e);
+        }
     }
 
     /**

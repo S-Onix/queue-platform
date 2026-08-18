@@ -7,9 +7,11 @@ import com.sonix.queue.infrastructure.entity.TokenEntityId;
 import com.sonix.queue.infrastructure.repository.TokenJpaRepository;
 import org.springframework.stereotype.Repository;
 
+import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @Repository
 public class TokenJpaAdapter implements TokenRepository {
@@ -32,5 +34,25 @@ public class TokenJpaAdapter implements TokenRepository {
         }
 
         tokenJpaRepository.saveAll(deduped.values());
+    }
+
+    @Override
+    public Optional<Token> findByTokenId(String queueId, long tenantId, String tokenId) {
+        return tokenJpaRepository.findOneByTokenId(queueId, tenantId, tokenId)
+                .map(TokenEntity::toDomain);
+    }
+
+    @Override
+    public Optional<Token> findAdmittedByAdmitToken(String queueId, long tenantId,
+                                                    String admitToken, int freshSeconds) {
+        return tokenJpaRepository.findAdmittedByAdmitToken(queueId, tenantId, admitToken, freshSeconds)
+                .map(TokenEntity::toDomain);
+    }
+
+    @Override
+    public int markCompleted(String queueId, long tenantId, String tokenId, String admitToken,
+                             LocalDateTime completedAt, int validWindowSeconds) {
+        return tokenJpaRepository.markCompleted(
+                queueId, tenantId, tokenId, admitToken, completedAt, validWindowSeconds);
     }
 }

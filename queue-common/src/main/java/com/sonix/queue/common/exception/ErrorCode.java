@@ -18,7 +18,12 @@ public enum ErrorCode {
     AK_002_FORBIDDEN("AK002", "권한이 없습니다.", 403),
     RL_001_KEY_LIMIT("RL001", "요청 한도를 초과했습니다.", 429),
     QUEUE_ENGINE_UNAVAILABLE("QE001", "대기열 처리 중 일시적 오류입니다. 잠시 후 재시도하세요.", 503),
-    TOKEN_NOT_FOUND("TK001", "대기 토큰을 찾을 수 없습니다.", 404);
+    TOKEN_NOT_FOUND("TK001", "대기 토큰을 찾을 수 없습니다.", 404),
+    /**
+     * verify: admitToken이 Redis에도 DB에도 없다(= 발급된 적 없거나 유효 창을 넘겼다).
+     * complete: (tokenId, admitToken) 짝이 완료 가능한 상태가 아니다 — 같은 뜻이라 코드를 나누지 않는다.
+     */
+    INVALID_ADMIT_TOKEN("TK002", "유효하지 않은 입장 토큰입니다.", 404);
 
 
     private final String code;

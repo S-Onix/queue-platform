@@ -18,6 +18,7 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -367,6 +368,48 @@ public class RedisQueueEngine implements QueueEngine {
         );
 
         return parseAdmitResult(raw);
+    }
+
+    @Override
+    public Map<String, Instant> findIssuedAt(String queueId, List<String> identifiers) {
+        if (identifiers.isEmpty()) {
+            return Map.of();
+        }
+
+        // HMGET 한 번. 키가 하나뿐이라 CROSSSLOT 여지도 없다.
+        // routeForWrite인 이유는 admit()과 같다 — 큐 존재가 이미 확인된 뒤 호출되고,
+        // 오배송되면 빈 값이 돌아와 ADMITTED 발행이 통째로 빠진다(조용한 유실).
+        List<Object> raw = routeForWrite(queueId)
+                .opsForHash()
+                .multiGet(QueueKeys.tokens(queueId), List.copyOf(identifiers));
+
+        Map<String, Instant> issuedAt = new HashMap<>(identifiers.size());
+        for (int i = 0; i < identifiers.size(); i++) {
+            String stored = (String) raw.get(i);
+            if (stored == null) continue;
+            int sep = stored.indexOf('|');
+            if (sep < 0) continue;   // 레거시(구분자 없는 값) — admit.lua도 같은 이유로 건너뛴다
+            issuedAt.put(identifiers.get(i), Instant.ofEpochMilli(Long.parseLong(stored.substring(sep + 1))));
+        }
+        return issuedAt;
+    }
+
+    @Override
+    public Optional<String> findTokenIdByAdmitToken(String queueId, String admitToken) {
+        return Optional.ofNullable(
+                routeForWrite(queueId).opsForValue().get(QueueKeys.admitByAdmit(queueId, admitToken)));
+    }
+
+    @Override
+    public void cleanupCompleted(String queueId, String identifier, String tokenId, String admitToken, long seq) {
+        StringRedisTemplate redis = routeForWrite(queueId);
+
+        // TTL 만료로 WAITING에 복귀해 있을 수 있다(§6.6 — status 0을 허용하는 것과 같은 이유).
+        redis.opsForZSet().remove(QueueKeys.waiting(queueId), identifier);
+        redis.opsForZSet().remove(QueueKeys.admitted(queueId), seq + "|" + identifier);
+        // 두 키 모두 {queueId} 해시태그라 같은 슬롯이다 — 다중 키 DEL이 Cluster에서도 성립한다.
+        redis.delete(List.of(QueueKeys.admitByToken(queueId, tokenId),
+                             QueueKeys.admitByAdmit(queueId, admitToken)));
     }
 
     /**

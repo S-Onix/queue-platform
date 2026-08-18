@@ -6,6 +6,7 @@ import com.sonix.queue.domain.queue.EnqueueEventPublisher;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.QueueSnapshot;
+import com.sonix.queue.domain.queue.TokenRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -39,6 +40,7 @@ import static org.mockito.Mockito.when;
 class QueueEnginePollTest {
 
     @Mock private QueueRepository queueRepository;
+    @Mock private TokenRepository tokenRepository;
     @Mock private QueueEngine queueEngine;
     @Mock private EnqueueEventPublisher eventPublisher;
     @Mock private QueueSnapshotCache snapshotCache;
@@ -50,7 +52,7 @@ class QueueEnginePollTest {
 
     @BeforeEach
     void setUp() {
-        service = new QueueEngineService(queueRepository, queueEngine, eventPublisher, snapshotCache, clock);
+        service = new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher, snapshotCache, clock);
     }
 
     @Test

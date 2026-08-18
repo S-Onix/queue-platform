@@ -1,5 +1,10 @@
 package com.sonix.queue.domain.queue;
 
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
 public interface QueueEngine {
 
     /**
@@ -45,4 +50,37 @@ public interface QueueEngine {
      *                  Lua에서 시각을 만들면 스크립트가 비결정적이 된다.
      */
     AdmitResult admit(String queueId, String requestId, int count, long nowMillis);
+
+    /**
+     * identifier → issuedAt. {@code queue:&#123;q&#125;:tokens} Hash 값 {@code "tokenId|issuedAt"}의 뒷조각을 읽는다.
+     *
+     * <p>🔴 <b>이것은 우회다.</b> {@code admit.lua}가 HGET으로 그 값을 이미 읽고도 tokenId만 쓰고
+     * issuedAt을 버리기 때문에 생겼다. ADMITTED Kafka 이벤트({@code EnqueueEvent})는 issuedAt이
+     * 필수인데(컨슈머의 멱등 키가 {@code UNIQUE(token_id, issued_at)}이고 파티션 키도 issued_at이다)
+     * {@code AdmitResult.AdmitRecord}에 그 값이 없다. 없는 채로 발행하면 컨슈머가 <b>같은 토큰의
+     * 두 번째 행</b>을 만든다.
+     *
+     * <p>admit.lua가 issuedAt을 records에 실어 주면 <b>이 메서드는 통째로 사라진다.</b>
+     * (admit.lua·QueueKeys·RedisQueueEngine.admit은 이번 작업의 수정 금지 대상이라 우회했다)
+     *
+     * <p>왕복은 admit 호출당 1회(HMGET)다 — 토큰당이 아니다.
+     *
+     * @return 값이 없거나 구분자가 없는 항목은 결과에서 빠진다(맵 크기 &lt; 입력 크기일 수 있다)
+     */
+    Map<String, Instant> findIssuedAt(String queueId, List<String> identifiers);
+
+    /**
+     * verify: admitToken → tokenId ({@code admit-by-admit} 조회). 없으면 빈 Optional → 호출자가 DB fallback.
+     */
+    Optional<String> findTokenIdByAdmitToken(String queueId, String admitToken);
+
+    /**
+     * complete: 대기열·admit 흔적 제거 (FRS §6.6 ②). 멱등 — 없는 키를 지워도 무해하다.
+     *
+     * <p>{@code admit-by-admit}은 TTL 말고 삭제 경로가 여기뿐이다. 지우지 않으면 완료된
+     * admitToken으로 최대 60초간 verify가 계속 통과한다.
+     *
+     * @param seq {@code admitted} ZSet 멤버가 {@code "seq|identifier"}라 필요하다
+     */
+    void cleanupCompleted(String queueId, String identifier, String tokenId, String admitToken, long seq);
 }

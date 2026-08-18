@@ -1,6 +1,8 @@
 package com.sonix.queue.domain.queue;
 
+import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 
 public interface TokenRepository {
     /**
@@ -16,4 +18,39 @@ public interface TokenRepository {
      * @param tokens 적재할 토큰들 (Consumer가 poll한 배치 단위, 보통 수백 건)
      */
     void saveAllIfAbsent(List<Token> tokens);
+
+    /**
+     * 신원 조회 — verify가 Redis 히트일 때 identifier를 얻는 경로 (FRS §6.5).
+     *
+     * <p><b>status·admitted_at 술어를 걸지 않는다.</b> Redis {@code admit-by-admit} 키가 살아 있다는
+     * 사실이 이미 "60초 안에 admit됐다"를 증명하고, DB의 {@code status}/{@code admit_token}은
+     * ADMITTED 이벤트를 컨슈머가 소비한 뒤에야 갱신되기 때문이다(§6.4 — 200이 보장하지 않는 것).
+     * 여기에 status=1을 걸면 컨슈머 랙 구간의 <b>정상 토큰이 404</b>가 된다.
+     *
+     * <p>{@code queue_id}·{@code tenant_id}는 소유권 술어라 생략 불가.
+     */
+    Optional<Token> findByTokenId(String queueId, long tenantId, String tokenId);
+
+    /**
+     * verify의 DB fallback — Redis가 키를 잃었을 때만 탄다 (FRS §6.5).
+     *
+     * <p>기준 컬럼은 {@code issued_at}이 아니라 <b>{@code admitted_at}</b>이다. issued_at은
+     * "줄을 선 시각"이라 두 시간 전일 수 있어 TTL 60초 판정에 쓸 값이 아니다(§80).
+     *
+     * @param freshSeconds admitToken TTL(60). {@code admitted_at > UTC_TIMESTAMP(3) - INTERVAL n SECOND}
+     */
+    Optional<Token> findAdmittedByAdmitToken(String queueId, long tenantId, String admitToken, int freshSeconds);
+
+    /**
+     * complete의 원자 상태 전이 (FRS §6.6). <b>탐색 키는 {@code token_id}</b>이고
+     * {@code admit_token}은 입장 자격을 증명하는 술어다.
+     *
+     * <p>{@code status IN (0, 1)}로 관대하게 잡는다 — admitToken TTL이 만료돼 WAITING으로
+     * 복귀했는데 Tenant는 이미 유저를 입장시킨 경우가 실재하고, 그때 거절하면 그 자리가
+     * 영원히 안 빠진다. 무한 소급은 {@code validWindowSeconds}가 막는다.
+     *
+     * @return 갱신된 행 수. 0이면 대상 없음(404).
+     */
+    int markCompleted(String queueId, long tenantId, String tokenId, String admitToken,
+                      LocalDateTime completedAt, int validWindowSeconds);
 }

@@ -46,6 +46,15 @@ public class TokenEntity implements Persistable<TokenEntityId> {
     @JdbcTypeCode(SqlTypes.TINYINT)
     @Column(insertable = false) Integer expiredReason;
     @Column(insertable = false, length = 50) String  admitToken;
+    /**
+     * admit 시각 (DECISIONS §80). verify·complete의 유효 창 판정 기준 컬럼이다 —
+     * {@code issued_at}("줄 선 시각")이 아니다.
+     *
+     * <p>매핑이 없어도 {@code ddl-auto: validate}는 <b>여분 DB 컬럼을 통과시킨다.</b> 그래서
+     * 지금까지 안 깨졌을 뿐이고, 매핑이 없으면 이 컬럼을 JPQL에서 참조할 수 없다.
+     * 쓰기는 ADMITTED 이벤트를 소비하는 컨슈머 UPSERT 몫이라 {@code insertable = false}다.
+     */
+    @Column(insertable = false) LocalDateTime admittedAt;
     @JdbcTypeCode(SqlTypes.TINYINT)
     @Column(insertable = false) boolean redisSyncNeeded;
 
