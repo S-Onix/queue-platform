@@ -366,6 +366,16 @@ Body: { count: N, requestId: "req_abc" }
 ⚠️ 200이 보장하는 것: "대기열에서 빠졌고 admitToken을 쥐었다" (Redis의 사실)
    보장하지 않는 것: "tokens.status가 이미 1이다" (Kafka 소비 후에 그렇게 된다)
 
+HGET 미스/레거시(구분자 없는 값): ZADD로 원래 seq에 되돌리고 그 사람은 건너뛴다.
+  되돌리지 않으면 대기열에서 빠진 채 admitToken도 못 받아 사라진다 — §80이 ②(중간 DB 확인)를
+  폐기한 이유가 그 사고다. 되돌린 사람은 admit되지 않았으므로 admitted ZSet에도 안 들어가고
+  Kafka 발행도 없다 (TTL 만료 복귀와는 다른 경로).
+
+Kafka 발행 실패: 200을 준다. Lua가 이미 커밋됐고 되돌릴 수 없다.
+  5xx를 주면 Tenant 재시도 → admit-idem이 REPLAY로 같은 답만 주고 Kafka는 여전히 안 간다.
+  미반영의 피해는 complete가 status IN (0,1)로 관대해 이미 흡수한다.
+  실패는 로그 + queue_admit_requests_total{result=error}로 남긴다.
+
 count 상한: 존재한다. 값은 실측 후 확정(임시 1,000).
   Redis는 단일 스레드라 N이 크면 스크립트 하나가 master를 수십~100ms 잡고,
   그동안 폴링을 포함한 모든 명령이 밀린다.

@@ -1202,7 +1202,7 @@ DB 먼저 이유:
 > ⛔ **`verified-token`은 §80이 폐기했다.** 위 해결책의 심장은 **"admit이 verified 토큰을
 > 제외한다"**인데, §80이 **admit에서 Redis 밖 조회를 전부 걷어냈다**(중간 DB 확인이 정상 대기자를
 > 지우기 때문 — §71 D11). 읽는 곳이 사라진 플래그는 플래그가 아니다.
-> **대체**: complete를 관대하게 만든다 — `WHERE admit_token = ? AND status IN (0, 1)` +
+> **대체**: complete를 관대하게 만든다 — `WHERE token_id = ? AND admit_token = ? AND status IN (0, 1)` +
 > `admitted_at` 유효 창. 중복 입장은 **`admit_token` 자체의 유일성**이 막는다.
 
 #### ④ 용량 초과 (maxCapacity 위반)
@@ -5422,11 +5422,12 @@ master 한 대에 몰립니다.**
 ② EVAL admit.lua                            ← 전 구간 원자. Redis 밖 호출 0회
      ZPOPMIN queue:{q}:waiting N            → (identifier, seq) N쌍
      HGET   queue:{q}:tokens identifier     → "tokenId|issuedAt"
+       └ 미스/레거시(구분자 없음)면 ZADD로 원래 seq에 되돌리고 건너뛴다
      SET    queue:{q}:admit-by-token:{tokenId}   PX 60000   ← 동적 키
      SET    queue:{q}:admit-by-admit:{admitToken} PX 60000  ← 동적 키
      ZADD   queue:{q}:admitted  {만료 epoch ms}  "seq|identifier"
      watermark 조건부 갱신 (현재값보다 클 때만, §79)
-     admit-idem:{requestId} 에 결과 payload 저장 (재시도 시 REPLAY)
+     queue:{q}:admit-idem:{requestId} 에 결과 payload 저장 (재시도 시 REPLAY)
 ③ Kafka publishAll — ADMITTED × N (key = tokenId)
 ④ 200 { admitted: [...] }
 ```
@@ -5439,7 +5440,7 @@ master 한 대에 몰립니다.**
 | 항목 | 결정 |
 |---|---|
 | verify · complete | **분리 유지** |
-| `verified-token:{tokenId}` | 🔴 **폐기.** 대신 complete를 관대하게 — `WHERE admit_token = ? AND status IN (0, 1)` + `admitted_at` 유효 창 |
+| `verified-token:{tokenId}` | 🔴 **폐기.** 대신 complete를 관대하게 — `WHERE token_id = ? AND admit_token = ? AND status IN (0, 1)` + `admitted_at` 유효 창 |
 | TTL 만료 후 verify | **404** |
 | `admit_requests` 테이블 | 🔴 **폐기** (`schema.sql`에서 삭제) |
 | TTL 만료 → WAITING 복귀 트리거 | **`queue:{q}:admitted` ZSet + claim-Lua** (score = 만료 시각) |
@@ -5538,7 +5539,7 @@ admit은 Backpressure Pull이라 Tenant가 슬롯이 빌 때만 부른다(설계
 complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출도 **어차피 정당한 토큰을
 가진 정당한 호출**이다. 거절할 근거가 없다.
 
-대신 complete를 **관대하게** 만든다: `WHERE admit_token = ? AND status IN (0, 1)`.
+대신 complete를 **관대하게** 만든다: `WHERE token_id = ? AND admit_token = ? AND status IN (0, 1)`.
 `0`을 허용하는 이유는 **TTL 만료로 WAITING에 복귀했지만 Tenant는 이미 입장시킨** 경우가 실재하기
 때문이다. `admitted_at` 유효 창으로 무한 소급은 막는다.
 
@@ -5561,6 +5562,12 @@ complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출�
 - **Redis 멱등키가 유실되면 중복 admit을 감지할 수단이 없다.** `admit_requests`의
   `UNIQUE (request_id)`가 마지막 방어선이었는데 폐기했다. Redis 전손 시 같은 `requestId`
   재시도가 두 번 실행된다 — **T1의 대가로 명시적으로 수용한다**
+- **③ Kafka 발행이 실패해도 200을 준다.** Lua는 이미 커밋됐고 되돌릴 수단이 없다. 여기서 5xx를
+  주면 Tenant가 재시도하는데, `admit-idem`이 REPLAY로 같은 답을 돌려줄 뿐 **Kafka는 여전히 안 간다** —
+  상태가 나아지지 않는 무한 반복이다. 미반영의 피해(`tokens.status`가 0에 머무름)는 complete가
+  `status IN (0, 1)`로 관대한 덕에 **이미 흡수하도록 설계돼 있다.** 실패는 로그와
+  `queue_admit_requests_total{result=error}`로 남긴다. enqueue가 발행 실패를 QE001(503)으로 돌리는
+  것과 반대인데, enqueue는 **아직 아무것도 확정되지 않은** 시점이라 거절이 성립하기 때문이다
 - **`count` 상한이 필요하다.** Redis는 단일 스레드이고 `ZPOPMIN N` + `N × (HGET + SET·SET·ZADD)`가
   한 스크립트 안에서 돈다. `N = 10,000`이면 **수십~100ms 블로킹**이고, 그동안 폴링을 포함한
   모든 명령이 대기해 **p99가 연쇄로 무너진다.** 값은 실측 후 (임시 1,000)
@@ -5570,7 +5577,12 @@ complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출�
   **지금은 만들지 않고 적어만 둔다**(과설계 방지). 관측에 잡히면 그때 판단한다
 - **`tokens` Hash의 레거시 값**(구분자 `|` 없이 `tokenId`만 저장된 항목)은 `issuedAt`을 복원할 수
   없다. `tokens` 테이블의 PK가 `(token_id, issued_at)`이라 `issuedAt` 없이는 행을 특정하지 못한다.
-  → **건너뛰고 reconciliation에 맡긴다.** admit 경로에서 추측해 만들어 넣으면 중복 행이 생긴다
+  → **원래 seq로 `ZADD` 되돌린 뒤 건너뛰고, reconciliation에 맡긴다.** admit 경로에서 추측해
+  만들어 넣으면 중복 행이 생긴다.
+  ⚠️ **되돌리지 않으면 그 사람은 대기열에서 빠진 채 admitToken도 못 받아 사라진다.**
+  이 결정이 ②(중간 DB 확인)를 폐기한 이유가 정확히 그 사고인데, 되돌리지 않으면 같은 사고를
+  다른 문에서 다시 여는 셈이다. 되돌린 사람은 admit되지 않은 것이므로 `admitted` ZSet에도
+  들어가지 않고 Kafka 발행도 없다 — TTL 만료 복귀(§36)와는 다른 경로다
 - **`queue:{q}:admitted` ZSet이 새로 생긴다** — 큐 상태 키가 4종 → 5종. `QueueKeys` 경유 필수(§70 D10),
   §75 D26의 "한 큐의 키는 같은 클러스터" 대상에 포함된다
 - **`queue-batch`가 처음으로 Redis Lua를 돌린다.** 지금은 Application 클래스뿐인 껍데기다.
