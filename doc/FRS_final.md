@@ -353,6 +353,9 @@ Body: { count: N, requestId: "req_abc" }
      HGET queue:{queueId}:tokens {identifier}   → "tokenId|issuedAt"
      SET  queue:{queueId}:admit-by-token:{tokenId}    {admitToken} PX 60000
      SET  queue:{queueId}:admit-by-admit:{admitToken} {tokenId}    PX 60000
+       → 이 두 키와 admit-idem은 KEYS[]에 선언할 수 없다(두 번째 조각이 런타임 값).
+         접두사는 Java가 만들어 ARGV로 넘기고 Lua는 prefix .. tokenId 만 한다 (§80 ⑥).
+         QueueKeys.admitByTokenPrefix(queueId) 등 — Lua 파일에 접두사 리터럴 금지.
      ZADD queue:{queueId}:admitted {만료 epoch ms} "{seq}|{identifier}"
        → TTL 만료 복귀의 claim 대상 (§80, 배치가 ZRANGEBYSCORE 0 now 로 집어낸다)
      watermark 조건부 갱신 — 현재값보다 클 때만 (§79)
@@ -376,9 +379,12 @@ Kafka 발행 실패: 200을 준다. Lua가 이미 커밋됐고 되돌릴 수 없
   미반영의 피해는 complete가 status IN (0,1)로 관대해 이미 흡수한다.
   실패는 로그 + queue_admit_requests_total{result=error}로 남긴다.
 
-count 상한: 존재한다. 값은 실측 후 확정(임시 1,000).
+count 상한: 100. @Max(100) 한 줄로 강제한다 (전용 검증 클래스 만들지 않는다).
   Redis는 단일 스레드라 N이 크면 스크립트 하나가 master를 수십~100ms 잡고,
   그동안 폴링을 포함한 모든 명령이 밀린다.
+  왜 100인가: 상한은 올리는 건 하위호환이지만 내리는 건 파괴적 변경이라, 시작값은
+  "견딜 수 있는 최대"가 아니라 "필요를 채우는 최소"여야 한다. 30만/2시간 = 평균 42/s인데
+  cap 100 × admit 10 rps = 1,000/s로 이미 24배다. 근거·상향 절차는 §80 ⑦.
 
 admitToken TTL: 60초
 만료 시: WAITING 복귀 (seq 유지 → 우선순위 보존). 트리거는 admitted ZSet claim (§36·§80)
@@ -591,6 +597,12 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 > 모든 큐 키는 `{queueId}` 해시태그를 갖는다 — 다중 키 Lua(`enqueue_bulk` 3키, `poll_verify` 3키)가
 > 같은 슬롯을 요구하기 때문이다 (DECISIONS §70 D10 · §75 D26). **로컬 Sentinel에선 위반이 안 잡힌다.**
 > 캐시성 키(`apikey:*`, `tenant:*` 등)는 `cache/RedisKeyFactory.java` 소관이다.
+>
+> **동적 키(`admit-by-token` · `admit-by-admit` · `admit-idem`)도 `QueueKeys`가 접두사까지 만든다.**
+> `admit.lua`는 이 셋을 `KEYS[]`에 선언할 수 없어(두 번째 조각이 런타임 값) **CROSSSLOT 사전 검사가
+> 아예 안 걸린다** — 선언 없는 접근은 `ERR ... non local key`이고, **슬롯이 달라도 같은 노드면 조용히
+> 성공한다**(마스터 4대 = 약 25%). 남는 방어는 `QueueKeysSlotTest`의 리플렉션 전수 단언 하나뿐이므로,
+> 접두사가 `.lua` 파일에 있으면 그 단언이 닿지 못한다 (DECISIONS §80 ⑥).
 
 **큐 상태 키 (`QueueKeys`, 구현됨)**
 
@@ -653,7 +665,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | Job | 주기 | 처리 |
 |-----|------|------|
 | `TokenExpiryJob` | 10초 | WAITING TTL 만료 → EXPIRED + Kafka 발행 |
-| `AdmitTokenExpiryJob` | 10초 | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now`) → WAITING 복귀 (seq 유지) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80) |
+| `AdmitTokenExpiryJob` | 10초 | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → WAITING 복귀 (seq 유지) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
 | `RedisSyncJob` | 5분 | redis_sync_needed=1 토큰 → Redis 재삽입 |
 | `BillingSnapshotJob` | M+2월 초 | tokens 원본 집계 → queue_daily_stats + billing_snapshots → 파티션 DROP |
 

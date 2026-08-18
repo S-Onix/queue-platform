@@ -191,6 +191,7 @@ Optional<Tenant> findByIdForUpdate(@Param("id") Long id);
 | 일별 통계 집계 (스케줄러) | ShedLock | leader election 성격 |
 | enqueue (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
 | admit (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
+| admitToken TTL 복귀 배치 (스케줄러) | **락 없음 (claim-Lua)** | `ZRANGEBYSCORE 0 now` + `ZREM`이 한 Lua = **`EVAL` 자체가 claim**. N대가 동시에 돌아도 한 대만 가져가고 나머지는 빈 배열 → 사다리 2단이 5단을 이긴다. `@Scheduled` + leader election 규칙의 **명시적 예외** (DECISIONS §80 ⑧) |
 | 파티션 DROP | 분산 락 | 관리 작업, 단일 실행 보장 |
 
 ---

@@ -160,7 +160,7 @@ flowchart TD
 
     ADMIT --> OWN["① queues 행 읽기\nTenant 소유권 검증\n※ tokens 행은 읽지 않는다"]
 
-    OWN --> LUA["② EVAL admit.lua — 전 구간 원자 (Redis 밖 호출 0회)\n\nqueue:{queueId}:admit-idem:{requestId} 있으면 → REPLAY 반환\n\nZPOPMIN queue:{queueId}:waiting N → (identifier, seq) N쌍\n  ※ ZSet 하나(§66 D2) + score가 INCR 단조증가(§70 D9) → 이미 FIFO\n  ※ 거를 대상이 없어 ZRANGE+ZREM이 ZPOPMIN 한 명령이 됐다\nHGET queue:{queueId}:tokens {identifier} → 'tokenId|issuedAt'\n  ※ 미스/레거시면 ZADD로 원래 seq에 되돌리고 건너뛴다 — 안 되돌리면 대기열에서 사라진다\nSET queue:{queueId}:admit-by-token:{tokenId} PX 60000\nSET queue:{queueId}:admit-by-admit:{admitToken} PX 60000\nZADD queue:{queueId}:admitted {만료 epoch ms} '{seq}|{identifier}'\nwatermark 조건부 갱신 (현재값보다 클 때만, §79)\nqueue:{queueId}:admit-idem:{requestId} = 결과 payload"]
+    OWN --> LUA["② EVAL admit.lua — 전 구간 원자 (Redis 밖 호출 0회)\n\nqueue:{queueId}:admit-idem:{requestId} 있으면 → REPLAY 반환\n\nZPOPMIN queue:{queueId}:waiting N → (identifier, seq) N쌍\n  ※ ZSet 하나(§66 D2) + score가 INCR 단조증가(§70 D9) → 이미 FIFO\n  ※ 거를 대상이 없어 ZRANGE+ZREM이 ZPOPMIN 한 명령이 됐다\nHGET queue:{queueId}:tokens {identifier} → 'tokenId|issuedAt'\n  ※ 미스/레거시면 ZADD로 원래 seq에 되돌리고 건너뛴다 — 안 되돌리면 대기열에서 사라진다\nSET queue:{queueId}:admit-by-token:{tokenId} PX 60000\nSET queue:{queueId}:admit-by-admit:{admitToken} PX 60000\n  ※ 이 둘과 admit-idem은 KEYS[] 선언 불가 → CROSSSLOT 검사가 안 걸린다\n  ※ 접두사는 Java(QueueKeys)가 만들어 ARGV로. Lua는 prefix .. tokenId 만 (§80)\nZADD queue:{queueId}:admitted {만료 epoch ms} '{seq}|{identifier}'\nwatermark 조건부 갱신 (현재값보다 클 때만, §79)\nqueue:{queueId}:admit-idem:{requestId} = 결과 payload"]
 
     LUA --> KAFKA["③ Kafka token-lifecycle 발행\nADMITTED × N (key=tokenId)\n→ Consumer: status 0→1, admit_token, admitted_at"]
     --> ARESP(["④ 200 OK\n{ admitted: [{tokenId, identifier, seq, admitToken}...] }\n\n보장: 대기열에서 빠졌고 admitToken을 쥐었다 (Redis 사실)\n미보장: tokens.status가 이미 1이다"])
@@ -187,7 +187,7 @@ flowchart TD
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
 
-    LUA -->|"admitToken TTL 60초 초과"| BACK["WAITING 복귀 — queue-batch (§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다"]
+    LUA -->|"admitToken TTL 60초 초과"| BACK["WAITING 복귀 — queue-batch (§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
 ```
 
 > **왜 DB WAITING 확인이 없나 (§80)**

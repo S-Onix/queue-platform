@@ -455,7 +455,12 @@ flowchart TD
 - `POST /queues/:queueId/admit` — **동기 응답.** `queues` 행 1개 읽기 → `EVAL admit.lua` → Kafka → 200
   - `admit.lua` 하나에 `ZPOPMIN` + `HGET tokens` + 토큰 키 2종 `SET`(PX 60000) + `admitted` ZADD
     + watermark 조건부 갱신 + `admit-idem` payload 저장이 전부 들어간다 (**Redis 밖 호출 0회**)
-  - `count` 상한 도입 — 값은 실측 후(임시 1,000). N이 크면 단일 스레드 master를 수십~100ms 잡는다
+  - **동적 키 3종(`admit-by-token`·`admit-by-admit`·`admit-idem`)의 접두사는 `QueueKeys`가 만들어 ARGV로 넘긴다.**
+    Lua는 `prefix .. tokenId`만. `KEYS[]` 선언이 불가능해 **CROSSSLOT 그물이 없는 첫 스크립트**라
+    `QueueKeysSlotTest`의 리플렉션 전수 단언이 **유일한 방어**다 — 접두사가 `.lua`에 있으면 안 걸린다 (§80 ⑥)
+  - **`count` 상한 = 100** (`@Max(100)` 한 줄. 전용 검증 클래스 만들지 않는다).
+    올리는 건 하위호환이지만 **내리는 건 파괴적 변경**이라 시작값은 "필요를 채우는 최소"다 —
+    30만/2h = 42/s인데 cap 100 × 10 rps = 1,000/s로 24배다 (§80 ⑦)
 - `POST /queues/:queueId/admit-tokens/:admitToken/verify` — DB Fallback 술어는 **`admitted_at`** 기준
   - **Redis·DB 쓰기 0회.** "상태 변경 없음"이 문자 그대로가 된다
 - `POST /queues/:queueId/tokens/:tokenId/complete` — **DB 권위** 조건부 UPDATE
@@ -465,6 +470,11 @@ flowchart TD
 - Kafka `ADMITTED`·`RETURNED` 이벤트 + **소비 측 전이 가드**(허용 출발 상태별 조건부 UPSERT)
 - **ADMIT_TOKEN_TTL 만료 → WAITING 복귀** — `admitted` ZSet claim-Lua, 실행 주체 **`queue-batch`**
   ← 포트폴리오 차별 포인트
+  - **ShedLock을 쓰지 않는다.** `ZRANGEBYSCORE 0 now` + `ZREM`이 한 Lua 안이면 **`EVAL` 자체가 claim**이라
+    3대가 같은 초에 돌아도 한 대만 멤버를 가져간다. `CLAUDE.md` "`@Scheduled` 단독 금지" 규칙의
+    **명시적 예외**이며 근거는 §80 ⑧ — 근거를 안 보면 리뷰에서 규칙 위반으로 지적된다
+  - **큐 목록은 DB `queues`에서 읽는다.** Cluster에서 `SCAN`은 접속한 노드만 훑어 다른 마스터의 큐가
+    **조용히 누락**되고, 복귀 안 된 토큰은 에러조차 내지 않는다
 - **`queue-batch`에 actuator + micrometer-prometheus 추가** (claim-Lua 계측. Sprint 9 reconciliation과 **같은 선행 작업**)
 - 관측 메트릭 **2개 + 조건부 1개**: `queue_admit_requests_total{queueId,result}` /
   `queue_admit_tokens_issued_total{queueId}` / (복귀 구현 시) `queue_admit_returned_to_waiting_total{queueId}`
@@ -493,13 +503,16 @@ flowchart TD
 **착수 전 검증 2건 (§80):**
 - [ ] **admit Lua의 동적 키가 Cluster에서 도는가** — 로컬 Cluster A(7001-7008)에서 실증.
       `{tokenId}`·`{admitToken}`이 런타임에 정해져 `KEYS[]` 선언이 안 된다.
-      **Sentinel로는 절대 안 잡힌다**
+      **Sentinel로는 절대 안 잡힌다.** ⚠️ **Cluster에서 통과해도 안전의 증거가 아니다** —
+      슬롯이 달라도 같은 노드면 조용히 성공한다(마스터 4대 = 약 25%, 2026-08-18 실측).
+      진짜 방어는 접두사를 `QueueKeys`가 만드는 것 + `QueueKeysSlotTest` 단언이다
 - [x] **`ALGORITHM=INSTANT`가 파티션 테이블 `ADD COLUMN`에서 되는가** — **된다. 실증 완료(2026-08-17,
       MySQL 8.0.46).** `admitted_at` 은 실 DB(master·replica)에 이미 들어가 있다.
       근거·전제는 `DECISIONS.md` §80 / `schema.sql` tokens 주석
 
-**착수 전 결정할 것 (남은 미판정):**
-- `count` 상한값 — 실측 후 (임시 1,000)
+**착수 전 결정할 것 — 남은 미판정 0건 (전부 닫힘):**
+- ~~`count` 상한값~~ → **100으로 확정** (§80 ⑦). 실측은 **올릴 근거로만** 쓰고,
+  그때는 admit 단독 지연이 아니라 **폴링 부하를 함께 건 상태의 폴링 p99 증가분**을 잰다
 - ~~"pop 성공 + admitToken SET 실패" 창~~ → **§80이 닫음** (Lua 하나 = 창 없음)
 - ~~`verified-token` 클러스터 소속~~ → **§80이 닫음** (키 폐기)
 - ~~admit 요청 전달 수단~~ → **§80이 닫음** (동기라 명령이 없다)
