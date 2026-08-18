@@ -96,10 +96,10 @@ public class RedisClusterAssigner {
                 // 판정할 노드가 하나도 없으면 사용률은 영원히 0이고, 신규 큐는 cluster1에만 쌓인다.
                 // 침묵하면 "임계에 안 닿았다"와 구분되지 않아 §75가 무성으로 죽는다.
                 //
-                // ⚠️ 가정이 아니라 이미 기록된 충돌이다. doc/ROADMAP.md의 "maxmemory 명시 설정"
-                //    항목이 "D27-3의 분모다. 0(무제한)이면 판정이 성립하지 않는다"고 적으면서
-                //    같은 문서의 maxmemory 0 권고와 충돌한다고 명시해 뒀다. 그 권고를 적용하는
-                //    순간 이 분기로 들어온다.
+                // ⚠️ 2026-08-18 실측 기준으로는 이 분기에 들어오지 않는다 — Cluster A/B 16노드가
+                //    전부 maxmemory=1gb + noeviction이다(doc/ROADMAP.md의 "maxmemory 명시 설정"
+                //    항목이 기록하던 충돌은 그래서 해소됐다). 남겨두는 이유는 새 노드를 한도 없이
+                //    추가하는 순간 판정이 조용히 무력화되기 때문이다.
                 log.warn("Redis cluster1에 maxmemory가 설정된 master가 없다. 사용률 판정이 성립하지 않아 "
                         + "신규 큐가 계속 cluster{}로만 배정된다 (DECISIONS §75 D27-3)", CLUSTER1);
             }

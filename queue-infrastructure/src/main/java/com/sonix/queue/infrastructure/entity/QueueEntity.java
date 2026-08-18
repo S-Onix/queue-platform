@@ -46,7 +46,7 @@ public class QueueEntity {
      *
      * <p><b>{@code updatable = false}인 이유:</b> {@code QueueJpaAdapter.save()}는 수정 시에도
      * {@code fromDomain()}으로 <b>새 detached 엔티티</b>를 만들어 merge한다. 이 컬럼이
-     * 수정 대상이면 큐 이름을 바꾸는 것만으로 배정 기록이 기본값(0)으로 덮여 사라진다.
+     * 수정 대상이면 큐 이름을 바꾸는 것만으로 배정 기록이 기본값(1)으로 덮여 사라진다.
      * 값은 INSERT 시점에 한 번만 정해지고(§75 D27-2: 큐는 옮기지 않는다) 이후 불변이다.
      */
     @Column(name = "redis_cluster_no", updatable = false)

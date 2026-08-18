@@ -9,5 +9,3 @@ queue:
       nodes: ${REDIS_CLUSTER1_NODES:redis-a-1:6379,redis-a-2:6379,redis-a-3:6379,redis-a-4:6379}
     cluster2:
       nodes: ${REDIS_CLUSTER2_NODES:redis-b-1:6379,redis-b-2:6379,redis-b-3:6379,redis-b-4:6379}
-
-spring:

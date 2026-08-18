@@ -11,7 +11,7 @@ spring:
 
   autoconfigure:
     exclude:
-      # queue-infrastructure의 RedisConfig가 Sentinel 연결 팩토리를 직접 만든다.
+      # queue-infrastructure의 RedisConfig가 Cluster 연결 팩토리를 직접 만든다.
       - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
       - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
 

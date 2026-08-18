@@ -200,7 +200,20 @@ public class RedisQueueEngine implements QueueEngine {
         return ownerByQueueId.size();
     }
 
-    /** 읽기 경로: 소유자를 못 찾으면 기록하지 않고 기존 동작(빈 결과)으로 떨어진다. */
+    /**
+     * 읽기 경로: 소유자를 못 찾으면 관찰 메모에 <b>기록하지 않고</b> cluster1에서 읽는다.
+     *
+     * <p><b>이 폴백의 결과는 빈 결과가 아니라 404다.</b> cluster2 소유 큐인데 프로브가 실패하면
+     * (해당 슬롯 failover 중 + 이 WAS가 그 큐를 아직 캐시 안 함) cluster1의 빈 키를 읽어
+     * {@code verifyWaiting}이 false가 되고, {@code QueueEngineService}가 이를
+     * {@code TOKEN_NOT_FOUND}(404)로 바꾼다. 클라이언트에게 404는 <b>재시도가 아니라 종료 신호</b>다.
+     * 같은 순간 캐시가 데워진 WAS는 예외를 그대로 올려 5xx를 내므로, 같은 사용자가 어느 WAS에
+     * 붙느냐로 응답이 갈린다.
+     *
+     * <p>상태가 갈라지지는 않는다 — {@code poll_verify}는 불일치 시 아무것도 쓰지 않는다.
+     * 그리고 이 분기는 <b>cluster2에 큐가 실제로 배정된 뒤에만</b> 발현한다. 동작을 바꿀지는
+     * Sprint 7 admit이 새 읽기 경로를 추가할 때 함께 결정한다.
+     */
     private StringRedisTemplate routeForRead(String queueId) {
         return route(queueId, () -> null);
     }
