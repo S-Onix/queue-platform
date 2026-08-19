@@ -55,6 +55,20 @@ public interface QueueEngine {
     Optional<String> findTokenIdByAdmitToken(String queueId, String admitToken);
 
     /**
+     * polling: tokenId → admitToken ({@code admit-by-token} 조회). 아직 admit 안 됐거나
+     * TTL(60s)이 지났으면 빈 Optional.
+     *
+     * <p><b>폴링이 이걸 봐야 하는 이유:</b> admit되면 {@code waiting} ZSet에서 빠지므로
+     * {@link #verifyWaiting}이 false가 된다. 이 조회가 없으면 <b>정상 입장자가 404</b>를 받고,
+     * 404는 클라이언트에게 재시도가 아니라 종료 신호다.
+     *
+     * <p><b>{@code admitted} ZSet이 아니라 이 키를 보는 이유:</b> 유효 창은 admitToken의 PX 60초이고
+     * {@code admitted}는 그보다 오래 남는다(배치가 지운다). 즉 여기 값이 있다는 것 자체가
+     * "지금 입장 가능"의 증명이며, 돌려줄 admitToken도 여기에만 있다.
+     */
+    Optional<String> findAdmitTokenByTokenId(String queueId, String tokenId);
+
+    /**
      * admitToken TTL이 지난 항목을 <b>집어(claim)</b> 원래 seq 그대로 WAITING으로 되돌린다
      * (FRS §10 {@code AdmitTokenExpiryJob} · §36 · §80 ⑧).
      *

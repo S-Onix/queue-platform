@@ -381,6 +381,26 @@ public class RedisQueueEngine implements QueueEngine {
                 routeForWrite(queueId).opsForValue().get(QueueKeys.admitByAdmit(queueId, admitToken)));
     }
 
+    /**
+     * 폴링 전용 역방향 조회. <b>{@code routeForRead}를 쓴다 — {@code routeForWrite}가 아니다.</b>
+     *
+     * <p>{@code findTokenIdByAdmitToken}(verify)은 Tenant 인증 뒤의 저빈도 호출이라 쓰기 폴백
+     * (DB 배정 조회)을 타도 되지만, 이 메서드는 <b>인증 없는 폴링</b> 경로다. 쓰기 폴백을 달면
+     * 임의 queueId를 섞은 요청만으로 DB 조회를 유발할 수 있다({@link #routeForWrite} 주석과 같은 이유).
+     *
+     * <p>왕복이 추가되는 것은 {@code verifyWaiting}이 false인 경우뿐이다(= admit됐거나 없는 토큰).
+     * 대기 중인 정상 폴링(최대 15만/s)은 여기에 도달하지 않는다. 소유 클러스터도 같은 요청의
+     * {@code verifyWaiting}이 이미 관찰해 뒀으므로 추가 프로브가 없다.
+     */
+    @Override
+    public Optional<String> findAdmitTokenByTokenId(String queueId, String tokenId) {
+        if (tokenId == null || tokenId.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(
+                routeForRead(queueId).opsForValue().get(QueueKeys.admitByToken(queueId, tokenId)));
+    }
+
     @Override
     public List<ExpiredAdmit> claimExpiredAdmits(String queueId, long nowMillis, int limit) {
         // ⚠️ routeForWrite 필수. 직접 템플릿을 쓰면 cluster2에 배정된 큐의 복귀가 cluster1에서 돌아

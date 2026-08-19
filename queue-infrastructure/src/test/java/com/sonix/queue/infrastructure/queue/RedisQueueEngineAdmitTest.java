@@ -136,6 +136,22 @@ class RedisQueueEngineAdmitTest {
     }
 
     @Test
+    @DisplayName("admit 직후 tokenId로 admitToken을 되찾는다 — 폴링이 404 대신 ready를 주는 근거 (U8)")
+    void findAdmitTokenByTokenId_returnsIssuedToken() {
+        seedWaiter("id-a", 1, "tok_a");
+
+        String issued = admit("req-1", 1).records().get(0).admitToken();
+
+        // admit.lua가 접두사+ARGV로 만든 키를 Java가 QueueKeys로 다시 조립해 읽는다.
+        // 두 조립이 어긋나면(단일 출처 붕괴) 정상 입장자가 전부 404가 되는데,
+        // 그 어긋남은 실제 Redis 왕복에서만 드러난다.
+        assertThat(engine.findAdmitTokenByTokenId(QUEUE_ID, "tok_a")).contains(issued);
+
+        // waiting에도 admit-by-token에도 없으면(= 존재하지 않는 토큰) 빈 Optional → 호출자가 404
+        assertThat(engine.findAdmitTokenByTokenId(QUEUE_ID, "tok_none")).isEmpty();
+    }
+
+    @Test
     @DisplayName("빈 큐에서 admit해도 멱등키는 저장된다 — 같은 requestId는 계속 0건 (버그 아님, §80)")
     void admit_emptyResultIsStillIdempotent() {
         assertThat(admit("req-1", 5).records()).isEmpty();

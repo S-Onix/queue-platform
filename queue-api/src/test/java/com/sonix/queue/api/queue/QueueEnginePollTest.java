@@ -20,6 +20,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.HashSet;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -56,9 +57,10 @@ class QueueEnginePollTest {
     }
 
     @Test
-    @DisplayName("검증 실패(대기 항목 없음 또는 tokenId 불일치)면 TOKEN_NOT_FOUND, 스냅샷 미조회")
-    void notWaiting_throws() {
+    @DisplayName("waiting에도 admit-by-token에도 없으면 TOKEN_NOT_FOUND, 스냅샷 미조회")
+    void notWaiting_andNotAdmitted_throws() {
         when(queueEngine.verifyWaiting("q1", 5000L, "tok_x", true, NOW)).thenReturn(false);
+        when(queueEngine.findAdmitTokenByTokenId("q1", "tok_x")).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.poll("q1", "tok_x", 5000L, true))
                 .isInstanceOf(BusinessException.class)
@@ -66,6 +68,36 @@ class QueueEnginePollTest {
                         .isEqualTo(ErrorCode.TOKEN_NOT_FOUND));
 
         verify(snapshotCache, never()).get(anyString());
+    }
+
+    @Test
+    @DisplayName("admit되면 waiting에서 빠지지만 404가 아니라 ready=true + admitToken이다 (U8 회귀 방지)")
+    void admitted_returnsReadyWithAdmitToken() {
+        // admit.lua의 ZPOPMIN이 waiting에서 빼갔으므로 검증은 실패한다. 여기서 404를 주면
+        // 정상 입장자가 종료 신호를 받는다 — admit 도입 전에는 없던 회귀다.
+        when(queueEngine.verifyWaiting("q1", 100L, "tok_x", false, NOW)).thenReturn(false);
+        when(queueEngine.findAdmitTokenByTokenId("q1", "tok_x")).thenReturn(Optional.of("adm_1"));
+        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(200L, 5_000L));
+
+        PollResult r = service.poll("q1", "tok_x", 100L, false);
+
+        assertThat(r.ready()).isTrue();
+        assertThat(r.admitToken()).isEqualTo("adm_1");
+    }
+
+    @Test
+    @DisplayName("TTL 만료로 WAITING 복귀한 사람은 검증을 통과한다 → 정상 대기 응답(404도 ready도 아님)")
+    void returnedAfterAdmitExpiry_pollsNormally() {
+        // 복귀 배치가 원래 seq 그대로 되돌려 놨으므로 admit-by-token은 이미 만료돼 없다.
+        when(queueEngine.verifyWaiting("q1", 100L, "tok_x", false, NOW)).thenReturn(true);
+        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(1L, 10_000L));
+
+        PollResult r = service.poll("q1", "tok_x", 100L, false);
+
+        assertThat(r.ready()).isFalse();
+        assertThat(r.admitToken()).isNull();
+        // 핫패스(최대 15만/s)에 Redis 왕복이 늘지 않는다 — 대기 중이면 두 번째 조회는 없다.
+        verify(queueEngine, never()).findAdmitTokenByTokenId(anyString(), anyString());
     }
 
     @Test

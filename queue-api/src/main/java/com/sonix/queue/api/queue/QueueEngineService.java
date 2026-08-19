@@ -231,15 +231,38 @@ public class QueueEngineService {
         return queue;
     }
 
+    /**
+     * 대기 상태 폴링 (FRS §6.3).
+     *
+     * <p><b>waiting에 없다고 곧장 404를 주지 않는다.</b> admit되면 {@code waiting} ZSet에서 빠지므로
+     * ({@code admit.lua}의 ZPOPMIN) 검증만으로는 <b>정상 입장자와 없는 토큰이 구분되지 않는다</b>.
+     * 그 둘을 {@code admit-by-token}으로 가른다 — 값이 있으면 입장권을 돌려주고, 없을 때만 404다.
+     * 404는 클라이언트에게 재시도가 아니라 <b>종료 신호</b>라 정상 입장자에게 주면 안 된다.
+     *
+     * <p><b>왜 Lua가 아니라 Java에서 한 번 더 보는가:</b>
+     * <ul>
+     *   <li>이 조회는 {@code verifyWaiting}이 <b>false일 때만</b> 실행된다 = 대기 중인 폴링
+     *       (최대 15만/s)에는 왕복이 늘지 않는다. 늘어나는 쪽은 admit된 사람과 없는 토큰뿐이다.</li>
+     *   <li>{@code poll_verify.lua}에 넣으려면 admitToken을 실어 보내야 해서 반환이
+     *       {@code Long} → 배열로 바뀐다. 핫패스 이득 0에 파급만 크다.</li>
+     *   <li>{@code admit-by-token}은 tokenId가 런타임 값이라 {@code KEYS[]} 선언이 불가능하다.
+     *       Lua에서 접두사+ARGV로 만들면 <b>슬롯이 달라도 같은 노드면 조용히 통과</b>하는 구멍이
+     *       생기지만(§80 ⑥), 평범한 {@code GET}은 Lettuce가 슬롯으로 정확히 라우팅한다.</li>
+     * </ul>
+     *
+     * <p>⚠️ <b>TTL 만료로 복귀한 사람은 이 분기에 오지 않는다.</b> 복귀 배치가 원래 seq 그대로
+     * {@code waiting}에 되돌려 놓으므로 {@code verifyWaiting}이 통과한다 — 정상 대기 응답이다.
+     */
     public PollResult poll(String queueId, String tokenId, long seq, boolean keepalive){
-        boolean ready = false;
-        String admitToken = null;
-
         // 존재(seq)만이 아니라 소유권(tokenId)까지 검증한다. seq는 큐별 INCR이라 추측이 자명해서,
         // 존재 판정만 하면 남의 대기 항목에 ka=1로 keepalive를 걸 수 있다.
         // keepalive 갱신도 이 호출 안에서 원자적으로 처리된다(poll_verify.lua).
+        String admitToken = null;
         if(!queueEngine.verifyWaiting(queueId, seq, tokenId, keepalive, clock.millis())) {
-            throw new BusinessException(ErrorCode.TOKEN_NOT_FOUND);
+            // admitted ZSet이 아니라 admit-by-token을 본다. 유효 창은 admitToken의 PX 60초인데
+            // admitted는 복귀 배치가 집어갈 때까지 더 오래 남고, 돌려줄 admitToken도 여기에만 있다.
+            admitToken = queueEngine.findAdmitTokenByTokenId(queueId, tokenId)
+                    .orElseThrow(() -> new BusinessException(ErrorCode.TOKEN_NOT_FOUND));
         }
 
         QueueSnapshot snap = snapshotCache.get(queueId);
@@ -247,7 +270,7 @@ public class QueueEngineService {
         long rank = (snap.frontSeq() < 0) ? 0 : Math.max(0, seq-snap.frontSeq());
         int next = nextPollAfterSec(rank);
 
-        return new PollResult(ready, admitToken, snap.frontSeq(), snap.total(), next);
+        return new PollResult(admitToken != null, admitToken, snap.frontSeq(), snap.total(), next);
     }
 
     /**
