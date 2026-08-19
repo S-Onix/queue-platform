@@ -99,15 +99,30 @@ public class ApiKeyAuthenticationFilter extends OncePerRequestFilter {
     }
 
     /**
-     * 엔진 계열 경로에서만 이 필터를 적용한다.
-     * enqueue: POST /api/v1/queues/{queueId}/tokens
-     * (이후 admit/verify/complete 추가 시 이 조건을 확장)
+     * <b>Tenant가 X-API-Key로 부르는 경로에만</b> 이 필터를 적용한다.
+     *
+     * <p>화이트리스트라 <b>새 엔드포인트를 추가하고 여기를 잊으면 조용히 401</b>이 된다.
+     * 실제로 그렇게 됐다 — §80이 admit·verify·complete 컨트롤러를 추가했으나 이 조건이
+     * enqueue 하나에 머물러, FRS가 X-API-Key로 명세한 세 경로가 <b>전부 401</b>이었다.
+     * (JWT Bearer로는 통과해서 테스트가 잡지 못했다.) 컨트롤러의 {@code @*Mapping}을
+     * 전수로 세어 대조할 것.
+     *
+     * <p>🪤 <b>인증 주체가 경로마다 다르다.</b> 아래 둘은 이 필터를 <b>타지 않아야</b> 한다.
+     * <ul>
+     *   <li>{@code GET /{queueId}/tokens/{tokenId}} — 폴링. <b>유저가 직접</b> 부르고 API Key가 없다</li>
+     *   <li>{@code GET /{queueId}/status} — 공용 전광판. {@code permitAll}이다</li>
+     * </ul>
+     * 그래서 {@code /tokens/{tokenId}/complete}와 {@code /tokens/{tokenId}}를 구분해야 한다 —
+     * 정규식이 뭉개지면 <b>폴링이 401</b>이 된다.
      */
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
         String uri = request.getRequestURI();
-        // /api/v1/queues/{queueId}/tokens 형태만 통과
-        boolean isEnqueuePath = uri.matches("/api/v1/queues/[^/]+/tokens");
-        return !isEnqueuePath;
+        boolean isTenantEnginePath =
+                   uri.matches("/api/v1/queues/[^/]+/tokens")                       // enqueue
+                || uri.matches("/api/v1/queues/[^/]+/admit")                        // admit
+                || uri.matches("/api/v1/queues/[^/]+/admit-tokens/[^/]+/verify")    // verify
+                || uri.matches("/api/v1/queues/[^/]+/tokens/[^/]+/complete");       // complete
+        return !isTenantEnginePath;
     }
 }
