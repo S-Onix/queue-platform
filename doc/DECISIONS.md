@@ -5651,10 +5651,26 @@ ShedLock이 필요한 잡은 **원자 claim이 불가능한 것들**이다 — �
   재시도가 두 번 실행된다 — **T1의 대가로 명시적으로 수용한다**
 - **③ Kafka 발행이 실패해도 200을 준다.** Lua는 이미 커밋됐고 되돌릴 수단이 없다. 여기서 5xx를
   주면 Tenant가 재시도하는데, `admit-idem`이 REPLAY로 같은 답을 돌려줄 뿐 **Kafka는 여전히 안 간다** —
-  상태가 나아지지 않는 무한 반복이다. 미반영의 피해(`tokens.status`가 0에 머무름)는 complete가
-  `status IN (0, 1)`로 관대한 덕에 **이미 흡수하도록 설계돼 있다.** 실패는 로그와
+  상태가 나아지지 않는 무한 반복이다. 실패는 로그와
   `queue_admit_requests_total{result=error}`로 남긴다. enqueue가 발행 실패를 QE001(503)으로 돌리는
   것과 반대인데, enqueue는 **아직 아무것도 확정되지 않은** 시점이라 거절이 성립하기 때문이다
+
+  > 🔴 **정정 (2026-08-19).** 이 항목은 원래 *"미반영의 피해는 complete가 `status IN (0, 1)`로
+  > 관대한 덕에 이미 흡수하도록 설계돼 있다"*고 적었다. **거짓이다.** complete의 술어에는
+  > `admitted_at > UTC_TIMESTAMP(3) - INTERVAL {유효 창} SECOND`가 함께 있고, **`admitted_at`을
+  > 채우는 유일한 경로가 바로 그 실패한 `ADMITTED` 이벤트**다. 값이 NULL이면 `NULL > x`가 NULL이라
+  > 행이 제외되므로 `status IN (0, 1)`의 관대함은 여기 닿지 못한다.
+  >
+  > **수용하는 대가**: `ADMITTED` 발행이 실패한 토큰은 admit 200을 받았고(사용자는 입장했고),
+  > verify는 60초간 통과하지만(Redis 히트 경로는 `admitted_at`을 보지 않는다),
+  > **complete는 영구히 404다.** `tokens.status`는 0에 남고 그 자리는 회수되지 않는다.
+  >
+  > 같은 뿌리의 두 번째 창이 있다 — **`ADMITTED` 소비 전(컨슈머 랙 · replica 랙)에도 complete가
+  > 404**다. verify는 `readOnly = true`라 replica를 읽어 랙이 한 겹 더 얹힌다.
+  >
+  > 발행은 동기 `ack=all` + `enable.idempotence`라 실패율이 낮고, 실패해도 200을 주는 쪽이
+  > 무한 재시도보다 낫다는 판단은 유지한다. **다만 "흡수된다"는 근거는 철회한다.**
+  > 실제 발생률은 통합테스트에서 관측한다
 - **`count` 상한이 필요하다.** Redis는 단일 스레드이고 `ZPOPMIN N` + `N × (HGET + SET·SET·ZADD)`가
   한 스크립트 안에서 돈다. `N = 10,000`이면 **수십~100ms 블로킹**이고, 그동안 폴링을 포함한
   모든 명령이 대기해 **p99가 연쇄로 무너진다.** **상한은 100**이다(⑦). 올릴 때 재야 하는 것은
