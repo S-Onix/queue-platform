@@ -3,25 +3,22 @@ package com.sonix.queue.api.queue;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.EnqueueEventPublisher;
+import com.sonix.queue.domain.queue.PacingTier;
+import com.sonix.queue.domain.queue.QueueBoard;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
-import com.sonix.queue.domain.queue.QueueSnapshot;
 import com.sonix.queue.domain.queue.TokenRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.HashSet;
 import java.util.Optional;
-import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -31,11 +28,20 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * QueueEngineService.poll() 단위 테스트 (Mockito, Spring/Redis 없음).
+ * {@code QueueEngineService}의 폴링 두 경로 단위 테스트 (Mockito, Spring/Redis 없음).
  *
- * <p>Redis 어댑터(검증+keepalive)·스냅샷캐시·시계를 모두 목킹하여 poll의 조립 로직만 검증:
- * 검증 실패 404 분기, keepalive ka 위임, nextPollAfterSec 등급, PollResult 조립.
- * tokenId 대조 자체는 Lua 안에서 일어나므로 PollRedisAdapterIntegrationTest가 담당한다.
+ * <p>§79로 <b>엔드포인트가 둘로 갈렸다</b>. 여기서 보는 것도 둘이다:
+ * <ul>
+ *   <li>{@code status()} — 전원 동일 응답. 큐 실재 판정(404)과 위임뿐이다</li>
+ *   <li>{@code poll()} — 개인화 응답. 검증 실패 시의 <b>404 대 ready 분기</b>가 전부다</li>
+ * </ul>
+ *
+ * <p><b>사라진 테스트와 그 이유:</b> {@code nextPollAfterSec_tiers}(등급·지터)와
+ * {@code emptySnapshotEdge}({@code frontSeq=-1})는 서버가 더 이상 rank도 간격도 계산하지 않아
+ * 검증 대상 자체가 없다. 그 불변식은 SDK로 이관됐고 <b>SDK에는 아직 테스트 인프라가 없다</b> —
+ * §79 Consequences가 "비용을 모르고 옮기면 안 된다"고 적은 바로 그 지점이다.
+ *
+ * <p>tokenId 대조 자체는 Lua 안에서 일어나므로 {@code PollRedisAdapterIntegrationTest}가 담당한다.
  */
 @ExtendWith(MockitoExtension.class)
 class QueueEnginePollTest {
@@ -44,7 +50,6 @@ class QueueEnginePollTest {
     @Mock private TokenRepository tokenRepository;
     @Mock private QueueEngine queueEngine;
     @Mock private EnqueueEventPublisher eventPublisher;
-    @Mock private QueueSnapshotCache snapshotCache;
 
     private static final long NOW = 1_700_000_000_000L;
     private final Clock clock = Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC);
@@ -53,11 +58,42 @@ class QueueEnginePollTest {
 
     @BeforeEach
     void setUp() {
-        service = new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher, snapshotCache, clock);
+        service = new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher, clock);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // status() — 큐 전광판
+    // ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("status: 전광판 값을 그대로 돌려준다. rank도 폴링 간격도 계산하지 않는다")
+    void status_returnsBoardAsIs() {
+        QueueBoard board = new QueueBoard(47L, PacingTier.DEFAULT);
+        when(queueEngine.readStatus("q1")).thenReturn(Optional.of(board));
+
+        assertThat(service.status("q1")).isSameAs(board);
     }
 
     @Test
-    @DisplayName("waiting에도 admit-by-token에도 없으면 TOKEN_NOT_FOUND, 스냅샷 미조회")
+    @DisplayName("status: 미지 queueId는 404 QUEUE_NOT_FOUND — DB는 한 줄도 읽지 않는다")
+    void status_unknownQueue_throwsWithoutDb() {
+        when(queueEngine.readStatus("q_ghost")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.status("q_ghost"))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(e -> assertThat(((BusinessException) e).getErrorCode())
+                        .isEqualTo(ErrorCode.QUEUE_NOT_FOUND));
+
+        // 인증 없는 경로다(§79). 큐 존재 확인을 DB로 하면 임의 문자열만으로 MySQL을 때울 수 있다.
+        verify(queueRepository, never()).findByQueueId(anyString());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // poll() — 개인 상태
+    // ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("waiting에도 admit-by-token에도 없으면 TOKEN_NOT_FOUND")
     void notWaiting_andNotAdmitted_throws() {
         when(queueEngine.verifyWaiting("q1", 5000L, "tok_x", true, NOW)).thenReturn(false);
         when(queueEngine.findAdmitTokenByTokenId("q1", "tok_x")).thenReturn(Optional.empty());
@@ -66,8 +102,6 @@ class QueueEnginePollTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(e -> assertThat(((BusinessException) e).getErrorCode())
                         .isEqualTo(ErrorCode.TOKEN_NOT_FOUND));
-
-        verify(snapshotCache, never()).get(anyString());
     }
 
     @Test
@@ -77,7 +111,6 @@ class QueueEnginePollTest {
         // 정상 입장자가 종료 신호를 받는다 — admit 도입 전에는 없던 회귀다.
         when(queueEngine.verifyWaiting("q1", 100L, "tok_x", false, NOW)).thenReturn(false);
         when(queueEngine.findAdmitTokenByTokenId("q1", "tok_x")).thenReturn(Optional.of("adm_1"));
-        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(200L, 5_000L));
 
         PollResult r = service.poll("q1", "tok_x", 100L, false);
 
@@ -90,7 +123,6 @@ class QueueEnginePollTest {
     void returnedAfterAdmitExpiry_pollsNormally() {
         // 복귀 배치가 원래 seq 그대로 되돌려 놨으므로 admit-by-token은 이미 만료돼 없다.
         when(queueEngine.verifyWaiting("q1", 100L, "tok_x", false, NOW)).thenReturn(true);
-        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(1L, 10_000L));
 
         PollResult r = service.poll("q1", "tok_x", 100L, false);
 
@@ -101,68 +133,34 @@ class QueueEnginePollTest {
     }
 
     @Test
-    @DisplayName("ka=false면 keepalive=false로 위임, frontSeq/total은 스냅샷값·ready=false")
-    void waiting_noKeepalive() {
+    @DisplayName("대기 중 폴링은 Redis 왕복이 verifyWaiting 1회뿐이다 — 전광판을 다시 읽지 않는다")
+    void waiting_doesNotReadBoard() {
         when(queueEngine.verifyWaiting("q1", 100L, "tok_x", false, NOW)).thenReturn(true);
-        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(1L, 10_000L));
 
         PollResult r = service.poll("q1", "tok_x", 100L, false);
 
         assertThat(r.ready()).isFalse();
-        assertThat(r.admitToken()).isNull();
-        assertThat(r.frontSeq()).isEqualTo(1L);
-        assertThat(r.total()).isEqualTo(10_000L);
-        verify(queueEngine).verifyWaiting("q1", 100L, "tok_x", false, NOW);
+        // §79 분할의 핵심. 개인 응답에 공유값(frontSeq/total/간격)을 실으면 EVAL이 다시 늘어난다.
+        verify(queueEngine, never()).readStatus(anyString());
     }
 
     @Test
     @DisplayName("ka=true면 tokenId·now(clock)와 함께 keepalive=true로 위임")
     void waiting_keepalive() {
         when(queueEngine.verifyWaiting("q1", 100L, "tok_x", true, NOW)).thenReturn(true);
-        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(1L, 10_000L));
 
         service.poll("q1", "tok_x", 100L, true);
 
         verify(queueEngine).verifyWaiting("q1", 100L, "tok_x", true, NOW);
     }
 
-    @DisplayName("nextPollAfterSec: rank 구간별 등급 + 지터는 등급 하한 위로만 (base ~ base+max(1,base/4))")
-    @ParameterizedTest(name = "seq={0}, frontSeq={1} → {2}~{3}s")
-    @CsvSource({
-            "10,    1,  2,  3",     // rank 9     → ≤50    → 2  (+0~1)
-            "600,   1,  5,  6",     // rank 599   → ≤1000  → 5  (+0~1)
-            "3001,  1,  10, 12",    // rank 3000  → ≤5000  → 10 (+0~2)
-            "8001,  1,  15, 18",    // rank 8000  → ≤10000 → 15 (+0~3)
-            "20001, 1,  20, 25"     // rank 20000 → else   → 20 (+0~5)
-    })
-    void nextPollAfterSec_tiers(long seq, long frontSeq, int min, int max) {
-        when(queueEngine.verifyWaiting("q1", seq, "tok_x", false, NOW)).thenReturn(true);
-        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(frontSeq, 100_000L));
-
-        // 지터가 있으므로 단발 호출로는 하한 위반을 못 잡는다. 반복해서 구간 전체를 본다.
-        Set<Integer> seen = new HashSet<>();
-        for (int i = 0; i < 300; i++) {
-            seen.add(service.poll("q1", "tok_x", seq, false).nextPollAfterSec());
-        }
-
-        assertThat(seen).allSatisfy(v -> assertThat(v).isBetween(min, max));
-        assertThat(seen).hasSizeGreaterThan(1);   // 지터가 실제로 흩어지는가 (전부 같은 값이면 몰림 그대로)
-
-        // 구간의 양 끝이 실제로 나오는가. 상한을 안 보면 nextInt의 +1이 빠져 상한이 영영
-        // 안 나와도(폭이 1 좁아져도) 위 두 assert는 그대로 통과한다.
-        // 300회면 폭이 가장 넓은 20s 등급(6종)에서도 한쪽 끝을 못 볼 확률이 (5/6)^300 ≈ 1e-24.
-        assertThat(seen).contains(min, max);
-    }
-
     @Test
-    @DisplayName("frontSeq=-1(빈 스냅샷) 엣지 → rank 0으로 처리 → 2~3s")
-    void emptySnapshotEdge() {
-        when(queueEngine.verifyWaiting("q1", 5000L, "tok_x", false, NOW)).thenReturn(true);
-        when(snapshotCache.get("q1")).thenReturn(new QueueSnapshot(-1L, 0L));
+    @DisplayName("ka=false면 keepalive=false로 그대로 위임한다")
+    void waiting_noKeepalive() {
+        when(queueEngine.verifyWaiting("q1", 100L, "tok_x", false, NOW)).thenReturn(true);
 
-        PollResult r = service.poll("q1", "tok_x", 5000L, false);
+        service.poll("q1", "tok_x", 100L, false);
 
-        assertThat(r.nextPollAfterSec()).isBetween(2, 3);   // rank=0 → ≤50 → 2 (+지터)
-        assertThat(r.frontSeq()).isEqualTo(-1L);
+        verify(queueEngine).verifyWaiting("q1", 100L, "tok_x", false, NOW);
     }
 }

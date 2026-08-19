@@ -2,7 +2,7 @@ package com.sonix.queue.infrastructure.queue;
 
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
-import com.sonix.queue.domain.queue.QueueSnapshot;
+import com.sonix.queue.domain.queue.QueueBoard;
 import com.sonix.queue.infrastructure.repository.QueueJpaRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -82,6 +82,7 @@ class RedisQueueEngineRoutingTest {
                         QueueKeys.waiting(queueId), QueueKeys.seq(queueId),
                         QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId),
                         QueueKeys.admitted(queueId), QueueKeys.admitWatermark(queueId),
+                        QueueKeys.pacing(queueId),
                         QueueKeys.admitIdem(queueId, "req-1"),
                         QueueKeys.admitByToken(queueId, "tok_1")));
             }
@@ -97,17 +98,17 @@ class RedisQueueEngineRoutingTest {
 
     @Test
     @DisplayName("읽기: cluster2에만 있는 큐를 팬아웃으로 찾아낸다 (cluster1만 보면 빈 결과가 났을 것)")
-    void readSnapshot_findsQueueOnCluster2() {
+    void readStatus_findsQueueOnCluster2() {
         seedOnCluster2(ON_CLUSTER2);
+        cluster2.opsForValue().set(QueueKeys.admitWatermark(ON_CLUSTER2), "7");
         RedisQueueEngine engine = engine();
 
-        // cluster1에는 이 큐가 없다 — 라우팅이 없으면 여기서 total=0이 나온다.
-        assertThat(cluster1.hasKey(QueueKeys.waiting(ON_CLUSTER2))).isFalse();
+        // cluster1에는 이 큐가 없다 — 라우팅이 없으면 여기서 빈 결과(404)가 나온다.
+        assertThat(cluster1.hasKey(QueueKeys.seq(ON_CLUSTER2))).isFalse();
 
-        QueueSnapshot snap = engine.readSnapshot(ON_CLUSTER2);
+        QueueBoard board = engine.readStatus(ON_CLUSTER2).orElseThrow();
 
-        assertThat(snap.total()).isEqualTo(1L);
-        assertThat(snap.frontSeq()).isEqualTo(1L);
+        assertThat(board.lastAdmittedSeq()).isEqualTo(7L);
         // 읽기 경로는 DB를 절대 건드리지 않는다 — 인증 없는 폴링(최대 15만/s)의 증폭 경로가 된다.
         verifyNoInteractions(queueJpaRepository);
     }
@@ -183,7 +184,7 @@ class RedisQueueEngineRoutingTest {
         RedisQueueEngine engine = engine();
 
         // 존재하지 않는 큐: 읽기는 빈 결과, 쓰기는 cluster1로 떨어지되 둘 다 기억하지 않는다.
-        assertThat(engine.readSnapshot(NOT_A_QUEUE).total()).isZero();
+        assertThat(engine.readStatus(NOT_A_QUEUE)).isEmpty();
         assertThat(engine.ownerCacheSize()).isZero();
 
         engine.executeBulkLua(NOT_A_QUEUE,
@@ -210,14 +211,14 @@ class RedisQueueEngineRoutingTest {
 
     @Test
     @DisplayName("읽기: cluster1 프로브가 예외를 던져도 cluster2 소유 큐는 정상 조회된다")
-    void readSnapshot_survivesCluster1Failure() {
+    void readStatus_survivesCluster1Failure() {
         seedOnCluster2(ON_CLUSTER2);
+        cluster2.opsForValue().set(QueueKeys.admitWatermark(ON_CLUSTER2), "7");
         RedisQueueEngine engine = engineWithDeadCluster1();
 
-        QueueSnapshot snap = engine.readSnapshot(ON_CLUSTER2);
+        QueueBoard board = engine.readStatus(ON_CLUSTER2).orElseThrow();
 
-        assertThat(snap.total()).isEqualTo(1L);
-        assertThat(snap.frontSeq()).isEqualTo(1L);
+        assertThat(board.lastAdmittedSeq()).isEqualTo(7L);
     }
 
     @Test
@@ -242,7 +243,7 @@ class RedisQueueEngineRoutingTest {
         // cluster1은 예외, cluster2에는 없는 큐 → 아무도 소유를 증명하지 못했다.
         // 읽기 폴백 대상이 그 죽은 cluster1이라 호출 자체는 실패한다(장애가 드러나는 게 맞다).
         // 여기서 보는 것은 그 실패가 아니라 '맵에 무엇이 남았는가'다.
-        catchThrowable(() -> engine.readSnapshot(NOT_A_QUEUE));
+        catchThrowable(() -> engine.readStatus(NOT_A_QUEUE));
 
         assertThat(engine.ownerCacheSize())
                 .as("모름을 기록하면 cluster1이 회복돼도 틀린 라우팅이 고착된다")
@@ -256,13 +257,13 @@ class RedisQueueEngineRoutingTest {
         RedisQueueEngine engine = engine();
 
         assertThat(engine.ownerCacheSize()).isZero();
-        engine.readSnapshot(ON_CLUSTER2);
+        engine.readStatus(ON_CLUSTER2);
         assertThat(engine.ownerCacheSize()).isEqualTo(1);
 
         // 소유 클러스터에서 큐를 통째로 지워도 캐시는 유지된다 — 큐는 옮기지 않으므로(D27-2)
         // 이 값은 불변이고, 무효화 로직이 없다는 사실을 여기서 못박는다.
         cleanupQueue(cluster2, ON_CLUSTER2);
-        engine.readSnapshot(ON_CLUSTER2);
+        engine.readStatus(ON_CLUSTER2);
         assertThat(engine.ownerCacheSize()).isEqualTo(1);
     }
 

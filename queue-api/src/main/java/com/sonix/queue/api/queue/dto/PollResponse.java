@@ -3,35 +3,26 @@ package com.sonix.queue.api.queue.dto;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.sonix.queue.api.queue.PollResult;
 
+/**
+ * 개인 상태 응답 (FRS §6.3 ②). 차례 근처 + keepalive(30~60초 1회)에만 호출된다.
+ *
+ * <p>대기 중이면 {@code {"ready": false}}, admit됐으면 {@code {"ready": true, "admitToken": "..."}}.
+ * 순번·대기 인원·다음 폴링 간격은 여기 없다 — 전원 동일값이라 {@code /status}로 갔다 (§79).
+ */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public final class PollResponse {
-    private final boolean ready;          // 입장 준비(admitToken 발급). Admit 전엔 항상 false
+    private final boolean ready;          // 입장 준비(admitToken 발급)
     private final String  admitToken;     // ready=true일 때만, else null
-    private final long    frontSeq;       // 큐 맨앞 seq (스냅샷) → SDK가 rank=mySeq-frontSeq
-    private final long    total;          // 대기 인원 (스냅샷)
-    // 서버가 등급(내부 rank)에 지터까지 얹어 확정한 값이다. SDK는 그대로 지킨다.
-    // SDK가 여기에 다시 ±지터를 걸면 안 된다 — 서버는 등급 하한 위로만 흩는데(Rate Limit
-    // refill과 맞물려 있어서), 클라이언트가 아래로 흩으면 그 하한이 깨진다.
-    private final int     nextPollAfterSec;
 
-
-    private PollResponse(boolean ready, String admitToken, long frontSeq,
-                         long total, int nextPollAfterSec) {
+    private PollResponse(boolean ready, String admitToken) {
         this.ready = ready;
         this.admitToken = admitToken;
-        this.frontSeq = frontSeq;
-        this.total = total;
-        this.nextPollAfterSec = nextPollAfterSec;
     }
 
     public static PollResponse from(PollResult result) {
-        return new PollResponse(
-                result.ready(), result.admitToken(), result.frontSeq(), result.total(), result.nextPollAfterSec());
+        return new PollResponse(result.ready(), result.admitToken());
     }
 
     public boolean isReady()          { return ready; }
     public String  getAdmitToken()    { return admitToken; }
-    public long    getFrontSeq()      { return frontSeq; }
-    public long    getTotal()         { return total; }
-    public int     getNextPollAfterSec() { return nextPollAfterSec; }
 }

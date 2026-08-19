@@ -53,9 +53,15 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /**
      * 폴링 버킷 회복 속도.
      *
-     * <p>0.5/s였을 때 {@code nextPollAfterSec} 최소값 2초와 소비 속도가 정확히 같아,
-     * 앞줄(rank≤50) 사용자는 여유가 0이었다. 시계 오차나 재시도 한 번이 곧바로 429가 됐다.
+     * <p>0.5/s였을 때 pacing 최저 구간 2초와 소비 속도가 정확히 같아, 앞줄(rank≤50) 사용자는
+     * 여유가 0이었다. 시계 오차나 재시도 한 번이 곧바로 429가 됐다.
      * 1.0/s면 2초 간격 폴링이 토큰 1개를 쓰고 2개를 회복해 버킷이 늘 차 있다.
+     *
+     * <p>⚠️ <b>이 한도는 pacing 최저 구간(2초)과 클라이언트 지터에 매여 있다</b> (§79).
+     * 지터가 아래로도 흩어지면 실효 간격이 2초 밑으로 내려간다 — {@code /status}는 이 필터를
+     * 지나가지 않으므로 여기서 소비되는 것은 개인 엔드포인트 호출뿐이고, 그래서 -20%(1.6초)까지는
+     * 0.625/s로 여유가 남는다. 다만 <b>지터 규약 자체가 §79 안에서 갈린다</b>
+     * ({@code QueueStatusResponse} 참조) — pacing 하한이나 지터 폭을 바꿀 때 이 값을 같이 봐라.
      */
     private static final double POLL_REFILL_PER_SEC = 1.0;
 

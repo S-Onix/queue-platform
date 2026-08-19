@@ -38,7 +38,7 @@
 |---|---|---|
 | §38 | FLOW 개선 (`nextPollAfterSec` 적응형) | ✏️ |
 | §74 | 폴링 소유권 검증 — `poll_verify.lua` 원자 1회 (→8) | ✅ |
-| §79 | 폴링 응답 계약 — `admitWatermark` + `pacing`, 엔드포인트 2분할 | 🚧 |
+| §79 | 폴링 응답 계약 — `admitWatermark` + `pacing`, 엔드포인트 2분할 | ✅ |
 
 **3. Admit · Verify · Complete**
 
@@ -4996,7 +4996,7 @@ Platform 직접으로 분리돼 있었습니다. **없는 문제를 풀려던 �
 > **폐기**했다. 그래서 "pop 성공 + 토큰 SET 실패" 창도 사라졌다(Lua 하나).
 > **watermark 조건부 갱신·🔴 표시 전용 가드레일·A/B/C 판정·404 계약은 그대로 유효하다.**
 
-**결정일**: 2026-08-14. **설계 확정, 구현 미착수.** §74(폴링 소유권 검증)가 만든 폴링 경로의
+**결정일**: 2026-08-14. **구현 완료 (2026-08-19).** §74(폴링 소유권 검증)가 만든 폴링 경로의
 **응답 계약**을 바꾼다. Admit(Sprint 7) 착수 전에 닫아야 하는 결정이다 — watermark를 갱신하는
 주체가 admit이고, JS SDK가 이 계약 위에 올라가기 때문이다.
 
@@ -5399,8 +5399,18 @@ master 한 대에 몰립니다.**
 - **§71** (Redis 유실 복구) — watermark는 캐시가 아니라 원본이므로 복구 대상이다
 - **§75 D27** — 이 절이 초판에서 정했던 **큐 → 클러스터 라우팅을 §75로 되돌렸다**(D2).
   폴링 경로(`/status`·개인)가 DB 행을 안 읽는다는 사실은 §75에 남겼다
-- 후속: `QueueSnapshotCache` 제거(도메인 포트 시그니처 변경 + **위 테스트 4건 재작성**),
-  `ErrorCode` 신규 추가(404 계약), ETA(`estimatedWaitSeconds`) 거처,
+- ~~후속: `QueueSnapshotCache` 제거(도메인 포트 시그니처 변경 + 위 테스트 4건 재작성)~~ **완료(2026-08-19)** —
+  Caffeine 의존성도 함께 제거됐다(유일한 사용처였다). `QueueSnapshot` → `QueueBoard`,
+  `readSnapshot` → `readStatus`(`Optional`, 미지 큐는 빈 값)
+- 🔴 **후속(미해결): `ErrorCode` 신규 추가(404 계약).** ErrorCode만 추가해서는 **아무도 던질 수 없다** —
+  복귀 대기자는 `admitted` ZSet에 있는데 멤버가 `"seq|identifier"`라 조회에 `identifier`가 필요하고,
+  `seq → identifier` 역방향은 `waiting` ZSet을 통해서만 되는데 그 사람은 거기서 빠져 있다.
+  즉 **판정 수단부터 없다.** 자료구조 변경이 함께 필요하며 이 절이 정하지 않은 사항이다
+- 🔴 **후속(미해결): 지터 규약이 이 절 안에서 갈린다.** 본문 "간격 = pacing 표 조회 + **±20% 지터**"(대칭)와
+  Consequences "지터는 **등급 하한 위로만**"(비대칭, `base ~ base+max(1,base/4)`)은 양립하지 않는다.
+  삭제된 서버 구현(`nextPollAfterSec`)은 비대칭이었다. **서버가 간격을 계산하지 않게 된 지금
+  어느 쪽도 서버 코드로 강제할 수 없다** — SDK 착수 전에 결론이 필요하다
+- 후속: ETA(`estimatedWaitSeconds`) 거처,
   pacing `rank<=0` 구간(관측 후), ~~admit 전 구간 원자성~~ · ~~`verified-token` 클러스터 소속~~
   (**둘 다 §80이 닫음** — Lua 하나 / 키 폐기),
   **CDN 도입 시 `Cache-Control max-age` 값 결정**(Sprint 11 — D1이 지금은 안 붙이기로 한 것)

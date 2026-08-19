@@ -1,6 +1,8 @@
 package com.sonix.queue.infrastructure.queue;
 
 import com.sonix.queue.domain.queue.AdmitResult;
+import com.sonix.queue.domain.queue.PacingTier;
+import com.sonix.queue.domain.queue.QueueBoard;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -43,6 +45,7 @@ class RedisQueueEngineAdmitTest {
     @AfterEach
     void cleanUp() {
         List<String> keys = new ArrayList<>(List.of(WAITING, TOKENS, ADMITTED, WATERMARK,
+                QueueKeys.seq(QUEUE_ID),
                 QueueKeys.admitIdem(QUEUE_ID, "req-1"),
                 QueueKeys.admitIdem(QUEUE_ID, "req-2"),
                 QueueKeys.admitByToken(QUEUE_ID, "tok_a"),
@@ -96,6 +99,30 @@ class RedisQueueEngineAdmitTest {
         assertThat(redis.opsForValue().get(WATERMARK)).isEqualTo("2");
 
         assertThat(redis.opsForZSet().range(WAITING, 0, -1)).containsExactly("id-c");
+    }
+
+    @Test
+    @DisplayName("admit이 올린 watermark를 readStatus가 읽는다 — 쓰는 쪽과 읽는 쪽이 실제로 이어지는가 (§79)")
+    void readStatus_reflectsWatermarkRaisedByAdmit() {
+        // admit.lua가 KEYS[4]에 쓰기만 하고 읽는 코드가 0건이던 구간을 닫는 테스트다.
+        // 키 이름이 어긋나면(해시태그 누락 등) 여기서만 드러난다 — 쓰기 단언은 여전히 통과한다.
+        redis.opsForValue().set(QueueKeys.seq(QUEUE_ID), "3");
+        seedWaiter("id-a", 1, "tok_a");
+        seedWaiter("id-b", 2, "tok_b");
+        seedWaiter("id-c", 3, "tok_c");
+
+        // admit 전: 아무도 입장 안 했으므로 0이 맞는 값이다(콜드 스타트 폴백이 없는 이유).
+        assertThat(engine.readStatus(QUEUE_ID)).get()
+                .extracting(QueueBoard::lastAdmittedSeq).isEqualTo(0L);
+
+        admit("req-1", 2);
+
+        assertThat(engine.readStatus(QUEUE_ID)).get()
+                .extracting(QueueBoard::lastAdmittedSeq).isEqualTo(2L);
+
+        // pacing 키가 없으므로 코드 상수 사다리가 그대로 나온다 (§79 — 큐 대부분이 이 경로).
+        assertThat(engine.readStatus(QUEUE_ID)).get()
+                .extracting(QueueBoard::pacing).isEqualTo(PacingTier.DEFAULT);
     }
 
     @Test

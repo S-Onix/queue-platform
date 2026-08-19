@@ -54,8 +54,8 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 ### [증상] 폴링이 429(RL001)를 계속 뱉는다
 
 - **먼저 의심할 것**: **같은 tokenId를 여러 곳이 동시에 폴링하고 있다**(탭 3개 이상, 또는 SDK가
-  `nextPollAfterSec`를 무시하고 자체 주기로 도는 것).
-  refill 1.0/s에 최소 폴링 간격 2초(`QueueEngineService.java:106`, rank ≤ 50)라 정상 클라이언트
+  `/status`의 `pacing` 표를 무시하고 자체 주기로 도는 것).
+  refill 1.0/s에 `pacing` 최저 구간 2초(`PacingTier.DEFAULT`, rank ≤ 50)라 정상 클라이언트
   하나는 **초당 0.5건을 쓰고 1.0건을 회복**한다 — 버킷이 cap 5에 붙어 있는 게 정상이다.
   손익분기는 **초당 1.0건 = 같은 토큰으로 탭 2개**이고, 탭 3개(1.5/s)면 full에서 10초 뒤 429다.
 
@@ -71,11 +71,19 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
   **`tokens` 값이 1.0 미만이면 그 토큰은 지금 거부 상태.** 0에 붙어 있으면 지속 초과다.
 - **정상 범위**: `tokens` ≥ 1.0, 정상 폴링 중이면 대개 cap 5에 붙어 있다. 429 비율은 **기준선 수집 필요** — **SDK가 붙은 실사용 3일치 429 비율을 재고, 그 값이 1%를 넘으면 한도 설계 자체를 재검토**해야 한다.
 - **원인별 분기**:
-  - 다수 tokenId가 동시에 429 → 여유가 0이던 옛 구조와 달리 지금은 **한도 설계가 아닌 다른 원인**을 먼저 봐라. SDK 배포판이 `nextPollAfterSec`를 안 지키거나, 재시도 루프가 백오프 없이 도는 경우다.
-  - 소수 tokenId만 429 → 그 클라이언트가 `nextPollAfterSec`를 무시하고 있다. SDK/브라우저 확인. 탭 3개 이상도 여기 해당한다.
+  - 다수 tokenId가 동시에 429 → 여유가 0이던 옛 구조와 달리 지금은 **한도 설계가 아닌 다른 원인**을 먼저 봐라. SDK 배포판이 `pacing`을 안 지키거나, 재시도 루프가 백오프 없이 도는 경우다.
+  - **`queue:{q}:pacing` 오버라이드를 방금 바꿨는가?** 최저 구간을 2초 밑으로 내리면 그 큐의 대기자 전원이 이 한도를 때린다. `redis-cli get "queue:{q}:pacing"` 으로 확인하고 되돌린다(`DEL` = 코드 기본 사다리).
+  - 위와 함께 **그 큐가 admit 정체 중**이라면 → 전원이 `rank<=0`이 되어 개인 엔드포인트로 몰린 것이다. Tenant가 admitToken을 소비하지 못하면 §79 분할의 이득이 통째로 사라지고 트래픽이 전량 `EVAL`로 되돌아간다. 근본 원인은 Rate Limit이 아니라 admit 정체다.
+  - 소수 tokenId만 429 → 그 클라이언트가 `pacing`을 무시하고 있다. SDK/브라우저 확인. 탭 3개 이상도 여기 해당한다.
   - 429인데 `rl:poll:token:*` 키가 없다 → 폴링 경로가 아니라 다른 경로의 429다. 응답 본문 `error` 확인(`RL001` vs `Q005` 정원 초과).
 - **조치**:
-  - **런타임 조정 불가.** capacity 5 / refill 1.0은 `RateLimitFilter.java:51,60`(`POLL_CAPACITY`, `POLL_REFILL_PER_SEC`)에 하드코딩돼 있다.
+  - **한도 자체는 런타임 조정 불가.** capacity 5 / refill 1.0은 `RateLimitFilter`(`POLL_CAPACITY`, `POLL_REFILL_PER_SEC`)에 하드코딩돼 있다.
+  - **대신 반대편을 늘릴 수 있다** — `queue:{q}:pacing`으로 폴링 간격을 늘리면 소비 속도가 줄어 429가 사라진다. 재배포가 필요 없는 유일한 레버다:
+    ```bash
+    redis-cli -p 6379 set 'queue:{q_xxx}:pacing' '50:4,1000:10,5000:20,10000:30,*:40'
+    # 되돌리기: redis-cli -p 6379 del 'queue:{q_xxx}:pacing'
+    ```
+    ⚠️ 형식이 깨지면 **조용히** 기본 사다리로 돌아간다(핫패스라 로그가 없다). `/status` 응답으로 반영을 확인할 것.
   - 개별 사용자 구제가 필요하면 그 버킷만 지운다(즉시 5개 토큰 회복):
     ```bash
     redis-cli -p 6379 del "rl:poll:token:tok_019..."

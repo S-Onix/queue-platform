@@ -17,9 +17,10 @@ alias RW='redis-cli -p 6379'    # 쓰기/설정
 
 ---
 
-## 1. 특정 사용자 폴링이 왜 404인가 (3단계, 30초)
+## 1. 특정 사용자 폴링이 왜 404인가 (4단계, 30초)
 
-`poll_verify.lua`가 0을 반환하는 경로는 셋뿐이다. 순서대로 재현한다.
+`poll_verify.lua`가 0을 반환하는 경로는 셋인데, **셋 중 어느 것이든 404가 아닐 수 있다** —
+admit되면 `waiting`에서 빠지므로 검증은 실패하지만 응답은 `ready:true`다. ④를 반드시 같이 본다.
 
 ```bash
 # ① seq에 해당하는 멤버가 있는가
@@ -30,30 +31,43 @@ VAL=$(RR hget "queue:{$Q}:tokens" "$ID"); echo "stored=[$VAL]"
 
 # ③ tokenId가 일치하는가
 echo "expect=${VAL%%|*}  actual=$TOK"
+
+# ④ admit된 사람인가 (①~③이 전부 실패해도 여기 값이 있으면 404가 아니다)
+RW get "queue:{$Q}:admit-by-token:$TOK"
+RW zscore "queue:{$Q}:admitted" "$SEQ|$ID"
 ```
 
 | 단계 | 빈 값/불일치일 때 |
 |---|---|
-| ① 비었다 | 그 seq의 대기 항목이 없다. 큐 전체가 비었는지 `zcard`로 확인 → 0이면 **Redis 유실** ([`queries/kafka-persistence.md` §4](kafka-persistence.md)) |
+| ① 비었다 | 그 seq의 대기 항목이 없다. **④를 먼저 보라.** ④도 비었고 큐 전체가 비었으면(`zcard` 0) **Redis 유실** ([`queries/kafka-persistence.md` §4](kafka-persistence.md)) |
 | ② 비었다 | ZSet엔 있는데 Hash엔 없다 → **Lua 계약 파손. 에스컬레이션** (정상 경로에서는 발생 불가) |
 | ③ 불일치 | 남의 seq를 조회한 것. **정상 거절이다** |
+| ④ `admit-by-token`에 값이 있다 | **404가 아니라 `ready:true`가 나가야 정상이다.** 404가 나왔다면 회귀다 |
+| ④ `admit-by-token`은 비었는데 `admitted`에 score가 있다 | **admitToken TTL 만료 → WAITING 복귀 대기 중.** 복귀 배치가 아직 안 집었다. 지금은 이것도 `TK001`이라 SDK가 종료해버린다 (§79 404 계약 — ErrorCode 미분리, **미해결**) |
 
 ---
 
-## 2. 큐 스냅샷 (사용자가 보는 값의 원본)
+## 2. 큐 전광판 (사용자가 보는 값의 원본)
 
 ```bash
-RR zrange "queue:{$Q}:waiting" 0 0 WITHSCORES    # frontSeq (맨 앞 순번)
-RR zcard  "queue:{$Q}:waiting"                   # total
+RW get "queue:{$Q}:admit-watermark"    # lastAdmittedSeq. 없으면 0 (아무도 입장 안 함)
+RW get "queue:{$Q}:pacing"             # 오버라이드. 없는 것이 정상 — 코드 기본 사다리가 쓰인다
+RW exists "queue:{$Q}:seq"             # 0이면 /status가 404 (§79 D3 — 큐 실재 판정)
+
+# 서버가 실제로 내려주는 값
+curl -s "http://localhost:8080/api/v1/queues/$Q/status" | jq .data
 ```
-응답의 `rank`는 서버가 `seq - frontSeq`로 계산하고, 클라이언트에 내려가는 값은
-**최대 2초 묵은 Caffeine 캐시**(`QueueSnapshotCache`, `expireAfterWrite 2s`, **WAS-local**)다.
+`rank`는 **서버가 계산하지 않는다.** 클라이언트가 `mySeq − lastAdmittedSeq`로 구하고
+`pacing` 표에서 간격을 고른다. 응답은 **30만 명 전원 동일**하며 WAS-local 캐시는 없다(§79 D1).
 
 | 관찰 | 판정 |
 |---|---|
-| `frontSeq`가 30초 뒤에도 동일 | **정상.** admit 미구현 → `ZREM` 0건 → 맨 앞은 절대 안 빠진다 |
-| WAS별로 `total`이 다르다 | **정상.** 캐시가 WAS-local이라 최대 N종류의 값이 동시에 존재한다 |
-| `total`이 감소했다 | 비정상. 누군가 `ZREM`/`DEL`을 실행했다는 뜻 |
+| `admit-watermark`가 30초 뒤에도 동일 | Tenant가 그 사이 admit을 안 불렀다. **Platform 문제가 아니다** |
+| `admit-watermark`가 **감소**했다 | **비정상.** `admit.lua`는 현재값보다 클 때만 쓴다 — 수동 `SET`이나 계약 파손 |
+| 사용자마다 값이 미세하게 다르다 | **정상.** WAS마다 읽은 시점이 다르다. SDK가 `max()`로 clamp한다 |
+| 순번이 실제보다 많이 남아 보인다 | **정상이고 의도된 것.** watermark는 취소·만료로 빠진 사람을 못 뺀다(항상 상한) |
+| `pacing` 키가 없다 | **정상.** 평상시 큐 대부분이 이렇다 |
+| `pacing` 키가 있는데 응답이 기본 사다리다 | **형식 오류.** 조용히 폴백한다(15만/s 경로라 로그를 못 남긴다). `상한:초` CSV + 마지막 `*:초` |
 
 ---
 
@@ -90,31 +104,54 @@ RR --bigkeys -i 0.1     # -i 로 슬립을 넣어 부하를 낮춘다. master �
 
 ---
 
-## 4. Redis 부하 — 폴링 1건 = master 왕복 2회
+## 4. Redis 부하 — 개인 폴링 1건 = master 왕복 2회 / `/status` 1건 = 읽기 1회
 
 ```bash
-RW info commandstats | grep -E 'cmdstat_(evalsha|zrangebyscore|zadd|hget|hmset)'
+RW info commandstats | grep -E 'cmdstat_(evalsha|mget|zrangebyscore|zadd|hget|hmset)'
 RW info stats | grep instantaneous_ops_per_sec
 RW slowlog get 10
 ```
 
 | 관찰 | 판정 |
 |---|---|
-| `evalsha calls` 증가율 ≈ 폴링 RPS × 2 | 구조상 정상 (token-bucket 1회 + poll_verify 1회) |
-| `evalsha calls` >> 폴링 RPS × 2 | 클라이언트가 `nextPollAfterSec`(등급 2/5/10/15/20 + 지터 → 실제 2~25초)를 무시 |
+| `evalsha calls` 증가율 ≈ **개인 엔드포인트** RPS × 2 | 구조상 정상 (token-bucket 1회 + poll_verify 1회) |
+| `evalsha calls` >> 개인 엔드포인트 RPS × 2 | 클라이언트가 `pacing`(기본 2/5/10/15/20초 + 클라이언트 지터)을 무시 |
+| `mget calls` 증가율 ≈ `/status` RPS | 구조상 정상 (3키 1왕복) |
+| `mget calls` 폭증 | `/status`는 **인증도 Rate Limit도 없다**(§79). 앱에서 막을 수단이 없으니 CDN·WAF로 간다 |
 | `evalsha usec_per_call` | **기준선 수집 필요.** 평상시 폴링 3일치 p50/p95를 재고 p95×3을 경고선으로 |
 | `slowlog` 신규 항목 | 0건/시간이 정상 |
 
 > `poll_verify.lua`는 `ka=1`일 때 `ZADD`를 하므로 **쓰기다. replica로 뺄 수 없다.**
 > `token-bucket.lua`도 `HMSET`+`EXPIRE`라 쓰기다. 둘 다 master 부하로 직행한다.
+> **`/status`의 `MGET`만이 순수 읽기**이며, §79가 엔드포인트를 쪼갠 이유가 이것이다 —
+> 평상시 트래픽을 `EVAL`(master 고정)에서 빼냈다. 다만 replica로 실제로 보내려면
+> `ReadFrom` 설정이 따로 필요하다(**미적용**).
+
+### 4-1. 부하 급증 시 유일한 런타임 레버 — `pacing`
+
+```bash
+# 전원 폴링 간격 2배. 재배포도 SDK 갱신도 필요 없다
+RW set "queue:{$Q}:pacing" '50:4,1000:10,5000:20,10000:30,*:40'
+curl -s "http://localhost:8080/api/v1/queues/$Q/status" | jq .data.pacing   # 반영 확인 필수
+RW del "queue:{$Q}:pacing"       # 되돌리기 = 코드 기본 사다리
+```
+**형식**: `상한:간격초` CSV, **마지막은 반드시 `*:초`**(그 이상 전부).
+깨지면 조용히 기본 사다리로 폴백하므로 **반드시 응답으로 확인**할 것.
+⚠️ 최저 구간을 2초 밑으로 내리지 마라 — 개인 엔드포인트 Rate Limit(cap 5, refill 1.0/s)과 맞물려 있다.
 
 ---
 
 ## 5. HTTP 측 지표 (PromQL)
 
 ```promql
-# 폴링 RPS
+# 개인 엔드포인트 RPS
 sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens/{tokenId}"}[1m]))
+
+# /status RPS — 평상시 폴링의 대부분이 여기다. 용량 산정은 반드시 둘을 더한다
+sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/status"}[1m]))
+
+# /status 404 (미지 queueId) — 인증 없는 경로의 유일한 앱 측 flood 신호
+sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/status",status="404"}[5m]))
 
 # 404 비율 (TK001)
 sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens/{tokenId}",status="404"}[5m]))
@@ -127,7 +164,8 @@ histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{u
 
 | 지표 | 정상 | 이상 |
 |---|---|---|
-| 404 비율 | < 0.05 | > 0.50 → 랜덤 tokenId 공격 의심 ([`runbook/rate-limit.md`](../runbook/rate-limit.md)) |
+| 404 비율(개인) | < 0.05 | > 0.50 → 랜덤 tokenId 공격 의심 ([`runbook/rate-limit.md`](../runbook/rate-limit.md)). **단, Tenant가 admitToken을 못 쓰는 사고 중에는 정상 대기자의 복귀 대기 404가 섞인다** (§1 ④) |
+| `/status` 404 비율 | < 0.01 | 급증 = 미지 queueId 스캔. Redis 1왕복에서 끝나 DB는 안전하지만 **앱 측 제한이 없다** → CDN·WAF |
 | p99 | **기준선 수집 필요.** 폴링 단독 부하 실측이 없다. 실사용 3일치 p99를 재라 (`doc/ROADMAP.md`의 "p99 < 50ms"는 **목표치이지 실측이 아니다**) | |
 
 **429는 `uri` 라벨이 `UNKNOWN`으로 집계될 가능성이 높다** — RateLimitFilter가 DispatcherServlet 전에 응답을 끝내 URI 패턴이 확정되지 않는다. 429를 셀 때는 `uri` 없이 `status="429"`만 쓰라. (**실측 확인 필요 — 라벨 값을 한 번 눈으로 볼 것.**)

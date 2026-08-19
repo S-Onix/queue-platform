@@ -267,7 +267,7 @@ Response 200:
    UUIDv7이면 이 경로가 죽는다.
 ```
 
-### 6.3 Polling — 엔드포인트 2분할 (DECISIONS §79. 설계 확정, 구현 미착수)
+### 6.3 Polling — 엔드포인트 2분할 (DECISIONS §79. **구현 완료** — 404 ErrorCode 분리만 미해결)
 
 **① 큐 전광판 — 30만 명 전원 동일 응답. 캐시 가능**
 
@@ -275,24 +275,41 @@ Response 200:
 GET /api/v1/queues/:queueId/status
 인증: 없음 (permitAll)   Rate Limit: 없음   ← 아래 "가드레일" 참조
 
-처리: 키 2개 MGET (같은 해시태그 → 1왕복)
+처리: 키 3개 MGET (같은 해시태그 → 1왕복)
   queue:{queueId}:admit-watermark   없으면 0
-  queue:{queueId}:pacing            없으면 코드 상수 기본값
+  queue:{queueId}:pacing            없으면 코드 상수 기본값(PacingTier.DEFAULT)
+  queue:{queueId}:seq               큐 실재 판정 (§79 D3)
+
+  seq 없음 AND admit-watermark 없음 → 404 Q001. DB로 내려가지 않는다.
+  대가: enqueue가 0건인 실존 큐는 404다(대기 페이지는 enqueue 이후에 서빙되므로 실사용 경로가 아니다).
 
 Response:
 { "lastAdmittedSeq": 47,
   "pacing": [[50,2],[1000,5],[5000,10],[10000,15],[null,20]] }
 
 pacing = [[rank 상한, 폴링 간격 초], ...]. 마지막 항의 상한 null = 그 이상 전부.
-기본값은 코드 상수(QueueEngineService)와 같다. Redis 키가 있으면 그 값이 이긴다.
+기본값은 코드 상수(PacingTier.DEFAULT)다. Redis 키가 있으면 그 값이 이긴다.
+
+Redis 오버라이드 값 형식 (사고 중에 사람이 redis-cli로 직접 치는 운영 레버라 CSV):
+  "50:2,1000:5,5000:10,10000:15,*:20"      상한:간격초 CSV, 마지막은 반드시 *:초
+  형식이 깨지면 조용히 기본 사다리로 폴백한다 — 폴링 핫패스(최대 15만/s)라 로그를 남기지 않는다.
+  바꾼 뒤에는 반드시 /status 응답으로 반영을 확인할 것.
 ```
 
 ```
 SDK 계산 (서버는 rank를 계산하지 않는다):
-  rank  = mySeq − lastAdmittedSeq          ← 뺄셈 1회
-  간격  = pacing 표 조회 + ±20% 지터
+  wm    = max(직전 wm, lastAdmittedSeq)    ← 단조 clamp. 세션 어피니티가 없어 값이 작아질 수 있다
+  rank  = max(0, mySeq − wm)               ← 뺄셈 1회
+  간격  = pacing 표 조회 + 지터             ← ⚠️ 지터 규약 미확정. 아래 참조
   rank <= 0 → 그때만 ② 개인 엔드포인트로 admitToken 확인
 ```
+
+> 🔴 **지터 규약이 §79 안에서 갈린다 (미해결 — SDK 착수 전 결론 필요).**
+> §79 본문은 `±20% 지터`(대칭)라고 적었는데, 같은 절의 Consequences는 SDK로 이관되는 불변식을
+> **"지터는 등급 하한 위로만"**(비대칭, `base ~ base+max(1,base/4)`)이라고 적었다. 대칭이면 실효
+> 간격이 등급 하한 아래로 내려간다. 삭제된 서버 구현(`nextPollAfterSec`)은 **비대칭**이었다.
+> 지금은 서버가 간격을 계산하지 않으므로 **어느 쪽이든 서버 코드로 강제할 수단이 없다** —
+> 이 값을 지키는 유일한 장치가 SDK인데 SDK에는 테스트 인프라가 없다.
 
 **② 개인 상태 — 차례 근처 + keepalive(30~60초 1회)에만 호출**
 
@@ -302,39 +319,53 @@ GET /api/v1/queues/:queueId/tokens/:tokenId?seq={seq}&ka={0|1}
 Rate Limit: tokenId 기준 Token Bucket — cap 5 / refill 1.0 per sec
 
 처리: poll_verify.lua 1회 (ZRANGEBYSCORE + HGET 대조 + ka=1이면 ZADD last-active)
+      검증 실패 시에만 GET queue:{queueId}:admit-by-token:{tokenId}  ← 추가 왕복은 이 경우뿐이다
+        값이 있으면  → ready:true + admitToken  (admit되면 waiting에서 빠지므로 필수. 없으면 정상 입장자가 404)
+        값이 없으면  → 404 TK001
 
 Response (아직 대기):     { "ready": false }
-Response (ADMIT_ISSUED):  { "ready": true, "admitToken": "at_abc123" }
+Response (ADMIT_ISSUED):  { "ready": true, "admitToken": "adm_..." }
+
+⚠️ 대기 중인 폴링(최대 15만/s)은 그 추가 왕복에 도달하지 않는다 — verifyWaiting이 통과하기 때문.
 ```
 
 **404 계약 — SDK는 HTTP 상태가 아니라 `errorCode`로 재시도를 결정한다**
 
 | 상황 | errorCode | SDK 동작 |
 |---|---|---|
+| admit됐다 (`waiting`엔 없지만 `admit-by-token`에 있다) | — (200) | `ready:true` + `admitToken` |
 | 취소·만료로 토큰이 진짜 사라짐 | `TK001` (기존 `TOKEN_NOT_FOUND`) | **종료** |
-| admitToken TTL 만료 → WAITING 복귀 대기 중 (배치 반영 전) | **신규 ErrorCode (후속)** | **백오프 후 재시도** |
+| admitToken TTL 만료 → WAITING 복귀 대기 중 (배치 반영 전) | **신규 ErrorCode (미구현)** | **백오프 후 재시도** |
 
-> ⚠️ 현재 `ErrorCode`에는 `TOKEN_NOT_FOUND` 하나뿐이라 두 상황이 뭉개진다.
-> ErrorCode 추가는 **후속 작업**이며, 이 표는 그 전까지의 계약 정의다.
+> 🔴 **미해결.** 현재 `ErrorCode`에는 `TOKEN_NOT_FOUND` 하나뿐이라 아래 두 줄이 뭉개진다.
+> **판정 수단이 없는 것이 원인이다** — 복귀 대기 중인 사람은 `admitted` ZSet에 남아 있는데,
+> 그 멤버가 `"seq|identifier"` 형식이라 조회하려면 `identifier`가 필요하고, `seq → identifier`
+> 역방향 조회는 `waiting` ZSet을 통해서만 가능한데 그 사람은 거기서 빠져 있다.
+> 즉 **ErrorCode만 추가해서는 아무도 던질 수 없다.** 자료구조 변경이 함께 필요하며,
+> 그것은 §79가 정하지 않은 사항이라 별도 결정 대상이다.
+>
+> **깨지는 것**: Tenant가 admitToken을 대량으로 소비하지 못하는 사고 중, TTL 만료 ~ 복귀 배치
+> 실행 사이(≈ 배치 주기)의 코호트 전체가 `TK001`을 받고 SDK가 일제히 종료한다.
 
-**가드레일 — `/status`에 `permitAll`만 추가하면 "인증 0 + 제한 0"이 된다**
+**가드레일 — `/status`는 "인증 0 + 제한 0"이다. 모르고 그런 것이 아니라 알고 그렇게 뒀다**
 
 `RateLimitFilter`는 미등록 public 경로를 **무조건 통과**시킨다(인증 필요 경로는 SecurityConfig가
-401로 막는다는 전제). `/status`는 인증도 없으므로 필터를 그냥 지나간다.
-→ 방어는 두 가지다.
-① **CDN·WAS 캐시 키에서 쿼리스트링을 제외**한다. `?x=랜덤` cache-buster가 죽고,
-   **유효한 queueId 1개당** 오리진 부하가 `1 ÷ 캐시 TTL`로 고정된다.
-② **미지 queueId는 맵 선적재로 막는다.** 경로 자체(`/queues/{임의}/status`)가 cache-buster라
-   ①만으로는 안 막힌다 — 매번 새 캐시 키다. 큐→클러스터 매핑은 **불변**이므로(DECISIONS §75 D27-2)
-   **맵을 통째로 선적재하고, 맵에 없으면 그대로 404**로 끝낸다. DB 조회도, negative 캐시 엔트리도
-   만들지 않는다(엔트리를 만들면 미지 ID마다 메모리가 는다).
-   ⚠️ **맵은 주기적으로 통째 리로드한다.** 큐는 런타임에 생성되므로 부팅 시 선적재한 맵에는
-   그 이후 만들어진 정상 큐가 없다 → 그대로 두면 **새 큐의 `/status`가 WAS 재기동 전까지 404**다.
-   매핑이 불변이라 값 충돌이 없어 통째 교체가 안전하고, 런타임에 생성된 큐가 그때 들어온다.
-   **미스는 DB로 내려보내지 않는다.** **리로드 주기는 미정** — 큐 생성 후 `/status`가
-   열리기까지의 지연이 그 값이다.
+401로 막는다는 전제). `/status`는 `isPollPath` 정규식(`/queues/*/tokens/*`)에도 안 걸리므로
+필터를 그냥 지나간다.
 
-**Rate Limit은 걸지 않는다** (30만 명이 한 버킷을 공유하면 남용자 1명이 정상 대기자 전원을 429시킨다).
+- **막아야 할 것은 "인증 없는 요청이 MySQL을 때우는 증폭"이고, 그건 위 D3이 끝낸다.**
+  미지 `queueId`는 `MGET`에 포함된 `queue:{q}:seq`가 비어 있어 **Redis 1왕복 안에서 404**다.
+  남는 비용은 값싼 404 하나뿐이고, 그건 `/status` 고유 문제가 아니라 모든 공개 엔드포인트에
+  공통인 L7 flood이라 **CDN·WAF 소관**이다.
+- **큐 단위 Rate Limit은 오히려 해롭다.** 30만 명이 한 버킷을 공유하므로 남용자 1명이 정상
+  대기자 **전원을 429**시킨다 — 429는 부하 제어가 아니라 사용자 대기 실패다.
+- **CDN 도입 시(Sprint 11) 캐시 키에서 쿼리스트링을 제외**한다. `?x=랜덤` cache-buster가 죽고
+  유효한 queueId 1개당 오리진 부하가 `1 ÷ max-age`로 고정된다. 지금은 CDN이 없어
+  `Cache-Control`도 붙이지 않는다(§79 D1).
+
+> ✏️ 초판의 "맵 선적재 + 주기 리로드"는 **§79 D2·D3이 폐기**했다. 큐→클러스터 매핑의 거처는
+> §75 D27-1(`queues` 테이블)이 이미 정했고, 미지 큐 판정은 `seq` 키 하나로 끝난다 —
+> 맵 리로드 주기 미정값도, "새 큐가 리로드 전까지 404"라는 최악의 타이밍 문제도 함께 사라졌다.
 
 ### 6.4 Admit → ADMIT_ISSUED
 
