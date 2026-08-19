@@ -5662,11 +5662,14 @@ ShedLock이 필요한 잡은 **원자 claim이 불가능한 것들**이다 — �
   > 행이 제외되므로 `status IN (0, 1)`의 관대함은 여기 닿지 못한다.
   >
   > **수용하는 대가**: `ADMITTED` 발행이 실패한 토큰은 admit 200을 받았고(사용자는 입장했고),
-  > verify는 60초간 통과하지만(Redis 히트 경로는 `admitted_at`을 보지 않는다),
+  > verify는 60초간 통과하지만(Redis 히트 경로는 `admitted_at`을 보지 않고, `admit-by-admit`
+  > 값이 `"tokenId|identifier"`라 DB를 아예 읽지 않는다 — §6.5),
   > **complete는 영구히 404다.** `tokens.status`는 0에 남고 그 자리는 회수되지 않는다.
   >
   > 같은 뿌리의 두 번째 창이 있다 — **`ADMITTED` 소비 전(컨슈머 랙 · replica 랙)에도 complete가
-  > 404**다. verify는 `readOnly = true`라 replica를 읽어 랙이 한 겹 더 얹힌다.
+  > 404**다. complete는 `tokens` 행이 있어야 하고 그 행은 컨슈머가 만든다.
+  > (verify는 §6.5 변경으로 Redis 히트 시 DB를 아예 읽지 않아 **이 창을 타지 않는다.**
+  > Redis가 키를 잃었을 때의 DB fallback만 `readOnly = true`로 replica 랙에 걸린다.)
   >
   > 발행은 동기 `ack=all` + `enable.idempotence`라 실패율이 낮고, 실패해도 200을 주는 쪽이
   > 무한 재시도보다 낫다는 판단은 유지한다. **다만 "흡수된다"는 근거는 철회한다.**
