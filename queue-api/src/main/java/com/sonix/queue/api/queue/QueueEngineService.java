@@ -11,6 +11,8 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 
 @Slf4j
@@ -127,9 +129,23 @@ public class QueueEngineService {
      * ({@code IF(status = 0, ...)})가 이미 status 1이라 이 값을 <b>쓰지 않으므로</b> 무해하고,
      * 첫 발행이 실패한 경우에만 반영되는데 그때는 이 값이 가진 유일한 근거다.
      * 재시도가 늦은 만큼 유효 창(60초)이 뒤로 밀린다.
+     *
+     * <p>🔴 <b>첫 발행 실패에서 끊는다.</b> 발행은 건별 {@code .get(12초)} 블로킹이라, 브로커가
+     * 무응답이면 {@code count=100}짜리 admit 한 건이 <b>최대 20분</b> 동안 요청 스레드를 잡는다.
+     * 첫 건이 시한을 다 쓰고 실패했다면 나머지 99건도 같은 브로커를 기다릴 뿐이다.
+     *
+     * <p>⚠️ <b>건너뛴 분은 자동으로 복구되지 않는다.</b> admit은 발행이 실패해도 200을 주므로
+     * Tenant에게 재시도할 이유가 없다 — "복구는 REPLAY"는 Tenant가 <b>마침</b> 같은 requestId로
+     * 다시 불렀을 때만 성립하는 <b>가능성</b>이지 경로가 아니다. 그래서 건너뛴 건수와 첫
+     * tokenId를 ERROR로 남긴다(그 로그가 유일한 흔적이다).
+     *
+     * <p>병렬 발행으로는 이 최악을 못 고친다. 메타데이터가 없으면 {@code send()} 자체가
+     * 블로킹이라 스레드만 늘고 벽시계는 그대로다.
      */
     private void publishAdmitted(long tenantId, String queueId, AdmitResult result, Instant admittedAt) {
-        for (AdmitResult.AdmitRecord record : result.records()) {
+        List<AdmitResult.AdmitRecord> records = result.records();
+        for (int i = 0; i < records.size(); i++) {
+            AdmitResult.AdmitRecord record = records.get(i);
             if (record.issuedAt() == null) {
                 // issuedAt이 없으면 발행할 수 없다. 컨슈머의 멱등 키가 (token_id, issued_at)이라
                 // 아무 값이나 넣으면 같은 토큰의 두 번째 행이 생긴다 — 조용히 틀리느니 빼고 남긴다.
@@ -138,9 +154,14 @@ public class QueueEngineService {
                         record.tokenId(), queueId, record.identifier());
                 continue;
             }
-            publishQuietly(new EnqueueEvent(TokenEventType.ADMITTED.name(), record.tokenId(), queueId,
-                    tenantId, record.identifier(), record.seq(), record.issuedAt(),
-                    record.admitToken(), admittedAt));
+            boolean published = publishQuietly(new EnqueueEvent(TokenEventType.ADMITTED.name(),
+                    record.tokenId(), queueId, tenantId, record.identifier(), record.seq(),
+                    record.issuedAt(), record.admitToken(), admittedAt));
+            if (!published) {
+                log.error("ADMITTED 발행 중단 queueId={} 건너뜀={}건 첫tokenId={}",
+                        queueId, records.size() - i, record.tokenId());
+                break;
+            }
         }
     }
 
@@ -157,9 +178,19 @@ public class QueueEngineService {
         // Redis 히트 = "60초 안에 admit됐다"가 이미 증명된 것(키의 PX가 그 증명이다).
         // 그래서 신원만 읽는다. 여기에 status=1을 걸면 ADMITTED 이벤트를 아직 소비하지 않은
         // 구간의 정상 토큰이 404가 된다 (§6.4 — 200이 보장하지 않는 것).
-        Token token = queueEngine.findTokenIdByAdmitToken(queueId, admitToken)
+        Optional<AdmitRef> ref = queueEngine.findAdmitRefByAdmitToken(queueId, admitToken);
+
+        // 값에 identifier가 들어 있으면 **DB를 읽지 않는다**. tokenId만 얻고 신원을 DB에서 찾던
+        // 예전 경로는, 컨슈머 백로그로 행이 아직 없는 정상 토큰을 404로 만들었다.
+        Optional<String> fromRedis = ref.map(AdmitRef::identifier).filter(id -> !id.isBlank());
+        if (fromRedis.isPresent()) {
+            return fromRedis.get();
+        }
+
+        // 구 포맷(tokenId만)이거나 Redis 미스 → 기존 DB 경로. 후자의 기준 컬럼은
+        // issued_at이 아니라 admitted_at이다.
+        Token token = ref.map(AdmitRef::tokenId)
                 .flatMap(tokenId -> tokenRepository.findByTokenId(queueId, tenantId, tokenId))
-                // Redis 미스 → DB fallback. 기준 컬럼은 issued_at이 아니라 admitted_at이다.
                 .or(() -> tokenRepository.findAdmittedByAdmitToken(
                         queueId, tenantId, admitToken, ADMIT_TTL_SECONDS))
                 .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN));
@@ -209,13 +240,19 @@ public class QueueEngineService {
         return completedAt;
     }
 
-    /** 발행 실패를 삼키고 로그만 남긴다. 호출자 주석에 "왜 삼켜도 되는가"가 있다. */
-    private void publishQuietly(EnqueueEvent event) {
+    /**
+     * 발행 실패를 삼키고 로그만 남긴다. 호출자 주석에 "왜 삼켜도 되는가"가 있다.
+     *
+     * @return 성공 여부. 여러 건을 연달아 발행하는 호출자가 <b>첫 실패에서 끊을</b> 근거다
+     */
+    private boolean publishQuietly(EnqueueEvent event) {
         try {
             eventPublisher.publish(event);
+            return true;
         } catch (RuntimeException e) {
             log.error("{} 이벤트 발행 실패 tokenId={} queueId={} — 상태는 이미 확정됐으므로 응답은 200이다",
                     event.eventType(), event.tokenId(), event.queueId(), e);
+            return false;
         }
     }
 

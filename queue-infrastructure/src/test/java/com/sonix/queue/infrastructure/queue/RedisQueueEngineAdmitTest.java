@@ -91,7 +91,7 @@ class RedisQueueEngineAdmitTest {
 
         // 양방향 매핑 + 만료 기준이 Redis에 실제로 남았는가
         assertThat(redis.opsForValue().get(QueueKeys.admitByToken(QUEUE_ID, "tok_a"))).isEqualTo(admitToken);
-        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, admitToken))).isEqualTo("tok_a");
+        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, admitToken))).isEqualTo("tok_a|id-a");
         assertThat(redis.opsForZSet().score(ADMITTED, "1|id-a")).isEqualTo(NOW + 60_000d);
         assertThat(redis.opsForValue().get(WATERMARK)).isEqualTo("2");
 

@@ -8,7 +8,7 @@
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING : POST /tokens\nEnqueue (Tenant 서버)\nZADD NX member=identifier\nscore = INCR queue:{queueId}:seq
+    [*] --> WAITING : POST /tokens\nEnqueue (Tenant 서버)\nHSETNX tokens[identifier]\nscore = INCR queue:{queueId}:seq
 
     WAITING --> ADMIT_ISSUED : POST /admit\nTenant 서버 — N명 입장토큰 발급\nZPOPMIN + admitToken TTL 60초\nKafka ADMITTED 발행 (key=tokenId)
 

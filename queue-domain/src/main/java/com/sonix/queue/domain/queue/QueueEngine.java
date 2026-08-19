@@ -50,9 +50,18 @@ public interface QueueEngine {
     AdmitResult admit(String queueId, String requestId, int count, long nowMillis);
 
     /**
-     * verify: admitToken → tokenId ({@code admit-by-admit} 조회). 없으면 빈 Optional → 호출자가 DB fallback.
+     * verify: admitToken → (tokenId, identifier) ({@code admit-by-admit} 조회).
+     * 없으면 빈 Optional → 호출자가 DB fallback.
+     *
+     * <p><b>identifier까지 담는 이유:</b> verify가 Tenant에게 돌려줄 값은 identifier인데,
+     * Redis에 tokenId만 있으면 identifier를 DB에서만 얻을 수 있다. Kafka 적재가 아직 안 끝난
+     * 정상 토큰이 <b>404</b>가 되는 구간이 그래서 생겼다. admit 시점에 identifier가 이미 손에
+     * 있으므로 같은 키에 함께 적는다(새 키가 아니다) — verify의 DB 읽기가 0회가 된다.
+     *
+     * @return {@link AdmitRef}. 롤링 배포 중 남은 구 포맷 값이면 identifier가 {@code null}이고,
+     *         호출자는 tokenId로 기존 DB 경로를 탄다
      */
-    Optional<String> findTokenIdByAdmitToken(String queueId, String admitToken);
+    Optional<AdmitRef> findAdmitRefByAdmitToken(String queueId, String admitToken);
 
     /**
      * polling: tokenId → admitToken ({@code admit-by-token} 조회). 아직 admit 안 됐거나
@@ -94,6 +103,10 @@ public interface QueueEngine {
      *
      * <p>{@code admit-by-admit}은 TTL 말고 삭제 경로가 여기뿐이다. 지우지 않으면 완료된
      * admitToken으로 최대 60초간 verify가 계속 통과한다.
+     *
+     * <p><b>{@code tokens} Hash 필드도 여기서 지운다.</b> 그 필드의 존재가 enqueue의 중복
+     * 게이트(HSETNX)라, 남겨두면 완료한 사람이 다시 대기열에 들어오지 못한다. 반대로 지우는
+     * 순서를 앞당기면 아직 큐에 있는 사람이 폴링에서 영영 404가 된다(구현 주석 참조).
      *
      * @param seq {@code admitted} ZSet 멤버가 {@code "seq|identifier"}라 필요하다
      */

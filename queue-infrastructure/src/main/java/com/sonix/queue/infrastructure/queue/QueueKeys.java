@@ -41,7 +41,20 @@ public final class QueueKeys {
         return "queue:{" + queueId + "}:seq";
     }
 
-    /** identifier -> tokenId 매핑 Hash (발급 원장 + EXISTS 재사용). */
+    /**
+     * identifier -> {@code "tokenId|issuedAt"} 매핑 Hash (발급 원장 + EXISTS 재사용).
+     *
+     * <p>🔴 <b>이 Hash의 필드 존재 = 중복 게이트다.</b> {@code enqueue_bulk.lua}가 {@code HSETNX}로
+     * 신규/기존을 가른다. {@code waiting} ZSet은 게이트가 아니다 — admit되면 거기서 빠지는데
+     * 그 사람은 아직 큐를 떠난 것이 아니라서, waiting으로 판정하면 admit된 사람의 재-enqueue가
+     * 새 tokenId·새 seq를 받는다(폴링 404 · {@code billing_snapshots}의 {@code COUNT(*)} 과금
+     * 중복 · {@code status=1} 고아 행).
+     *
+     * <p>따라서 <b>사람을 큐에서 빼는 경로는 반드시 이 필드를 {@code HDEL}한다.</b> 현재 그 경로는
+     * {@code cleanupCompleted} 하나이며, 거기서 HDEL은 <b>맨 마지막 명령</b>이어야 한다(이유는
+     * 해당 구현 주석 참조). 새 경로(예: cancel)를 만들 때도 같은 규칙이다 — 안 지우면 그 사람은
+     * 영영 재입장하지 못하고, 먼저 지우면 아직 큐에 있는 사람이 폴링에서 404가 된다.
+     */
     public static String tokens(String queueId) {
         return "queue:{" + queueId + "}:tokens";
     }
@@ -90,7 +103,13 @@ public final class QueueKeys {
         return admitByTokenPrefix(queueId) + tokenId;
     }
 
-    /** {@code admit-by-admit} 접두사 (뒤에 admitToken이 붙는다). verify/complete용 tokenId 역참조. */
+    /**
+     * {@code admit-by-admit} 접두사 (뒤에 admitToken이 붙는다). verify용 역참조.
+     *
+     * <p><b>값은 {@code "tokenId|identifier"}</b>다. tokenId만 담으면 verify가 돌려줄 identifier를
+     * DB에서만 얻을 수 있어, Kafka 적재가 아직 안 끝난 정상 토큰이 404가 된다. 읽는 쪽은
+     * <b>첫 {@code '|'}로만</b> 쪼갠다(identifier는 Tenant 자유 문자열이라 {@code '|'}가 들어올 수 있다).
+     */
     public static String admitByAdmitPrefix(String queueId) {
         return "queue:{" + queueId + "}:admit-by-admit:";
     }

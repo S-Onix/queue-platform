@@ -114,7 +114,8 @@ class AdmitLuaTest {
 
         assertThat(redis.opsForZSet().range(ADMITTED, 0, -1)).containsExactly("1|id-a", "2|id-b");
         assertThat(redis.opsForValue().get(QueueKeys.admitByToken(QUEUE_ID, "tok_a"))).isEqualTo("adm_1");
-        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, "adm_1"))).isEqualTo("tok_a");
+        // 값이 "tokenId|identifier"다 — verify가 identifier를 DB 없이 답하기 위한 것(§80 ⑧)
+        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, "adm_1"))).isEqualTo("tok_a|id-a");
         assertThat(redis.opsForValue().get(WATERMARK)).isEqualTo("2");
 
         // 되돌린 사람 몫의 후보는 버려진다 (Java가 미리 만든 admitToken은 채택될 때만 쓴다)

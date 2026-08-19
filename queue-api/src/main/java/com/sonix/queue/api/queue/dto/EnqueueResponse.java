@@ -65,8 +65,11 @@ public class EnqueueResponse {
             );
         }
 
-        // Redis 0-based → 사용자 1-based 변환
-        long rankOneBased = result.getRank() + 1;
+        // Redis 0-based → 사용자 1-based 변환.
+        // ⚠️ getRank() + 1을 직접 쓰지 않는다. admit된 사람이 재-enqueue하면 EXISTS이면서
+        //    waiting에 없어 rank가 -1로 오는데, +1을 그대로 하면 와이어에 0(=존재하지 않는 순번)이
+        //    나간다. 도메인이 이미 "-1은 -1로 둔다"는 계약을 갖고 있다.
+        long rankOneBased = result.getDisplayRank();
 
         // 도메인 편의 메서드 사용 (Status enum 직접 참조 X)
         boolean already = result.isExists();

@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <b>독립된 BatchProcessor</b>를 갖지만, <b>같은 Redis</b>를 공유한다.
  *
  * <p><b>검증 명제:</b> Global Queue가 인스턴스별로 분리되어 있어도, 순번 발급/중복 방지/정원의
- * 원자성은 Redis 단일 키(INCR seq, ZADD NX)에 있으므로 <b>3개 BatchProcessor가 같은 큐 키를
+ * 원자성은 Redis 단일 키(INCR seq, HSETNX tokens)에 있으므로 <b>3개 BatchProcessor가 같은 큐 키를
  * 동시에 때려도 정합성이 깨지지 않는다</b> (CLAUDE.md 동시성 원칙).
  *
  * <p><b>시나리오:</b> 5 tenant × 1 queue = 5 queue, 총 10,000 enqueue 를 (요청 i)

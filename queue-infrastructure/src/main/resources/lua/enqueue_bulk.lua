@@ -6,6 +6,11 @@
 -- KEYS[3]: token key (예: queue:{q_bts}:tokens) — identifier -> "tokenId|issuedAt" 매핑 Hash
 --   중괄호는 Redis Cluster 해시태그(QueueKeys 참조). 세 키가 같은 슬롯에 놓여야
 --   Lua가 실행된다 — 없으면 CROSSSLOT 에러.
+--   🔴 **중복 게이트는 이 Hash다** (waiting ZSet이 아니다). 사람은 admit되면 waiting에서
+--   빠지지만(admit.lua의 ZPOPMIN) 아직 큐를 떠난 게 아니므로, waiting 존재 여부로 신규를
+--   판정하면 admit된 사람의 재-enqueue가 새 tokenId·새 seq를 받는다 → 폴링 404, 과금 중복
+--   (billing_snapshots가 tokens 행을 COUNT한다), status=1 고아 행. 그래서 게이트는
+--   HSETNX이고, 사람을 큐에서 빼는 경로(cleanupCompleted)가 HDEL로 이 필드를 지운다.
 -- ARGV[1]: maxCapacity (Queue 최대 인원)
 -- ARGV[2]: requestCount (Bulk 요청 개수)
 -- ARGV[3]: issuedAt (이 청크의 발급 시각, epoch millis 문자열)
@@ -20,6 +25,8 @@
 --   score는 KEYS[2] INCR로 발급 (단조증가, 유일) → Redis 도달 순서 = rank 순서
 --   OK: 정상 추가 (rank 0-based, total 추가 후 크기, issuedAt = ARGV[3])
 --   EXISTS: 이미 존재 (기존 rank + 현재 total, tokenId·issuedAt은 Hash의 최초 값)
+--     ※ admit된 사람이 재-enqueue하면 EXISTS이면서 waiting에는 없다 → rank·seq는 -1이다.
+--       그 사람은 폴링에서 admit-by-token으로 입장권을 돌려받는다(seq로 찾지 않는다).
 --   FULL: Capacity 초과 (rank -1, 현재 total, tokenId·issuedAt = "")
 --   ※ 빈 문자열은 배열을 자르지 않는다. nil/false만 RESP 변환에서 뒤를 끊으므로
 --     "모름"은 반드시 ""로 표현할 것 (Java의 size() < 7 검사가 이를 전제한다).
@@ -61,19 +68,27 @@ for i = 1, requestCount do
 	else
 	-- score를 INCR로 발급 (큐별 전역 순번, 단조증가)
 		local seq = redis.call('INCR', seqKey)
-		-- ZADD NX 시도
-		local isNew = redis.call('ZADD', queueKey, 'NX', seq, identifier)
+		-- 게이트는 tokens Hash다 (KEYS[3] 주석 참조). HSETNX가 0이면 이미 발급된 사람이다.
+		local isNew = redis.call('HSETNX', tokenKey, identifier, tokenId .. '|' .. issuedAt)
 
 		if isNew == 0 then
 		-- EXISTS (이미 존재 — INCR한 seq는 버려짐, 순서엔 영향 없음)
-			local existingRank = redis.call('ZRANK', queueKey, identifier)
+			-- HSETNX는 기존 값을 돌려주지 않는다. 최초 tokenId·issuedAt을 알려면 HGET이 필수다.
 			local existingToken, existingIssuedAt = splitTokenValue(redis.call('HGET', tokenKey, identifier))
+			-- 🔴 admit된 사람은 waiting에 없어 ZRANK/ZSCORE가 false를 준다. false를 그대로
+			--    테이블에 넣으면 RESP 변환이 배열을 그 자리에서 잘라 Java의 size() < 7 검사가
+			--    터지고, 청크(최대 500건)가 통째로 실패한다.
+			local existingRank = redis.call('ZRANK', queueKey, identifier)
+			if not existingRank then existingRank = -1 end   -- nil-truncation 방어
 			local existingSeq = tonumber(redis.call('ZSCORE', queueKey, identifier))
-			if not existingSeq then existingSeq = -1 end   -- nil-truncation 방어
+			if not existingSeq then existingSeq = -1 end     -- nil-truncation 방어
 			table.insert(enqueueResults, {identifier, existingToken, "EXISTS", existingRank, currentSize, existingSeq, existingIssuedAt})
 		else
 		-- OK
-			redis.call('HSET', tokenKey, identifier, tokenId .. '|' .. issuedAt)
+			-- NX를 붙이지 않는다. 게이트를 이미 HSETNX가 통과시켰으므로, waiting에 같은
+			-- identifier가 남아 있다면 그건 admit.lua가 HGET 미스로 되돌려 놓은 고아다.
+			-- NX로 옛 score를 살려두면 응답의 seq와 실제 score가 갈려 폴링이 자기 항목을 못 찾는다.
+			redis.call('ZADD', queueKey, seq, identifier)
 			local newRank = redis.call('ZRANK', queueKey, identifier)
 			currentSize = currentSize + 1
 			table.insert(enqueueResults, {identifier, tokenId, "OK", newRank, currentSize, seq, issuedAt})

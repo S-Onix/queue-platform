@@ -85,7 +85,12 @@ for i = 1, #popped, 2 do
 		local admitToken = ARGV[ADMIT_TOKEN_OFFSET + (i + 1) / 2]
 
 		redis.call('SET', byTokenPrefix .. tokenId, admitToken, 'PX', admitTtl)
-		redis.call('SET', byAdmitPrefix .. admitToken, tokenId, 'PX', admitTtl)
+		-- 값이 "tokenId|identifier"인 이유: verify는 Tenant에게 identifier를 돌려줘야 하는데,
+		-- tokenId만 담으면 identifier를 DB에서만 얻을 수 있어 컨슈머 백로그 구간(= Kafka 적재가
+		-- 아직 안 끝난 정상 토큰)에 404가 난다. 그 값은 지금 이 자리에 이미 있다.
+		-- ⚠️ 읽는 쪽은 **첫 '|'로만** 쪼갠다 — identifier는 Tenant 자유 문자열이라 '|'가 들어올
+		--    수 있고, tokenId('tok_'+UUID)에는 없다. admit_expire.lua의 member 규약과 같다.
+		redis.call('SET', byAdmitPrefix .. admitToken, tokenId .. '|' .. identifier, 'PX', admitTtl)
 		redis.call('ZADD', admittedKey, expiresAt, seq .. '|' .. identifier)
 
 		table.insert(records, { identifier, tokenId, seq, admitToken, issuedAt })

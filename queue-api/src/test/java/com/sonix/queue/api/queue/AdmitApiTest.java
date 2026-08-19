@@ -7,6 +7,7 @@ import com.sonix.queue.api.security.RateLimitFilter;
 import com.sonix.queue.api.security.TenantAuth;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
+import com.sonix.queue.domain.queue.AdmitRef;
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueEvent;
 import com.sonix.queue.domain.queue.EnqueueEventPublisher;
@@ -210,15 +211,31 @@ class AdmitApiTest {
     // ── §6.5 Verify ──
 
     @Test
-    @DisplayName("verify Redis 히트 → 200 valid + identifier. DB fallback 쿼리는 타지 않는다")
+    @DisplayName("verify Redis 히트 → 200 valid + identifier. DB는 아예 읽지 않는다")
     void verify_redisHit() throws Exception {
-        when(queueEngine.findTokenIdByAdmitToken(QUEUE_ID, "adm_1")).thenReturn(Optional.of("tok_a"));
+        // 값이 "tokenId|identifier"라 신원이 Redis에 이미 있다. 예전처럼 tokenId로 DB 행을 찾으면
+        // 컨슈머 백로그 구간(= 적재 전)의 정상 토큰이 404가 된다.
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
+                .thenReturn(Optional.of(new AdmitRef("tok_a", "0190e2c1-user")));
+
+        mockMvc.perform(post("/api/v1/queues/{q}/admit-tokens/{a}/verify", QUEUE_ID, "adm_1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.valid").value(true))
+                .andExpect(jsonPath("$.data.identifier").value("0190e2c1-user"));
+
+        verifyNoInteractions(tokenRepository);
+    }
+
+    @Test
+    @DisplayName("verify 구 포맷(tokenId만) → 기존 DB 경로로 폴백 (롤링 배포 중 60초)")
+    void verify_legacyValue_fallsBackToDb() throws Exception {
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
+                .thenReturn(Optional.of(new AdmitRef("tok_a", null)));
         when(tokenRepository.findByTokenId(QUEUE_ID, TENANT_ID, "tok_a"))
                 .thenReturn(Optional.of(token(TokenStatus.ADMIT_ISSUED, "adm_1")));
 
         mockMvc.perform(post("/api/v1/queues/{q}/admit-tokens/{a}/verify", QUEUE_ID, "adm_1"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.valid").value(true))
                 .andExpect(jsonPath("$.data.identifier").value("0190e2c1-user"));
 
         verify(tokenRepository, never()).findAdmittedByAdmitToken(anyString(), anyLong(), anyString(), anyInt());
@@ -227,7 +244,7 @@ class AdmitApiTest {
     @Test
     @DisplayName("verify Redis 미스 → DB fallback (admitted_at 기준, 유효 창 60초)")
     void verify_dbFallback() throws Exception {
-        when(queueEngine.findTokenIdByAdmitToken(QUEUE_ID, "adm_1")).thenReturn(Optional.empty());
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1")).thenReturn(Optional.empty());
         when(tokenRepository.findAdmittedByAdmitToken(QUEUE_ID, TENANT_ID, "adm_1", 60))
                 .thenReturn(Optional.of(token(TokenStatus.ADMIT_ISSUED, "adm_1")));
 
@@ -239,7 +256,7 @@ class AdmitApiTest {
     @Test
     @DisplayName("verify Redis·DB 둘 다 미스 → 404 TK002. Redis·DB 쓰기 0회")
     void verify_notFound() throws Exception {
-        when(queueEngine.findTokenIdByAdmitToken(QUEUE_ID, "adm_x")).thenReturn(Optional.empty());
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_x")).thenReturn(Optional.empty());
         when(tokenRepository.findAdmittedByAdmitToken(QUEUE_ID, TENANT_ID, "adm_x", 60))
                 .thenReturn(Optional.empty());
 

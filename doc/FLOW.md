@@ -31,7 +31,7 @@ flowchart TD
     SCHED["⑥ BatchProcessor (Consumer)\n@Scheduled(fixedRate=1000ms)"]
     --> DRAIN["drain (최대 MAX_DRAIN=5000)\nqueueId별 groupBy"]
     --> CHUNK["CHUNK_SIZE=500씩 분할"]
-    --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\nKEYS[3]=queue:{queueId}:tokens\n(Hash Tag — 세 키가 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity? → FULL\n  INCR seq → score 발급\n  ZADD NX member=identifier → 신규? OK : EXISTS\n  HSET tokens[identifier]='tokenId|issuedAt'\n  ZRANK → 순번\n결과 array (입력과 동일 순서)"]
+    --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\nKEYS[3]=queue:{queueId}:tokens\n(Hash Tag — 세 키가 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity? → FULL\n  INCR seq → score 발급\n  HSETNX tokens[identifier]='tokenId|issuedAt' → 신규? OK : EXISTS\n  (게이트는 이 Hash다 — waiting은 admit되면 빠진다)\n  신규면 ZADD waiting member=identifier score=seq\n  ZRANK → 순번(EXISTS인데 admit됐으면 -1)\n결과 array (입력과 동일 순서)"]
     --> COMPLETE["⑧ 위치(index)로 매칭하여\n각 future.complete(result)\n※ identifier는 중복 가능하므로 key로 쓰면 안 됨"]
 
     COMPLETE --> PUB["⑨ KafkaEnqueueEventPublisher.publish()\ntoken-lifecycle, key=tokenId (§73 D16)\n**동기** — 브로커 ack까지 최대 12s 대기\n실패 시 QE001(503) — 200이 안 나간다"]
@@ -52,7 +52,7 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 **확정 결정** (DECISIONS §66-70, ARCHITECTURE_ROADMAP 부록 A):
 - D1: identifier는 Tenant가 제공 — 단 **형식은 UUIDv7로 좁혀졌다(§78)**. 이메일·순번 ID처럼
   추측 가능한 값은 금지(enqueue가 EXISTS 시 기존 `tokenId`·`seq`를 돌려주므로 자격 증명이 샌다).
-  같은 사용자·같은 큐엔 **항상 같은 UUID를 재사용**해야 `ZADD NX` 중복 방지가 성립한다
+  같은 사용자·같은 큐엔 **항상 같은 UUID를 재사용**해야 `HSETNX` 중복 방지가 성립한다
 - D2: ZSet 하나 (`queue:{queueId}:waiting`)
 - D3: ZRANK + ZCARD (별도 counter 없음)
 - D4: Java (부하 측정) + Lua (원자 처리) 분리
@@ -180,7 +180,7 @@ flowchart TD
 
     COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - {유효 창}\n\n0을 허용하는 이유: TTL 만료로 복귀했지만\nTenant는 이미 입장시킨 경우가 실재한다"]
     DB -->|"0행"| E404C(["404 / 409"])
-    DB -->|"1행"| ZREM["Redis 정리 (나중)\nZREM queue:{queueId}:waiting\nZREM queue:{queueId}:admitted\nDEL admit-by-token + admit-by-admit\nDEL token-info"]
+    DB -->|"1행"| ZREM["Redis 정리 (나중)\nZREM queue:{queueId}:waiting\nZREM queue:{queueId}:admitted\nDEL admit-by-token + admit-by-admit\nDEL token-info\nHDEL queue:{queueId}:tokens {identifier} ← 반드시 마지막\n(중복 게이트 해제. 먼저 지우면 폴링이 영영 404)"]
     --> KAFKA2["Kafka COMPLETED 발행 (key=tokenId)"]
     --> AVG["avgWaitingTime 직접 갱신\nwaitingSeconds = completedAt - issuedAt\n이상치 필터: > waitingTtl × 0.8 제외\nHINCRBYFLOAT queue-stats waitingTimeSum\nHINCRBY queue-stats waitingTimeCount"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])

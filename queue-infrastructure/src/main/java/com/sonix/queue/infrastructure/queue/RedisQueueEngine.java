@@ -3,6 +3,7 @@ package com.sonix.queue.infrastructure.queue;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.common.util.IdGenerator;
+import com.sonix.queue.domain.queue.AdmitRef;
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.ExpiredAdmit;
@@ -376,15 +377,25 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     @Override
-    public Optional<String> findTokenIdByAdmitToken(String queueId, String admitToken) {
-        return Optional.ofNullable(
-                routeForWrite(queueId).opsForValue().get(QueueKeys.admitByAdmit(queueId, admitToken)));
+    public Optional<AdmitRef> findAdmitRefByAdmitToken(String queueId, String admitToken) {
+        String raw = routeForWrite(queueId).opsForValue().get(QueueKeys.admitByAdmit(queueId, admitToken));
+        if (raw == null) {
+            return Optional.empty();
+        }
+        // ⚠️ **첫 '|'로만** 쪼갠다. identifier는 Tenant가 정하는 자유 문자열이라 '|'가 들어올 수
+        //    있고, tokenId는 'tok_' + UUID라 '|'를 포함할 수 없다 — 첫 구분자가 정확한 경계다.
+        //    구분자가 없으면 롤링 배포 중 남은 구 포맷(tokenId만)이다: 관용적으로 받아 주고
+        //    identifier는 null로 둔다(호출자가 DB 경로로 간다). admit_expire.lua·splitTokenValue와 같은 규약.
+        int sep = raw.indexOf('|');
+        return Optional.of(sep < 0
+                ? new AdmitRef(raw, null)
+                : new AdmitRef(raw.substring(0, sep), raw.substring(sep + 1)));
     }
 
     /**
      * 폴링 전용 역방향 조회. <b>{@code routeForRead}를 쓴다 — {@code routeForWrite}가 아니다.</b>
      *
-     * <p>{@code findTokenIdByAdmitToken}(verify)은 Tenant 인증 뒤의 저빈도 호출이라 쓰기 폴백
+     * <p>{@code findAdmitRefByAdmitToken}(verify)은 Tenant 인증 뒤의 저빈도 호출이라 쓰기 폴백
      * (DB 배정 조회)을 타도 되지만, 이 메서드는 <b>인증 없는 폴링</b> 경로다. 쓰기 폴백을 달면
      * 임의 queueId를 섞은 요청만으로 DB 조회를 유발할 수 있다({@link #routeForWrite} 주석과 같은 이유).
      *
@@ -443,6 +454,16 @@ public class RedisQueueEngine implements QueueEngine {
         // 두 키 모두 {queueId} 해시태그라 같은 슬롯이다 — 다중 키 DEL이 Cluster에서도 성립한다.
         redis.delete(List.of(QueueKeys.admitByToken(queueId, tokenId),
                              QueueKeys.admitByAdmit(queueId, admitToken)));
+
+        // 🔴 **반드시 마지막이다.** tokens Hash가 enqueue의 중복 게이트(HSETNX)라, 지우지 않으면
+        //    완료한 사람이 다시 들어오지 못한다. 그런데 이 메서드는 Lua가 아니라 명령 4개라
+        //    중간에 죽을 수 있고, 순서가 결과를 가른다.
+        //      HDEL이 먼저면: Hash만 사라지고 waiting에 남아 poll_verify가 HGET 미스로 계속 0을
+        //                     반환한다 → 그 사람은 영영 404다 (복구 경로 없음).
+        //      HDEL이 마지막이면: waiting/admitted가 먼저 지워지고 Hash만 남아 재입장만 막힌다
+        //                     (다음 complete·TTL 정리로 해소 가능). 안전한 쪽이다.
+        //    "정리 순서 통일" 같은 이유로 위로 올리지 말 것.
+        redis.opsForHash().delete(QueueKeys.tokens(queueId), identifier);
     }
 
     /**

@@ -166,7 +166,7 @@ CREATE TABLE tokens (
     UNIQUE KEY uq_tokens_token_id         (token_id, issued_at),
     INDEX idx_tokens_token_status         (token_id, status),          -- ⚠️ 삭제 후보: uq_tokens_token_id가 (token_id, ...) 접두로 커버
     INDEX idx_tokens_queue_status_issued  (queue_id, status, issued_at),
-    INDEX idx_tokens_queue_user_status    (queue_id, user_id, status), -- ⚠️ 삭제 후보: 중복 판정은 Lua ZADD NX가 한다. 6개 중 가장 넓다
+    INDEX idx_tokens_queue_user_status    (queue_id, user_id, status), -- ⚠️ 삭제 후보: 중복 판정은 Lua HSETNX(tokens Hash)가 한다. 6개 중 가장 넓다
     INDEX idx_tokens_status_admit         (status, issued_at),         -- ⚠️ 삭제 후보(Sprint 9 확정 후). 이름의 admit은 admit_token과 무관 — 오해를 부른다
     INDEX idx_tokens_sync_needed          (redis_sync_needed, status)
 
