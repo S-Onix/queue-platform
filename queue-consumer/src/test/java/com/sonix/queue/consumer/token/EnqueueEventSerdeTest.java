@@ -58,7 +58,7 @@ class EnqueueEventSerdeTest {
         // tokens.issued_at 이 DATETIME(3) 이므로 밀리초까지가 저장 대상이다.
         Instant issuedAt = Instant.parse("2026-08-10T12:34:56.789Z");
         EnqueueEvent original = new EnqueueEvent(
-                "ENQUEUED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L, issuedAt);
+                "ENQUEUED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L, issuedAt, null, null);
 
         EnqueueEvent restored = roundTrip(original);
 
@@ -96,7 +96,7 @@ class EnqueueEventSerdeTest {
     void keepsUnknownEventTypeAsIs() {
         EnqueueEvent original = new EnqueueEvent(
                 "WHAT_IS_THIS", "tok_x", "q_ticket", 1L, "user-1", 1L,
-                Instant.parse("2026-08-10T00:00:00.001Z"));
+                Instant.parse("2026-08-10T00:00:00.001Z"), null, null);
 
         assertThat(roundTrip(original).eventType()).isEqualTo("WHAT_IS_THIS");
     }
@@ -107,12 +107,46 @@ class EnqueueEventSerdeTest {
         // 과학표기·double 변환이 끼어들면 큰 정수가 뭉개진다. Long 경계로 확인한다.
         EnqueueEvent original = new EnqueueEvent(
                 "ENQUEUED", "tok_big", "q_ticket", Long.MAX_VALUE, "user-1",
-                Long.MAX_VALUE, Instant.parse("2026-08-10T00:00:00.001Z"));
+                Long.MAX_VALUE, Instant.parse("2026-08-10T00:00:00.001Z"), null, null);
 
         EnqueueEvent restored = roundTrip(original);
 
         assertThat(restored.seq()).isEqualTo(Long.MAX_VALUE);
         assertThat(restored.tenantId()).isEqualTo(Long.MAX_VALUE);
         assertThat(restored).isEqualTo(original);
+    }
+
+    /**
+     * ADMITTED만 갖는 두 칸이 왕복에서 살아남는지. {@code admittedAt}은 verify·complete의
+     * 유효 창(60초) 기준이라 밀리초가 뭉개지면 창의 경계가 달라진다.
+     */
+    @Test
+    @DisplayName("ADMITTED의 admitToken·admittedAt이 왕복 후에도 보존된다")
+    void preservesAdmitFields() {
+        Instant admittedAt = Instant.parse("2026-08-10T12:35:00.123Z");
+        EnqueueEvent original = new EnqueueEvent(
+                "ADMITTED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L,
+                Instant.parse("2026-08-10T12:34:56.789Z"), "adm_9f3c", admittedAt);
+
+        EnqueueEvent restored = roundTrip(original);
+
+        assertThat(restored.admitToken()).isEqualTo("adm_9f3c");
+        assertThat(restored.admittedAt()).isEqualTo(admittedAt);
+        assertThat(restored).isEqualTo(original);
+    }
+
+    /**
+     * ENQUEUED에는 두 칸이 없다. null이 빠지거나 문자열 "null"이 되면 컨슈머가
+     * admit_token 칸에 쓰레기를 넣는다.
+     */
+    @Test
+    @DisplayName("ENQUEUED의 admitToken·admittedAt은 왕복 후에도 null이다")
+    void keepsAdmitFieldsNullForEnqueued() {
+        EnqueueEvent restored = roundTrip(new EnqueueEvent(
+                "ENQUEUED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L,
+                Instant.parse("2026-08-10T12:34:56.789Z"), null, null));
+
+        assertThat(restored.admitToken()).isNull();
+        assertThat(restored.admittedAt()).isNull();
     }
 }

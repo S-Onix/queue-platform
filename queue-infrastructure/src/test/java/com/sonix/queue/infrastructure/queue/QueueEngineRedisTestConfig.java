@@ -36,9 +36,13 @@ public class QueueEngineRedisTestConfig {
             @org.springframework.beans.factory.annotation.Qualifier("enqueueBulkScript")
             org.springframework.data.redis.core.script.RedisScript<List> enqueueBulkScript,
             @org.springframework.beans.factory.annotation.Qualifier("pollVerifyScript")
-            org.springframework.data.redis.core.script.RedisScript<Long> pollVerifyScript
+            org.springframework.data.redis.core.script.RedisScript<Long> pollVerifyScript,
+            @org.springframework.beans.factory.annotation.Qualifier("admitScript")
+            org.springframework.data.redis.core.script.RedisScript<List> admitScript,
+            @org.springframework.beans.factory.annotation.Qualifier("admitExpireScript")
+            org.springframework.data.redis.core.script.RedisScript<List> admitExpireScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
     }
 
     @Bean
@@ -61,6 +65,7 @@ public class QueueEngineRedisTestConfig {
             @Override public Queue save(Queue queue) { throw new UnsupportedOperationException(); }
             @Override public Optional<Queue> findById(Long id) { return Optional.empty(); }
             @Override public List<Queue> findAllByTenantId(Long tenantId) { return List.of(); }
+            @Override public List<Queue> findAll() { return List.of(); }
             @Override public boolean existsByTenantIdAndName(Long tenantId, String name) { return false; }
         };
     }

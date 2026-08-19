@@ -31,13 +31,37 @@ spring:
           batch_size: 500          # 배치 INSERT 크기 (CHUNK와 맞춤)
         order_inserts: true        # 같은 테이블 INSERT 모아 배치 효율↑
 
+  # AdmitTokenExpiryJob이 RETURNED를 발행한다 (§36 · §80). 이 블록이 없으면 기본값
+  # (value-serializer = StringSerializer)이라 EnqueueEvent 직렬화가 런타임에 실패한다.
+  #
+  # ⚠️ spring.json.add.type.headers=false 는 협상 불가다 — 컨슈머가
+  #    spring.json.use.type.headers=false + default.type 으로 읽으므로 양쪽이 어긋나면
+  #    역직렬화가 엉뚱한 타입으로 시도된다 (queue-api·queue-consumer와 같은 값).
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092,localhost:9094,localhost:9096}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        spring.json.add.type.headers: false
+        # 브로커가 죽었을 때 스케줄 스레드가 기본값(max.block 60s + delivery 120s)만큼
+        # 매달리면 잡 한 바퀴가 통째로 멈춘다. 발행 실패는 어차피 삼키고 로그만 남기므로
+        # (복귀는 Redis에서 이미 확정) 빨리 실패하는 편이 낫다.
+        max.block.ms: 4000
+        request.timeout.ms: 3000
+        delivery.timeout.ms: 8000
+
 server:
   port: ${SERVER_PORT:8081}
 
 # Redis 독립 2 Cluster (DECISIONS §75). 프로파일별 노드 목록은 application-{local,prod}.yml.
 #
-# ⚠️ batch는 코드에서 Redis를 쓰지 않지만, scanBasePackages가 com.sonix.queue 전체라
-#    queue-infrastructure의 Redis 빈이 함께 생성된다. 이제 클러스터가 둘이므로
+# ⚠️ AdmitTokenExpiryJob이 claim-Lua를 돌리므로 batch도 Redis를 직접 쓴다(§80).
+#    게다가 scanBasePackages가 com.sonix.queue 전체라 queue-infrastructure의 Redis 빈이
+#    함께 생성된다. 이제 클러스터가 둘이므로
 #    이 프로세스는 Lettuce 클라이언트를 2벌 문다(각각 토폴로지 갱신 타이머 포함).
 #    Lettuce는 연결을 지연 생성하므로 실제 통신은 첫 사용 때까지 일어나지 않는다.
 #    스캔 범위를 좁히면 이 블록과 함께 사라진다(별건, 후속 정리 대상).

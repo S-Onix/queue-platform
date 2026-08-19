@@ -1,6 +1,7 @@
 package com.sonix.queue.consumer.token;
 
 import com.sonix.queue.domain.queue.Token;
+import com.sonix.queue.domain.queue.TokenEventType;
 import com.sonix.queue.domain.queue.TokenRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,9 +32,19 @@ public class TokenPersistService {
      *
      * <p>배치 크기는 {@code max-poll-records}가 결정하며, hibernate {@code batch_size}와
      * 맞춰 두었다. 두 값이 어긋나면 JDBC 배치가 중간에 쪼개져 왕복이 늘어난다.
+     *
+     * <p><b>{@code ENQUEUED}만 다른 길로 간다.</b> 신규 적재는 충돌 시 no-op이면 되지만, 나머지
+     * 전이는 <b>허용 출발 상태를 강제하는 가드</b>가 이벤트마다 달라 SQL이 갈린다 (§80 가드 표).
+     *
+     * @param tokens <b>같은 타입이 연속하는 구간</b>이어야 한다. 타입별로 모아 넘기면 같은 토큰의
+     *               전이 순서가 뒤집힌다 — 파티션이 지켜준 순서를 여기서 깨는 셈이다
      */
     @Transactional
-    public void persist(List<Token> tokens) {
-        tokenRepository.saveAllIfAbsent(tokens);
+    public void persist(TokenEventType type, List<Token> tokens) {
+        if (type == TokenEventType.ENQUEUED) {
+            tokenRepository.saveAllIfAbsent(tokens);
+        } else {
+            tokenRepository.applyTransition(type, tokens);
+        }
     }
 }

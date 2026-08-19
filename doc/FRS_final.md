@@ -200,7 +200,7 @@ Redis (QueueKeys — §8 참조):
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING : POST /tokens (ZADD NX)
+    [*] --> WAITING : POST /tokens (HSETNX tokens)
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
     ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-lifecycle 발행
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
@@ -226,8 +226,11 @@ Body: { identifier: string }        ← UUIDv7. 생성·전달 주체는 Tenant 
    queue:{queueId}:waiting / queue:{queueId}:seq / queue:{queueId}:tokens
    항목마다: ZCARD ≥ maxCapacity → FULL
              INCR seq → score 발급 (§70 D9)
-             ZADD NX member=identifier score=seq → 신규 OK / 기존 EXISTS
-             HSET tokens[identifier] = "tokenId|issuedAt"   ← 중복 판정·소유권 대조의 원장
+             HSETNX tokens[identifier] = "tokenId|issuedAt" → 신규 OK / 기존 EXISTS
+               ← **중복 판정의 원장은 이 Hash다** (waiting ZSet이 아니다).
+                 admit되면 waiting에서 빠지므로 ZADD NX로 판정하면 admit된 사람의
+                 재-enqueue가 새 tokenId를 받아 과금이 두 번 잡힌다
+             ZADD waiting member=identifier score=seq   ← 신규일 때만
              ZRANK → rank
 6. Kafka token-lifecycle 발행 (key=tokenId) — **동기**. 브로커 ack까지 최대 12s 대기
    (`spring.kafka.producer` sendTimeout). 실패하면 QE001(503)이고 200이 안 나간다
@@ -254,7 +257,7 @@ Response 200:
 | 재사용 | **같은 사용자·같은 큐에는 항상 같은 UUID를 재사용**한다 |
 
 ```
-⚠️ 매 요청 새 UUID를 만들면 enqueue_bulk.lua의 ZADD NX가 안 걸려
+⚠️ 매 요청 새 UUID를 만들면 enqueue_bulk.lua의 HSETNX가 안 걸려
    한 사람이 자리를 여러 개 차지한다.
 
 ⚠️ identifier가 추측 가능한 값(이메일 · 순번 ID)이면 안 된다.
@@ -352,7 +355,9 @@ Body: { count: N, requestId: "req_abc" }
          이미 FIFO 순이고, 거를 대상이 없으므로 ZRANGE+ZREM이 아니라 ZPOPMIN 한 명령이다
      HGET queue:{queueId}:tokens {identifier}   → "tokenId|issuedAt"
      SET  queue:{queueId}:admit-by-token:{tokenId}    {admitToken} PX 60000
-     SET  queue:{queueId}:admit-by-admit:{admitToken} {tokenId}    PX 60000
+     SET  queue:{queueId}:admit-by-admit:{admitToken} "{tokenId}|{identifier}" PX 60000
+       → identifier까지 담는 이유: verify가 돌려줄 값이 identifier인데 tokenId만 담으면
+         DB에서만 얻을 수 있어, Kafka 적재 전인 정상 토큰이 404가 된다. 읽는 쪽은 첫 '|'로만 쪼갠다
        → 이 두 키와 admit-idem은 KEYS[]에 선언할 수 없다(두 번째 조각이 런타임 값).
          접두사는 Java가 만들어 ARGV로 넘기고 Lua는 prefix .. tokenId 만 한다 (§80 ⑥).
          QueueKeys.admitByTokenPrefix(queueId) 등 — Lua 파일에 접두사 리터럴 금지.
@@ -412,8 +417,9 @@ POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
 
 처리 흐름:
 0. API Key tenant의 queueId 소유 검증 → 아니면 QUEUE_NOT_OWNED   ← enqueue와 동일
-1. Redis GET queue:{queueId}:admit-by-admit:{admitToken} → tokenId
-   없으면 → DB Fallback
+1. Redis GET queue:{queueId}:admit-by-admit:{admitToken} → "tokenId|identifier"
+   → identifier를 그대로 응답한다. **DB 읽기 0회** (키의 PX 60초가 이미 유효성의 증명이다)
+   없으면(또는 롤링 배포 중 남은 구 포맷=tokenId만) → DB Fallback
      SELECT WHERE queue_id=? AND tenant_id=?           ← 술어 필수 (0단계와 같은 이유)
             AND status=ADMIT_ISSUED AND admit_token=?
             AND admitted_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND
@@ -490,6 +496,10 @@ Body: { admitToken: "at_xxx" }
    ZREM queue:{queueId}:admitted
    DEL queue:{queueId}:admit-by-token + queue:{queueId}:admit-by-admit
    DEL token-info
+   HDEL queue:{queueId}:tokens {identifier}   ← **반드시 마지막**
+     안 지우면: 이 Hash가 enqueue의 중복 게이트(HSETNX)라 완료한 사람이 다시 못 들어온다
+     먼저 지우면: 중간에 죽었을 때 waiting에는 남고 Hash만 없어 폴링이 영영 404다
+     (이 4개는 Lua가 아니라 개별 명령이라 원자적이지 않다 — 순서가 결과를 가른다)
 3. Kafka token-lifecycle 발행 — COMPLETED (key=tokenId)
    → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
 4. avgWaitingTime 직접 갱신 (Kafka Consumer 없이)
@@ -615,11 +625,11 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 |----------|----------|-----|------|
 | `queue:{queueId}:waiting` | Sorted Set | 없음 | 대기열. **member=`identifier`**, score=`seq` |
 | `queue:{queueId}:seq` | String | 없음 | 큐별 순번 카운터. `INCR`이 score를 발급 (§70 D9) |
-| `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `"tokenId\|issuedAt"`. 중복 Enqueue 방지 + 폴링 소유권 대조(§74) |
+| `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `"tokenId\|issuedAt"`. **중복 Enqueue 게이트(`HSETNX`)** + 폴링 소유권 대조(§74). 큐에서 빼는 경로는 반드시 `HDEL` |
 | `queue:{queueId}:last-active` | Sorted Set | 없음 | keepalive. member=`seq`, score=epoch ms. `ka=1` 폴링이 갱신 (§74) |
 | `queue:{queueId}:admitted` | Sorted Set | 없음 | **admit된 토큰의 만료 시각**. score=만료 epoch ms, member=`"seq\|identifier"`. TTL 만료 복귀 배치가 `ZRANGEBYSCORE 0 now`로 claim (§80) |
 
-> ⚠️ `:tokens`·`:last-active`에 **회수 경로(`HDEL`/`ZREM`/`EXPIRE`)가 전 코드 0건**이다. 회수 배치는 Sprint 9.
+> ⚠️ `:tokens`의 회수는 **complete 경로(`cleanupCompleted`의 `HDEL`)뿐**이고, `:last-active`는 여전히 회수 경로가 **전 코드 0건**이다. 이탈자(complete하지 않은 사람) 회수 배치는 Sprint 9.
 
 **그 외**
 
@@ -629,7 +639,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | `queue-stats:{t}:{q}` | Hash | 없음 | avgWaitingTime (complete 시 직접 갱신) |
 | `token-info:{tokenId}` | String | 폴링 간격+2s | Polling 캐시 (⚠️ §79는 폴링 경로에서 DB status를 읽지 않으므로 존치 여부 후속 검토) |
 | `queue:{queueId}:admit-by-token:{tokenId}` | String | 60s | Polling 응답용 admitToken |
-| `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify/complete용 tokenId |
+| `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify용 역참조. 값은 `"tokenId\|identifier"` — verify가 DB 없이 신원을 답한다 |
 | `queue:{queueId}:admit-watermark` | String | 없음 | 마지막 admit seq. `/status` 전광판 원본 (§79) |
 | `queue:{queueId}:pacing` | String | 없음 | 폴링 간격 구간표 **오버라이드**. 없으면 코드 상수 (§79) |
 | `queue:{queueId}:admit-idem:{requestId}` | String | 300s | admit 멱등성. `requestId`는 **Tenant가 정하는 값**이라 큐 스코프 필수 |
@@ -652,7 +662,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 
 | 문제 | 해결 |
 |------|------|
-| 중복 Enqueue | `queue:{queueId}:tokens` Hash(identifier→tokenId) + ZADD NX — 둘 다 `enqueue_bulk.lua` 안 |
+| 중복 Enqueue | `queue:{queueId}:tokens` Hash에 **HSETNX** (identifier→"tokenId\|issuedAt") — `enqueue_bulk.lua` 안. waiting ZSet은 게이트가 아니다(admit되면 빠지므로) |
 | 용량 초과 | `enqueue_bulk.lua`의 ZCARD ≥ maxCapacity 판정 |
 | Enqueue DB 유실 | Kafka At-Least-Once + UNIQUE KEY 방어 |
 | 대량 Enqueue 병목 | INCRBY + ZADD multi (500건 Adaptive) |

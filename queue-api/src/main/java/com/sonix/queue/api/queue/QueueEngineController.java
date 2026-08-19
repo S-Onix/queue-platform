@@ -1,11 +1,19 @@
 package com.sonix.queue.api.queue;
 
 import com.sonix.queue.api.common.response.ApiResponse;
+import com.sonix.queue.api.queue.dto.AdmitRequest;
+import com.sonix.queue.api.queue.dto.AdmitResponse;
+import com.sonix.queue.api.queue.dto.CompleteRequest;
+import com.sonix.queue.api.queue.dto.CompleteResponse;
 import com.sonix.queue.api.queue.dto.EnqueueRequest;
 import com.sonix.queue.api.queue.dto.EnqueueResponse;
 import com.sonix.queue.api.queue.dto.PollResponse;
+import com.sonix.queue.api.queue.dto.VerifyResponse;
 import com.sonix.queue.api.security.TenantAuth;
+import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
+
+import java.time.LocalDateTime;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -16,8 +24,7 @@ import org.springframework.web.bind.annotation.*;
  * QueueEngine(대기열 라이프사이클) HTTP 엔드포인트.
  *
  * <p>관리용 컨트롤러(생성/수정/정지/삭제, JWT)와 분리된 엔진 엔드포인트.
- * Tenant 서버가 X-API-Key로 호출한다. Sprint 5-E는 enqueue만 노출하며,
- * 이후 admit / verify / complete가 순차 추가될 예정이다.
+ * Tenant 서버가 X-API-Key로 호출한다 (polling만 예외 — permitAll).
  */
 @RestController
 @RequestMapping("/api/v1/queues")
@@ -50,6 +57,67 @@ public class QueueEngineController {
         EnqueueResult result = queueEngineService.enqueue(tenantAuth.getId(),queueId, request.getIdentifier());
         EnqueueResponse response = EnqueueResponse.from(queueId, result);
         return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    /**
+     * 입장 허가 (Admit).
+     *
+     * <p>POST /api/v1/queues/{queueId}/admit
+     *
+     * <p>{@code count} 상한 100은 {@link AdmitRequest}의 {@code @Max}가 강제한다 —
+     * 초과하면 여기 도달하기 전에 400이다.
+     *
+     * <p><b>Kafka 발행이 실패해도 200이다.</b> Lua가 이미 커밋돼 되돌릴 수 없기 때문이다.
+     * 근거는 {@code QueueEngineService.publishAdmitted} 참조.
+     */
+    @PostMapping("/{queueId}/admit")
+    public ResponseEntity<ApiResponse<AdmitResponse>> admit(
+            @AuthenticationPrincipal TenantAuth tenantAuth,
+            @PathVariable String queueId,
+            @Valid @RequestBody AdmitRequest request
+    ) {
+        AdmitResult result = queueEngineService.admit(
+                tenantAuth.getId(), queueId, request.count(), request.requestId());
+        return ResponseEntity.ok(ApiResponse.ok(AdmitResponse.from(result)));
+    }
+
+    /**
+     * admitToken 유효성 확인 (Verify). <b>상태를 바꾸지 않는다.</b>
+     *
+     * <p>POST /api/v1/queues/{queueId}/admit-tokens/{admitToken}/verify
+     *
+     * <p>경로에 queueId가 있는 이유는 Redis 키를 {@code queue:&#123;queueId&#125;:*} 해시태그로
+     * 묶기 위해서다. 무효하면 404 {@code TK002}.
+     */
+    @PostMapping("/{queueId}/admit-tokens/{admitToken}/verify")
+    public ResponseEntity<ApiResponse<VerifyResponse>> verify(
+            @AuthenticationPrincipal TenantAuth tenantAuth,
+            @PathVariable String queueId,
+            @PathVariable String admitToken
+    ) {
+        String identifier = queueEngineService.verify(tenantAuth.getId(), queueId, admitToken);
+        return ResponseEntity.ok(ApiResponse.ok(VerifyResponse.ok(identifier)));
+    }
+
+    /**
+     * 입장 완료 통보 (Complete).
+     *
+     * <p>POST /api/v1/queues/{queueId}/tokens/{tokenId}/complete
+     *
+     * <p><b>탐색 키는 URL의 tokenId</b>이고, 본문의 admitToken은 입장 자격을 증명하는 술어다.
+     * verify를 건너뛴 호출도 거절하지 않는다 — complete 자체가 admitToken을 검증하므로
+     * 거절할 근거가 없다 (§80).
+     */
+    @PostMapping("/{queueId}/tokens/{tokenId}/complete")
+    public ResponseEntity<ApiResponse<CompleteResponse>> complete(
+            @AuthenticationPrincipal TenantAuth tenantAuth,
+            @PathVariable String queueId,
+            @PathVariable String tokenId,
+            @Valid @RequestBody CompleteRequest request
+    ) {
+        LocalDateTime completedAt = queueEngineService.complete(
+                tenantAuth.getId(), queueId, tokenId, request.admitToken());
+        return ResponseEntity.ok(ApiResponse.ok(new CompleteResponse("COMPLETED", completedAt)));
     }
 
     /**

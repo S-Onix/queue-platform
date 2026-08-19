@@ -13,7 +13,26 @@ import java.time.Instant;
  * 깨지므로(§73 D18) 한 토픽·한 스키마에 싣고 본문 필드로 구분한다. 현재 발행되는 값은
  * {@code ENQUEUED} 하나뿐이고, admit·complete 등은 Sprint 7 이후 같은 스키마로 실린다.
  *
+ * <p><b>{@code admitToken}·{@code admittedAt}은 타입에 따라 null이다.</b> 이벤트마다 존재하는
+ * 값이 다른데 스키마는 하나여서 생기는 일이며, 소비 측 UPSERT가 타입별로 필요한 칸만 쓰므로
+ * 나머지가 null인 것이 정상이다(§80 가드 표).
+ *
+ * <table><caption>타입별 null 규약</caption>
+ *   <tr><th>eventType</th><th>admitToken</th><th>admittedAt</th></tr>
+ *   <tr><td>{@code ENQUEUED}</td><td>null</td><td>null</td></tr>
+ *   <tr><td>{@code ADMITTED}</td><td><b>필수</b></td><td><b>필수</b></td></tr>
+ *   <tr><td>{@code COMPLETED}</td><td>필수(자격 증명)</td><td>null</td></tr>
+ *   <tr><td>{@code RETURNED}·{@code CANCELLED}·{@code EXPIRED}</td><td>null</td><td>null</td></tr>
+ * </table>
+ *
+ * <p>여기서 강제하지 않는 이유: 이 record는 <b>역직렬화 경로</b>이기도 하다. 정식 생성자에서
+ * 던지면 잘못된 메시지 한 건이 <b>배치 안 어느 인덱스인지 모르는 채</b> 터져 그 한 건만
+ * 격리하는 길이 막힌다({@link TokenEventType#from}이 예외 대신 null을 주는 것과 같은 이유).
+ *
  * @param eventType {@link TokenEventType} 이름. 아래 정규화 규칙 참조
+ * @param admitToken ADMITTED에서 발급된 입장 자격. 그 외 타입은 null일 수 있다
+ * @param admittedAt admit 시각(UTC). {@code tokens.admitted_at}에 그대로 적재되며
+ *                   verify·complete의 유효 창 기준이다 — {@code issuedAt}("줄 선 시각")이 아니다
  */
 public record EnqueueEvent(
                 String eventType,
@@ -22,7 +41,9 @@ public record EnqueueEvent(
                 long tenantId,
                 String userId,
                 long seq,
-                Instant issuedAt
+                Instant issuedAt,
+                String admitToken,
+                Instant admittedAt
         ) {
 
     /**
@@ -44,12 +65,13 @@ public record EnqueueEvent(
         }
     }
 
-    /** OK 결과 + 발행 맥락(tenantId, issuedAt)으로 이벤트 생성. */
+    /** OK 결과 + 발행 맥락(tenantId, issuedAt)으로 이벤트 생성. admit 관련 두 칸은 아직 없다. */
     public static EnqueueEvent of(long tenantId, String queueId, EnqueueResult result) {
         return new EnqueueEvent(
                 TokenEventType.ENQUEUED.name(),
                 result.getTokenId(), queueId, tenantId,
-                result.getIdentifier(), result.getSeq(), result.getIssuedAt()
+                result.getIdentifier(), result.getSeq(), result.getIssuedAt(),
+                null, null
         );
     }
 }

@@ -64,7 +64,7 @@ public class RedisConfig {
      *
      * <p><b>⚠️ 단, enqueue 경로에서 이 실패는 "재시도하면 회복된다"가 아니다.</b>
      * 클라이언트 타임아웃은 서버 실행을 취소하지 않는다. Lua가 Redis에서 이미 성공한 뒤
-     * 이 시한에 걸려 포기하면, 사용자가 재시도해도 {@code enqueue_bulk.lua}의 {@code ZADD NX}가
+     * 이 시한에 걸려 포기하면, 사용자가 재시도해도 {@code enqueue_bulk.lua}의 {@code HSETNX}가
      * 0을 반환해 <b>EXISTS</b>로 떨어진다. {@code QueueEngineService.enqueue()}는
      * {@code if (result.isOk())}일 때만 Kafka에 발행하므로 <b>발행이 스킵되고 DB row가 생기지 않는다</b>
      * — Redis에만 있고 DB에 없는 좀비 WAITING이 된다.
@@ -200,6 +200,16 @@ public class RedisConfig {
     @Bean
     public RedisScript<Long> pollVerifyScript() {
         return loadScript("lua/poll_verify.lua", Long.class);
+    }
+
+    @Bean
+    public RedisScript<List> admitScript() {
+        return loadScript("lua/admit.lua", List.class);
+    }
+
+    @Bean
+    public RedisScript<List> admitExpireScript() {
+        return loadScript("lua/admit_expire.lua", List.class);
     }
 
     @Bean

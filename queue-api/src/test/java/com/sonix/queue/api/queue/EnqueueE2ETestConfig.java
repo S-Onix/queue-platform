@@ -47,9 +47,11 @@ public class EnqueueE2ETestConfig {
     public RedisQueueEngine redisQueueEngine(
             StringRedisTemplate redisTemplate,
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
-            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript
+            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
+            @Qualifier("admitScript") RedisScript<List> admitScript,
+            @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
     }
 
     @Bean
@@ -60,7 +62,9 @@ public class EnqueueE2ETestConfig {
     @Bean
     public QueueEngineService queueEngineService(QueueRepository queueRepository, RedisQueueEngine engine,
                                                  EnqueueEventPublisher eventPublisher) {
-        return new QueueEngineService(queueRepository, engine, eventPublisher,
+        // TokenRepository는 admit/verify/complete 전용이다. 이 config는 enqueue 흐름(Redis)만
+        // 태우므로 JPA 컨텍스트를 끌어오지 않는다 → null.
+        return new QueueEngineService(queueRepository, null, engine, eventPublisher,
                 new QueueSnapshotCache(engine), java.time.Clock.systemUTC());
     }
 
@@ -131,6 +135,9 @@ public class EnqueueE2ETestConfig {
             }
             @Override public List<Queue> findAllByTenantId(Long tenantId) {
                 return byQueueId.values().stream().filter(q -> tenantId.equals(q.getTenantId())).toList();
+            }
+            @Override public List<Queue> findAll() {
+                return List.copyOf(byQueueId.values());
             }
             @Override public boolean existsByTenantIdAndName(Long tenantId, String name) {
                 return byQueueId.values().stream()

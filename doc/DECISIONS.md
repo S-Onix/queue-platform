@@ -4883,7 +4883,7 @@ Tenant가 받는 enqueue는 요청을 Platform으로 넘기고 `tokenId`를 돌�
 Platform은 **형식 가이드만 제시**하고, `identifier` 검증 책임은 **전적으로 Tenant**에 있다.
 
 **Tenant는 `userId → identifier(UUIDv7)` 매핑을 저장하고, 같은 사용자·같은 큐에는 항상 같은
-UUID를 재사용한다.** 매 요청 새로 생성하면 `enqueue_bulk.lua`의 `ZADD NX`가 안 걸려
+UUID를 재사용한다.** 매 요청 새로 생성하면 `enqueue_bulk.lua`의 `HSETNX`가 안 걸려
 **한 사람이 자리를 여러 개 차지한다.**
 
 **왜 추측 가능한 값(이메일·순번 ID)이면 안 되나 — enqueue가 조회 오라클이 된다**

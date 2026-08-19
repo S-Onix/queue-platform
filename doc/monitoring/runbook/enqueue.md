@@ -11,7 +11,7 @@ HTTP 요청
   └ QueueEngineService.enqueue()          : queue 조회(DB) + 소유권/상태 검증
       └ RedisQueueEngine.enqueue()        : globalQueue.offer() 후 Future.get(30s) 블로킹  ← JVM 힙
           └ BatchProcessor @Scheduled(1000ms) : drain(최대 5000) → queueId groupBy → 500씩
-              └ enqueue_bulk.lua          : ZCARD 1회 + 건당 INCR/ZADD NX/ZRANK/HSET
+              └ enqueue_bulk.lua          : ZCARD 1회 + 건당 INCR/HSETNX/ZADD/ZRANK
       └ KafkaEnqueueEventPublisher.publish() : send().get(12s)   ← OK 결과만
   └ 200 OK
 ```
@@ -86,7 +86,7 @@ HTTP 요청
   **유실 상한 ≈ (유입 RPS × 1초) + 5000.** 유입 2,000 RPS였다면 최대 7,000건.
 - **정상 범위**: 정상 종료(SIGTERM + graceful shutdown)라면 0이어야 하지만, **graceful shutdown 설정이 없다** (`server.shutdown: graceful` 미설정). 즉 정상 재배포에서도 유실 가능.
 - **원인별 분기**: 이 유실은 **Redis에도 안 들어간 상태**라 아래 "유령 토큰"(Redis O / DB X)과 다르다. 3자 대조로는 안 잡힌다 — Redis·DB 어디에도 없기 때문에 대조는 "일치"로 나온다.
-- **조치**: 서버 쪽 복구 수단이 없다. Tenant에게 "해당 시간대 enqueue 요청 중 응답을 못 받은 건은 재시도하라"고 통지한다. 재시도는 안전하다 — 같은 `identifier`로 다시 넣으면 `enqueue_bulk.lua`가 `ZADD NX`로 EXISTS 처리하며 기존 순번을 그대로 돌려준다(`enqueue_bulk.lua:66-72`).
+- **조치**: 서버 쪽 복구 수단이 없다. Tenant에게 "해당 시간대 enqueue 요청 중 응답을 못 받은 건은 재시도하라"고 통지한다. 재시도는 안전하다 — 같은 `identifier`로 다시 넣으면 `enqueue_bulk.lua`가 `HSETNX`로 EXISTS 처리하며 기존 tokenId·순번을 그대로 돌려준다(`enqueue_bulk.lua` EXISTS 분기).
 - **하면 안 되는 것**: "Redis와 DB가 일치하니 유실 없음"이라고 결론짓는 것. 이 유실 유형은 3자 대조로 검출되지 않는다.
 
 ---

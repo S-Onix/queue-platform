@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <b>독립된 BatchProcessor</b>를 갖지만, <b>같은 Redis</b>를 공유한다.
  *
  * <p><b>검증 명제:</b> Global Queue가 인스턴스별로 분리되어 있어도, 순번 발급/중복 방지/정원의
- * 원자성은 Redis 단일 키(INCR seq, ZADD NX)에 있으므로 <b>3개 BatchProcessor가 같은 큐 키를
+ * 원자성은 Redis 단일 키(INCR seq, HSETNX tokens)에 있으므로 <b>3개 BatchProcessor가 같은 큐 키를
  * 동시에 때려도 정합성이 깨지지 않는다</b> (CLAUDE.md 동시성 원칙).
  *
  * <p><b>시나리오:</b> 5 tenant × 1 queue = 5 queue, 총 10,000 enqueue 를 (요청 i)
@@ -54,6 +54,8 @@ class MultiInstanceEnqueueTest {
     @Autowired private StringRedisTemplate redisTemplate;
     @Autowired @Qualifier("enqueueBulkScript") private RedisScript<List> enqueueBulkScript;
     @Autowired @Qualifier("pollVerifyScript") private RedisScript<Long> pollVerifyScript;
+    @Autowired @Qualifier("admitScript") private RedisScript<List> admitScript;
+    @Autowired @Qualifier("admitExpireScript") private RedisScript<List> admitExpireScript;
     @Autowired private QueueRepository queueRepository;
     @Autowired private TenantRepository tenantRepository;
 
@@ -85,10 +87,11 @@ class MultiInstanceEnqueueTest {
         // WAS 3대: 각자 독립 engine(=독립 Global Queue) + 독립 batch, 공유 repo/redis
         running.set(true);
         for (int w = 0; w < WAS_COUNT; w++) {
-            RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript);
+            RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
             BatchProcessor batch = new BatchProcessor(engine, queueRepository);
             // Kafka 브로커 없이 Enqueue(Redis) 흐름만 검증 → no-op 발행자
-            QueueEngineService service = new QueueEngineService(queueRepository, engine, event -> { },
+            // enqueue 경로는 TokenRepository를 쓰지 않는다(admit/verify/complete 전용) → null
+            QueueEngineService service = new QueueEngineService(queueRepository, null, engine, event -> { },
                     new QueueSnapshotCache(engine), java.time.Clock.systemUTC());
             instances.add(new Was(engine, batch, service));
 

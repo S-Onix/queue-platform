@@ -1,5 +1,6 @@
 package com.sonix.queue.infrastructure.queue;
 
+import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueSnapshot;
 import com.sonix.queue.infrastructure.repository.QueueJpaRepository;
@@ -53,6 +54,14 @@ class RedisQueueEngineRoutingTest {
     @Qualifier("pollVerifyScript")
     private RedisScript<Long> pollVerifyScript;
 
+    @Autowired
+    @Qualifier("admitScript")
+    private RedisScript<List> admitScript;
+
+    @Autowired
+    @Qualifier("admitExpireScript")
+    private RedisScript<List> admitExpireScript;
+
     private static final String ON_CLUSTER2 = "q_dev_route_on_b";
     private static final String BRAND_NEW = "q_dev_route_new";
     private static final String NOT_A_QUEUE = "q_dev_route_ghost";
@@ -62,7 +71,7 @@ class RedisQueueEngineRoutingTest {
 
     private RedisQueueEngine engine() {
         return new RedisQueueEngine(cluster1, cluster2, queueJpaRepository,
-                enqueueBulkScript, pollVerifyScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
     }
 
     @AfterEach
@@ -71,7 +80,10 @@ class RedisQueueEngineRoutingTest {
             for (StringRedisTemplate redis : List.of(cluster1, cluster2)) {
                 redis.delete(List.of(
                         QueueKeys.waiting(queueId), QueueKeys.seq(queueId),
-                        QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId)));
+                        QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId),
+                        QueueKeys.admitted(queueId), QueueKeys.admitWatermark(queueId),
+                        QueueKeys.admitIdem(queueId, "req-1"),
+                        QueueKeys.admitByToken(queueId, "tok_1")));
             }
         }
     }
@@ -113,6 +125,25 @@ class RedisQueueEngineRoutingTest {
                 .isEqualTo((double) NOW);
         assertThat(cluster1.hasKey(QueueKeys.lastActive(ON_CLUSTER2))).isFalse();
         verifyNoInteractions(queueJpaRepository);
+    }
+
+    @Test
+    @DisplayName("쓰기: admit(EVAL)도 소유 클러스터에서 실행된다 — cluster1로 가면 빈 대기열에서 0명을 뽑는다")
+    void admit_runsOnOwningCluster() {
+        seedOnCluster2(ON_CLUSTER2);
+        RedisQueueEngine engine = engine();
+
+        AdmitResult result = engine.admit(ON_CLUSTER2, "req-1", 1, NOW);
+
+        assertThat(result.records()).extracting(AdmitResult.AdmitRecord::tokenId).containsExactly("tok_1");
+
+        // 부수효과가 cluster2에만 남았다 = 스크립트가 거기서 돌았다는 직접 증거.
+        // (라우팅을 건너뛰면 cluster1의 빈 큐에서 0건이 나오고, 아래 세 단언이 뒤집힌다)
+        assertThat(cluster2.opsForZSet().size(QueueKeys.admitted(ON_CLUSTER2))).isEqualTo(1L);
+        assertThat(cluster1.hasKey(QueueKeys.admitted(ON_CLUSTER2))).isFalse();
+        assertThat(cluster1.hasKey(QueueKeys.admitWatermark(ON_CLUSTER2))).isFalse();
+
+        cluster2.delete(QueueKeys.admitByAdmit(ON_CLUSTER2, result.records().get(0).admitToken()));
     }
 
     @Test
@@ -174,7 +205,7 @@ class RedisQueueEngineRoutingTest {
         when(dead.hasKey(anyString()))
                 .thenThrow(new RedisConnectionFailureException("cluster1 down"));
         return new RedisQueueEngine(dead, cluster2, queueJpaRepository,
-                enqueueBulkScript, pollVerifyScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
     }
 
     @Test

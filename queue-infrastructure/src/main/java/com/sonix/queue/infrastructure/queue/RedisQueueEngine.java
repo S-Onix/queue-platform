@@ -3,7 +3,10 @@ package com.sonix.queue.infrastructure.queue;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.common.util.IdGenerator;
+import com.sonix.queue.domain.queue.AdmitRef;
+import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
+import com.sonix.queue.domain.queue.ExpiredAdmit;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueSnapshot;
@@ -51,6 +54,15 @@ public class RedisQueueEngine implements QueueEngine {
 
     private static final long MAX_WAIT_SECONDS = 30L;
 
+    /** admitToken 유효 시간 (FRS §6.4). admit-by-* 키의 PX이자 admitted ZSet score의 기준. */
+    private static final long ADMIT_TTL_MILLIS = 60_000L;
+
+    /** admit 멱등 payload 보관 시간. Tenant 재시도가 끝났을 시점 이후로 잡는다 (§80). */
+    private static final long ADMIT_IDEM_TTL_MILLIS = 300_000L;
+
+    /** admit.lua에서 admitToken 후보가 시작되는 ARGV 위치 직전까지의 고정 인자 수. */
+    private static final int ADMIT_TOKEN_OFFSET = 7;
+
     private final StringRedisTemplate cluster1;
     private final StringRedisTemplate cluster2;
 
@@ -78,6 +90,8 @@ public class RedisQueueEngine implements QueueEngine {
 
     private final RedisScript<List> enqueueBulkScript;
     private final RedisScript<Long> pollVerifyScript;
+    private final RedisScript<List> admitScript;
+    private final RedisScript<List> admitExpireScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
@@ -98,13 +112,17 @@ public class RedisQueueEngine implements QueueEngine {
             @Qualifier("cluster2StringRedisTemplate") StringRedisTemplate cluster2,
             QueueJpaRepository queueJpaRepository,
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
-            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript
+            @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
+            @Qualifier("admitScript") RedisScript<List> admitScript,
+            @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript
     ) {
         this.cluster1 = cluster1;
         this.cluster2 = cluster2;
         this.queueJpaRepository = queueJpaRepository;
         this.enqueueBulkScript = enqueueBulkScript;
         this.pollVerifyScript = pollVerifyScript;
+        this.admitScript = admitScript;
+        this.admitExpireScript = admitExpireScript;
     }
 
     /**
@@ -116,9 +134,12 @@ public class RedisQueueEngine implements QueueEngine {
     public RedisQueueEngine(
             StringRedisTemplate redisTemplate,
             RedisScript<List> enqueueBulkScript,
-            RedisScript<Long> pollVerifyScript
+            RedisScript<Long> pollVerifyScript,
+            RedisScript<List> admitScript,
+            RedisScript<List> admitExpireScript
     ) {
-        this(redisTemplate, redisTemplate, null, enqueueBulkScript, pollVerifyScript);
+        this(redisTemplate, redisTemplate, null,
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
     }
 
     /**
@@ -322,6 +343,164 @@ public class RedisQueueEngine implements QueueEngine {
         );
 
         return result != null && result == 1L;
+    }
+
+    @Override
+    public AdmitResult admit(String queueId, String requestId, int count, long nowMillis) {
+        // ARGV: count, expiresAt, admitTtlMs, idemKey(완성), idemTtlMs, byTokenPrefix, byAdmitPrefix, admitToken×N
+        List<String> args = new ArrayList<>(ADMIT_TOKEN_OFFSET + count);
+        args.add(Integer.toString(count));
+        args.add(Long.toString(nowMillis + ADMIT_TTL_MILLIS));
+        args.add(Long.toString(ADMIT_TTL_MILLIS));
+        args.add(QueueKeys.admitIdem(queueId, requestId));
+        args.add(Long.toString(ADMIT_IDEM_TTL_MILLIS));
+        args.add(QueueKeys.admitByTokenPrefix(queueId));
+        args.add(QueueKeys.admitByAdmitPrefix(queueId));
+        // admitToken 후보를 미리 count개 만든다. HGET 미스로 되돌아간 사람 몫은 그냥 버려진다 —
+        // Lua가 채택할 때만 쓰기 때문이고, 스크립트 안에서 만들면 EVAL이 비결정적이 된다.
+        for (int i = 0; i < count; i++) {
+            args.add(IdGenerator.generate("adm_"));
+        }
+
+        // ⚠️ routeForWrite 필수. redisTemplate을 직접 쓰면 cluster2에 배정된 큐의 admit이 cluster1로
+        //    가서 빈 대기열에서 0명을 뽑는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
+        //    쓰기 폴백(DB 배정)을 타는 것도 맞다 — admit은 큐 존재가 이미 확인된 뒤 호출된다.
+        @SuppressWarnings("unchecked")
+        List<Object> raw = routeForWrite(queueId).execute(
+                admitScript,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.tokens(queueId),
+                        QueueKeys.admitted(queueId), QueueKeys.admitWatermark(queueId)),
+                args.toArray()
+        );
+
+        return parseAdmitResult(raw);
+    }
+
+    @Override
+    public Optional<AdmitRef> findAdmitRefByAdmitToken(String queueId, String admitToken) {
+        String raw = routeForWrite(queueId).opsForValue().get(QueueKeys.admitByAdmit(queueId, admitToken));
+        if (raw == null) {
+            return Optional.empty();
+        }
+        // ⚠️ **첫 '|'로만** 쪼갠다. identifier는 Tenant가 정하는 자유 문자열이라 '|'가 들어올 수
+        //    있고, tokenId는 'tok_' + UUID라 '|'를 포함할 수 없다 — 첫 구분자가 정확한 경계다.
+        //    구분자가 없으면 롤링 배포 중 남은 구 포맷(tokenId만)이다: 관용적으로 받아 주고
+        //    identifier는 null로 둔다(호출자가 DB 경로로 간다). admit_expire.lua·splitTokenValue와 같은 규약.
+        int sep = raw.indexOf('|');
+        return Optional.of(sep < 0
+                ? new AdmitRef(raw, null)
+                : new AdmitRef(raw.substring(0, sep), raw.substring(sep + 1)));
+    }
+
+    /**
+     * 폴링 전용 역방향 조회. <b>{@code routeForRead}를 쓴다 — {@code routeForWrite}가 아니다.</b>
+     *
+     * <p>{@code findAdmitRefByAdmitToken}(verify)은 Tenant 인증 뒤의 저빈도 호출이라 쓰기 폴백
+     * (DB 배정 조회)을 타도 되지만, 이 메서드는 <b>인증 없는 폴링</b> 경로다. 쓰기 폴백을 달면
+     * 임의 queueId를 섞은 요청만으로 DB 조회를 유발할 수 있다({@link #routeForWrite} 주석과 같은 이유).
+     *
+     * <p>왕복이 추가되는 것은 {@code verifyWaiting}이 false인 경우뿐이다(= admit됐거나 없는 토큰).
+     * 대기 중인 정상 폴링(최대 15만/s)은 여기에 도달하지 않는다. 소유 클러스터도 같은 요청의
+     * {@code verifyWaiting}이 이미 관찰해 뒀으므로 추가 프로브가 없다.
+     */
+    @Override
+    public Optional<String> findAdmitTokenByTokenId(String queueId, String tokenId) {
+        if (tokenId == null || tokenId.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(
+                routeForRead(queueId).opsForValue().get(QueueKeys.admitByToken(queueId, tokenId)));
+    }
+
+    @Override
+    public List<ExpiredAdmit> claimExpiredAdmits(String queueId, long nowMillis, int limit) {
+        // ⚠️ routeForWrite 필수. 직접 템플릿을 쓰면 cluster2에 배정된 큐의 복귀가 cluster1에서 돌아
+        //    빈 admitted ZSet을 보고 **조용히 0건**을 반환한다. 단일 클러스터 로컬에서는 무해해
+        //    테스트로 안 잡히고, 만료된 토큰은 아무 에러도 없이 영원히 복귀하지 못한다.
+        //    쓰기 폴백(DB 배정 기록)을 타는 것도 맞다 — 큐 목록 자체를 DB에서 읽어왔으므로
+        //    호출 시점에 큐 존재가 이미 확인돼 있다.
+        @SuppressWarnings("unchecked")
+        List<Object> raw = routeForWrite(queueId).execute(
+                admitExpireScript,
+                List.of(QueueKeys.admitted(queueId), QueueKeys.waiting(queueId), QueueKeys.tokens(queueId)),
+                Long.toString(nowMillis),
+                Integer.toString(limit)
+        );
+
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+
+        List<ExpiredAdmit> claimed = new ArrayList<>(raw.size());
+        for (Object row : raw) {
+            @SuppressWarnings("unchecked")
+            List<String> f = (List<String>) row;
+            // tokens Hash 미스는 빈 문자열로 온다(nil이면 배열 뒤가 잘린다). null로 바꿔
+            // 호출자가 "발행 불가"로 읽게 한다.
+            String tokenId = f.get(2).isEmpty() ? null : f.get(2);
+            claimed.add(new ExpiredAdmit(
+                    f.get(0), Long.parseLong(f.get(1)), tokenId, parseIssuedAt(f.get(3))));
+        }
+        return claimed;
+    }
+
+    @Override
+    public void cleanupCompleted(String queueId, String identifier, String tokenId, String admitToken, long seq) {
+        StringRedisTemplate redis = routeForWrite(queueId);
+
+        // TTL 만료로 WAITING에 복귀해 있을 수 있다(§6.6 — status 0을 허용하는 것과 같은 이유).
+        redis.opsForZSet().remove(QueueKeys.waiting(queueId), identifier);
+        redis.opsForZSet().remove(QueueKeys.admitted(queueId), seq + "|" + identifier);
+        // 두 키 모두 {queueId} 해시태그라 같은 슬롯이다 — 다중 키 DEL이 Cluster에서도 성립한다.
+        redis.delete(List.of(QueueKeys.admitByToken(queueId, tokenId),
+                             QueueKeys.admitByAdmit(queueId, admitToken)));
+
+        // 🔴 **반드시 마지막이다.** tokens Hash가 enqueue의 중복 게이트(HSETNX)라, 지우지 않으면
+        //    완료한 사람이 다시 들어오지 못한다. 그런데 이 메서드는 Lua가 아니라 명령 4개라
+        //    중간에 죽을 수 있고, 순서가 결과를 가른다.
+        //      HDEL이 먼저면: Hash만 사라지고 waiting에 남아 poll_verify가 HGET 미스로 계속 0을
+        //                     반환한다 → 그 사람은 영영 404다 (복구 경로 없음).
+        //      HDEL이 마지막이면: waiting/admitted가 먼저 지워지고 Hash만 남아 재입장만 막힌다
+        //                     (다음 complete·TTL 정리로 해소 가능). 안전한 쪽이다.
+        //    "정리 순서 통일" 같은 이유로 위로 올리지 말 것.
+        redis.opsForHash().delete(QueueKeys.tokens(queueId), identifier);
+    }
+
+    /**
+     * admit.lua 결과 파싱:
+     * {@code { "OK"|"REPLAY", { {identifier, tokenId, seq, admitToken, issuedAt}, ... } }}
+     *
+     * <p>seq·issuedAt은 두 경로 모두 <b>문자열</b>이다. OK는 ZPOPMIN score와 Hash 값을 문자열
+     * 그대로 쓰고(Lua 숫자 포맷 %.14g를 피하려고), REPLAY는 cjson 왕복을 거치는데 문자열은
+     * 문자열로 남기 때문이다.
+     *
+     * <p><b>원소가 4개인 행을 허용하는 이유:</b> 멱등 payload는 Redis에 300초 남는다. 롤링 배포
+     * 중에는 <b>이전 버전이 저장한 4개짜리 행</b>이 REPLAY로 돌아올 수 있다. 그 경우 issuedAt은
+     * null이고, 호출자가 ADMITTED 발행을 건너뛴다 — 아무 값이나 채우면 컨슈머의 멱등 키가
+     * 어긋나 같은 토큰의 두 번째 행이 생긴다.
+     */
+    @SuppressWarnings("unchecked")
+    private static AdmitResult parseAdmitResult(List<Object> raw) {
+        if (raw == null || raw.size() < 2) {
+            throw new IllegalStateException("Invalid admit Lua result: " + raw);
+        }
+
+        boolean replay = "REPLAY".equals(raw.get(0));
+        List<Object> rows = (List<Object>) raw.get(1);
+        List<AdmitResult.AdmitRecord> records = new ArrayList<>(rows.size());
+
+        for (Object row : rows) {
+            List<Object> f = (List<Object>) row;
+            records.add(new AdmitResult.AdmitRecord(
+                    (String) f.get(0),
+                    (String) f.get(1),
+                    Long.parseLong((String) f.get(2)),
+                    (String) f.get(3),
+                    f.size() > 4 ? parseIssuedAt((String) f.get(4)) : null
+            ));
+        }
+
+        return new AdmitResult(replay, records);
     }
 
     /**
