@@ -412,8 +412,11 @@ HGET 미스/레거시(구분자 없는 값): ZADD로 원래 seq에 되돌리고 
 
 Kafka 발행 실패: 200을 준다. Lua가 이미 커밋됐고 되돌릴 수 없다.
   5xx를 주면 Tenant 재시도 → admit-idem이 REPLAY로 같은 답만 주고 Kafka는 여전히 안 간다.
-  미반영의 피해는 complete가 status IN (0,1)로 관대해 이미 흡수한다.
   실패는 로그 + queue_admit_requests_total{result=error}로 남긴다.
+  🔴 대가: 발행이 실패하면 admitted_at이 NULL로 남아 complete가 영구 404다.
+     complete 술어의 admitted_at > UTC_TIMESTAMP(3) - INTERVAL {유효 창} SECOND 가
+     NULL을 배제하므로, status IN (0,1)의 관대함이 여기 닿지 못한다 (DECISIONS §80 정정).
+     ADMITTED 소비 전(컨슈머 랙)에도 같은 창이 열린다.
 
 count 상한: 100. @Max(100) 한 줄로 강제한다 (전용 검증 클래스 만들지 않는다).
   Redis는 단일 스레드라 N이 크면 스크립트 하나가 master를 수십~100ms 잡고,
