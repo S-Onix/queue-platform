@@ -1,6 +1,7 @@
 package com.sonix.queue.infrastructure.queue;
 
-import com.sonix.queue.domain.queue.QueueSnapshot;
+import com.sonix.queue.domain.queue.PacingTier;
+import com.sonix.queue.domain.queue.QueueBoard;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -20,7 +21,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * 폴링 어댑터 통합 테스트 (실제 Redis).
  *
  * <p><b>대기자 1만명 규모</b>로 waiting ZSet + tokens Hash를 seed하고, 폴링이 쓰는 두 연산
- * ({@code readSnapshot} / {@code verifyWaiting})을 검증한다.
+ * ({@code readStatus} / {@code verifyWaiting})을 검증한다.
  * enqueue 경로를 우회하고 직접 seed하므로 tenant/DB가 필요 없다
  * (poll이 public·Redis-only인 특성 그대로).
  *
@@ -36,6 +37,8 @@ public class PollRedisAdapterIntegrationTest {
     private static final String WAITING_KEY = QueueKeys.waiting(QUEUE_ID);
     private static final String LAST_ACTIVE_KEY = QueueKeys.lastActive(QUEUE_ID);
     private static final String TOKENS_KEY = QueueKeys.tokens(QUEUE_ID);
+    private static final String SEQ_KEY = QueueKeys.seq(QUEUE_ID);
+    private static final String PACING_KEY = QueueKeys.pacing(QUEUE_ID);
     private static final int WAITERS = 10_000;
     private static final long NOW = 1_700_000_000_000L;
 
@@ -62,6 +65,8 @@ public class PollRedisAdapterIntegrationTest {
         }
         redisTemplate.opsForZSet().add(WAITING_KEY, tuples);
         redisTemplate.opsForHash().putAll(TOKENS_KEY, tokens);
+        // seq 키가 "이 큐는 실재한다"의 증거다 (§79 D3). 실제 enqueue는 INCR로 만든다.
+        redisTemplate.opsForValue().set(SEQ_KEY, String.valueOf(WAITERS));
     }
 
     @AfterEach
@@ -69,37 +74,41 @@ public class PollRedisAdapterIntegrationTest {
         redisTemplate.delete(WAITING_KEY);
         redisTemplate.delete(LAST_ACTIVE_KEY);
         redisTemplate.delete(TOKENS_KEY);
+        redisTemplate.delete(SEQ_KEY);
+        redisTemplate.delete(PACING_KEY);
     }
 
     @Test
-    @DisplayName("readSnapshot: 1만 대기 시 frontSeq=최소seq(1), total=10000")
-    void readSnapshot_returnsFrontSeqAndTotal() {
-        QueueSnapshot snap = queueEngine.readSnapshot(QUEUE_ID);
+    @DisplayName("readStatus: watermark가 없으면 0 + 기본 사다리. 대기 인원(ZCARD)은 응답에 없다")
+    void readStatus_noWatermarkYet() {
+        // 1만 명이 대기 중이어도 이 경로는 waiting ZSet을 건드리지 않는다 — §79가 total을 뺀
+        // 이유가 그것이다(ZCARD는 큐 크기만큼 부담). seq 키 하나가 큐 실재를 증명한다.
+        QueueBoard board = queueEngine.readStatus(QUEUE_ID).orElseThrow();
 
-        assertThat(snap.frontSeq()).isEqualTo(1L);
-        assertThat(snap.total()).isEqualTo(WAITERS);
+        assertThat(board.lastAdmittedSeq()).isZero();
+        assertThat(board.pacing()).isEqualTo(PacingTier.DEFAULT);
     }
 
     @Test
-    @DisplayName("readSnapshot: 맨앞이 빠지면(admit) frontSeq가 다음 최소로 전진")
-    void readSnapshot_frontAdvancesAfterRemoval() {
-        redisTemplate.opsForZSet().remove(WAITING_KEY, "user_1", "user_2", "user_3");
+    @DisplayName("readStatus: pacing 키가 있으면 코드 상수를 이긴다 (운영 중 즉시 변경 레버)")
+    void readStatus_pacingOverrideWins() {
+        // 장애 시 "전원 간격 2배"를 재배포 없이 하는 수단. 이게 없으면 남는 건 429뿐인데
+        // 그건 부하 제어가 아니라 사용자 대기 실패다 (§79).
+        redisTemplate.opsForValue().set(PACING_KEY, "50:4,*:40");
 
-        QueueSnapshot snap = queueEngine.readSnapshot(QUEUE_ID);
+        QueueBoard board = queueEngine.readStatus(QUEUE_ID).orElseThrow();
 
-        assertThat(snap.frontSeq()).isEqualTo(4L);          // 1,2,3 빠짐 → 4가 front
-        assertThat(snap.total()).isEqualTo(WAITERS - 3);
+        assertThat(board.pacing()).containsExactly(
+                new PacingTier(50L, 4), new PacingTier(null, 40));
     }
 
     @Test
-    @DisplayName("readSnapshot: 빈 큐면 frontSeq=-1, total=0")
-    void readSnapshot_emptyQueue() {
-        redisTemplate.delete(WAITING_KEY);
+    @DisplayName("readStatus: seq도 watermark도 없으면 빈 결과 — 미지 queueId를 Redis 1왕복에서 끝낸다")
+    void readStatus_unknownQueue() {
+        // 인증이 없는 경로라(§79) 여기서 DB로 내려보내면 임의 문자열만으로 MySQL을 때울 수 있다.
+        redisTemplate.delete(SEQ_KEY);
 
-        QueueSnapshot snap = queueEngine.readSnapshot(QUEUE_ID);
-
-        assertThat(snap.frontSeq()).isEqualTo(-1L);
-        assertThat(snap.total()).isZero();
+        assertThat(queueEngine.readStatus(QUEUE_ID)).isEmpty();
     }
 
     @Test

@@ -79,6 +79,21 @@ public final class QueueKeys {
     }
 
     /**
+     * 폴링 간격 사다리 오버라이드 (§79). <b>평상시 대부분의 큐에는 이 키가 없다</b> —
+     * 없으면 코드 상수({@code PacingTier.DEFAULT})가 쓰이므로 관리 대상이 0이다.
+     *
+     * <p>존재 이유는 장애 시 "전원 폴링 간격 2배"를 서버가 즉시 할 수 있다는 것 하나다.
+     * 큐 생성 시 미리 채워두지 않는다 — 폴백 분기는 어차피 못 지우고(AFTER_COMMIT 실패·Redis
+     * 유실), 미리 쓰면 쓰기 경로와 삭제 경로만 늘어난다 (§79 D4).
+     *
+     * <p>값 형식은 {@code "50:2,1000:5,5000:10,10000:15,*:20"} — {@code PacingTier.parse} 참조.
+     * {@code admit-watermark}·{@code seq}와 같은 해시태그라 {@code MGET} 한 번에 실린다.
+     */
+    public static String pacing(String queueId) {
+        return "queue:{" + queueId + "}:pacing";
+    }
+
+    /**
      * {@code admit-by-token} 접두사 (뒤에 tokenId가 붙는다). Polling 응답용 admitToken 조회.
      *
      * <p><b>접두사를 Java가 만드는 이유 (§80 ⑥):</b> admit.lua는 이 키를 {@code KEYS[]}에 선언할 수

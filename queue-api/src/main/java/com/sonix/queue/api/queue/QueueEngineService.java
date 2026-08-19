@@ -13,7 +13,6 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.ThreadLocalRandom;
 
 @Slf4j
 @Service
@@ -45,17 +44,15 @@ public class QueueEngineService {
     private final TokenRepository tokenRepository;
     private final QueueEngine queueEngine;
     private final EnqueueEventPublisher eventPublisher;
-    private final QueueSnapshotCache snapshotCache;   // ②
     private final Clock clock;                        // 시간 주입(테스트 제어)
 
     public QueueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher,
-                              QueueSnapshotCache snapshotCache, Clock clock) {
+                              Clock clock) {
         this.queueRepository = queueRepository;
         this.tokenRepository = tokenRepository;
         this.queueEngine = queueEngine;
         this.eventPublisher = eventPublisher;
-        this.snapshotCache = snapshotCache;
         this.clock = clock;
     }
 
@@ -302,34 +299,27 @@ public class QueueEngineService {
                     .orElseThrow(() -> new BusinessException(ErrorCode.TOKEN_NOT_FOUND));
         }
 
-        QueueSnapshot snap = snapshotCache.get(queueId);
-
-        long rank = (snap.frontSeq() < 0) ? 0 : Math.max(0, seq-snap.frontSeq());
-        int next = nextPollAfterSec(rank);
-
-        return new PollResult(admitToken != null, admitToken, snap.frontSeq(), snap.total(), next);
+        // rank·폴링 간격은 계산하지 않는다 — 그건 /status의 lastAdmittedSeq와 pacing으로
+        // 클라이언트가 한다(§79). 여기서 계산하면 응답이 사람마다 달라져 분할이 무의미해진다.
+        return new PollResult(admitToken != null, admitToken);
     }
 
     /**
-     * 등급 간격에 지터를 더한다.
+     * 큐 전광판 조회 (FRS §6.3 ①). <b>인증 없음. 30만 명 전원에게 같은 응답.</b>
      *
-     * <p>같은 등급의 대기자는 전부 같은 초를 받아 다음 폴링이 동시에 몰린다. 등급 경계에서
-     * 한 번 정렬되면 그 뒤로도 계속 같은 초에 돌아와, 큐가 클수록 주기적인 스파이크가 된다.
+     * <p>서버가 하는 일은 {@code MGET} 3키 <b>한 왕복</b>이 전부다. rank도, 폴링 간격도 계산하지
+     * 않는다 — 개인화를 걷어내야 응답이 전원 동일해지고, 그래야 평상시 폴링 트래픽이
+     * {@code EVAL}(write·master 고정)에서 {@code MGET}(read)으로 바뀐다 (§79 Alternative D).
      *
-     * <p>위로만 흩는다. 아래로 흩으면 간격이 등급 하한보다 짧아져 Rate Limit(cap 5, refill 1/s)을
-     * 먼저 때린다. 폭은 등급의 1/4 — 등급 자체가 뭉개지지 않는 선이다.
+     * <p><b>{@code @Transactional}을 붙이지 않는다.</b> DB를 한 줄도 읽지 않기 때문이다.
+     * 여기에 큐 존재 확인용 {@code findQueueAndVerifyOwner}를 넣으면 인증 없는 최대 15만/s가
+     * 그대로 MySQL로 간다 — 큐 실재 판정은 {@code MGET}에 실린 {@code seq} 키가 한다(§79 D3).
+     *
+     * @throws BusinessException 큐에 enqueue 기록이 없으면 404 {@code QUEUE_NOT_FOUND}
      */
-    private int nextPollAfterSec(long rank) {
-        int base = basePollAfterSec(rank);
-        return base + ThreadLocalRandom.current().nextInt(Math.max(1, base / 4) + 1);
-    }
-
-    private int basePollAfterSec(long rank) {
-        if(rank <= 50) return 2;
-        if(rank <= 1000) return 5;
-        if(rank <= 5000) return 10;
-        if(rank <= 10000) return 15;
-        return 20;
+    public QueueBoard status(String queueId) {
+        return queueEngine.readStatus(queueId)
+                .orElseThrow(() -> new BusinessException(ErrorCode.QUEUE_NOT_FOUND));
     }
 
 }

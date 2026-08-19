@@ -18,10 +18,26 @@ public interface QueueEngine {
     EnqueueResult enqueue(String queueId, String identifier);
 
     /**
-     * 큐 스냅샷 조회 — 맨앞 seq(frontSeq)와 대기 인원(total).
-     * 폴링 순위 계산의 공유값. Caffeine 캐시(WAS-local)가 이 결과를 2초간 재사용한다.
+     * 큐 전광판 조회 — {@code GET /status}의 원본 (§79). <b>읽기 1왕복</b>({@code MGET} 3키).
+     *
+     * <p>키 셋이 같은 {@code &#123;queueId&#125;} 해시태그라 한 슬롯이고, 그래서 왕복이 하나다:
+     * {@code admit-watermark}(전광판 값) · {@code pacing}(오버라이드, 없을 수 있다) ·
+     * {@code seq}(큐 실재 판정).
+     *
+     * <p><b>미지 큐 판정에 {@code seq}를 쓰는 이유 (§79 D3):</b> {@code seq}는 그 큐의 첫 enqueue가
+     * {@code INCR}로 만든다. 즉 큐가 실재하고 한 명이라도 들어왔다면 반드시 있다. 이 판정이 없으면
+     * 인증 없는 {@code /status}에 임의 queueId를 던지는 것만으로 DB 조회를 유발할 수 있다 —
+     * 여기서 끝내면 <b>Redis 1왕복 안에서 404</b>이고 MySQL로 내려가지 않는다.
+     *
+     * <p><b>대가</b>: enqueue가 0건인 실존 큐는 404다. 대기 페이지는 enqueue 이후에 서빙되므로(§78)
+     * 실사용 경로가 아니다.
+     *
+     * <p>⚠️ 구현은 반드시 <b>읽기 라우팅</b>을 써야 한다. 쓰기 라우팅은 소유자를 못 찾을 때 DB
+     * 배정 기록을 조회하는데, 이 경로는 인증이 없어 그 조회가 곧 증폭 경로가 된다.
+     *
+     * @return 큐가 실재하지 않으면 빈 {@link Optional} → 호출자가 404
      */
-    QueueSnapshot readSnapshot(String queueId);
+    Optional<QueueBoard> readStatus(String queueId);
 
     /**
      * 폴링 소유권 검증 + keepalive를 한 번에 수행. 쓰기(master).

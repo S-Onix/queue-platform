@@ -9,13 +9,13 @@ import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.ExpiredAdmit;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
-import com.sonix.queue.domain.queue.QueueSnapshot;
+import com.sonix.queue.domain.queue.PacingTier;
+import com.sonix.queue.domain.queue.QueueBoard;
 import com.sonix.queue.infrastructure.repository.QueueJpaRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
@@ -24,7 +24,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
@@ -156,7 +155,7 @@ public class RedisQueueEngine implements QueueEngine {
      *
      * <p><b>오배송이 안전한 이유(읽기 경로):</b> {@code poll_verify.lua}는 대조에 실패하면
      * {@code return 0}으로 끝나 <b>아무것도 쓰지 않는다</b>. {@code ZADD last-active}는
-     * 소유권 대조를 통과한 뒤에만 실행된다. {@code readSnapshot}도 읽기뿐이다.
+     * 소유권 대조를 통과한 뒤에만 실행된다. {@code readStatus}도 읽기뿐이다.
      * 그래서 최악의 결과가 "빈 결과 1회"이며, 상태가 갈라지지 않는다.
      *
      * @param fallbackForNewQueue 양쪽 모두 키가 없을 때의 목적지 결정. 읽기는 cluster1로
@@ -302,23 +301,32 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     @Override
-    public QueueSnapshot readSnapshot(String queueId) {
-        String waitingKey = QueueKeys.waiting(queueId);
-        StringRedisTemplate redis = routeForRead(queueId);
+    public Optional<QueueBoard> readStatus(String queueId) {
+        // 세 키가 같은 {queueId} 해시태그 = 같은 슬롯이라 MGET 한 번이 1왕복이다.
+        // ⚠️ routeForRead 필수. routeForWrite를 쓰면 소유자 미확인 시 DB를 조회하는데,
+        //    이 경로는 인증이 없어(§79) 임의 queueId를 던지는 것만으로 MySQL을 때울 수 있다.
+        List<String> values = routeForRead(queueId).opsForValue().multiGet(List.of(
+                QueueKeys.admitWatermark(queueId),
+                QueueKeys.pacing(queueId),
+                QueueKeys.seq(queueId)));
 
-        Set<ZSetOperations.TypedTuple<String>> front = redis.opsForZSet().rangeWithScores(waitingKey, 0, 0);
-
-        long total = Optional.ofNullable(
-                redis.opsForZSet().zCard(waitingKey)).orElse(0L);
-
-        long frontSeq = -1L;
-
-        if(front != null && !front.isEmpty()) {
-            Double score = front.iterator().next().getScore();
-            if(score != null) frontSeq = score.longValue();
+        if (values == null || values.size() < 3) {
+            return Optional.empty();
         }
 
-        return new QueueSnapshot(frontSeq, total);
+        String watermark = values.get(0);
+        String pacing = values.get(1);
+        String seq = values.get(2);
+
+        // seq도 watermark도 없다 = 이 큐에 아무도 들어온 적이 없다 → 404 (§79 D3).
+        // watermark만 있고 seq가 없는 경우는 Redis 유실 복구 중일 수 있으므로 실재로 본다.
+        if (seq == null && watermark == null) {
+            return Optional.empty();
+        }
+
+        return Optional.of(new QueueBoard(
+                watermark == null ? 0L : Long.parseLong(watermark),
+                PacingTier.parse(pacing)));
     }
 
     @Override

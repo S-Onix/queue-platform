@@ -44,6 +44,11 @@ public class SecurityConfig {
 
                         // === token의 polling은 api-key인증을 거치지 않는다 ===
                         .requestMatchers(HttpMethod.GET, "/api/v1/queues/*/tokens/*").permitAll()
+                        // === 큐 전광판도 인증 없음 (§79) ===
+                        // queueId는 대기 페이지 JS에 박히는 공개값이라 인증으로 막을 게 없고,
+                        // 노출되는 것은 admit 진행률과 pacing 표뿐이다. Rate Limit도 일부러 안 건다
+                        // (RateLimitFilter가 미등록 public 경로를 통과시킨다 — QueueEngineController.status 참조).
+                        .requestMatchers(HttpMethod.GET, "/api/v1/queues/*/status").permitAll()
                         // === 그 외 모두 인증 필요 ===
                         .anyRequest().authenticated()
                 )

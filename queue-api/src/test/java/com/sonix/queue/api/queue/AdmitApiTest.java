@@ -81,8 +81,6 @@ class AdmitApiTest {
     @MockBean private TokenRepository tokenRepository;
     @MockBean private QueueEngine queueEngine;
     @MockBean private EnqueueEventPublisher eventPublisher;
-    @MockBean private QueueSnapshotCache snapshotCache;
-
     // 필터는 addFilters=false로 꺼지지만 빈 자체는 컨텍스트가 요구한다 (기존 컨트롤러 테스트와 동일)
     @MockBean private JwtProvider jwtProvider;
     @MockBean private JwtAuthenticationFilter jwtAuthenticationFilter;
@@ -92,10 +90,9 @@ class AdmitApiTest {
     static class RealServiceConfig {
         @Bean
         QueueEngineService queueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
-                                              QueueEngine queueEngine, EnqueueEventPublisher eventPublisher,
-                                              QueueSnapshotCache snapshotCache) {
+                                              QueueEngine queueEngine, EnqueueEventPublisher eventPublisher) {
             return new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher,
-                    snapshotCache, Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
+                    Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
         }
     }
 
