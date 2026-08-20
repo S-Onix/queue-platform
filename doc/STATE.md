@@ -1,6 +1,6 @@
 # 📊 Queue Platform — 상태 흐름도
 
-> FRS v1.12 기준 | 전이 가드는 DECISIONS §80
+> FRS v1.13 기준 | 전이 가드는 DECISIONS §80
 
 ---
 
@@ -13,6 +13,8 @@ stateDiagram-v2
     WAITING --> ADMIT_ISSUED : POST /admit\nTenant 서버 — N명 입장토큰 발급\nZPOPMIN + admitToken TTL 60초\nKafka ADMITTED 발행 (key=tokenId)
 
     ADMIT_ISSUED --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\nKafka token-lifecycle 발행 (key=tokenId)
+
+    WAITING --> COMPLETED : POST /tokens/:tokenId/complete\nTTL 만료로 복귀했지만 Tenant는 이미 입장시킨 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
 
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nWAITING 복귀 (EXPIRED 아님)\nseq 유지 → 우선순위 보존\nKafka RETURNED 발행 (key=tokenId)
 
@@ -43,6 +45,10 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 > 특히 `ZADD`(enqueue Lua)가 Kafka 발행보다 먼저라 **`ENQUEUED`보다 `ADMITTED`가 먼저 도착**하는
 > 창이 실재한다. `ENQUEUED`의 no-op upsert가 그 역전을 흡수한다.
 >
+> ℹ️ **`COMPLETED` 가드가 `1`만 허용하는데 complete API는 `status IN (0,1)`을 허용하는 것은 모순이 아니다.**
+> complete는 **동기 UPDATE로 이미 2를 쓰고** 나서 이벤트를 발행하므로, 소비 시점의 행은 이미 `2`다 —
+> 이 가드는 되살아남만 막는 안전장치이고 상태를 만드는 주체가 아니다(권위는 API의 조건부 UPDATE).
+>
 > ⚠️ **알려진 구멍**: `0 → 1 → (TTL 만료) → 0` 왕복 뒤 **옛 `ADMITTED`가 재전달**되면 낡은 토큰으로
 > 다시 1이 된다. 가드는 `status`만 보고 **세대를 모르기 때문**이다. 60초를 넘긴 재전달이라 희박해
 > 지금은 막지 않는다(막으려면 버전 컬럼 — §80에 기록만).
@@ -55,7 +61,7 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | verify | ADMIT_ISSUED 상태 유지. 유효성 확인만. 상태 변경 없음 |
 | complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
 | admitToken 만료 | WAITING 복귀 (EXPIRED 아님). seq 기반 순위 복원 |
-| 이탈 허용 | WAITING만. ADMIT_ISSUED → 409 (유저 귀책) |
+| 이탈 허용 | WAITING만. ADMIT_ISSUED → 409 (유저 귀책). ⬜ **API 미구현** — `DELETE /tokens/:tokenId`도 `QE_006_INVALID_STATUS`도 아직 없다 |
 | 세션 관리 | Tenant 책임. Platform 관여 안 함 |
 | complete 순서 | DB 먼저 → ZREM 나중 (잔류가 유실보다 안전) |
 | 복구 | Batch 10초 내 ZREM 재실행 (멱등) |

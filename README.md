@@ -226,7 +226,6 @@ flowchart TD
 | `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `tokenId\|issuedAt` (중복 방지 + 소유권 대조) |
 | `queue:{queueId}:last-active` | ZSet | 없음 | keepalive. member=`seq`, score=ms |
 | `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 |
-| `queue-stats:{t}:{q}` | Hash | 없음 | avgWaitingTime |
 | `token-info:{tokenId}` | String | 폴링 간격+2s | Polling 캐시 (§79 이후 존치 여부 후속 검토) |
 | `queue:{queueId}:admit-by-token:{tokenId}` | 60s | Polling 응답용 |
 | `queue:{queueId}:admit-by-admit:{admitToken}` | 60s | verify/complete용 |
@@ -377,7 +376,6 @@ Tenant (REST API)       : POST /verify → POST /complete
 | admit_token 컬럼 | Redis 미스 시 DB Fallback | 컬럼 추가 | verify 안정성 향상 |
 | queue_daily_stats | 파티션 DROP 후 과금 근거 보존 | 배치 필요 | 감사/청구 불변 기록 |
 | billing_snapshots 직접 집계 | tokens 원본 → 중복 방지 불필요 | 집계 쿼리 필요 | billing_events 테이블 제거 |
-| avgWaitingTime 직접 갱신 | 별도 통계 Consumer 불필요 → 단순화 | Kafka 재처리 중복 허용 | ETA는 보조 정보 → 허용 범위 |
 | 파티션 1달 유예 DROP | 월말 걸친 토큰 과금 누락 방지 | 스토리지 2배 | B2B 과금 정확도 우선 |
 | ZCARD Pipeline | queue-count 관리 불필요 | N번 ZCARD | 카운터 불일치 위험 제거 |
 | `pacing` 구간표 | 서버 부하 절약 + 장애 시 서버가 전원 간격 조정 | SDK 구현 필요 | 순위 높을수록 Polling 드물게 (§79) |
@@ -409,10 +407,10 @@ Tenant (REST API)       : POST /verify → POST /complete
 
 | 문서 | 설명 |
 |------|------|
-| [FRS v1.12](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
+| [FRS v1.13](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
 | [STATE](doc/STATE.md) | Token · Queue · ApiKey 상태 머신 |
 | [FLOW](doc/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
-| [DECISIONS](doc/DECISIONS.md) | 79개 설계 결정 + 근거 + 면접 포인트 |
+| [DECISIONS](doc/DECISIONS.md) | 81개 설계 결정 + 근거 + 면접 포인트 |
 | [ROADMAP](doc/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
 | [CONCURRENCY](doc/CONCURRENCY.md) | 동시성 제어 우선순위 · `@DistributedLock` |
 

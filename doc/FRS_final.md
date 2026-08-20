@@ -1,6 +1,11 @@
 # 📄 Queue Platform — 기능 정의서 (FRS)
 
-> 버전: v1.12 | 상태: 확정 | 대상: 실제 구현 범위
+> 버전: v1.13 | 상태: 확정 | 대상: 실제 구현 범위
+>
+> v1.13 변경사항 (Sprint 7 구현 반영 — `dev` `ba21221`, PR #31~38): 중복 게이트 `HSETNX`(=`tokens` Hash)
+> 명시, verify는 **DB 읽기 0회**(§6.5), complete 유효 창 **300초 확정**(§6.6),
+> `INVALID_ADMIT_TOKEN`/`TK002`를 **구현됨 표로 이동**(§11), admit 관측 메트릭은 **미구현**임을 명시(§6.4),
+> `avgWaitingTime`·`queue-stats` **삭제**(DECISIONS §81), ODKU 함정 ②를 `AS new` 별칭으로 정정(§7)
 >
 > v1.12 변경사항: 구현과 어긋난 서술 정정 — Redis 키표를 `QueueKeys` 4종으로 교체(slice·global-seq·
 > queue-user·token-last-active 폐기, §66 D2·§70 D9·§74), Kafka를 단일 `token-lifecycle` + 키 `tokenId`로
@@ -54,7 +59,7 @@ Tenant    → 슬롯 관리 + 입장 제어
 | pacing | `/status`가 내려주는 폴링 간격 구간표. rank로 조회 → SDK가 지터를 더해 사용 (§79) |
 | lastAdmittedSeq | 마지막으로 admit된 seq(전광판). `rank = mySeq − lastAdmittedSeq` (§79) |
 | ~~nextPollAfterSec~~ | 폐기 — 서버가 개인별 간격을 계산해 내려주던 필드. `pacing`으로 대체 (§79) |
-| avgWaitingTime | 평균 대기 시간 (issuedAt ~ completedAt). ETA 계산에 사용 |
+| ~~avgWaitingTime~~ | 폐기 — 평균 대기 시간. ETA와 `queue-stats` 키까지 함께 폐기 (§81). 필요해지면 `tokens` 사후 집계 |
 
 ### Token 저장 구조
 
@@ -156,6 +161,14 @@ Redis (QueueKeys — §8 참조):
 > 자기가 admit을 건 큐를 알고 있으므로 URL에 실을 수 있다. Cluster에서 CROSSSLOT은 사라진다.
 > 이는 **전 구간 원자성의 필요조건**이었고, **§80이 충분조건까지 채웠다** — 중간 DB 확인을 삭제해
 > admit 전 구간이 Lua 하나에 들어갔고, 소속이 미정이던 `verified-token`은 폐기됐다.
+
+> 🔴 **위 "인증" 칸은 `ApiKeyAuthenticationFilter.shouldNotFilter`의 화이트리스트와 1:1이어야 한다.**
+> 실제로 어긋났다 — §80이 admit·verify·complete를 추가했는데 화이트리스트가 `enqueue` 하나에 머물러
+> **세 경로가 전부 401**이었다(`28106ba`. JWT Bearer로는 통과해서 테스트가 못 잡았다).
+> **인증 주체가 경로마다 다르다는 것이 함정이다** — `GET /{queueId}/tokens/{tokenId}`(폴링)는
+> **유저가 직접** 부르고 API Key가 없으며, `GET /{queueId}/status`는 `permitAll`이다.
+> 즉 `/tokens/{tokenId}/complete`와 `/tokens/{tokenId}`를 정규식으로 **구분**해야 하고, 뭉개면
+> **폴링이 401**이 된다. 아직 미구현인 `DELETE /{queueId}/tokens/{tokenId}`(이탈)도 같은 함정이다.
 
 ### 4.2 관리 API
 
@@ -412,7 +425,13 @@ HGET 미스/레거시(구분자 없는 값): ZADD로 원래 seq에 되돌리고 
 
 Kafka 발행 실패: 200을 준다. Lua가 이미 커밋됐고 되돌릴 수 없다.
   5xx를 주면 Tenant 재시도 → admit-idem이 REPLAY로 같은 답만 주고 Kafka는 여전히 안 간다.
-  실패는 로그 + queue_admit_requests_total{result=error}로 남긴다.
+  🔴 **첫 발행 실패에서 나머지를 건너뛴다.** 발행은 건별 12초 블로킹이라 count=100이면 최악 20분간
+     요청 스레드를 잡는다 — 첫 건이 시한을 다 쓰고 실패했다면 나머지도 같은 브로커를 기다릴 뿐이다.
+  ⚠️ **건너뛴 분은 자동 복구되지 않는다.** admit은 실패해도 200이라 Tenant가 재시도할 이유가 없다 —
+     "복구는 REPLAY"는 같은 requestId로 **마침** 다시 불렀을 때만 성립하는 가능성이지 경로가 아니다.
+  실패는 로그(건너뛴 건수 + 첫 tokenId)로 남는다.
+     ⬜ `queue_admit_requests_total{result=error}`는 **아직 미구현**이다 — 계측 코드 0건이라
+        현재 유일한 흔적은 그 ERROR 로그다.
   🔴 대가: 발행이 실패하면 admitted_at이 NULL로 남아 complete가 영구 404다.
      complete 술어의 admitted_at > UTC_TIMESTAMP(3) - INTERVAL {유효 창} SECOND 가
      NULL을 배제하므로, status IN (0,1)의 관대함이 여기 닿지 못한다 (DECISIONS §80 정정).
@@ -463,9 +482,12 @@ POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
      --    앱의 JDBC 세션은 time_zone=+00:00 이라 NOW()도 UTC지만, 서버 default-time-zone은
      --    아직 +09:00 이라 mysql CLI로 같은 쿼리를 돌리면 NOW()가 KST다.
      --    UTC_TIMESTAMP()는 어느 경로에서도 같은 값이므로 이쪽을 쓴다.
-     없으면 → 404 TK_002_INVALID_ADMIT_TOKEN
-2. DB ADMIT_ISSUED 상태 확인 (Replica)
-3. 끝. **Redis 쓰기 0회, DB 쓰기 0회.**
+     없으면 → 404 `INVALID_ADMIT_TOKEN` (`TK002`)
+2. 끝. **Redis 쓰기 0회, DB 쓰기 0회.**
+
+⚠️ 구 서술의 "2. DB ADMIT_ISSUED 상태 확인"은 **별도 단계가 아니다.** 상태·신선도 술어는 위
+   fallback 쿼리 안에 이미 있고(`status = 1` + `admitted_at` 60초), Redis 히트 경로는 **DB를
+   아예 읽지 않는다.** 구 포맷(tokenId만) 히트일 때만 `token_id`로 한 줄 읽어 신원을 얻는다.
 
 Response: { "valid": true, "identifier": "0190e2c1-..." }
 ```
@@ -509,12 +531,16 @@ Body: { admitToken: "at_xxx" }
     WHERE queue_id = ? AND tenant_id = ? AND token_id = ?
       AND admit_token = ?                    ← 이 값이 곧 입장 자격
       AND status IN (0, 1)                   ← 관대하게. 아래 이유
-      AND admitted_at > UTC_TIMESTAMP(3) - INTERVAL {유효 창} SECOND
-      -- ⚠️ {유효 창}은 미정이다. 제약은 하나 — **admitToken TTL 60초보다 길어야 한다.**
-      --    TTL 만료로 WAITING 복귀했는데 Tenant는 이미 유저를 입장시킨 경우를 덮어야 하기
-      --    때문이다(그게 §80이 complete를 관대하게 만든 이유다). 값 자체는 "테넌트가 얼마나
-      --    늦어도 봐줄 것인가"라는 SLA 결정이라 Sprint 7 착수 시 확정한다.
-   0행 → 404 (또는 409)
+      AND admitted_at > UTC_TIMESTAMP(3) - INTERVAL 300 SECOND
+      -- ✅ 유효 창 = **300초 확정** (`QueueEngineService.COMPLETE_VALID_WINDOW_SECONDS`).
+      --    제약은 하나였다 — **admitToken TTL 60초보다 길어야 한다.** TTL 만료로 WAITING
+      --    복귀했는데 Tenant는 이미 유저를 입장시킨 경우를 덮어야 하기 때문이다.
+      --    300인 이유: "얼마나 늦어도 봐줄 것인가"는 SLA 판단이라 시스템 상수에서 유도되지
+      --    않는다. 그래서 **이미 있는 숫자**에 맞췄다 — admit 멱등키 TTL(300s)이 "Tenant
+      --    재시도가 끝났을 시점"이고, 큐 기본 inactiveTtl도 300s다. 외울 숫자가 하나로 준다.
+      --    늘리는 건 하위호환, 줄이는 건 파괴적 변경이라 여기서도 "필요를 채우는 최소"다.
+   0행 → 404 `INVALID_ADMIT_TOKEN` (`TK002`)   ← 409를 따로 두지 않는다. 원인이 여럿이지만
+        (상태 불가 · admitToken 불일치 · 유효 창 초과) Tenant가 할 일은 어느 쪽이든 같다
 
    ⚠️ status = 0(WAITING)을 허용하는 이유:
       admitToken TTL이 만료돼 WAITING으로 복귀했지만 Tenant는 이미 유저를 입장시킨
@@ -529,18 +555,19 @@ Body: { admitToken: "at_xxx" }
    ZREM queue:{queueId}:waiting  (복귀했다면 남아 있다)
    ZREM queue:{queueId}:admitted
    DEL queue:{queueId}:admit-by-token + queue:{queueId}:admit-by-admit
-   DEL token-info
    HDEL queue:{queueId}:tokens {identifier}   ← **반드시 마지막**
      안 지우면: 이 Hash가 enqueue의 중복 게이트(HSETNX)라 완료한 사람이 다시 못 들어온다
      먼저 지우면: 중간에 죽었을 때 waiting에는 남고 Hash만 없어 폴링이 영영 404다
      (이 4개는 Lua가 아니라 개별 명령이라 원자적이지 않다 — 순서가 결과를 가른다)
 3. Kafka token-lifecycle 발행 — COMPLETED (key=tokenId)
    → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
-4. avgWaitingTime 직접 갱신 (Kafka Consumer 없이)
-   waitingSeconds = completedAt - issuedAt
-   이상치 필터: waitingTtl × 0.8 초과 시 스킵
-   HINCRBYFLOAT queue-stats:{t}:{q} waitingTimeSum {seconds}
-   HINCRBY queue-stats:{t}:{q} waitingTimeCount 1
+   ⚠️ 발행 실패는 삼킨다(로그만). DB는 이미 status=2로 확정됐고, 여기서 5xx를 주면 Tenant
+      재시도가 status IN (0,1)에 걸려 404를 받는다 — 더 나쁘다.
+   ⚠️ admittedAt은 싣지 않는다 — COMPLETED UPSERT는 status만 만지고 admitted_at은 ADMITTED가
+      이미 채운 값이다(§7 가드 표).
+
+   ⛔ 구 4단계 "avgWaitingTime 직접 갱신(HINCRBYFLOAT)"은 **폐기**됐다 (DECISIONS §81).
+      ETA와 `queue-stats` 키도 함께 폐기다 — 한 줄도 구현된 적이 없다.
 
 Response: { "status": "COMPLETED", "completedAt": "..." }
 ```
@@ -554,7 +581,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 처리:
   Redis ZREM queue:{queueId}:waiting {identifier}
   DB status = CANCELLED(3)
-  HDEL queue:{queueId}:tokens {identifier} + DEL token-info
+  HDEL queue:{queueId}:tokens {identifier}   ← complete와 같은 이유로 마지막 (§6.6)
   Kafka token-lifecycle 발행 (key=tokenId)
 ```
 
@@ -624,7 +651,12 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 > ① MySQL ODKU의 `SET` 절은 **좌 → 우 평가**다. `status`를 먼저 쓰면 다음 줄이 이미 갱신된 값을 봐서
 >    `admit_token`이 **영원히 NULL**이 된다 → **`status` 갱신을 마지막에** 둘 것
 > ② ODKU 절에 **`?`를 쓰면 `rewriteBatchedStatements`가 조용히 꺼진다**(Connector/J `QueryInfo.java:168`).
->    `VALUES(admit_token)` 형태는 안전하다. **500건 배치가 500왕복으로 퇴화하는데 예외도 로그도 없다**
+>    **500건 배치가 500왕복으로 퇴화하는데 예외도 로그도 없다.** 그래서 가드의 상수는 전부 리터럴이다
+> ③ 값 참조는 `VALUES(col)`이 아니라 **`VALUES (...) AS new` 별칭 + `new.col`**이다.
+>    `VALUES(col)`은 MySQL 8.0.20부터 deprecated라 **사용 1회마다 경고 1287**이 쌓인다(실측).
+>    ⚠️ 별칭을 붙이면 ODKU 안의 맨 컬럼명이 모호해져 `ERROR 1052 ... ambiguous`가 난다 —
+>    **기존 행은 `tokens.`, 새 값은 `new.`로 전부 한정**할 것. `AS` 절은 Connector/J가 VALUES 절의
+>    끝으로 인식하므로 재작성은 유지된다(`TokenUpsertRewriteTest`가 왕복 횟수로 못박는다)
 
 ### Consumer
 
@@ -670,8 +702,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | Key 패턴 | 자료구조 | TTL | 역할 |
 |----------|----------|-----|------|
 | `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 |
-| `queue-stats:{t}:{q}` | Hash | 없음 | avgWaitingTime (complete 시 직접 갱신) |
-| `token-info:{tokenId}` | String | 폴링 간격+2s | Polling 캐시 (⚠️ §79는 폴링 경로에서 DB status를 읽지 않으므로 존치 여부 후속 검토) |
+| `token-info:{tokenId}` | String | — | ⚠️ **구현된 적 없다**(전 코드 0건). 존재 이유였던 "폴링의 DB status 조회 대체"를 §79가 없앴다(폴링은 DB를 안 읽는다). **폐기 여부 미판정** |
 | `queue:{queueId}:admit-by-token:{tokenId}` | String | 60s | Polling 응답용 admitToken |
 | `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify용 역참조. 값은 `"tokenId\|identifier"` — verify가 DB 없이 신원을 답한다 |
 | `queue:{queueId}:admit-watermark` | String | 없음 | 마지막 admit seq. `/status` 전광판 원본 (§79) |
@@ -714,9 +745,19 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | Job | 주기 | 처리 |
 |-----|------|------|
 | `TokenExpiryJob` | 10초 | WAITING TTL 만료 → EXPIRED + Kafka 발행 |
-| `AdmitTokenExpiryJob` | 10초 | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → WAITING 복귀 (seq 유지) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
+| `AdmitTokenExpiryJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → WAITING 복귀 (seq 유지) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
 | `RedisSyncJob` | 5분 | redis_sync_needed=1 토큰 → Redis 재삽입 |
 | `BillingSnapshotJob` | M+2월 초 | tokens 원본 집계 → queue_daily_stats + billing_snapshots → 파티션 DROP |
+
+> 🔴 **`AdmitTokenExpiryJob`의 한 주기 상한은 큐당 `CLAIM_LIMIT = 500`이고, 적체는 실재한다.**
+> 통합테스트에서 **14,747건이 약 30주기(≈300초)에 걸쳐** 복귀했다. **에러도 경고도 없이 지연만
+> 늘어난다** — 관측 없이는 보이지 않는다. 상한을 두는 이유는 두 가지다: `ZREM`이 `unpack`으로
+> 인자를 펴므로 Lua 스택 상한(≈8000)을 넘으면 안 되고, 만료가 몰려도 Redis 단일 스레드를 오래
+> 잡으면 **같은 노드의 폴링이 함께 밀린다.** 올릴 때는 `count` 상한과 같은 기준 — admit 단독
+> 지연이 아니라 **폴링 p99 증가분**을 잰다.
+>
+> ⚠️ 그 사이 사용자는 폴링에서 **404**를 받는다(실측 창 ≈1초, 이론 최악은 배치 주기 10초).
+> 그 404가 "진짜 사라짐"과 구분되지 않는 것이 §6.3의 미해결 404 계약 문제다.
 
 ---
 
@@ -733,6 +774,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | `AK_002_FORBIDDEN` | `AK002` | 403 | 권한 없음 |
 | `RL_001_KEY_LIMIT` | `RL001` | 429 | 요청 한도 초과 (+ `Retry-After`) |
 | `TOKEN_NOT_FOUND` | `TK001` | 404 | 대기 토큰 없음 (폴링 소유권 실패 포함, §74) |
+| `INVALID_ADMIT_TOKEN` | `TK002` | 404 | 입장토큰 무효 — verify(Redis·DB 둘 다 없음) / complete(짝이 완료 가능 상태 아님). **둘을 나누지 않는다** |
 | `QUEUE_NOT_FOUND` | `Q001` | 404 | 큐 없음 |
 | `QUEUE_NOT_OWNED` | `Q002` | 403 | 본인 큐 아님 |
 | `DUPLICATE_QUEUE_NAME` | `Q003` | 409 | 큐 이름 중복 |
@@ -751,9 +793,9 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 
 | 가칭 | HTTP | 상황 | 필요해지는 시점 |
 |------|------|------|---|
-| `TK_002_INVALID_ADMIT_TOKEN` | 404 | 입장토큰 만료 or 무효 (§6.5 verify) | Sprint 7 |
-| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 (complete / 이탈) | Sprint 7 |
-| (WAITING 복귀 대기) | 404 | admitToken TTL 만료 → 배치 반영 전 (§6.3 404 계약) | Sprint 7 |
+| ~~`TK_002_INVALID_ADMIT_TOKEN`~~ | — | **구현됨** — 위 표의 `INVALID_ADMIT_TOKEN`(`TK002`) | — |
+| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 — **complete에는 쓰지 않는다.** §6.6이 원인(상태 불가 · admitToken 불일치 · 유효 창 초과)을 구분하지 않고 전부 `TK002` 404로 답하기로 확정했다. 남은 후보는 **이탈(`DELETE /tokens/:tokenId`)뿐**이고 그 API가 미구현이다 | 이탈 구현 시 |
+| (WAITING 복귀 대기) | 404 | admitToken TTL 만료 → 배치 반영 전 (§6.3 404 계약) | **미해결** — ErrorCode만 추가해선 던질 수 없다(§6.3 판정 수단 부재) |
 
 ---
 
@@ -771,7 +813,7 @@ SDK가 없으므로 아래 제약은 **명세에 명시하고 서버가 방어**
 
 | Tenant가 지켜야 할 것 | 위반 시 | Platform의 대응 |
 |---|---|---|
-| verify를 **Tenant 내부 처리 전에** 먼저 호출 | 내부 처리가 길면 admitToken TTL 60초 초과 → `TK_002` 404 | 순서 강제 불가(Tenant 책임). OpenAPI description에 명시 |
+| verify를 **Tenant 내부 처리 전에** 먼저 호출 | 내부 처리가 길면 admitToken TTL 60초 초과 → `TK002` 404 | 순서 강제 불가(Tenant 책임). OpenAPI description에 명시 |
 | complete는 admitToken TTL 60초 내 호출 | 만료된 admitToken → 404 | 위와 동일 |
 | **verify 후 지체 없이 complete** | 내부 처리가 길어 `admitted_at` 유효 창을 넘기면 complete가 404 | **강제 불가 — Tenant 책임.** OpenAPI description에 명시 |
 | `identifier`는 **UUIDv7**, 사용자·큐당 **같은 값을 재사용** | §6.2 참조 — 자리 중복 점유 / 자격 증명 유출 | 형식 가이드만 제시. 검증은 Tenant 책임 |
