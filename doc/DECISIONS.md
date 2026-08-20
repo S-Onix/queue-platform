@@ -5989,11 +5989,26 @@ GROUP BY tenant_id
 취소해서 과금을 피하는 경로가 원천적으로 없다. **§21의 그 제약이 이 결정의 전제**이므로, §21을
 느슨하게 바꾸려면 여기도 같이 봐야 한다.
 
-**② 🪤 DB row가 실제로 `status = 3`에 도달해야만 빠진다.** enqueue 직후 취소하면 outbox 적재
-전이라 `UPDATE ... SET status = 3`이 **0건**이 되고, 뒤늦게 들어온 INSERT가 `status = 0`짜리
-row를 만든다(좀비 WAITING). 그러면 **취소했는데 과금된다.** 지금까지 이 경로의 대가는
-"유령이 줄에 남는다"였는데, 이 결정으로 **청구 오차**가 하나 더 붙었다. 대책(UPDATE 0건이면
-outbox drain 후 짧게 재시도)은 Sprint 9 종료 경로 설계에 이미 올라와 있다 — 새 과제가 아니다.
+**② DB row가 실제로 `status = 3`에 도달해야만 빠진다 — 그리고 그건 구현 방식이 정한다.**
+
+취소가 `UPDATE ... SET status = 3` **한 문장**이면 위험하다. enqueue 직후 취소는 컨슈머가 아직
+행을 안 만든 창이라 **0건**이 되고, 뒤늦은 `ENQUEUED`가 `status = 0` row를 만든다(좀비 WAITING).
+**취소했는데 과금된다.**
+
+**그래서 Cancel은 `UPDATE`를 쓰지 않는다.** `TokenRepository.applyTransition(CANCELLED, ...)`은
+`INSERT ... ON DUPLICATE KEY UPDATE`라 **행이 없으면 `status = 3`으로 INSERT한다.** 뒤늦게 온
+`ENQUEUED`는 `TokenEntity.@SQLInsert`의 `ON DUPLICATE KEY UPDATE token_id = token_id`(진짜 no-op)에
+걸려 3을 덮지 못한다. 도착 순서 셋(취소 먼저 / `ENQUEUED` 먼저 / 그 사이) **전부 3으로 수렴**한다.
+`TokenJpaAdapterIntegrationTest`의 *"행이 없으면 도착 상태로 INSERT한다"*가 이미 `CANCELLED`로
+그것을 단언하고 있다.
+
+🪤 **대신 `issued_at`이 원본과 정확히 같아야 한다.** 유니크 키가 `(token_id, issued_at)`이라
+1ms만 달라도 충돌이 안 나 **두 번째 행**이 생기고, 그 행은 `status = 0`이라 결국 과금된다 —
+막으려던 것이 그대로 돌아온다. 그래서 취소 경로는 `issued_at`을 **새로 만들지 않고** Redis
+`tokens` Hash 값(`tokenId|issuedAt`)에서 읽은 원본을 그대로 싣는다.
+
+남는 창은 **"DB 쓰기와 Kafka 발행이 동시에 실패"** 하나뿐이다(어느 하나만 성공해도 3에 도달한다).
+그건 Sprint 9 reconciliation의 몫이고, 여기서 대책을 만들면 Cancel보다 커진다.
 
 **③ 집계 비용은 그대로다.** 이미 월 파티션 전체를 스캔해 `GROUP BY tenant_id`를 하므로
 `status <> 3`은 그 스캔에 얹히는 필터다. **인덱스를 새로 만들지 않는다.**
