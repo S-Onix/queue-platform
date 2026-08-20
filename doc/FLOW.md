@@ -1,7 +1,7 @@
 # 🔄 Queue Platform — 상세 흐름도
 
 > **최종 업데이트**: 2026-08-17 (구현 대조 — Kafka 단일 토픽 §73, 슬라이스 절 폐기 §66 D2, 3-key Lua)
-> **관련 문서**: DECISIONS.md §66-70·§73-§79, doc/ARCHITECTURE_ROADMAP.md, FRS v1.12
+> **관련 문서**: DECISIONS.md §66-70·§73-§81, doc/ARCHITECTURE_ROADMAP.md, FRS v1.13
 
 ---
 
@@ -92,8 +92,11 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 > ⚠️ **이 절은 §79(2026-08-14) 이전의 검토안이다.** 현행 계약은 아래
 > "클라이언트 Polling 구조 (JS SDK)" 절과 `FRS_final.md §6.3`을 보라.
 > §79에서 바뀐 것: 엔드포인트 2분할 / 서버는 rank를 계산하지 않는다 /
-> `QueueSnapshotCache`(Caffeine)는 **제거 대상**이다.
+> `QueueSnapshotCache`(Caffeine)는 **제거됐다**(2026-08-19).
 > 아래 `/rank/:identifier`·`{rank, total, estimatedWaitSeconds}` 표기는 **채택되지 않았다.**
+> ⛔ 그중 ETA(`estimatedWaitSeconds`)와 그 입력인 `avgWaitingTime`은 **§81이 정식 폐기**했다.
+> 그림에서 노드만 도려내지 않는 이유: 이 다이어그램은 캐시·`/rank`·서버 지터까지 통째로
+> 미채택이라 한 노드를 지워도 현행이 되지 않는다. **미채택 기록으로 통째로 남긴다.**
 
 Sprint 5-E 이후 Polling 부하 최적화:
 - **Jitter 적용** (JS SDK): 요청 시점 무작위 분산 (4-6초 랜덤)
@@ -162,27 +165,26 @@ flowchart TD
 
     OWN --> LUA["② EVAL admit.lua — 전 구간 원자 (Redis 밖 호출 0회)\n\nqueue:{queueId}:admit-idem:{requestId} 있으면 → REPLAY 반환\n\nZPOPMIN queue:{queueId}:waiting N → (identifier, seq) N쌍\n  ※ ZSet 하나(§66 D2) + score가 INCR 단조증가(§70 D9) → 이미 FIFO\n  ※ 거를 대상이 없어 ZRANGE+ZREM이 ZPOPMIN 한 명령이 됐다\nHGET queue:{queueId}:tokens {identifier} → 'tokenId|issuedAt'\n  ※ 미스/레거시면 ZADD로 원래 seq에 되돌리고 건너뛴다 — 안 되돌리면 대기열에서 사라진다\nSET queue:{queueId}:admit-by-token:{tokenId} PX 60000\nSET queue:{queueId}:admit-by-admit:{admitToken} PX 60000\n  ※ 이 둘과 admit-idem은 KEYS[] 선언 불가 → CROSSSLOT 검사가 안 걸린다\n  ※ 접두사는 Java(QueueKeys)가 만들어 ARGV로. Lua는 prefix .. tokenId 만 (§80)\nZADD queue:{queueId}:admitted {만료 epoch ms} '{seq}|{identifier}'\nwatermark 조건부 갱신 (현재값보다 클 때만, §79)\nqueue:{queueId}:admit-idem:{requestId} = 결과 payload"]
 
-    LUA --> KAFKA["③ Kafka token-lifecycle 발행\nADMITTED × N (key=tokenId)\n→ Consumer: status 0→1, admit_token, admitted_at"]
+    LUA --> KAFKA["③ Kafka token-lifecycle 발행\nADMITTED × N (key=tokenId)\n→ Consumer: status 0→1, admit_token, admitted_at\n※ 건별 12초 블로킹. 첫 발행 실패면 나머지를 건너뛴다\n※ 건너뛴 분은 자동 복구되지 않는다 — 실패해도 200이라\n   Tenant가 재시도할 이유가 없다. 흔적은 ERROR 로그뿐 (§80)"]
     --> ARESP(["④ 200 OK\n{ admitted: [{tokenId, identifier, seq, admitToken}...] }\n\n보장: 대기열에서 빠졌고 admitToken을 쥐었다 (Redis 사실)\n미보장: tokens.status가 이미 1이다"])
 
     ARESP --> POLL["유저 다음 Polling 시\nadmitToken 수신"]
     --> USER["유저 → Tenant\nadmitToken 전달"]
     --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 — Redis·DB 쓰기 0회"]
 
-    VERIFY --> VK{"queue:{queueId}:admit-by-admit:{admitToken}\n유효?"}
+    VERIFY --> VK{"queue:{queueId}:admit-by-admit:{admitToken}\n유효?\n값에 tokenId와 identifier가 함께 들어 있다 (첫 구분자로만 분리)\n→ identifier가 손에 있으므로 DB를 안 읽는다 (§80)"}
     VK -->|"만료 or 무효"| VDB["DB Fallback\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND admitted_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(issued_at 아님 — 줄 선 시각은 2시간 전일 수 있다. §80)"]
-    VDB -->|"없음"| E404(["404 TK_002_INVALID_ADMIT_TOKEN\n※ TTL 만료 후 verify는 404"])
+    VDB -->|"없음"| E404(["404 INVALID_ADMIT_TOKEN (TK002)\n※ TTL 만료 후 verify는 404"])
     VDB -->|"있음"| VRESP
     VK -->|"유효"| VRESP(["200 OK\n{ valid: true, identifier }"])
 
     VRESP --> ALLOW["Tenant → 유저 입장 허용"]
     --> COMPLETE["POST /queues/:queueId/tokens/:tokenId/complete\n{ admitToken }\nTenant → Platform"]
 
-    COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - {유효 창}\n\n0을 허용하는 이유: TTL 만료로 복귀했지만\nTenant는 이미 입장시킨 경우가 실재한다"]
-    DB -->|"0행"| E404C(["404 / 409"])
+    COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - 300초\n   (COMPLETE_VALID_WINDOW_SECONDS, §80 구현)\n\n0을 허용하는 이유: TTL 만료로 복귀했지만\nTenant는 이미 입장시킨 경우가 실재한다"]
+    DB -->|"0행"| E404C(["404 INVALID_ADMIT_TOKEN (TK002)\n409를 따로 두지 않는다 — 원인이 무엇이든\nTenant가 할 일은 같다"])
     DB -->|"1행"| ZREM["Redis 정리 (나중)\nZREM queue:{queueId}:waiting\nZREM queue:{queueId}:admitted\nDEL admit-by-token + admit-by-admit\nDEL token-info\nHDEL queue:{queueId}:tokens {identifier} ← 반드시 마지막\n(중복 게이트 해제. 먼저 지우면 폴링이 영영 404)"]
-    --> KAFKA2["Kafka COMPLETED 발행 (key=tokenId)"]
-    --> AVG["avgWaitingTime 직접 갱신\nwaitingSeconds = completedAt - issuedAt\n이상치 필터: > waitingTtl × 0.8 제외\nHINCRBYFLOAT queue-stats waitingTimeSum\nHINCRBY queue-stats waitingTimeCount"]
+    --> KAFKA2["Kafka COMPLETED 발행 (key=tokenId)\n※ 발행 실패는 삼킨다(로그만) — DB는 이미 status=2로 확정"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]

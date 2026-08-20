@@ -1,6 +1,6 @@
 # Queue Platform — 설계 결정 문서
 
-> FRS v1.12 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
+> FRS v1.13 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
 
 ---
 
@@ -55,7 +55,8 @@
 | §33 | verify API 제거 검토 → 유지로 번복 | ✏️ |
 | §34 | admitToken TTL 만료: EXPIRED → WAITING 복귀 | ✅ |
 | §36 | admitToken TTL 만료 → WAITING 복귀 (상세) | ✏️ |
-| §80 | **Sprint 7 Admit — 전 구간 원자 Lua + 동기 응답** (`verified-token`·`admit_requests` 폐기) | 🚧 |
+| §80 | **Sprint 7 Admit — 전 구간 원자 Lua + 동기 응답** (`verified-token`·`admit_requests` 폐기) | ✅ |
+| §81 | `avgWaitingTime`·ETA·`queue-stats` 폐기 (→8) | ✅ |
 
 **4. 이탈 · 만료 (TTL / CANCELLED / EXPIRED)**
 
@@ -405,7 +406,8 @@ Stripe, GitHub, AWS 동일 방식:
 > ✏️ **복구 절차가 §71 D12·D13에서 재설계됐다.** 아래 표의 `global-seq`(→ `queue:{queueId}:seq`)와
 > `queue-user 역인덱스`(→ `queue:{queueId}:tokens` Hash)는 폐기된 키다. 순서 복구도 `issued_at` 밀리초를
 > score로 쓰는 근사 복구가 아니라 **DB `tokens.seq`를 그대로 score로 복원**한다(§70 D9로 seq가
-> 단조증가·유일해졌기 때문). "DB가 원본" 원칙과 복구 불가 항목(비활동 TTL·avgWaitingTime) 판정은 유효하다.
+> 단조증가·유일해졌기 때문). "DB가 원본" 원칙과 복구 불가 항목(비활동 TTL) 판정은 유효하다.
+> ⛔ 아래 표의 **`avgWaitingTime` 행은 §81이 폐기**했다 — 값 자체를 만들지 않으므로 복구 대상이 아니다.
 
 ### 복구 가능 항목
 
@@ -417,7 +419,7 @@ Stripe, GitHub, AWS 동일 방식:
 | userId 역인덱스 | ✅ 재구성 가능 | WAITING 토큰에서 재구성 |
 | global-seq | ⚠️ 근사 복구 | 최대 score를 seq로 설정 |
 | 비활동 TTL | ❌ 복구 불가 | 전원 inactiveTtl 리셋 |
-| avgWaitingTime | ❌ 복구 불가 | ETA null 반환 |
+| ~~avgWaitingTime~~ | ⛔ **폐기 (§81)** | 값을 만들지 않는다 — 복구 대상 아님 |
 
 ### 복구 순서
 ```
@@ -432,8 +434,8 @@ Stripe, GitHub, AWS 동일 방식:
 > DATETIME(3) 밀리초 단위로 issued_at을 저장하므로
 > 200 rps 기준 1ms 내 충돌 확률이 0.2명 수준으로
 > FIFO를 사실상 완전 복구할 수 있습니다.
-> 비활동 TTL과 avgWaitingTime은 복구 불가하며
-> 각각 inactiveTtl 리셋, ETA null로 처리합니다."
+> 비활동 TTL은 복구 불가하며 inactiveTtl 리셋으로 처리합니다."
+> (⛔ 초판의 "avgWaitingTime은 ETA null로" 부분은 **§81이 폐기**했다 — 두 값 다 만들지 않는다)
 
 ---
 
@@ -614,8 +616,11 @@ queue-common을 각 모듈에서 직접 선언하는 이유:
 ```
 Admit ──┬──▶ DB COMPLETED  (상태 확정 — 먼저)
         ├──▶ Redis ZREM    (Dequeue — 나중)
-        └──▶ avgWaitingTime 갱신 (통계 — 마지막)
+        └──▶ ~~avgWaitingTime 갱신 (통계 — 마지막)~~  ⛔ **폐기 (§81)**
 ```
+
+> ⛔ **세 번째 단계는 §81이 폐기했다.** 남는 순서는 **DB 먼저 → Redis 정리 나중** 둘이다.
+> Redis 정리 안에서의 순서(§80 구현 결과 ①의 `HDEL` 마지막)는 그와 별개로 지켜야 한다.
 
 ### 순서가 중요한 이유
 
@@ -628,7 +633,7 @@ DB 먼저 → ZREM 실패:
   Tenant 입장: 유저 이미 입장 허용 → 서비스 이용 중 → 피해 없음
   Platform 입장: Sorted Set에 잔류 → 10초 내 정리
 
-avgWaitingTime 마지막인 이유:
+~~avgWaitingTime 마지막인 이유:~~   ⛔ 폐기 (§81 — 값도 ETA도 만들지 않는다)
   Admit 확정 후에야 정확한 대기시간(issuedAt ~ completedAt) 계산 가능
   다음 유저 ETA 계산에 사용 → 실제 Admit 데이터만 반영해야 정확
 ```
@@ -649,8 +654,13 @@ ZREM으로 제거 → 다음 score가 자동으로 rank 1
 두 명이 동시에 같은 token으로 complete 호출
 → DB UPDATE WHERE status=ADMIT_ISSUED (1번만 성공)
 → 먼저 성공한 쪽만 COMPLETED
-→ 나머지 → 409 QE_006_INVALID_STATUS
+→ 나머지 → 404 INVALID_ADMIT_TOKEN (TK002)
 ```
+
+> ✏️ **초판의 `409 QE_006_INVALID_STATUS`는 틀렸다(2026-08-20).** complete는 실패 원인을
+> 구분하지 않고 전부 **404 `TK002`**로 답한다 — 상태 불가·admitToken 불일치·유효 창 초과 중
+> 어느 쪽이든 **Tenant가 할 일이 같기 때문**이다(§80, `FRS §6.6`). `QE_006`은 `ErrorCode`에
+> 없고, 남은 후보는 미구현인 이탈(`DELETE /tokens/:tokenId`)뿐이다(§21).
 
 ### 면접 포인트
 > "정상 흐름에서 rank=1은 항상 1명입니다.
@@ -1149,7 +1159,7 @@ DB 먼저 이유:
 | `queue:{t}:{q}:{slice}` | Sorted Set | 없음 | score로 FIFO 보장. ZCOUNT O(log N). 슬라이스 분산으로 경합 감소 |
 | `global-seq:{t}:{q}` | String | 없음 | INCRBY 원자 연산. 슬라이스 간 전체 순번 채번. TTL 없음 = Queue 수명과 동일 |
 | `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 여러 필드를 Key 1개로 관리. HGET으로 필요 필드만 조회 |
-| `queue-stats:{t}:{q}` | Hash | 없음 | HINCRBYFLOAT으로 float 누적. complete 시 직접 갱신. avgWaitingTime 실시간 계산 |
+| ~~`queue-stats:{t}:{q}`~~ | Hash | 없음 | ⛔ **폐기 (§81)** — 용도가 avgWaitingTime 하나뿐이었고 그 값을 만들지 않기로 했다 |
 | `queue-user:{t}:{q}:{userId}` | String | waitingTtl | O(1) 중복 체크. TTL=waitingTtl로 대기 중 자동 보호. CANCELLED 시 즉시 DEL |
 | `token-last-active:{tokenId}` | String | inactiveTtl | Key 존재 여부로 활동 감지. Polling마다 TTL 갱신. EXISTS=0이면 EXPIRED |
 | `token-info:{tokenId}` | String | nextPollAfterSec+2s | Polling DB SELECT 대체. 상태 변경 시 즉시 갱신. 갱신 실패 시 DEL로 폴백 |
@@ -1245,7 +1255,9 @@ DB 먼저 이유:
   → Batch 서버 추가 시 선형 확장
 ```
 
-#### ⑧ avgWaitingTime ETA 왜곡
+#### ⑧ ~~avgWaitingTime ETA 왜곡~~ ⛔ **폐기 (§81)**
+
+> 문제 자체가 사라졌다 — avgWaitingTime도 ETA도 만들지 않는다. 아래는 역사 기록이다.
 
 ```
 해결: complete 시 직접 Redis 갱신 (StatsConsumer 불필요)
@@ -1729,7 +1741,7 @@ server:
    COMPLETED / CANCELLED / EXPIRED 시 발행
    → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
 
-avgWaitingTime은 Kafka 없이 complete API에서 직접 갱신:
+~~avgWaitingTime은 Kafka 없이 complete API에서 직접 갱신:~~   ⛔ **폐기 (§81)**
    complete 시 HINCRBYFLOAT queue-stats:{t}:{q}
    → StatsConsumer 불필요 → 설계 단순화
 ```
@@ -1809,9 +1821,8 @@ public class BillingConsumer {
 > billing_snapshots를 갱신합니다.
 > tokens가 원본이므로 별도 중복 방지 테이블이 불필요합니다.
 >
-> avgWaitingTime은 Kafka Consumer 없이
-> complete API에서 직접 Redis HINCRBYFLOAT으로 갱신합니다.
-> ETA는 보조 정보이므로 Kafka 재처리 중복 허용이 가능합니다."
+> (⛔ 초판의 마지막 문단 *"avgWaitingTime은 complete API에서 직접 HINCRBYFLOAT / ETA는 보조 정보"*는
+> **§81이 폐기**했다. 면접 답변에서도 빼라 — 만들지 않은 것을 만들었다고 말하게 된다.)"
 
 ---
 
@@ -2454,6 +2465,7 @@ Access Token 즉시 무효화가 필요한 경우:
 >
 > ✏️ **③의 DEL 대상 키 목록이 낡았다.** `queue:{t}:{q}:0 ~ {sliceCount-1}`·`global-seq:{t}:{q}` →
 > 현행은 `queue:{queueId}:waiting|seq|tokens|last-active` 4종이다(`QueueKeys`, §66 D2·§70 D9·§74).
+> `queue-stats:{t}:{q}`도 목록에서 빠진다 — **§81이 키 자체를 폐기**했다.
 > **상태 전이(DRAINING → DELETED)와 "DB 먼저 → Redis 나중" 순서는 유효하다.**
 
 ### 삭제 요청
@@ -5410,16 +5422,19 @@ master 한 대에 몰립니다.**
   Consequences "지터는 **등급 하한 위로만**"(비대칭, `base ~ base+max(1,base/4)`)은 양립하지 않는다.
   삭제된 서버 구현(`nextPollAfterSec`)은 비대칭이었다. **서버가 간격을 계산하지 않게 된 지금
   어느 쪽도 서버 코드로 강제할 수 없다** — SDK 착수 전에 결론이 필요하다
-- 후속: ETA(`estimatedWaitSeconds`) 거처,
-  pacing `rank<=0` 구간(관측 후), ~~admit 전 구간 원자성~~ · ~~`verified-token` 클러스터 소속~~
+- ~~후속: ETA(`estimatedWaitSeconds`) 거처~~ → **§81이 닫음(폐기).** 유일한 입력이던
+  `avgWaitingTime`을 함께 폐기했고, 응답에 개인화를 되살리지 않는 한 ETA가 앉을 자리가 없다
+- 후속: pacing `rank<=0` 구간(관측 후), ~~admit 전 구간 원자성~~ · ~~`verified-token` 클러스터 소속~~
   (**둘 다 §80이 닫음** — Lua 하나 / 키 폐기),
   **CDN 도입 시 `Cache-Control max-age` 값 결정**(Sprint 11 — D1이 지금은 안 붙이기로 한 것)
 - **소멸한 후속**(2026-08-17): ~~`/status` 캐시 TTL~~(D1 — 캐시를 안 만든다. CDN 시 `max-age`로 부활) ·
   ~~맵 리로드 주기~~(D2·D3) · ~~`pacing` "즉시 변경" ↔ "캐시 미스 때만" 모순~~(캐시가 없으니 **진짜 즉시**다.
   CDN 도입 시 `max-age`만큼의 지연으로 부활)
-- 🔴 **후속 — 큐 상태 키의 회수 경로가 통째로 없다 (같은 유형 2건, 회수 배치는 Sprint 9)**
-  - `queue:{q}:tokens` Hash — `HDEL`이 **전 문서·전 코드 0건**이고 큐 상태 키에 `EXPIRE`도 **0건**이다.
-    admit·complete·cancel·expire가 전부 `ZREM`만 하므로 **누적 enqueue 수만큼 필드가 영구 축적**된다
+- 🔴 **후속 — 큐 상태 키의 회수 경로가 거의 없다 (회수 배치는 Sprint 9)**
+  - ✏️ **정정(2026-08-20).** `queue:{q}:tokens` Hash의 `HDEL`이 **0건이었던 것은 §80 구현 전까지**다.
+    지금은 `cleanupCompleted`(complete 경로)에 있고, **거기서 맨 마지막 명령**이다(§80 구현 결과 ①).
+    남은 누수는 **complete하지 않고 떠난 사람**이다 — 이탈·TTL 만료 경로가 아직 없어
+    그만큼 필드가 영구 축적된다. 큐 상태 키에 `EXPIRE`는 여전히 **0건**이다
   - `queue:{q}:last-active` ZSet — `ZREM`이 0건. 폴링이 쓰기만 하고 읽는 곳이 없다(§74 Consequences)
   - 역설적으로 **이 누수 덕에 admitToken TTL 만료 후 WAITING 복귀가 `ZADD` 하나로 성립한다**
     (`tokens` Hash의 identifier→tokenId 매핑이 살아 있어야 복귀한 멤버를 다시 검증할 수 있다).
@@ -5429,8 +5444,9 @@ master 한 대에 몰립니다.**
 
 ## §80 — Sprint 7 Admit: 전 구간 원자 Lua + 동기 응답 (`verified-token`·`admit_requests` 폐기)
 
-**결정일**: 2026-08-17. **설계 확정, 구현 미착수.** §79가 "pop 성공 + 토큰 SET 실패 창은 미해결"로
-남긴 것과, `FRS §6.4`가 3단계(Lua → DB 확인 → SET)로 적어둔 흐름을 닫는다.
+**결정일**: 2026-08-17. **구현 완료 2026-08-20** (`dev` `ba21221`, PR #31~38 — 아래 "구현 결과" 참조).
+§79가 "pop 성공 + 토큰 SET 실패 창은 미해결"로 남긴 것과, `FRS §6.4`가 3단계(Lua → DB 확인 → SET)로
+적어둔 흐름을 닫는다.
 
 ### Decision
 
@@ -5464,7 +5480,7 @@ master 한 대에 몰립니다.**
 | `admit_requests` 테이블 | 🔴 **폐기** (`schema.sql`에서 삭제) |
 | `admit.lua` 동적 키 조립 | **Java가 접두사까지 만들어 ARGV로 넘긴다** — `QueueKeys.admitByTokenPrefix(queueId)` 등. Lua는 `prefix .. tokenId`만 한다. Lua 파일에 접두사 리터럴 박기(B안)는 기각 (⑥) |
 | TTL 만료 → WAITING 복귀 트리거 | **`queue:{q}:admitted` ZSet + claim-Lua** (score = 만료 시각) |
-| claim-Lua 실행 주체 | **`queue-batch`** — ⚠️ actuator·micrometer가 없어 **추가가 선행**이다(reconciliation과 같은 선행조건) |
+| claim-Lua 실행 주체 | **`queue-batch`** — actuator·micrometer 추가 완료(`6647ca5`). `AdmitTokenExpiryJob`, 주기 10초 `fixedDelay` |
 | claim-Lua의 leader election | **쓰지 않는다.** `EVAL` 자체가 claim이다 — `CLAUDE.md` "`@Scheduled` 단독 금지" 규칙의 **명시적 예외** (⑧) |
 | `tokens.admitted_at` | **추가** |
 | Kafka 이벤트 타입 | **판별 필드**(한 토픽·한 스키마 안에서 분기) |
@@ -5492,9 +5508,17 @@ master 한 대에 몰립니다.**
    **`admit_token`이 영원히 NULL**로 남는다. → **`status` 갱신을 항상 마지막에 둔다.**
 2. **ODKU 절에 `?` 플레이스홀더를 쓰면 `rewriteBatchedStatements`가 조용히 꺼진다**
    (Connector/J `QueryInfo.java:168` — ODKU에 파라미터가 있으면 재작성을 포기한다).
-   `VALUES(admit_token)` 형태는 안전하다. **500건 배치가 500왕복으로 퇴화하는데 예외도 로그도 없다.**
+   **500건 배치가 500왕복으로 퇴화하는데 예외도 로그도 없다.**
+   ✏️ **구현에서 정정됐다(2026-08-20).** 여기 적었던 `VALUES(admit_token)`은 MySQL **8.0.20부터
+   deprecated**라 서버(8.0.46)가 **사용 1회마다 경고 1287**을 돌려준다(실측: 한 문장에 2회 → 2건).
+   그래서 구현은 **`VALUES (...) AS new` 별칭**을 쓰고 값 참조를 `new.col`로 한다.
+   ⚠️ 별칭을 붙이면 ODKU 안의 맨 컬럼명이 **모호해진다** — `status = IF(status = 0, ...)`은
+   `ERROR 1052 Column 'status' is ambiguous`로 실패한다(실측). **기존 행은 `tokens.`, 새 값은
+   `new.`로 전부 한정**할 것. `AS` 절은 Connector/J가 VALUES 절의 끝으로 인식하므로 재작성은 유지되며,
+   `TokenUpsertRewriteTest`가 그것을 왕복 횟수로 못박는다.
 
-**관측 — 8개 후보에서 2개 + 조건부 1개**
+**관측 — 8개 후보에서 2개 + 조건부 1개. 🔴 셋 다 아직 미구현이다** (2026-08-20 `grep` 0건 —
+계측 코드가 없고, 현재 남는 신호는 `publishAdmitted`의 ERROR 로그와 기본 `http_server_requests`뿐이다)
 
 | 메트릭 | 라벨 |
 |---|---|
@@ -5529,6 +5553,83 @@ master 한 대에 몰립니다.**
   단 (a) 마지막이 아닌 위치의 INSTANT `ADD COLUMN` 은 **MySQL 8.0.29+** 이고,
   (b) 실증 당시 `tokens` 는 0행이라 대용량에서의 MDL 배타 락 대기까지 잰 것은 아니다.
   ⚠️ §75의 `ALTER COLUMN ... DROP DEFAULT`(4639행 부근)는 **다른 연산**이다. 그 서술을 이 근거로 쓰지 마라.
+
+### 구현 결과 (2026-08-20 · `dev` `ba21221` · PR #31~38)
+
+**설계대로 들어간 것**은 다시 적지 않는다. 아래는 **설계와 달라진 3건 + 설계에 없던 사실**이다.
+
+**① 중복 게이트가 `ZADD NX` → `HSETNX`로 옮겨졌다** (`c748fe6`)
+
+`enqueue_bulk.lua`의 신규/기존 판정이 `waiting` ZSet이 아니라 **`tokens` Hash의 필드 존재**다.
+`waiting`으로 판정하면 **admit된 사람이 게이트를 통과**한다 — admit이 `ZPOPMIN`으로 그를 빼갔기
+때문이다. 그 사람의 재-enqueue는 새 `tokenId`·새 `seq`를 받고, 결과는 셋이다:
+폴링 404(옛 tokenId로 물어보므로) · `billing_snapshots`의 `COUNT(*)` **과금 중복** · `status=1` 고아 행.
+
+> 🔴 **그래서 사람을 큐에서 빼는 경로는 반드시 `HDEL`한다.** 현재 그 경로는 `cleanupCompleted`
+> 하나이고, 거기서 `HDEL`은 **맨 마지막 명령**이다. 이 메서드는 Lua가 아니라 개별 명령 4개라
+> 중간에 죽을 수 있고 **순서가 결과를 가른다**:
+> `HDEL`이 먼저면 Hash만 사라지고 `waiting`에 남아 `poll_verify`가 HGET 미스로 계속 0을 반환한다
+> → **그 사람은 영영 404이고 복구 경로가 없다.** 마지막이면 재입장만 막히고 다음 complete·회수
+> 배치로 해소된다. "정리 순서 통일" 같은 이유로 위로 올리지 말 것.
+
+**② verify가 DB를 한 번도 읽지 않는다** (`c748fe6`)
+
+`admit-by-admit`의 값이 `tokenId` → **`"tokenId|identifier"`**로 넓어졌다. verify가 돌려줄 값은
+identifier인데 tokenId만 담으면 그걸 **DB에서만** 얻을 수 있고, 그러면 **컨슈머 백로그 구간의
+정상 토큰이 404**가 된다(행이 아직 없으므로). 그 값은 admit 시점에 이미 손에 있었다.
+읽는 쪽은 **첫 `'|'`로만** 쪼갠다 — identifier는 Tenant 자유 문자열이라 `'|'`가 들어올 수 있고
+`tokenId`(`tok_`+UUID)에는 없다. DB fallback은 **Redis 미스와 구 포맷**에만 남았다.
+
+**③ `publishAdmitted`가 첫 발행 실패에서 끊는다**
+
+발행은 건별 `.get(12초)` 블로킹이라, 브로커 무응답 시 `count=100`짜리 admit 한 건이 **최대 20분**
+요청 스레드를 잡는다. 첫 건이 시한을 다 쓰고 실패했다면 나머지 99건도 같은 브로커를 기다릴 뿐이다.
+병렬 발행으로는 못 고친다 — 메타데이터가 없으면 `send()` 자체가 블로킹이라 스레드만 늘고 벽시계는 그대로다.
+
+> ⚠️ **건너뛴 분은 자동으로 복구되지 않는다.** admit은 발행이 실패해도 200을 주므로 **Tenant에게
+> 재시도할 이유가 없다.** "복구는 REPLAY"는 Tenant가 **마침** 같은 `requestId`로 다시 불렀을 때만
+> 성립하는 **가능성이지 경로가 아니다.** 그래서 건너뛴 건수와 첫 `tokenId`를 ERROR로 남긴다 —
+> 그 로그가 유일한 흔적이다.
+
+**④ 🔴 `ApiKeyAuthenticationFilter` 화이트리스트 누락 — admit·verify·complete가 전부 401이었다** (`28106ba`)
+
+`shouldNotFilter`가 **화이트리스트**라, 이 결정이 컨트롤러 3개를 추가했는데 조건이 `enqueue`
+하나에 머물렀다. FRS §4가 X-API-Key로 명세한 세 경로가 **전부 401**이었고, **JWT Bearer로는
+통과해서 테스트가 잡지 못했다.** 새 엔드포인트를 추가하면 컨트롤러의 `@*Mapping`을 전수로 세어
+대조할 것.
+
+> 🪤 **인증 주체가 경로마다 다르다.** 아래 둘은 이 필터를 **타면 안 된다** —
+> `GET /{queueId}/tokens/{tokenId}`(폴링)는 **유저가 직접** 부르고 API Key가 없으며,
+> `GET /{queueId}/status`는 `permitAll`이다. 그래서 `/tokens/{tokenId}/complete`와
+> `/tokens/{tokenId}`를 구분해야 하고, **정규식이 뭉개지면 폴링이 401**이 된다.
+> 아직 미구현인 `DELETE /{queueId}/tokens/{tokenId}`(이탈)도 착수 시 같은 함정에 걸린다.
+
+**⑤ `CLAIM_LIMIT = 500` 적체는 실재한다 — 그리고 조용하다**
+
+통합테스트에서 **14,747건이 약 30주기(≈300초)에 걸쳐** 복귀했다. 한 주기(10초)에 큐당 500건이
+상한이기 때문이다. **에러도 경고도 없이 지연만 늘어난다** — 관측 없이는 보이지 않는다.
+올릴 값은 맞지만, 올리면 그만큼 Redis 단일 스레드를 오래 잡으므로 **폴링 p99와 함께** 재야 한다
+(⑦의 `count` 상한과 같은 기준).
+
+**⑥ 통합테스트 실측 (2026-08-20)**
+
+| 확인 | 결과 |
+|---|---|
+| 8만 건 enqueue — Redis · DB · 응답 **3자 교차대조** | `tokenId`·`seq`·`issuedAt` **불일치 0** |
+| admit된 사람의 재-enqueue | 같은 `tokenId` 반환, `tokens` 행 **+0** (게이트 동작) |
+| 혼합 청크 500건(신규 + admit된 사람 섞임) | **전부 200** — `ZRANK` nil 가드가 배열 절단을 막았다 |
+| complete 후 재-enqueue | **새 `tokenId`** — `HDEL`이 게이트를 연다 |
+| TTL 만료 복귀 | **60.9초 후**, score가 **원래 seq 그대로**(§36 성립) |
+| `admit-by-token` 만료 ~ 복귀 사이 404 창 | **≈ 1초** (이론 최악은 배치 주기 10초) |
+| `RETURNED` 가드 | `status` 1→0 복원 확인, `last-active` **미리셋** 확인(설계 준수) |
+
+**⑦ 남은 것**
+
+- ⬜ **착수 전 검증 ①은 여전히 미검증이다.** A안으로 조립한 실제 `admit.lua`를 로컬 Cluster A
+  (7001-7008)에서 돌려본 적이 없다. **구현이 끝난 것과 이 검증은 별개다** — 그리고 통과해도
+  안전의 증거가 아니다(슬롯이 달라도 같은 노드면 약 25% 확률로 조용히 성공)
+- ⬜ **관측 메트릭 3종 미구현** (위 표)
+- ⬜ `DELETE /tokens/:tokenId`(이탈)는 여전히 0건 — 이 결정의 범위 밖이다
 
 ### Rationale
 
@@ -5684,6 +5785,11 @@ ShedLock이 필요한 잡은 **원자 claim이 불가능한 것들**이다 — �
   > 발행은 동기 `ack=all` + `enable.idempotence`라 실패율이 낮고, 실패해도 200을 주는 쪽이
   > 무한 재시도보다 낫다는 판단은 유지한다. **다만 "흡수된다"는 근거는 철회한다.**
   > 실제 발생률은 통합테스트에서 관측한다
+  >
+  > ✏️ **구현에서 하나 더 붙었다(2026-08-20).** `publishAdmitted`는 **첫 발행 실패에서 끊는다**
+  > (건별 12초 블로킹 × 100건 = 최악 20분). 그래서 피해가 1건이 아니라 **그 요청의 나머지 전부**로
+  > 번질 수 있다. **REPLAY를 복구 경로라고 적지 마라** — admit은 실패해도 200이라 Tenant가
+  > 재시도할 이유가 없다. REPLAY는 경로가 아니라 **가능성**이고, 남는 흔적은 ERROR 로그뿐이다
 - **`count` 상한이 필요하다.** Redis는 단일 스레드이고 `ZPOPMIN N` + `N × (HGET + SET·SET·ZADD)`가
   한 스크립트 안에서 돈다. `N = 10,000`이면 **수십~100ms 블로킹**이고, 그동안 폴링을 포함한
   모든 명령이 대기해 **p99가 연쇄로 무너진다.** **상한은 100**이다(⑦). 올릴 때 재야 하는 것은
@@ -5747,3 +5853,86 @@ ShedLock이 필요한 잡은 **원자 claim이 불가능한 것들**이다 — �
   첫 스크립트**다. 그래서 접두사를 Java(`QueueKeys`)가 만든다(⑥)
 - 후속: `count` 상한 **상향** 실측(내리는 것은 파괴적 변경이라 100에서 시작한다),
   버전 컬럼(위 왕복 문제), `tokens` Hash 레거시 값 reconciliation, 포트 rename
+
+
+---
+
+## §81 — `avgWaitingTime` · ETA · `queue-stats` 폐기 (한 줄도 구현된 적 없다)
+
+**결정일**: 2026-08-20. Sprint 7(§80) 구현이 `dev`에 전부 들어간 뒤 문서와 코드를 대조하다 나왔다.
+
+### Decision
+
+**`avgWaitingTime` · `estimatedWaitSeconds`(ETA) · `queue-stats:{t}:{q}` 키를 셋 다 폐기한다.**
+complete 경로의 `HINCRBYFLOAT` / `HINCRBY` 두 줄도 **만들지 않는다.**
+
+| 폐기 대상 | 문서상 있던 곳 | 대체 |
+|---|---|---|
+| `avgWaitingTime` | FRS 용어표 · §6.6 4단계, FLOW complete, README 트레이드오프, §5·§9·§23·§24·§32 | **없음.** 필요해지면 `tokens`의 `completed_at − issued_at` 사후 집계 |
+| `estimatedWaitSeconds` (ETA) | FLOW 미채택 polling 다이어그램, §79 후속 | **없음.** §79가 폴링 응답에서 개인화를 이미 전부 걷어냈다 |
+| `queue-stats:{t}:{q}` | FRS §8 · README 키표, §23 키표 | **키 삭제.** 용도가 avgWaitingTime 하나뿐이었다 |
+
+### Rationale
+
+- **ETA를 실을 자리가 이미 없다.** §79가 `/status`를 `{lastAdmittedSeq, pacing}`으로, 개인 응답을
+  `{ready, admitToken?}`으로 고정했다. ETA를 살리려면 §79가 지운 **개인화를 되살려야** 한다 —
+  그건 이 결정이 아니라 §79를 뒤집는 일이다
+- **입력이 사라지면 키가 남을 이유가 없다.** `queue-stats`의 용도는 avgWaitingTime 하나였다
+- **한 줄도 구현된 적이 없다.** `grep -rn "avgWaitingTime\|queue-stats" --include=*.java --include=*.lua`
+  = **0건**. 지우는 결정이 아니라 **만들지 않기로 하는 결정**이다
+- **값 자체가 우리 것이 아니다.** `completed_at − issued_at` 평균에는 **Tenant가 admitToken을
+  얼마나 빨리 소비했는가**(플랫폼 소관 아님)와 **TTL 만료 복귀 왕복**이 섞인다. 큐 규모가 바뀌면
+  과거 평균이 미래를 못 맞춘다. 이상치 필터(`waitingTtl × 0.8`)는 그 편향을 못 없앤다
+- **§79와 같은 판단이다.** §79는 "정확한 순번 불필요, admit 누락 없이 통과가 핵심"이라며 rank
+  과대 추정을 수용했다. **틀린 ETA는 그보다 나쁘다** — 사용자가 시계를 보고 이탈한다
+
+### Alternatives
+
+**A. `avgWaitingTime`만 남기고 ETA는 안 쓴다 (기각)** — 읽는 곳이 없는 통계다. complete마다 Redis
+왕복 2회를 더 치르고 얻는 것이 0이다.
+
+**B. `COMPLETED` Kafka 컨슈머가 집계 (기각)** — 대체가 아니라 **확대**다. 지금 이 값을 필요로 하는
+사람이 없는데 컨슈머·토픽 소비 분기·시계열을 새로 만든다.
+
+**C. 나중에 필요해지면 (수용)** — `tokens`에 `issued_at` · `completed_at`이 이미 있다. **사후 집계가
+가능하므로 지금 실시간 누적을 만들 이유가 없다.** 되살리는 비용이 낮은 쪽을 택한다.
+
+### Consequences
+
+- **실시간 대기시간 지표가 0이 된다.** "이 큐는 평균 얼마나 기다리나"를 지금 당장은 답할 수단이 없다.
+  월 단위는 `queue_daily_stats`가 갖고, 임의 구간은 `tokens`에서 뽑는다
+  (⚠️ `tokens` 인덱스에 `completed_at`이 없어 그 집계는 파티션 스캔이다 — **상시 조회로 승격하려면
+  인덱스를 다시 봐야 한다.** §79의 watermark 복구 쿼리와 같은 성격)
+- **Redis 복구 표(§5)에서 "복구 불가" 한 줄이 줄어든다** — 없는 값은 잃을 수도 없다
+- **되살릴 때는 거처부터 다시 정해야 한다.** "complete API가 직접 Redis를 갱신"이라는 안은 이 절과
+  함께 폐기된다 — 저빈도 경로에 Redis 왕복 2회를 더하는 설계였고, 그때 다시 고를 이유가 없다
+- 폐기 대상이 문서 6개 파일에 흩어져 있었다. **`DECISIONS`는 지우지 않고 폐기 표시**했고
+  (§5·§9·§23·§24·§32), 명세·흐름도·README에서는 **삭제**했다 — 명세에 남으면 만들어야 할 것으로 읽힌다
+
+### Interview Point
+
+> "예상 대기 시간을 왜 안 보여주나요?"
+
+**보여줄 근거가 없어서**입니다. ETA를 만들려면 평균 대기시간이 필요한데, 그 평균에는 **저희가
+통제하지 못하는 시간**이 섞입니다 — 입장권을 받은 뒤 테넌트가 얼마나 빨리 입장시키는지는 테넌트
+사정이고, 60초 안에 못 하면 그 사람은 대기열로 돌아와서 다시 기다립니다. 큐 규모가 바뀌면 과거
+평균이 미래를 못 맞추기도 하고요.
+
+그래서 **"현재 47번 입장 중"** 하나만 내보냅니다. 은행 전광판과 같습니다. 틀린 시계를 보여주면
+사용자는 그 시계를 믿고 창을 닫습니다. 정직한 번호가 낫다고 봤습니다.
+
+포기한 게 아니라 **미룬 것**이기도 합니다 — `tokens` 테이블에 발급 시각과 완료 시각이 남아 있어서,
+필요해지면 사후 집계로 만들 수 있습니다. 지금 실시간 누적을 만들면 complete마다 Redis 왕복이
+두 번 늘어나는데, 읽는 사람이 없습니다.
+
+### Related
+
+- **§79** — ETA(`estimatedWaitSeconds`) 후속 항목을 **이 절이 닫는다**(폐기). 해당 줄에 상호 참조를 남겼다
+- **§9** (Admit = Dequeue + 통계 갱신) — 세 번째 단계 "avgWaitingTime 갱신(마지막)"을 **폐기한다.**
+  남는 순서는 DB 먼저 → Redis 정리 나중
+- **§23** (Redis Key 설계 이유) — `queue-stats:{t}:{q}` 행 폐기
+- **§24 ⑧** (avgWaitingTime ETA 왜곡) — **문제 자체가 소멸**한다
+- **§32** (Kafka 도입 설계) — "avgWaitingTime은 Kafka 없이 complete API에서 직접 갱신" 및 그 면접 답변 폐기
+- **§5** (Redis 장애 복구) — 복구 불가 항목에서 제외
+- **§80** — complete 구현(`QueueEngineService.complete`)에는 이 갱신이 **처음부터 없다.**
+  이 절은 코드를 바꾸는 결정이 아니라 **문서를 코드에 맞추는 결정**이다

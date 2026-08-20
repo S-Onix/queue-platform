@@ -8,7 +8,6 @@
 -- [파티션 유예] DROP은 M+2월 초 실행 (월말 걸친 토큰 보호)
 -- [단순화] billing_events, stats_events 제거
 --   billing: tokens 원본 직접 집계 → billing_snapshots UPSERT
---   avgWaitingTime: complete 시 직접 Redis HINCRBYFLOAT
 -- [v1.10] tenants.status 추가 (ACTIVE=0, DEACTIVATED=1)
 -- [v1.11] tenant_id, api_key_id, queue_id 크기를 36에서 50으로 변경 (prefix + UUIDv7 의 길이가 총 38임)
 -- ================================================================

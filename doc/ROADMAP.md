@@ -50,15 +50,17 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ✅ Sprint 4   완료 (2026-04-24)
 🔄 Sprint 5   5-A/B/C/D/E 완료, 5-F(문서) 진행 중
 🔄 Sprint 6   Token 도메인 + Enqueue + Polling 구현 / Cancel(DELETE) 미착수
-⬜ Sprint 7   admit·verify·complete — 컨트롤러 0건. §79(/status·watermark·pacing)도 여기서 함께
-🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / 상태 전이 이벤트는 Sprint 7과 함께
-⬜ Sprint 9   queue-batch는 Application 클래스 1개뿐 (껍데기)
+✅ Sprint 7   admit·verify·complete + §79(/status·watermark·pacing) 구현 완료 (dev ba21221, PR #31~38)
+              ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
+              ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
+🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·RETURNED·COMPLETED 발행까지 완료
+🔄 Sprint 9   queue-batch에 AdmitTokenExpiryJob 1개 (§80). 나머지 3개 잡·회수 경로는 미착수
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
 🎯 Cluster 로컬 실습 완료 (2026-07-08, 병행 학습) — 프로덕션 도입은 §75, 시점 미정
 ```
 
-**판정 근거 (2026-08-17 실측)**
+**판정 근거 (2026-08-17 실측)** — ⚠️ **아래 표는 §80 구현 전 상태다.** 2026-08-20 재실측은 그 밑 표.
 
 | 확인한 것 | 명령 | 결과 |
 |---|---|---|
@@ -69,6 +71,18 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 | §79 미착수 | `grep "private final" PollResponse.java` | `frontSeq` · `total` · `nextPollAfterSec`가 **아직 있다** |
 | 회수 경로 부재 | `grep -rn "ZREM\|HDEL" queue-*/src/main` | **0건** (Sprint 9 과제) |
 | `queue-batch` actuator | `grep actuator queue-batch/build.gradle` | **없음** — `starter-web`만 (reconciliation 선행 조건) |
+
+**재실측 (2026-08-20 · `dev` `ba21221`)** — 위 표에서 **뒤집힌 행만** 적는다.
+
+| 확인한 것 | 명령 | 결과 |
+|---|---|---|
+| Queue Engine 엔드포인트 | `grep -rn "Mapping(" queue-api/src/main` | `QueueEngineController`에 **6개** — enqueue · admit · verify · complete · `/status` · 폴링. **`DELETE /tokens/{tokenId}`만 여전히 0건** |
+| `queue-batch` 내용물 | `find queue-batch/src -name "*.java"` | `QueueBatchApplication` + **`AdmitTokenExpiryJob`** (+ 그 테스트) |
+| Lua 스크립트 | `ls .../resources/lua/` | **6개** — `admit` · `admit_expire`가 추가됐다 |
+| §79 구현됨 | `cat PollResponse.java` | 필드가 `ready` · `admitToken` **둘뿐**. `frontSeq` · `total` · `nextPollAfterSec` 소멸 |
+| `QueueSnapshotCache` 제거 | `find . -name "QueueSnapshotCache*"` | **0건** (§79 D1대로 제거됨) |
+| 회수 경로 | `grep -rln "ZREM\|HDEL" */src/main` | **6파일** — `admit.lua` · `admit_expire.lua` · `enqueue_bulk.lua` · `RedisQueueEngine` · `AdmitTokenExpiryJob` · `QueueKeys`. ⚠️ 다만 **complete 경로에만** 있다. 이탈·TTL 만료로 떠난 사람의 `tokens` Hash 필드는 여전히 누적 (§79 후속) |
+| `queue-batch` actuator | `grep actuator queue-batch/build.gradle` | **있다** — `starter-actuator` + `micrometer-registry-prometheus` (`6647ca5`) |
 
 **주요 학습 자산 축적**: 총 88개 통찰 (Line Pay Plus 시니어 백엔드 지원 자산)
 
@@ -303,7 +317,10 @@ flowchart TD
 - ✅ `EnqueueResult.java` Value Object (OK/EXISTS/FULL)
 
 **Phase B-E 완료** (2026-07-15) — **하이브리드 폐기, Bulk 단독으로 선회** (§70):
-- ✅ `enqueue_bulk.lua` (ZRANK 중복 방지 + ZADD NX + ZCARD Capacity + INCR seq)
+- ✅ `enqueue_bulk.lua` (**`HSETNX` 중복 게이트** + ZCARD Capacity + INCR seq + ZRANK 순번)
+  - ✏️ 초판 표기 "ZRANK 중복 방지 + ZADD NX"는 **틀렸다.** 중복 판정은 `queue:{q}:tokens`
+    Hash의 `HSETNX`다(§80 구현 결과 ①) — `waiting` ZSet으로 판정하면 **admit돼서 빠진 사람이
+    게이트를 통과**해 새 tokenId·새 seq를 받는다(폴링 404 + 과금 중복)
 - ❌ ~~`enqueue.lua`~~ — 폐기 (경로 2개는 순번 일관성 증명 부담)
 - ❌ ~~`SlidingWindowCounter`~~ — 폐기 (임계값 분기가 없어져 부하 측정 불필요)
 - ✅ `PendingEnqueue` + `RedisQueueEngine`(Global Queue, Producer) + `BatchProcessor`(Consumer)
@@ -433,16 +450,21 @@ flowchart TD
 - [ ] Polling 응답 시간 p99 < 50ms — **로컬 수치는 신뢰 구간이 아니다.** Sprint 10(k6)로 이관
 
 > ~~`nextPollAfterSec` 4단계(30/10/5/2초) 분기 테스트~~ — **§79가 이 필드를 응답에서 제거**하고
-> `/status`의 `pacing` 구간표 + SDK 계산으로 바꿨다. **다만 현재 코드는 아직 `nextPollAfterSec`를
-> 내려준다**(`PollResponse`에 필드가 살아 있고 등급은 2/5/10/15/20초 + 지터). §79 구현은 **Sprint 7**이므로
-> 그때까지 코드와 이 DoD는 어긋난 채로 둔다 — 지금 지우면 현재 동작을 검증하는 항목이 사라진다.
+> `/status`의 `pacing` 구간표 + SDK 계산으로 바꿨다. **2026-08-20 기준 구현 완료** —
+> `PollResponse`의 필드는 `ready`·`admitToken` 둘뿐이고, 등급표(2/5/10/15/20초)는
+> `PacingTier.DEFAULT`로 옮겨졌다. 지터는 **서버가 싣지 않는다**(SDK 몫, §79).
 > ~~token-info 캐시 히트율~~ — §79는 폴링 경로에서 DB status를 읽지 않는다. **키 존치 여부 자체가 후속 검토**다.
 
 **참조 문서:** FRS §6.2 (Enqueue), §6.3 (Polling), §74 (폴링 소유권), FLOW.md Enqueue/Polling 다이어그램
 
 ---
 
-### ⬜ Sprint 7 — Admit → Verify → Complete + 상태 머신
+### ✅ Sprint 7 — Admit → Verify → Complete + 상태 머신 — **구현 완료** (`dev` `ba21221`, PR #31~38)
+
+> ⚠️ **아래 DoD 체크박스는 대조하지 않았다.** 통합테스트로 확인된 항목은 `DECISIONS §80`
+> "구현 결과 ⑥"에 실측값과 함께 있다. **남은 것은 관측 메트릭 3종과 `admit.lua`의 로컬
+> Cluster(7001-7008) 실행 검증**이다(§80 ⑦) — 후자는 통과해도 안전의 증거가 아니다
+> (슬롯이 달라도 같은 노드면 약 25% 확률로 조용히 성공한다, §75).
 
 **예상 기간:** 1.5주
 **카테고리:** MVP
@@ -480,7 +502,6 @@ flowchart TD
   `queue_admit_tokens_issued_total{queueId}` / (복귀 구현 시) `queue_admit_returned_to_waiting_total{queueId}`
   - `admit_seconds` 히스토그램은 **넣지 않는다** — `le` 버킷 실측 69개 × 큐 100개 = 6,900 시계열로
     현재 전체(857개)의 8배다
-- avgWaitingTime 직접 갱신 (HINCRBYFLOAT)
 - **`/status` 엔드포인트 + `pacing` 구간표 (§79 구현)** — Sprint 6이 아니라 여기인 이유: **watermark는 admit이 있어야 존재한다.** admit이 0건이면 `lastAdmittedSeq`가 영원히 0이라 SDK의 `rank = mySeq − lastAdmittedSeq`가 무의미하다
   - 3키 `MGET`(watermark + pacing + **seq**) 직행. **WAS 캐시는 만들지 않는다**(§79 D1)
   - 딸려오는 것: `PollResponse`에서 `frontSeq`·`total`·`nextPollAfterSec` 제거 → **`QueueSnapshotCache`(Caffeine) 제거**(**도메인 포트 시그니처가 바뀌므로 문서로 안 끝난다**) + 404 계약용 `ErrorCode` 신규 추가 + **`QueueEnginePollTest` 재작성**(5개 중 2개 소멸, 1개 부분 소멸)
@@ -958,13 +979,19 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 - 5-E-F: 커밋 ⬜
 
 ### 단기 (1-2주)
-- **Sprint 7 착수** — 위 "착수 전 결정할 것" 4건을 먼저 정한다. 특히 "pop 성공 + SET 실패" 창
-- Sprint 6 잔여: Cancel(`DELETE /tokens/:tokenId`)
+> ✅ **Sprint 7과 §79는 끝났다**(`dev` `ba21221`). 아래는 그 뒤로 남은 것을 **의존 순서**로 다시 세운 것이다.
+
+- **admit 관측 메트릭 3종** — 왜 지금인가: `CLAIM_LIMIT=500` 적체가 **에러도 로그도 없이** 지연만
+  늘린다는 것이 통합테스트에서 확인됐다(14,747건 ≈30주기). 지금은 볼 수단이 없다 (§80 ⑦)
+- **`admit.lua`의 로컬 Cluster(7001-7008) 실행 검증** — 왜 지금인가: 동적 키 3종이 `KEYS[]`에
+  없어 **CROSSSLOT 그물이 안 걸리는 첫 스크립트**다. 프로덕션 전환 전에만 하면 되지만 비용이 싸다
+- Sprint 6 잔여: Cancel(`DELETE /tokens/:tokenId`) — 왜 지금인가: `tokens` Hash 회수 경로가
+  complete 하나뿐이라, 이탈 API가 생겨야 "떠난 사람" 누수의 절반이 닫힌다. ⚠️ `ApiKeyAuthenticationFilter`
+  화이트리스트를 함께 고쳐야 한다(폴링 경로와 정규식이 겹친다 — `28106ba`와 같은 함정)
 - 5-F: Sprint 5 마무리 (문서 갱신 · 회고)
 
 ### 중기 (다음 Sprint)
-- §79 구현(`/status` · watermark · pacing) — **Sprint 7과 한 묶음.** watermark는 admit이 있어야 존재한다
-- Sprint 9: 회수 배치 + reconciliation (**`queue-batch` actuator가 선행**)
+- Sprint 9: 회수 배치 + reconciliation (~~`queue-batch` actuator가 선행~~ → **선행 완료**, `6647ca5`)
 - Sprint 8+: Cluster 프로덕션 도입 준비 (§75, 시점 미정 / 로컬 학습은 완료)
 
 ---
@@ -973,8 +1000,8 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 
 - [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis Sentinel/Cluster/Kafka/k6/Prometheus/Grafana)
 - `AWS_LEARNING_PATH.md` — **미작성.** Sprint 11 대비 AWS 병렬 학습 경로 (파일 없음, 링크 걸지 말 것)
-- [FRS v1.12](FRS_final.md) — 기능 정의
-- [DECISIONS](DECISIONS.md) — 79개 설계 결정 (기능별 목차는 문서 맨 앞)
+- [FRS v1.13](FRS_final.md) — 기능 정의
+- [DECISIONS](DECISIONS.md) — 81개 설계 결정 (기능별 목차는 문서 맨 앞)
 - [FLOW](FLOW.md) — 상세 흐름도
 - [STATE](STATE.md) — 상태 머신
 - [CONCURRENCY](CONCURRENCY.md) — 동시성 제어
