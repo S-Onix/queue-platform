@@ -74,16 +74,21 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 > **일정의 정본은 `doc/ROADMAP.md`다.** 여기엔 "지금 어디인지"만 둔다 — 두 곳에 적으면 갈라진다.
 
 ```
-현재 위치: Sprint 5 마무리 ~ Sprint 6·8 병행.  다음 큰 덩어리 = Sprint 7 (Admit)
+현재 위치: Sprint 7(Admit) 완료.  다음 = 통합테스트 잔여 · Sprint 6 잔여(Cancel) · Sprint 9
 
-코드로 확인되는 상태 (2026-08-17):
-  구현됨  Redis Sentinel · Rate Limiter(Lua 2종) · ApiKey 캐시            (Sprint 5)
-  구현됨  Token 도메인 + Enqueue(POST /tokens) + Polling(GET /tokens/:id)  (Sprint 6 일부)
-  구현됨  Kafka 적재 경로 — token-lifecycle + queue-consumer 모듈          (Sprint 8 일부)
+코드로 확인되는 상태 (2026-08-20, dev 기준 재실측):
+  구현됨  Redis 독립 2 Cluster + 큐 단위 라우팅                            (§75)
+  구현됨  Rate Limiter(Lua 2종) · ApiKey 캐시 · Token 도메인               (Sprint 5)
+  구현됨  Enqueue · Polling · Kafka 적재(token-lifecycle + queue-consumer)  (Sprint 6·8)
+  구현됨  admit · verify · complete — 엔드포인트 6개                        (Sprint 7 §80)
+  구현됨  admit.lua · admit_expire.lua · 상태 전이 가드 UPSERT              (§80)
+  구현됨  queue-batch: AdmitTokenExpiryJob(TTL 만료 → WAITING 복귀)         (§80 · §36)
+  구현됨  /status 분할 · admitWatermark · pacing 구간표                     (§79)
   미착수  Cancel(DELETE /tokens/:id)                                       (Sprint 6 잔여)
-  미착수  admit · verify · complete — 컨트롤러 0건                          (Sprint 7)
-  미착수  queue-batch는 Application 클래스만 (껍데기)                       (Sprint 9)
-  설계만  /status 분할 · admitWatermark · pacing — 코드 0줄                 (§79)
+  미착수  관측 메트릭 2종(queue_admit_*) — 좀비 탐지 수단이 아직 0          (§80 U9)
+
+⚠️ 중복 게이트는 `tokens` Hash의 **HSETNX**다. `waiting` ZSet이 아니다 —
+   admit되면 waiting에서 빠지므로 게이트로 쓰면 재-enqueue가 신규로 판정된다(과금 중복).
 ```
 
 ### Sprint 5 현재 상태 (2026-07-08)
@@ -447,8 +452,8 @@ mysql -u root -p -P 3307  # Replica
 |------|------|
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
-| `doc/DECISIONS.md` | 79개 설계 결정 + 근거 + 면접 포인트 (최신 §79 — 폴링 응답 계약) |
-| `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (⚠️ **현행 코드 동작** 서술 — §79 구현 전까지 고치지 말 것) |
+| `doc/DECISIONS.md` | 81개 설계 결정 + 근거 + 면접 포인트 (최신 §81 — avgWaitingTime·ETA 폐기) |
+| `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (⚠️ **§79가 구현돼 폴링 4문서가 낡았다** — 갱신 대상) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |
 | `doc/STATE.md` | Token, Queue, ApiKey 상태 머신 |
