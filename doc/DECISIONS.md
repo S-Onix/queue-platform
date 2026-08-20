@@ -63,6 +63,7 @@
 | § | 제목 | 상태 |
 |---|---|---|
 | §21 | 이탈(CANCELLED) 정책 — WAITING만 허용 | ✅ |
+| §82 | **취소분은 과금에서 제외** (`status <> 3`) (→9) | ✅ |
 
 > TTL 만료는 별도 §가 없다. `ADMIT_TOKEN_TTL` → §34·§36, `waitingTtl`·`inactiveTtl` 판정 → `doc/STATE.md`,
 > 배치 흐름 → `doc/FLOW.md`. **inactive_ttl 배치는 미구현**이다.
@@ -1094,6 +1095,10 @@ ADMIT_ISSUED에서 이탈하려면:
   → DELETE /api/v1/queues/:queueId/tokens/:tokenId → CANCELLED
 ```
 
+> **취소분은 과금하지 않는다 — §82.** 이 절이 "언제 취소할 수 있는가"고, §82가 "취소하면 청구서에
+> 어떻게 잡히는가"다. ADMIT_ISSUED에서 취소가 막혀 있는 것이 §82의 전제이기도 하다 —
+> 막혀 있지 않으면 입장권을 받은 뒤 취소해 과금을 피하는 경로가 생긴다.
+
 ---
 
 ## §22 verify / complete 분리
@@ -1240,6 +1245,7 @@ DB 먼저 이유:
   BillingSnapshotJob (M+2월 초):
     SELECT COUNT(*) FROM tokens
     WHERE issued_at BETWEEN M월 AND M+1월
+      AND status <> 3          -- 취소분 제외 (§82)
     GROUP BY tenant_id
     → billing_snapshots UPSERT (ON DUPLICATE KEY)
   tokens가 원본 → 항상 정확
@@ -2612,6 +2618,7 @@ Step 1: queue_daily_stats 집계
 Step 2: billing_snapshots 집계
   SELECT COUNT(*) FROM tokens
   WHERE issued_at BETWEEN M월 AND M+1월
+    AND status <> 3            -- 취소분 제외 (§82)
   GROUP BY tenant_id
   → tokens 원본 직접 집계 (billing_events 불필요)
   ON DUPLICATE KEY UPDATE count = VALUES(count)
@@ -5684,7 +5691,7 @@ complete 자체가 `admit_token`을 검증하므로, verify를 건너뛴 호출�
 
 감사 기록으로서도 **반쪽이다**: 흐름이 `Lua 성공 → INSERT`라 **실패한 요청은 애초에 안 남는다.**
 남는 건 성공 기록뿐인데 그건 Kafka 이벤트와 메트릭이 이미 갖고 있다.
-**과금 근거도 아니다**(과금은 enqueue 수 기준). 장기 이력은 `queue_daily_stats.total_admit_count`다.
+**과금 근거도 아니다**(과금은 enqueue 수 기준 — 취소분은 빠진다, §82). 장기 이력은 `queue_daily_stats.total_admit_count`다.
 
 **⑥ 동적 키의 접두사는 Java가 만든다 — Lua에 문자열을 박지 않는다.**
 
@@ -5936,3 +5943,85 @@ complete 경로의 `HINCRBYFLOAT` / `HINCRBY` 두 줄도 **만들지 않는다.*
 - **§5** (Redis 장애 복구) — 복구 불가 항목에서 제외
 - **§80** — complete 구현(`QueueEngineService.complete`)에는 이 갱신이 **처음부터 없다.**
   이 절은 코드를 바꾸는 결정이 아니라 **문서를 코드에 맞추는 결정**이다
+
+---
+
+## §82 — 취소분은 과금에서 제외한다 (`status <> 3`)
+
+### Context
+
+과금 집계는 `tokens` 원본을 직접 세는 방식이다(§24 ⑥, §44 Step 2). 그런데 그 술어가
+`WHERE issued_at BETWEEN M월 AND M+1월` **하나뿐이라 상태를 보지 않았다.** 취소한 사람도,
+만료된 사람도, 아직 줄에 서 있는 사람도 전부 한 건으로 청구됐다.
+
+취소를 어떻게 셀지는 어디에도 적혀 있지 않았다 — 정해진 적이 없는 것이지 뒤집는 것이 아니다.
+
+### Decision
+
+**CANCELLED(`status = 3`)는 과금 대상에서 뺀다.**
+
+```sql
+SELECT tenant_id, COUNT(*)
+FROM tokens
+WHERE issued_at >= M월 AND issued_at < M+1월
+  AND status <> 3          -- 취소분 제외
+GROUP BY tenant_id
+```
+
+**뺀 것은 취소뿐이다.** WAITING(0)·ADMIT_ISSUED(1)·COMPLETED(2)·EXPIRED(4)는 그대로 과금한다.
+
+### 왜 취소만 빼는가
+
+| | 근거 |
+|---|---|
+| **취소** | 유저가 **스스로 줄을 떠났다.** Tenant는 그 사람에게서 아무것도 얻지 못한다 |
+| **만료(4)** | 유저가 **자리를 끝까지 점유했다.** waitingTtl/inactiveTtl을 다 쓰고 밀려난 것이라 Platform 자원은 정확히 그만큼 들었다 |
+| **미완료(0·1)** | 집계 시점에 아직 살아 있는 줄이다. 빼면 월말에 걸친 큐가 통째로 무료가 된다 (§44가 1달 유예를 두는 이유와 정면으로 충돌) |
+
+**과금 정책이 플랫폼 품질을 해치면 안 된다**는 것이 두 번째 이유다. 취소를 과금하면 Tenant에게
+**취소 API를 안 붙일 동기**가 생긴다. 취소가 안 들어오면 떠난 유저가 WAITING으로 남아
+`waitingTtl`이 만료될 때까지 줄을 차지하고, 그만큼 `admitWatermark`와 rank가 실제보다 나빠진다.
+청구서 몇 건 때문에 큐의 정확도를 잃는 거래다.
+
+### Consequences
+
+**① 우회 경로는 없다.** §21이 `ADMIT_ISSUED → CANCELLED`를 409로 막고 있다. 입장권을 받은 뒤
+취소해서 과금을 피하는 경로가 원천적으로 없다. **§21의 그 제약이 이 결정의 전제**이므로, §21을
+느슨하게 바꾸려면 여기도 같이 봐야 한다.
+
+**② 🪤 DB row가 실제로 `status = 3`에 도달해야만 빠진다.** enqueue 직후 취소하면 outbox 적재
+전이라 `UPDATE ... SET status = 3`이 **0건**이 되고, 뒤늦게 들어온 INSERT가 `status = 0`짜리
+row를 만든다(좀비 WAITING). 그러면 **취소했는데 과금된다.** 지금까지 이 경로의 대가는
+"유령이 줄에 남는다"였는데, 이 결정으로 **청구 오차**가 하나 더 붙었다. 대책(UPDATE 0건이면
+outbox drain 후 짧게 재시도)은 Sprint 9 종료 경로 설계에 이미 올라와 있다 — 새 과제가 아니다.
+
+**③ 집계 비용은 그대로다.** 이미 월 파티션 전체를 스캔해 `GROUP BY tenant_id`를 하므로
+`status <> 3`은 그 스캔에 얹히는 필터다. **인덱스를 새로 만들지 않는다.**
+
+**④ 파티션 DROP 후에도 재구성이 된다.** `queue_daily_stats`는 통계 테이블이라 `COUNT(*)`를
+그대로 두고(`total_enqueued`), `total_cancelled`를 따로 갖는다. 과금액 =
+`total_enqueued - total_cancelled`. 그래서 §44 Step 1은 **고치지 않았다.**
+
+**⑤ 아직 코드가 없다.** `BillingSnapshotJob`·`BillingConsumer` 둘 다 미구현(Sprint 9)이라
+이 결정은 문서와 `schema.sql`의 운영 쿼리에만 반영된다. 구현 시점에 이 술어를 그대로 옮기면 된다.
+
+### Related
+
+- **§21** (이탈 정책) — 주 카테고리. "언제 취소할 수 있는가"가 거기, "취소하면 얼마가 청구되는가"가 여기
+- **§44** (파티션 유예) — Step 2 집계 쿼리에 술어를 반영했다. Step 1은 위 ④ 때문에 그대로다
+- **§24 ⑥** (과금 누락) — 같은 쿼리가 복제돼 있어 함께 고쳤다
+- **§80** — `admit_requests`가 과금 근거가 아닌 이유("과금은 enqueue 수 기준")에 취소 제외를 덧붙였다
+- ⚠️ **§32의 `BillingConsumer` 예시 코드는 `COMPLETED`만 세는 다른 기준**이다. 그쪽은 초판
+  스케치이고 한 줄도 구현된 적이 없다. **집계 기준의 정본은 이 절**이다
+
+### Interview Point
+
+> "취소한 사용자도 과금하나요?"
+
+**안 합니다.** 기준은 "줄을 섰는가"인데, 스스로 떠난 사람에게서 테넌트가 얻는 게 없습니다.
+다만 **만료는 과금합니다** — 자리를 끝까지 점유하다 밀려난 것이라 저희가 쓴 자원은 동일합니다.
+
+실은 회계보다 **동기 설계** 쪽이 더 큰 이유였습니다. 취소를 과금하면 테넌트 입장에선 취소 API를
+안 붙이는 게 이득이 됩니다. 그러면 떠난 사람이 TTL이 끝날 때까지 대기열에 남아서, 남아 있는
+사람들의 순번이 실제보다 나쁘게 보입니다. **청구 몇 건 받으려다 대기열 정확도를 파는 셈**이라
+빼는 쪽을 골랐습니다.

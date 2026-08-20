@@ -613,8 +613,8 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - `RedisSyncJob` (5분 주기)
   - `redis_sync_needed=1` 토큰 → Redis 재삽입
 - `BillingSnapshotJob` (월 1회, M+2월 초)
-  - `queue_daily_stats` 집계
-  - `billing_snapshots` UPSERT
+  - `queue_daily_stats` 집계 (`COUNT(*)` 그대로 — 통계는 취소분도 센다)
+  - `billing_snapshots` UPSERT — **`status <> 3`으로 취소분 제외** (DECISIONS §82)
   - 파티션 DROP + REORGANIZE
   - > **실제 월 1회 스케줄 대기 대신 수동 트리거 + dry-run 쿼리로 검증**
 - ShedLock 또는 `batch-lock` 기반 멀티 인스턴스 분산
@@ -638,6 +638,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - [ ] **파티션 운영 쿼리 dry-run 검증** (schema.sql의 Step 1~4 각 쿼리 실행 + EXPLAIN)
   - `INSERT INTO queue_daily_stats ... ON DUPLICATE KEY UPDATE id = id` 멱등성 확인
   - `INSERT INTO billing_snapshots ... ON DUPLICATE KEY UPDATE count = VALUES(count)` 멱등성 확인
+  - 취소 토큰을 섞어 넣고 `billing_snapshots.count`에서 빠지는지 확인 (§82)
   - `EXPLAIN SELECT ... partitions: p2026_04` Partition Pruning 확인
 - [ ] Batch 2대 동시 기동 시 `batch-lock`으로 중복 실행 방지
 - [ ] Gap Lock 방지 (LIMIT 100 순차 처리)

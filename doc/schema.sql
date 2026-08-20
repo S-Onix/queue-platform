@@ -8,6 +8,7 @@
 -- [파티션 유예] DROP은 M+2월 초 실행 (월말 걸친 토큰 보호)
 -- [단순화] billing_events, stats_events 제거
 --   billing: tokens 원본 직접 집계 → billing_snapshots UPSERT
+--            (status <> 3 — 취소분 제외, DECISIONS §82)
 -- [v1.10] tenants.status 추가 (ACTIVE=0, DEACTIVATED=1)
 -- [v1.11] tenant_id, api_key_id, queue_id 크기를 36에서 50으로 변경 (prefix + UUIDv7 의 길이가 총 38임)
 -- ================================================================
@@ -200,7 +201,7 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
 --        admit이 동기 + Lua 하나가 되어 그 상태 자체가 없다. 성공했거나 예외거나다.
 --     ② 감사 기록으로도 반쪽이다 — 흐름이 'Lua 성공 → INSERT'라
 --        실패한 요청은 애초에 남지 않는다. 성공 기록은 Kafka 이벤트·메트릭이 이미 갖는다.
---     ③ 과금 근거가 아니다 (과금은 enqueue 수 기준).
+--     ③ 과금 근거가 아니다 (과금은 enqueue 수 기준 — 취소분 제외, DECISIONS §82).
 --   대체:
 --     멱등 → Redis queue:{q}:admit-idem:{requestId} (결과 payload 저장 → REPLAY)
 --     장기 이력 → queue_daily_stats.total_admit_count
@@ -278,11 +279,15 @@ GROUP BY tenant_id, queue_id, DATE(issued_at)
 ON DUPLICATE KEY UPDATE id = id; -- 멱등: 배치 재실행 안전
 
 -- Step 2: billing_snapshots 집계 (tokens 원본에서 직접)
+--   status <> 3 — 취소(CANCELLED)는 과금하지 않는다 (DECISIONS §82).
+--   Step 1은 COUNT(*) 그대로다: queue_daily_stats는 통계라 취소분도 센다
+--   (total_cancelled 컬럼이 따로 있어 파티션 DROP 후에도 과금액 재구성이 된다).
 INSERT INTO billing_snapshots (tenant_id, year_month, count)
 SELECT tenant_id, '202604', COUNT(*)
 FROM tokens
 WHERE issued_at >= '2026-04-01'
   AND issued_at <  '2026-05-01'
+  AND status <> 3
 GROUP BY tenant_id
 ON DUPLICATE KEY UPDATE count = VALUES(count), updated_at = NOW(3);
 
