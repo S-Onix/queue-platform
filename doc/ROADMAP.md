@@ -53,7 +53,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ✅ Sprint 7   admit·verify·complete + §79(/status·watermark·pacing) 구현 완료 (dev ba21221, PR #31~38)
               ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
               ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
-🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·RETURNED·COMPLETED 발행까지 완료
+🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·COMPLETED 발행까지 완료 (~~RETURNED~~는 §36이 폐기)
 🔄 Sprint 9   queue-batch에 AdmitTokenExpiryJob 1개 (§80). 나머지 3개 잡·회수 경로는 미착수
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
@@ -492,7 +492,7 @@ flowchart TD
   (`admit_token = ?` + `status IN (0,1)` + `admitted_at` 유효 창) → Redis 정리는 나중
 - `queue:{queueId}:admitted` ZSet 신설 (score=만료 epoch ms, member=`"seq|identifier"`) — `QueueKeys` 경유
 - `tokens.admitted_at` 컬럼 추가
-- Kafka `ADMITTED`·`RETURNED` 이벤트 + **소비 측 전이 가드**(허용 출발 상태별 조건부 UPSERT)
+- Kafka `ADMITTED`·`EXPIRED` 이벤트 + **소비 측 전이 가드**(허용 출발 상태별 조건부 UPSERT). ~~`RETURNED`~~는 §36이 폐기
 - **ADMIT_TOKEN_TTL 만료 → 종료** — `admitted` ZSet claim-Lua, 실행 주체 **`queue-batch`**.
   🔴 **§36(2026-08-21)이 복귀를 폐기**했다 — claim 후 `ZADD waiting`이 아니라 `HGET`→`HDEL tokens`+`EXPIRED` 발행
   ← 포트폴리오 차별 포인트

@@ -67,9 +67,11 @@ Platform과 커플링 없음
 
 ### 4. admitToken TTL 만료 → 종료 (복귀하지 않는다)
 ```
-TTL 60초 초과 → WAITING 복귀
-seq DB 저장 → Redis ZADD score 복원
-→ 다음 admit 호출 시 앞순서이면 재발급
+TTL 60초 초과 → claim 잡이 HGET → HDEL tokens (중복 게이트 해제) + EXPIRED 발행
+→ 유저는 404를 받고 재접속 → Tenant가 재-enqueue → 새 seq, 맨 뒤
+
+왜: Platform은 만료 원인(유저/불가항력/Tenant/Platform)을 구분할 수 없다.
+    Platform 귀책분(폴링 수령 지연)은 실측상 이미 60초 예산 안이므로 봐줄 이유가 없다.
 
 이유: 네트워크 지연 등 유저 귀책 아닐 수 있음
      EXPIRED 처리 시 유저가 맨 뒤로 → 불공평
@@ -371,7 +373,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 |------|------|------|------|
 | Spring MVC + Virtual Thread | 친숙한 생태계, 코드 단순 | blocking → VT 필요 | spring.threads.virtual.enabled=true 한 줄 적용 |
 | JPA + Virtual Thread | @Transactional 자연스러움 | blocking I/O | VT가 OS Thread 고갈 없이 처리 |
-| admitToken 만료 → WAITING 복귀 | 우선순위 보존. 유저 불이익 없음 | 슬롯 일시 점유 | seq DB 저장으로 score 복원 |
+| admitToken 만료 → **종료**(§36) | 좀비가 admit 슬롯을 재순환 점유하지 않는다 | 60초를 놓치면 맨 뒤 | Platform 귀책분(폴링 지연)이 이미 예산 안이라 봐줄 근거가 없다 |
 | Kafka Enqueue 버퍼 | DB 적재를 비동기로 흡수 | Eventually Consistent | At-Least-Once 보장 |
 | Kafka admit 처리 | admit 요청 영속성 | Consumer 처리 지연 | DB PENDING → 멱등성 보장 |
 | status TINYINT | 저장공간·비교 성능 | 가독성 (상수로 보완) | 대량 tokens 테이블 최적화 |

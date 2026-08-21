@@ -778,7 +778,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | Job | 주기 | 처리 |
 |-----|------|------|
 | `TokenExpiryJob` | 10초 | WAITING TTL 만료 → EXPIRED + Kafka 발행 |
-| `AdmitTokenExpiryJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → WAITING 복귀 (seq 유지) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
+| `AdmitTokenExpiryJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
 | `RedisSyncJob` | 5분 | redis_sync_needed=1 토큰 → Redis 재삽입 |
 | `BillingSnapshotJob` | M+2월 초 | tokens 원본 집계 → queue_daily_stats + billing_snapshots → 파티션 DROP |
 
@@ -828,7 +828,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 |------|------|------|---|
 | ~~`TK_002_INVALID_ADMIT_TOKEN`~~ | — | **구현됨** — 위 표의 `INVALID_ADMIT_TOKEN`(`TK002`) | — |
 | `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 — **complete에는 쓰지 않는다.** §6.6이 원인(상태 불가 · admitToken 불일치 · 유효 창 초과)을 구분하지 않고 전부 `TK002` 404로 답하기로 확정했다. 남은 후보였던 이탈(`DELETE /tokens/:tokenId`)은 **§82로 폐기**됐다 → **쓰이는 곳이 없다** | 없음 |
-| (WAITING 복귀 대기) | 404 | admitToken TTL 만료 → 배치 반영 전 (§6.3 404 계약) | **미해결** — ErrorCode만 추가해선 던질 수 없다(§6.3 판정 수단 부재) |
+| ~~(WAITING 복귀 대기)~~ | 404 | 🔴 **소멸 (§36)** — 복귀가 없어 이 상태가 존재하지 않는다 | ~~**미해결** — ErrorCode만 추가해선 던질 수 없다(§6.3 판정 수단 부재) |
 
 ---
 
@@ -1007,5 +1007,5 @@ BCrypt → 별도 스케줄러 격리 불필요
 > 유저는 **Platform에 직접 Polling**한다 (`pacing` 구간표 기반 적응형, §79).
 > verify = 유효성 확인만. complete = COMPLETED + ZREM + Kafka 발행.
 > DB 먼저, ZREM 나중 — **잔류가 유실보다 안전**하다.
-> seq를 DB에 저장 — **ADMIT_ISSUED 복귀 시 순위 복원 가능**하다.
+> seq를 DB에 저장 — **Redis 전손 시 DB 재구성**(§71)이 주 용도다. ~~ADMIT_ISSUED 복귀 시 순위 복원~~은 §36이 폐기.
 > Kafka At-Least-Once — **DB INSERT는 반드시 보장**된다.

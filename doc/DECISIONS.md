@@ -5392,8 +5392,10 @@ if maxPoppedSeq > cur then redis.call('SET', KEYS[n], maxPoppedSeq) end
 ### 🔴 가드레일 — watermark는 **표시 전용**이다
 
 **admit 대상 선택은 언제나 실제 `waiting` ZSet의 최소 seq부터 한다.**
-watermark 기준으로 "48번부터 뽑자"고 하면, admitToken TTL(60s) 만료로 **seq를 보존한 채 WAITING에
-복귀한 토큰**이 커서 뒤에 남아 **영구 누락**된다.
+watermark 기준으로 "48번부터 뽑자"고 하면, ~~admitToken TTL 만료로 seq를 보존한 채 WAITING에
+복귀한 토큰~~이 커서 뒤에 남아 **영구 누락**된다.
+🔴 **§36이 복귀를 폐기(2026-08-21)해 이 시나리오는 소멸했다.** 다만 **규칙 자체는 유지한다** —
+watermark는 표시 전용이고 커서가 아니라는 원칙은 다른 이유로도 유효하다.
 
 ### `mySeq <= lastAdmittedSeq` 일 때 — 상태 판정은 **새로 만들지 않는다**
 
@@ -5546,8 +5548,8 @@ watermark 기준으로 "48번부터 뽑자"고 하면, admitToken TTL(60s) 만�
   귀결: 개인화 트래픽은 500 rps가 아니라 **5,000~7,700 rps**다.
   **단, `inactive_ttl` 회수 배치는 아직 없다** — `last-active` ZSet은 폴링이 쓰기만 하고
   읽는 곳이 0이다(Sprint 7/9)
-- **⚠️ 장애 시 이 결정의 이득이 사라진다.** 테넌트가 admitToken 소비에 실패해 TTL 만료 →
-  seq 보존 WAITING 복귀가 누적되면 **전원이 `mySeq <= watermark`**가 되어 매 폴링이 개인
+- **⚠️ ~~장애 시 이 결정의 이득이 사라진다.~~** 🔴 **§36 복귀 폐기로 소멸(2026-08-21).**
+  ~~테넌트가 admitToken 소비에 실패해 TTL 만료 → seq 보존 WAITING 복귀가 누적되면~~ **전원이 `mySeq <= watermark`**가 되어 매 폴링이 개인
   엔드포인트 + `pacing` 최저 구간(2초)을 탄다. **분할로 얻은 `MGET` 전환이 통째로 무효화되고
   트래픽 전량이 `EVAL`로 되돌아간다** — 하필 부하가 가장 높을 때.
   → `pacing` 표에 `rank<=0` 구간을 신설할지는 **관측 후 결정(후속)**. 지금 값을 정하면 근거 없는 상수가 된다
@@ -5670,9 +5672,9 @@ Platform은 그걸 모른다. `ADMIT_TTL`이 `private static final` 상수인 �
     남은 누수는 **complete하지 않고 떠난 사람**이다 — 이탈·TTL 만료 경로가 아직 없어
     그만큼 필드가 영구 축적된다. 큐 상태 키에 `EXPIRE`는 여전히 **0건**이다
   - `queue:{q}:last-active` ZSet — `ZREM`이 0건. 폴링이 쓰기만 하고 읽는 곳이 없다(§74 Consequences)
-  - 역설적으로 **이 누수 덕에 admitToken TTL 만료 후 WAITING 복귀가 `ZADD` 하나로 성립한다**
-    (`tokens` Hash의 identifier→tokenId 매핑이 살아 있어야 복귀한 멤버를 다시 검증할 수 있다).
-    회수 배치를 설계할 때 **"언제 지워도 되는가"가 이 의존과 얽힌다**
+  - 🔴 **§36 폐기 후 의존 방향이 바뀌었다.** 이제 claim 잡이 그 필드를 **직접 `HDEL`한다** —
+    만료자의 중복 게이트를 푸는 유일한 주체다. 회수 배치(§82)는 그 사람들을 건드리지 않는다
+    (`waiting`에 없어 identifier 역산이 안 된다)
 
 ---
 
@@ -5855,7 +5857,7 @@ identifier인데 tokenId만 담으면 그걸 **DB에서만** 얻을 수 있고, 
 | complete 후 재-enqueue | **새 `tokenId`** — `HDEL`이 게이트를 연다 |
 | TTL 만료 복귀 | **60.9초 후**, score가 **원래 seq 그대로**(§36 성립) |
 | `admit-by-token` 만료 ~ 복귀 사이 404 창 | **≈ 1초** (이론 최악은 배치 주기 10초) |
-| `RETURNED` 가드 | `status` 1→0 복원 확인, `last-active` **미리셋** 확인(설계 준수) |
+| ~~`RETURNED` 가드~~ | 🔴 **§36 폐기로 대상 없음.** 대신 **만료자의 `status`가 `1`로 남는지**와 `HDEL tokens`로 재-enqueue가 새 seq를 받는지를 검증한다 |
 
 **⑦ 남은 것**
 
@@ -6079,7 +6081,7 @@ ShedLock이 필요한 잡은 **원자 claim이 불가능한 것들**이다 — �
   동기 처리라 전달할 명령이 없다
 - **§36** (TTL 만료 → WAITING 복귀) — 트리거를 `EXISTS admit-by-token` 스캔에서
   **`admitted` ZSet claim-Lua**로 확정한다
-- **§73 D16·D18** — `ADMITTED`·`RETURNED`도 같은 토픽 `token-lifecycle`, key = `tokenId`
+- **§73 D16·D18** — `ADMITTED`·`EXPIRED`도 같은 토픽 `token-lifecycle`, key = `tokenId`
 - **§75 D26** — 큐 상태 키 목록에 `admitted` 추가, `verified-token` 제거
 - **`CLAUDE.md` "`@Scheduled` 단독 금지, leader election 필요" · `CONCURRENCY.md` 동시성 매트릭스**
   — 복귀 claim-Lua는 그 규칙의 **명시적 예외**다(⑧). 매트릭스에도 같은 행을 넣었다
@@ -6261,7 +6263,7 @@ Cancel은 이탈의 **일부만** 덮는데, 덮는 그 일부조차 `inactiveTt
 
 **③ 취소 경로의 `issued_at` 원본 전파 함정이 소멸한다.** `UNIQUE (token_id, issued_at)`이라
 1ms만 어긋나도 두 번째 행이 생기는 문제(§83 Context)는 **취소 경로에서만** 사라진다.
-`ADMITTED` · `RETURNED` · `COMPLETED` · `EXPIRED`는 여전히 원본을 그대로 실어야 한다.
+`ADMITTED` · `COMPLETED` · `EXPIRED`는 여전히 원본을 그대로 실어야 한다(~~`RETURNED`~~는 §36이 폐기).
 
 **④ §21이 대체된다.** 초판 이탈 정책은 폐기 표기와 함께 기록으로만 남는다.
 
