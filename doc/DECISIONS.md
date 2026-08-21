@@ -54,7 +54,7 @@
 | §22 | verify / complete 분리 | ✏️ |
 | §33 | verify API 제거 검토 → 유지로 번복 | ✏️ |
 | §34 | admitToken TTL 만료: EXPIRED → WAITING 복귀 | ✅ |
-| §36 | admitToken TTL 만료 → WAITING 복귀 (상세) | ✏️ |
+| §36 | admitToken TTL 만료 → **seq 보존 WAITING 복귀** (2026-08-21 폐기 검토 → **유지**) | ✅ |
 | §80 | **Sprint 7 Admit — 전 구간 원자 Lua + 동기 응답** (`verified-token`·`admit_requests` 폐기) | ✅ |
 | §81 | `avgWaitingTime`·ETA·`queue-stats` 폐기 (→8) | ✅ |
 
@@ -2004,28 +2004,165 @@ N개를 동시에 고쳐야 해서 버전이 어긋납니다. REST API는 언어
 
 ## §36 admitToken TTL 만료 → WAITING 복귀 (상세)
 
-> ✏️ **트리거가 §80에서 확정됐다.** 아래 Redis Key 구성 중 `verified-token:{tokenId}`는 **폐기**다.
-> 그리고 만료 감지를 `EXISTS queue:{q}:admit-by-token:{tokenId}` 스캔으로 하던 것을
-> **`queue:{q}:admitted` ZSet + claim-Lua**로 바꾼다(score = 만료 epoch ms).
-> 스캔은 대상을 **알아야** 도는데, 만료된 키는 이미 사라져서 무엇이 만료됐는지 알 수단이 없었다 —
-> ZSet에 만료 시각을 넣어두면 `ZRANGEBYSCORE 0 now`로 **만료된 것만** 집어낼 수 있다.
-> 실행 주체는 **`queue-batch`**(§80). **seq 보존 복귀와 우선순위 유지라는 본 결정은 그대로다.**
+> ✏️ **트리거가 §80에서 확정됐다.** 만료 감지를 `EXISTS queue:{q}:admit-by-token:{tokenId}` 스캔으로
+> 하던 것을 **`queue:{q}:admitted` ZSet + claim-Lua**로 바꿨다(score = 만료 epoch ms). 스캔은 대상을
+> **알아야** 도는데 만료된 키는 이미 사라져서 무엇이 만료됐는지 알 수단이 없었다. 실행 주체는 `queue-batch`.
+>
+> 🔴 **2026-08-21 — 이 결정의 폐기를 검토했고 유지로 판정했다.** 아래 "폐기 검토" 절 참조.
 
-### Redis Key 최종 구성
+### Decision
+
+**admitToken TTL이 만료되면 그 사람을 `waiting` ZSet에 `EXPIRED`가 아니라 `WAITING`으로,
+`enqueue` 때 받은 `seq`를 그대로 score로 되돌린다.**
 
 ```
-유지:
-  queue:{queueId}:admit-by-token:{tokenId}   → admitToken (Polling 응답용)
-  queue:{queueId}:admit-by-admit:{admitToken} → tokenId (verify/complete용)
-  verified-token:{tokenId}          (중복 입장 방지)
+admit.lua        ZPOPMIN → waiting에서 빠진다. admitted ZSet에 "seq|identifier" (score = 만료 epoch ms)
+                 tokens Hash 필드는 그대로 둔다 (중복 게이트)
+   ↓ TTL 60초
+admit_expire.lua ZRANGEBYSCORE admitted 0 now  ← 이 EVAL 자체가 claim (§80 ⑧)
+                 ZREM admitted → ZADD waiting {원래 seq} {identifier}
+AdmitTokenExpiryJob  RETURNED 발행 (key = tokenId) → 컨슈머가 IF(status = 1, 0, status)
+```
+
+**새 seq를 받지 않는다.** 받으면 60초를 기다린 사람이 맨 뒤로 밀린다.
+
+### Rationale
+
+**유저 귀책이 아닌 사유로 순위를 박탈하지 않는다.** admitToken을 못 쓴 원인은 넷인데
+Platform은 **"60초 안에 verify가 안 왔다"는 사실 하나만** 알고 구분할 수단이 없다.
+
+| 원인 | 귀책 |
+|---|---|
+| 탭을 닫았다 | 유저 |
+| 네트워크가 끊겼다 | 아무도 아님 |
+| Tenant 서버가 느려 verify를 못 불렀다 | **Tenant** |
+| 폴링 간격 때문에 admitToken을 늦게 받았다 | **Platform** (§79 pacing 사다리) |
+
+**구분할 수 없으므로 판정하지 않는다.** 복귀는 "이 사람이 떠났는지 모르니 순서를 그대로 둔다"이고,
+탈락 선고가 아니다 — 이것이 핵심 설계 원칙 1(*Platform은 순서만 관리*)에 부합하는 쪽이다.
+
+**오판 비용이 비대칭이다.**
+
+| 오판 | 비용 | 회복 |
+|---|---|---|
+| 떠난 사람을 남긴다(위음성) | admit 슬롯 1개/사이클 | Tenant가 `count`를 더 부르면 즉시 보상 |
+| 있는 사람을 내보낸다(위양성) | 수 시간 대기가 무효 | 🔴 **불가역** — 아래 참조 |
+
+### 🔴 알려진 대가 — 좀비 head-of-line 점유
+
+**이 결정의 가장 큰 비용이고, 실재한다.**
+
+```
+좀비(이미 떠난 사람)가 admit된다 → 60초 뒤 원래 seq로 복귀 → seq가 최소라 큐 맨 앞
+→ 다음 admit에서 또 뽑힌다 → 약 70초(TTL 60 + 배치 주기 10) 주기로 무한 재순환
+```
+
+좀비 Z명, Tenant의 사이클당 처리율 R명일 때 매 사이클 `min(Z, R)`의 admit 슬롯이 좀비에게 간다.
+**Z ≥ R이면 정상 입장자가 0에 수렴한다.**
+
+**막는 장치가 오늘 0개다** — `queue-batch`에 `AdmitTokenExpiryJob` 하나뿐이고 `waitingTtl`·
+`inactiveTtl` 판정 잡은 파일 자체가 없다. 그래서 위음성 비용이 지금은 **무한**이고,
+위 비대칭 논거는 **`inactiveTtl` sweep이 생긴다는 전제 위에서만** 성립한다.
+
+📌 **좀비를 유한하게 만드는 것은 이 결정이 아니라 §82의 잔여 과제다.** sweep이 생기면
+좀비는 `inactiveTtl`(기본 300초 ≈ 4~5사이클) 안에 회수되어 낭비에 상한이 생긴다.
+그때까지는 이 절이 **상한 없는 대가를 지고 있다**는 것을 알고 있어야 한다.
+
+### 폐기 검토 (2026-08-21) — 유지로 판정
+
+업계 표준(Queue-it *"start over"* · Cloudflare *"back of the queue"* · CrowdHandler 순번 미보장)이
+전부 "차례를 놓치면 맨 뒤"라는 점에서 폐기를 검토했다. 에이전트 3인(설계·구현·반대심문) 교차 검토 결과
+**폐기 근거 4개 중 3개가 무너졌다.**
+
+| 폐기 근거 | 검토 결과 |
+|---|---|
+| 코드가 순감한다(228줄 삭제) | ❌ **사실오류.** 아래 "왜 인프라를 못 지우는가" 참조. 실제는 **Lua 1줄 교체** |
+| 업계 표준이 반대다 | ❌ **대응물이 어긋난다.** 업계의 "맨 뒤"는 우리 `inactiveTtl`에 해당하고 §82가 이미 그렇게 정했다. `admitTtl` 창은 **Backpressure Pull 고유물**이라 비교 대상이 없다 — 업계는 Tenant가 대신 뽑아가는 단계가 없고 입장 판정이 유저 요청과 동기다 |
+| 핵심 원칙 1 위반 | ❌ **방향이 반대다.** 무판정이 복귀, 탈락 선고가 폐기다 |
+| 좀비 head-of-line 해소 | 🟡 **성립한다.** 다만 회수 배치 부재의 증상이고, sweep이 더 정확한 도구다 |
+
+**🔴 폐기가 불가능한 이유 — 재진입 경로가 없다.**
+`ApiKeyAuthenticationFilter:122`가 enqueue(`POST /queues/{q}/tokens`)를 **X-API-Key 필수**로 잡는다.
+브라우저에는 API Key가 없다(SDK는 폴링 전용, §78·§35). 따라서 폐기 후 만료자의 실제 경험은
+"맨 뒤로 다시 선다"가 **아니라** "SDK가 404로 종료 → Tenant 페이지로 돌아가 Tenant 서버가 다시
+enqueue해줘야 한다"이며, 그 재진입 흐름을 **모든 Tenant가 각자 구현**해야 한다. 안 하면 유저는 튕긴다.
+
+**유일하게 살아남은 폐기 이득**은 §79의 미해결 후속(상태 B 판정 수단 부재 → 신규 `ErrorCode`)이
+소멸한다는 것이다. 그 하나로 위 비용을 사기에는 부족하다고 판단했다.
+
+**동반 제안이던 `admitTtl`의 Tenant 노브화도 함께 기각한다.** §82가 만료를 과금하고 재-enqueue를
+2건 청구하므로, TTL을 짧게 잡을수록 과금이 오르는 노브가 된다 — "유저 탈락률을 정하는 값"과
+"과금 건수를 정하는 값"이 같은 컬럼이 되는 구조다. DB 컬럼 + API 계약이라 **비가역**이기도 하다.
+
+**폐기 판정을 뒤집을 조건** (하나라도 참이면 재검토):
+- ① `inactiveTtl` sweep을 Sprint 9에도 만들지 않기로 확정 → 좀비 상한이 영영 없어진다
+- ② 실측에서 좀비 비율 Z가 Tenant 처리율 R에 근접 → 이론이 아니라 실재하는 기아
+- ③ SDK가 만료 시 자동 재진입할 수 있게 된다 → 재진입 경로 문제가 소멸
+- ⚠️ **②를 판정할 계기판이 오늘 0개다** — §80 U9의 `queue_admit_*` 메트릭 2종이 미구현이다
+
+### 🔴 왜 복귀 인프라를 못 지우는가 (폐기하더라도)
+
+중복 게이트가 `waiting` ZSet이 아니라 **`tokens` Hash의 `HSETNX`** 이고,
+**`HDEL tokens`의 유일한 경로가 `cleanupCompleted`**(`RedisQueueEngine:474`) 하나다.
+
+노쇼는 complete를 안 하므로 필드가 영구 잔류한다. `admitted` ZSet을 지우면 그 사람의
+`(seq, identifier)` 쌍을 아는 자료구조가 **0**이 된다 — `inactiveTtl` sweep도 못 잡는다
+(`last-active`로 seq는 찾아도 identifier를 `waiting`에서 역산해야 하는데 그 사람은 `waiting`에 없다).
+
+```
+재-enqueue → HSETNX 0 → EXISTS, rank -1, seq -1, 옛 tokenId (ZADD 미실행)
+          → 그 tokenId로 폴링 → 404 → 영구 락아웃
+```
+identifier가 "같은 사용자·같은 큐에는 항상 같은 UUIDv7" 규약이라(§79) 그 사용자는 **그 큐에서 영구 퇴출**된다.
+규약을 어기고 새 identifier를 쓰면 게이트를 우회해 **과금 2건**이다.
+
+→ 폐기하더라도 `admitted` ZSet · `admit_expire.lua` · `AdmitTokenExpiryJob` · `ExpiredAdmit` ·
+`QueueEngine.claimExpiredAdmits` 포트는 **전부 남는다.** 바뀌는 것은 `ZADD waiting` → `HDEL tokens`
+한 줄과 `RETURNED` → `EXPIRED` 이벤트 타입뿐이다.
+
+⚠️ **admit 시점에 `HDEL`하는 우회는 금지다.** 그러면 admit된 사람이 새로고침 한 번으로 새 tokenId·
+새 seq를 받아 맨 뒤에 다시 선다(과금 2건 + `status = 1` 고아). 게이트를 `waiting`이 아니라 Hash로 둔
+이유가 정확히 이것이다.
+
+### 실측으로 확인한 것 (재확인 불필요)
+
+- **`admit_expire.lua:57`이 원래 seq를 문자열 그대로 되돌린다.** `tonumber`를 거치면 Lua 숫자
+  포맷(`%.14g`)이 섞여 원래 score와 어긋난다
+- **복귀는 `last-active`를 갱신하지 않는다**(`AdmitTokenExpiryJob:37`, §80 확정). 갱신하면 브라우저를
+  닫은 사람이 복귀마다 되살아나 영원히 회수되지 않는다. **§82의 이탈 감지가 이 전제 위에 선다**
+- **`complete`는 복귀자를 받아준다.** `COMPLETE_VALID_WINDOW_SECONDS = 300`인데 admitToken TTL은 60초라
+  60~300초 구간의 complete가 정상 경로로 실재하고, `status IN (0, 1)`(`TokenJpaRepository:64`)이 이를 흡수한다
+- ⚠️ **`EXPIRED` 가드는 `IF(tokens.status = 0, 4, tokens.status)`** 다(`TokenJpaAdapter:81`).
+  admit된 사람(`status = 1`)에게 EXPIRED를 보내도 **no-op**이다. 이 가드를 `IN (0, 1)`로 넓히면
+  위 complete 경로가 죽으므로 **넓히지 마라**
+- **`admit.lua`의 watermark 갱신은 `admitted`와 논리적 의존이 없다** — `ZPOPMIN` 결과의 `maxSeq`로만
+  갱신하고 `admittedKey`를 읽지 않는다. KEYS 배열에 나란히 있을 뿐이다
+
+### Redis Key 구성
+
+```
+queue:{queueId}:admitted                    → ZSet. score = 만료 epoch ms, member = "seq|identifier"
+                                               🔴 만료 시각을 아는 유일한 자료구조 (§80)
+queue:{queueId}:admit-by-token:{tokenId}    → admitToken (Polling 응답용). PX = admitToken TTL
+queue:{queueId}:admit-by-admit:{admitToken} → tokenId (verify/complete용). PX 동일
 
 DB:
-  tokens.admit_token 컬럼
-    → Redis 미스 시 Fallback용
-    → verify DB Fallback 시 조회 기준
+  tokens.admit_token   → verify의 DB Fallback 조회 기준
+  tokens.seq           → Redis 전손 시 score 복원 (§71)
 ```
+🔴 **`verified-token:{tokenId}`는 폐기됐다**(§80). 이전 판의 "유지" 목록에 남아 있던 것을 2026-08-21에
+삭제했다 — 같은 절의 배너가 폐기라고 적어놓고 목록에는 남아 있어 서로 모순이었다.
 
----
+### Related
+
+- **§80** (Sprint 7 Admit) — 트리거를 `admitted` ZSet + claim-Lua로 확정. `EVAL` 자체가 claim이라
+  leader election을 쓰지 않는다(⑧). **복귀가 `last-active`를 안 건드리는 것도 여기서 확정**
+- **§79** (폴링 계약) — `frontSeq` 비단조의 원인이 이 절이고(Alternatives A), 가드레일과 상태 B가
+  이 결정에 기댄다. **pacing 사다리가 `admitToken` TTL과 결합돼 있다는 실측**도 그쪽에 있다
+- **§82** (Cancel 폐기) — 좀비를 유한하게 만드는 `inactiveTtl` sweep이 그쪽의 잔여 과제다.
+  **이 절의 대가에 상한을 주는 것이 그 sweep이다**
+- **§34** (admitToken TTL 60초) — TTL 값 자체의 근거
+- **§71** (Redis 전손 복구) — DB `tokens.seq`로 score를 복원하는 것이 이 절의 seq 보존과 같은 원칙
 
 ## §37 schema/entity 개선사항 (v1.9)
 
