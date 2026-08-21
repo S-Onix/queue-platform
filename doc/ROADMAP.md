@@ -49,7 +49,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ✅ Sprint 3   완료 (2026-04-23)
 ✅ Sprint 4   완료 (2026-04-24)
 🔄 Sprint 5   5-A/B/C/D/E 완료, 5-F(문서) 진행 중
-🔄 Sprint 6   Token 도메인 + Enqueue + Polling 구현 / Cancel(DELETE) 미착수
+✅ Sprint 6   Token 도메인 + Enqueue + Polling 구현 완료 (Cancel API는 §82로 폐기 — 범위에서 제거)
 ✅ Sprint 7   admit·verify·complete + §79(/status·watermark·pacing) 구현 완료 (dev ba21221, PR #31~38)
               ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
               ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
@@ -421,14 +421,14 @@ flowchart TD
 
 ---
 
-### 🔄 Sprint 6 — Token 도메인 + Queue Engine API (Enqueue / Polling) — **Cancel만 남음**
+### ✅ Sprint 6 — Token 도메인 + Queue Engine API (Enqueue / Polling)
 
 **예상 기간:** 1.5주
 **카테고리:** MVP
 
 **주요 산출물:**
 - ✅ **Token 도메인 모델** (분할된 Sprint 3의 후반)
-  - Token Rich Domain (`complete`, `cancel`, `expire`, `returnToWaiting`, `waitingSeconds`)
+  - Token Rich Domain (`complete`, `expire`, `returnToWaiting`, `waitingSeconds`) — ~~`cancel`~~ (§82)
   - `TokenRepository` Port 인터페이스
   - JPA Entity 파티셔닝 고려 (PK = token_id + issued_at)
 - ✅ **Enqueue API**
@@ -438,15 +438,16 @@ flowchart TD
   - Kafka 적재는 Sprint 8에서 이미 붙었다 (동기 DB INSERT 단계를 거치지 않았다)
 - ✅ **Polling API**
   - `GET /queues/:queueId/tokens/:tokenId?seq=&ka=` — `poll_verify.lua` 소유권 검증 (§74)
-- ⬜ **Cancel API**
-  - `DELETE /queues/:queueId/tokens/:tokenId` → CANCELLED **(미착수 — 이 Sprint의 잔여 전부)**
+- 🔴 ~~**Cancel API** `DELETE /queues/:queueId/tokens/:tokenId`~~ — **범위에서 제거 (DECISIONS §82).**
+  이탈은 `inactiveTtl` 판정 배치가 전담하고 결과는 EXPIRED(4)다. 그 배치는 Sprint 9 회수 배치에 있다.
+  **이로써 Sprint 6은 잔여 없이 종료된다.**
 
 **완료 기준 (DoD):**
 - [x] Token 도메인 단위 테스트 (상태 전환 매트릭스 전체)
 - [x] 1,000명 동시 Enqueue → 순번 중복 0건 (실제 Redis)
 - [x] 중복 identifier Enqueue 시 기존 토큰 반환 (멱등 처리)
 - [x] 폴링 소유권 — 남의 `seq` + 내 `tokenId` → 404 (§74)
-- [ ] Cancel 후 같은 identifier 재Enqueue 가능 (맨 뒤로)
+- [x] 같은 identifier 재Enqueue 시 기존 순번 복원 (`HSETNX` → `EXISTS`) — §82의 유예 창 근거
 - [ ] Polling 응답 시간 p99 < 50ms — **로컬 수치는 신뢰 구간이 아니다.** Sprint 10(k6)로 이관
 
 > ~~`nextPollAfterSec` 4단계(30/10/5/2초) 분기 테스트~~ — **§79가 이 필드를 응답에서 제거**하고
@@ -556,7 +557,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 > 안에서만 성립하고, `queueId` 키는 한 큐 30만 명이 통째로 한 파티션에 몰려 파티션을 늘려도 소용이 없다.
 > **현행: 단일 토픽 `token-lifecycle` / 파티션 키 `tokenId` / 18 파티션 / RF 3 / min.insync 2**
 > (`scripts/kafka/create-topics.sh`). Enqueue 적재 경로는 **이미 구현·실측 완료**(100만건, §73)이며,
-> 남은 것은 **상태 전이 이벤트**(admit/complete/cancel/expire)로 Sprint 7과 함께 온다.
+> 남은 것은 **상태 전이 이벤트**(admit/complete/expire)로 Sprint 7과 함께 온다.
 
 **선행 인프라:** [INFRA_SETUP.md §3](INFRA_SETUP.md) — Kafka 3 브로커 KRaft 모드 (9092/9192/9292) WSL2 직접 설치
 
@@ -573,7 +574,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
   - `@EnableScheduling` 금지 (붙이면 infra의 `@Scheduled` 빈까지 돌아 이중 적재)
   - actuator + micrometer-prometheus 포함 (없으면 컨슈머 lag을 PromQL로 볼 수단이 사라진다)
 - ✅ `TokenLifecycleConsumer` (배치 적재 → `tokens` 멱등 INSERT) + `TokenPersistService`
-- ⬜ **상태 전이 이벤트 발행** (admit/complete/cancel/expire) — 같은 토픽·같은 키(`tokenId`). **Sprint 7과 동시**
+- ⬜ **상태 전이 이벤트 발행** (admit/complete/expire) — 같은 토픽·같은 키(`tokenId`). **Sprint 7과 동시**
 - ✅ admit 요청 전달 수단 — **명령 토픽을 만들지 않는 것으로 닫혔다(§80).** admit이 동기 처리라 전달할 명령이 없다. 구 `enqueue-admit`·`AdmitConsumer`·`admit_requests`는 전부 폐기
 - ⬜ `BillingConsumer` 스켈레톤 (실제 집계는 Sprint 9)
 
@@ -986,13 +987,15 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
   늘린다는 것이 통합테스트에서 확인됐다(14,747건 ≈30주기). 지금은 볼 수단이 없다 (§80 ⑦)
 - **`admit.lua`의 로컬 Cluster(7001-7008) 실행 검증** — 왜 지금인가: 동적 키 3종이 `KEYS[]`에
   없어 **CROSSSLOT 그물이 안 걸리는 첫 스크립트**다. 프로덕션 전환 전에만 하면 되지만 비용이 싸다
-- Sprint 6 잔여: Cancel(`DELETE /tokens/:tokenId`) — 왜 지금인가: `tokens` Hash 회수 경로가
-  complete 하나뿐이라, 이탈 API가 생겨야 "떠난 사람" 누수의 절반이 닫힌다. ⚠️ `ApiKeyAuthenticationFilter`
-  화이트리스트를 함께 고쳐야 한다(폴링 경로와 정규식이 겹친다 — `28106ba`와 같은 함정)
+- **`inactiveTtl` 판정 배치 (Sprint 9 회수 배치에 포함)** — 왜 지금인가: `tokens` Hash 회수 경로가
+  complete 하나뿐이라 "떠난 사람"이 `waiting` ZSet에 무기한 남는다. **§82로 Cancel API를 폐기했으므로
+  이 배치가 이탈 회수의 유일한 경로다.** 판정 = `ZRANGEBYSCORE last-active -inf (now - inactiveTtl)`,
+  회수 = `ZREM waiting` + `HDEL tokens` + `ZREM last-active`, 발행 = `EXPIRED`.
+  `admit_expire.lua`의 claim 패턴(한 EVAL 안에 조회+제거)을 그대로 쓴다
 - 5-F: Sprint 5 마무리 (문서 갱신 · 회고)
 
 ### 중기 (다음 Sprint)
-- Sprint 9: 회수 배치 + reconciliation (~~`queue-batch` actuator가 선행~~ → **선행 완료**, `6647ca5`)
+- Sprint 9: 회수 배치(= `inactiveTtl` 판정, §82) + reconciliation (~~`queue-batch` actuator가 선행~~ → **선행 완료**, `6647ca5`)
 - Sprint 8+: Cluster 프로덕션 도입 준비 (§75, 시점 미정 / 로컬 학습은 완료)
 
 ---

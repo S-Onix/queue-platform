@@ -205,20 +205,28 @@ flowchart TD
 
 ---
 
-## 이탈 → CANCELLED
+## 이탈 → EXPIRED
+
+> 🔴 **이탈 전용 엔드포인트는 없다 (DECISIONS §82).** `DELETE /queues/:queueId/tokens/:tokenId`는
+> 만들지 않는다. 유저가 취소 버튼을 누르든 탭을 닫든 네트워크가 끊기든, Platform이 관측하는
+> 신호는 **"폴링이 멈춘다"** 하나뿐이다. 아래 TTL 만료 Batch의 `inactiveTtl` 경로가 그것을 잡는다.
 
 ```mermaid
 flowchart TD
-    DQ(["DELETE /queues/:queueId/tokens/:tokenId\nTenant 서버 호출\n유저 대기 포기"])
-    --> CHK["상태 확인"]
+    U(["유저 이탈\n취소 버튼 · 탭 닫음 · 네트워크 끊김"])
+    --> STOP["브라우저가 폴링을 멈춘다\nqueue:{queueId}:last-active score가 늙는다"]
+    --> WAIT["유예 창 = inactiveTtl (기본 300초)\nTenant가 큐마다 정한다"]
 
-    CHK -->|"ADMIT_ISSUED(1)"| E409A(["409 QE_006_INVALID_STATUS\n입장토큰 발급 후 이탈 불가\nadmitToken TTL 60초 후\nWAITING 복귀 후 이탈 가능"])
-    CHK -->|"WAITING 아님\n(COMPLETED/EXPIRED/CANCELLED)"| E409B(["409 QE_006_INVALID_STATUS"])
-    CHK -->|"WAITING(0)"| ZREM["Redis ZREM\n뒤 순위 자동 당겨짐"]
-    --> DB["DB status = CANCELLED(3)\ncancelledAt 기록"]
-    --> DEL["HDEL queue:{queueId}:tokens {identifier}\nDEL token-info 캐시\n같은 identifier 재Enqueue 가능 (맨 뒤)"]
-    --> OK(["200 OK\n{ status: CANCELLED, cancelledAt }"])
+    WAIT -->|"창 안에 재-enqueue"| BACK["enqueue_bulk.lua HSETNX → EXISTS\n기존 tokenId·seq·rank 복원\n순번 그대로 유지"]
+    WAIT -->|"창을 넘김"| JOB["TTL 만료 Batch가 회수\nZREM waiting + HDEL tokens + ZREM last-active"]
+
+    JOB --> EXP["Kafka EXPIRED 발행 (key=tokenId)\nDB status = EXPIRED(4)\nexpiredReason = INACTIVE_TTL"]
+    EXP --> BILL(["과금 대상 — 자리를 끝까지 점유했다 (§82)"])
+    JOB --> NEW["이후 재-enqueue는 신규\n새 tokenId·새 seq → 맨 뒤\n과금 +1건"]
 ```
+
+**`HDEL tokens`가 곧 중복 게이트를 푸는 행위다.** 그래서 `inactiveTtl`은 단순한 청소 주기가
+아니라 **"몇 초까지 자리를 지켜줄 것인가"** 라는 유예 창이 된다.
 
 ---
 

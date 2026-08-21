@@ -74,7 +74,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 > **일정의 정본은 `doc/ROADMAP.md`다.** 여기엔 "지금 어디인지"만 둔다 — 두 곳에 적으면 갈라진다.
 
 ```
-현재 위치: Sprint 7(Admit) 완료.  다음 = 통합테스트 잔여 · Sprint 6 잔여(Cancel) · Sprint 9
+현재 위치: Sprint 7(Admit) 완료.  다음 = 통합테스트 잔여 · Sprint 9(회수 배치 + reconciliation)
 
 코드로 확인되는 상태 (2026-08-20, dev 기준 재실측):
   구현됨  Redis 독립 2 Cluster + 큐 단위 라우팅                            (§75)
@@ -84,7 +84,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  admit.lua · admit_expire.lua · 상태 전이 가드 UPSERT              (§80)
   구현됨  queue-batch: AdmitTokenExpiryJob(TTL 만료 → WAITING 복귀)         (§80 · §36)
   구현됨  /status 분할 · admitWatermark · pacing 구간표                     (§79)
-  미착수  Cancel(DELETE /tokens/:id)                                       (Sprint 6 잔여)
+  폐기    Cancel(DELETE /tokens/:id) — 이탈은 inactiveTtl 배치가 전담        (§82)
+  미착수  inactiveTtl 판정 배치 — 이탈 회수 경로가 아직 0                    (§82 · Sprint 9)
   미착수  관측 메트릭 2종(queue_admit_*) — 좀비 탐지 수단이 아직 0          (§80 U9)
 
 ⚠️ 중복 게이트는 `tokens` Hash의 **HSETNX**다. `waiting` ZSet이 아니다 —
@@ -242,6 +243,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 4. **Status는 TINYINT (0~4)**
    - VARCHAR 대비 저장공간·비교 성능 최적화
    - 0=WAITING, 1=ADMIT_ISSUED, 2=COMPLETED, 3=CANCELLED, 4=EXPIRED
+   - ⚠️ **3은 예약값이다** — Cancel API를 만들지 않아 도달 경로가 없다 (§82). 이탈은 전부 4로 간다
 
 5. **Kafka 비동기 처리**
    - Enqueue: Redis Lua(순번 확정) → **Kafka 발행(동기, ack 대기)** → **200 응답** → Consumer가 DB INSERT (At-Least-Once)

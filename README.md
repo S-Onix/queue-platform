@@ -121,7 +121,7 @@ flowchart TD
     Batch -->|"@Scheduled\n(ZRANGEBYSCORE, ZREM\nbatch-lock)"| Redis
     Batch -->|"DB UPDATE (expire)\n@Transactional"| DB_M
     API -->|"SELECT\n@Transactional(readOnly)"| DB_R
-    API -->|"UPDATE\n(complete, cancel)\n@Transactional"| DB_M
+    API -->|"UPDATE\n(complete)\n@Transactional"| DB_M
     DB_M -->|"복제"| DB_R
 ```
 
@@ -178,12 +178,15 @@ stateDiagram-v2
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
     ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka 발행
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
-    WAITING --> CANCELLED : DELETE /token
-    WAITING --> EXPIRED : Batch TTL 만료
+    WAITING --> EXPIRED : Batch TTL 만료\n(waitingTtl · inactiveTtl)
     COMPLETED --> [*]
-    CANCELLED --> [*]
     EXPIRED --> [*]
 ```
+
+> 🔴 **취소 전용 엔드포인트는 없다 (DECISIONS §82).** 유저가 취소 버튼을 누르든 탭을 닫든
+> 신호는 **"폴링이 멈춘다"** 하나이고, `inactiveTtl` 판정 배치가 EXPIRED(4)로 보낸다.
+> `inactiveTtl`은 **"몇 초까지 자리를 지켜줄 것인가"** 라는 유예 창이라, 그 안에 돌아오면
+> 같은 identifier로 재-enqueue해 **원래 순번이 복원**된다.
 
 ---
 
@@ -424,7 +427,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 ✅ Sprint 3:  관리 도메인 (Tenant + ApiKey + Queue) 헥사고날 구현
 ✅ Sprint 4:  JWT 인증 + 관리 API 12개 + Service/Controller 테스트
 🔄 Sprint 5:  Redis + Lua Script + Sentinel + Rate Limit
-🔄 Sprint 6:  Token 도메인 + Queue Engine API  (Enqueue·Polling 구현, Cancel 미구현)
+✅ Sprint 6:  Token 도메인 + Queue Engine API  (Enqueue·Polling 구현 / Cancel은 §82로 폐기)
 ⬜ Sprint 7:  Admit → Verify → Complete
 🔄 Sprint 8:  Kafka KRaft 연동  (token-lifecycle 적재 경로 구현)
 ⬜ Sprint 9:  Batch 모듈

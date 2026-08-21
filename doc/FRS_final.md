@@ -1,6 +1,11 @@
 # 📄 Queue Platform — 기능 정의서 (FRS)
 
-> 버전: v1.13 | 상태: 확정 | 대상: 실제 구현 범위
+> 버전: v1.14 | 상태: 확정 | 대상: 실제 구현 범위
+>
+> v1.14 변경사항 (DECISIONS §82): **Cancel API(`DELETE /tokens/:tokenId`) 폐기** — 엔드포인트 표·
+> 상태 머신·소비 측 가드에서 삭제, §6.7을 "이탈 → EXPIRED"로 재작성(`inactiveTtl` 판정 배치가
+> 유일 경로, 유예 창 개념 추가), `status = 3`을 예약값으로 표기, `QE_006_INVALID_STATUS`를
+> **쓰이는 곳 없음**으로 정정
 >
 > v1.13 변경사항 (Sprint 7 구현 반영 — `dev` `ba21221`, PR #31~38): 중복 게이트 `HSETNX`(=`tokens` Hash)
 > 명시, verify는 **DB 읽기 0회**(§6.5), complete 유효 창 **300초 확정**(§6.6),
@@ -154,7 +159,6 @@ Redis (QueueKeys — §8 참조):
 | `POST` | `/api/v1/queues/:queueId/admit` | X-API-Key | Tenant 서버 | N명 입장토큰 발급 |
 | `POST` | `/api/v1/queues/:queueId/admit-tokens/:admitToken/verify` | X-API-Key | Tenant 서버 | 입장토큰 유효성 확인 |
 | `POST` | `/api/v1/queues/:queueId/tokens/:tokenId/complete` | X-API-Key | Tenant 서버 | 입장 완료 통보 → COMPLETED |
-| `DELETE` | `/api/v1/queues/:queueId/tokens/:tokenId` | X-API-Key | Tenant 서버 | 이탈 → CANCELLED |
 
 > **verify·complete 경로에 `queueId`가 들어간 이유** (DECISIONS §79):
 > admitToken 관련 Redis 키를 `queue:{queueId}:...` 해시태그로 묶기 위해서다. Tenant 서버는
@@ -168,7 +172,7 @@ Redis (QueueKeys — §8 참조):
 > **인증 주체가 경로마다 다르다는 것이 함정이다** — `GET /{queueId}/tokens/{tokenId}`(폴링)는
 > **유저가 직접** 부르고 API Key가 없으며, `GET /{queueId}/status`는 `permitAll`이다.
 > 즉 `/tokens/{tokenId}/complete`와 `/tokens/{tokenId}`를 정규식으로 **구분**해야 하고, 뭉개면
-> **폴링이 401**이 된다. 아직 미구현인 `DELETE /{queueId}/tokens/{tokenId}`(이탈)도 같은 함정이다.
+> **폴링이 401**이 된다. (~~`DELETE /{queueId}/tokens/{tokenId}`~~는 §82로 폐기돼 이 함정이 하나 줄었다.)
 
 ### 4.2 관리 API
 
@@ -207,7 +211,7 @@ Redis (QueueKeys — §8 참조):
 0 = WAITING
 1 = ADMIT_ISSUED
 2 = COMPLETED
-3 = CANCELLED
+3 = CANCELLED   ← 🔴 예약값. 도달하는 경로가 없다 (DECISIONS §82)
 4 = EXPIRED
 ```
 
@@ -217,10 +221,8 @@ stateDiagram-v2
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
     ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-lifecycle 발행
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
-    WAITING --> CANCELLED : DELETE /token\nKafka token-lifecycle 발행
-    WAITING --> EXPIRED : Batch\nKafka token-lifecycle 발행
+    WAITING --> EXPIRED : Batch (waitingTtl · inactiveTtl)\nKafka token-lifecycle 발행
     COMPLETED --> [*]
-    CANCELLED --> [*]
     EXPIRED --> [*]
 ```
 
@@ -572,18 +574,31 @@ Body: { admitToken: "at_xxx" }
 Response: { "status": "COMPLETED", "completedAt": "..." }
 ```
 
-### 6.7 이탈 → CANCELLED
+### 6.7 이탈 → EXPIRED
+
+> 🔴 **이탈 전용 엔드포인트는 없다 (DECISIONS §82).** `DELETE /tokens/:tokenId`를 만들지 않는다.
+> Cancel은 이탈의 일부(취소 버튼)만 덮는데 그 일부조차 `inactiveTtl`이 이미 덮고, 탭 닫기·네트워크
+> 끊김은 Tenant가 알 방법이 없어 Cancel로는 못 잡는다. 이탈 감지 배치는 어차피 필요하다.
 
 ```
-DELETE /api/v1/queues/:queueId/tokens/:tokenId
-조건: WAITING(0)만. ADMIT_ISSUED(1) → 409
+트리거: 브라우저가 폴링을 멈춘다 (취소 버튼 · 탭 닫음 · 네트워크 끊김 — 신호는 하나다)
+판정:   ZRANGEBYSCORE queue:{queueId}:last-active -inf (now_ms - inactiveTtl_ms)
+        ※ admit_expire.lua와 같은 claim 패턴 — 조회와 제거가 한 EVAL 안에 있다
 
 처리:
-  Redis ZREM queue:{queueId}:waiting {identifier}
-  DB status = CANCELLED(3)
-  HDEL queue:{queueId}:tokens {identifier}   ← complete와 같은 이유로 마지막 (§6.6)
-  Kafka token-lifecycle 발행 (key=tokenId)
+  Redis ZREM queue:{queueId}:waiting     {identifier}
+        ZREM queue:{queueId}:last-active {identifier}
+        HDEL queue:{queueId}:tokens      {identifier}   ← complete와 같은 이유로 마지막 (§6.6)
+  DB status = EXPIRED(4), expiredReason = INACTIVE_TTL
+  Kafka token-lifecycle 발행 (key=tokenId, eventType=EXPIRED)
 ```
+
+**`HDEL tokens`가 중복 게이트를 푸는 행위이므로, `inactiveTtl`은 곧 유예 창이다.**
+그 전에 같은 identifier로 재-enqueue하면 `enqueue_bulk.lua`의 `HSETNX`가 `EXISTS`를 돌려주어
+**기존 `tokenId`·`seq`·`rank`가 복원**된다(§6.2). 창을 넘기면 신규로 판정되어 맨 뒤에 선다.
+값은 `QueueCreateRequest.inactiveTtl`로 Tenant가 큐마다 정한다(기본 300초).
+
+⬜ **미구현** — Sprint 9 회수 배치.
 
 ---
 
@@ -593,7 +608,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 
 | 토픽 | 파티션 키 | 파티션 | 설명 |
 |------|------------|------|------|
-| `token-lifecycle` | **`tokenId`** | 18 | 토큰 생명주기 **단일 토픽** — enqueue + 상태 전이(admit/complete/cancel/expire) |
+| `token-lifecycle` | **`tokenId`** | 18 | 토큰 생명주기 **단일 토픽** — enqueue + 상태 전이(admit/complete/expire) |
 | `token-lifecycle.DLT` | — | 18 | 격리된 실패 레코드 |
 
 **왜 단일 토픽 + `tokenId` 키인가 (DECISIONS §73 D16·D18)**
@@ -640,7 +655,6 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | `ADMITTED` | 0 | `IF(status = 0, 1, status)` |
 | `RETURNED` | 1 | `IF(status = 1, 0, status)` |
 | `COMPLETED` | 1 | `IF(status = 1, 2, status)` |
-| `CANCELLED` | 0 | `IF(status = 0, 3, status)` |
 | `EXPIRED` | 0 | `IF(status = 0, 4, status)` |
 
 > 🔴 **순서를 파티션에 기대지 않는다.** 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있고,
@@ -794,7 +808,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | 가칭 | HTTP | 상황 | 필요해지는 시점 |
 |------|------|------|---|
 | ~~`TK_002_INVALID_ADMIT_TOKEN`~~ | — | **구현됨** — 위 표의 `INVALID_ADMIT_TOKEN`(`TK002`) | — |
-| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 — **complete에는 쓰지 않는다.** §6.6이 원인(상태 불가 · admitToken 불일치 · 유효 창 초과)을 구분하지 않고 전부 `TK002` 404로 답하기로 확정했다. 남은 후보는 **이탈(`DELETE /tokens/:tokenId`)뿐**이고 그 API가 미구현이다 | 이탈 구현 시 |
+| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 — **complete에는 쓰지 않는다.** §6.6이 원인(상태 불가 · admitToken 불일치 · 유효 창 초과)을 구분하지 않고 전부 `TK002` 404로 답하기로 확정했다. 남은 후보였던 이탈(`DELETE /tokens/:tokenId`)은 **§82로 폐기**됐다 → **쓰이는 곳이 없다** | 없음 |
 | (WAITING 복귀 대기) | 404 | admitToken TTL 만료 → 배치 반영 전 (§6.3 404 계약) | **미해결** — ErrorCode만 추가해선 던질 수 없다(§6.3 판정 수단 부재) |
 
 ---
@@ -925,7 +939,7 @@ keepalive:
 ### MySQL Read/Write 분리
 
 ```
-Write → Master: UPDATE (complete, cancel, expire)
+Write → Master: UPDATE (complete, expire)
 Read  → Replica: SELECT (Polling, API Key)
 INSERT → Kafka Consumer → Master (비동기)
 @Transactional(readOnly = true) → Replica

@@ -18,14 +18,19 @@ stateDiagram-v2
 
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nWAITING 복귀 (EXPIRED 아님)\nseq 유지 → 우선순위 보존\nKafka RETURNED 발행 (key=tokenId)
 
-    WAITING --> CANCELLED : DELETE /token\n유저 자발적 이탈\nWAITING만 허용\nZREM + cancelledAt\nKafka token-lifecycle 발행 (key=tokenId)
-
-    WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과\nKafka token-lifecycle 발행 (key=tokenId)
+    WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과\nZREM waiting + HDEL tokens\nKafka token-lifecycle 발행 (key=tokenId)
 
     COMPLETED --> [*]
-    CANCELLED --> [*]
     EXPIRED --> [*]
 ```
+
+> 🔴 **`CANCELLED(3)`으로 가는 전이는 없다 (DECISIONS §82).** `DELETE /tokens/:tokenId`를
+> 만들지 않기로 확정했다. 유저가 취소 버튼을 누르든 탭을 닫든 신호는 **"폴링이 멈춘다"** 하나이고,
+> `inactiveTtl` 판정 배치가 그것을 잡아 **EXPIRED(4)** 로 보낸다. `status = 3`은 예약값으로만 남는다.
+>
+> **`inactiveTtl`은 유예 창이다.** 배치가 `HDEL tokens`를 하기 전에 같은 identifier로 재-enqueue하면
+> `enqueue_bulk.lua`의 `HSETNX` 게이트가 `EXISTS`를 돌려주어 **기존 `tokenId`·`seq`·`rank`가 복원**된다.
+> 창을 넘기면 신규로 판정되어 맨 뒤에 선다.
 
 ### 🔴 전이를 실제로 강제하는 것 = Kafka 소비 측 가드 (DECISIONS §80)
 
@@ -38,7 +43,6 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | `ADMITTED` | 0 WAITING | `IF(status = 0, 1, status)` |
 | `RETURNED` | 1 ADMIT_ISSUED | `IF(status = 1, 0, status)` |
 | `COMPLETED` | 1 ADMIT_ISSUED | `IF(status = 1, 2, status)` |
-| `CANCELLED` | 0 WAITING | `IF(status = 0, 3, status)` |
 | `EXPIRED` | 0 WAITING | `IF(status = 0, 4, status)` |
 
 > **왜 파티션 순서에 기대지 않는가**: 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있다.
@@ -68,14 +72,14 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | seq 저장 | DB tokens.seq 컬럼 — ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
 | admit_token 컬럼 | DB 저장 → Redis 미스 시 Fallback용 + verify DB Fallback |
 | redis_sync_needed | Redis 다운 중 INSERT된 토큰 추적 → 복구 배치 기준 |
-| Kafka 발행 | **모든 상태 변경**에서 발행 (ENQUEUED/ADMITTED/RETURNED/COMPLETED/CANCELLED/EXPIRED). 단일 토픽 `token-lifecycle`, key=`tokenId` |
+| Kafka 발행 | **모든 상태 변경**에서 발행 (ENQUEUED/ADMITTED/RETURNED/COMPLETED/EXPIRED). 단일 토픽 `token-lifecycle`, key=`tokenId` |
 
 ### expiredReason
 
 | 값 | 원인 | 대상 | Batch 감지 |
 |----|------|------|------------|
 | `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms) |
-| `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) |
+| `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) — **이탈 회수의 유일한 경로다(§82). 미구현** |
 | `ADMIT_TOKEN_TTL` | admitToken 60초 초과 → WAITING 복귀 (EXPIRED 아님) | ADMIT_ISSUED | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
 
 > ADMIT_TOKEN_TTL은 EXPIRED 아닌 WAITING 복귀

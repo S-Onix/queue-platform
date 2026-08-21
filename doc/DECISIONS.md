@@ -58,14 +58,15 @@
 | §80 | **Sprint 7 Admit — 전 구간 원자 Lua + 동기 응답** (`verified-token`·`admit_requests` 폐기) | ✅ |
 | §81 | `avgWaitingTime`·ETA·`queue-stats` 폐기 (→8) | ✅ |
 
-**4. 이탈 · 만료 (TTL / CANCELLED / EXPIRED)**
+**4. 이탈 · 만료 (TTL / EXPIRED)**
 
 | § | 제목 | 상태 |
 |---|---|---|
-| §21 | 이탈(CANCELLED) 정책 — WAITING만 허용 | ✅ |
+| §21 | 이탈 정책 — ~~CANCELLED~~ → **TTL 만료로 일원화** (§82가 대체) | ✅ |
+| §82 | **Cancel API를 만들지 않는다 + 과금은 상태를 보지 않는다** (→9) | ✅ |
 
 > TTL 만료는 별도 §가 없다. `ADMIT_TOKEN_TTL` → §34·§36, `waitingTtl`·`inactiveTtl` 판정 → `doc/STATE.md`,
-> 배치 흐름 → `doc/FLOW.md`. **inactive_ttl 배치는 미구현**이다.
+> 배치 흐름 → `doc/FLOW.md`. **`inactiveTtl` 배치는 미구현**이며, §82 이후 이탈 회수의 **유일한** 경로다.
 
 ### Ⅱ. 플랫폼 기능
 
@@ -262,7 +263,7 @@ Polling VT:
   (캐시 히트 시 DB 접근 없음)
   2,000 × 0.005 = 10개
 
-업데이트 VT (admit/complete/cancel):
+업데이트 VT (admit/complete):
   DB UPDATE + Redis ZREM + Kafka produce: ~20~50ms
   3,000 × 0.05 = 150개
 
@@ -510,7 +511,6 @@ public CompleteResult complete(CompleteCommand command) {
 | Entity | 메서드 | 역할 |
 |--------|--------|------|
 | `Token` | `complete()` | ADMIT_ISSUED 확인 + COMPLETED 전환 |
-| `Token` | `cancel()` | WAITING 확인 + CANCELLED 전환 |
 | `Token` | `expire(reason)` | WAITING 확인 + EXPIRED 전환 |
 | `Token` | `returnToWaiting()` | admitToken TTL 만료 → WAITING 복귀 |
 | `Token` | `waitingSeconds()` | issuedAt ~ completedAt 계산 |
@@ -1082,9 +1082,15 @@ Redis maxmemory: 4GB / maxmemory-policy: noeviction
 
 ---
 
-## §21 이탈(CANCELLED) 정책
+## §21 이탈 정책
+
+> ✏️ **이 절은 §82가 대체한다.** 아래 초판 설계는 `DELETE /tokens/:tokenId`(Cancel API)를 전제로
+> 했으나, **그 API를 만들지 않기로 확정**했다(§82). 이탈은 전부 `inactiveTtl` 판정 배치가 잡고
+> 결과 상태는 **EXPIRED(4)** 다. `CANCELLED(3)`에 도달하는 경로는 **하나도 남지 않는다.**
+> 기록으로 남기는 이유는 "왜 취소를 별도로 두지 않는가"의 출발점이 여기이기 때문이다.
 
 ```
+❌ 폐기된 초판 설계 (§82 이전)
 이탈 허용 상태:
   WAITING      → CANCELLED ✅
   ADMIT_ISSUED → 409 QE_006_INVALID_STATUS ❌
@@ -1094,6 +1100,22 @@ ADMIT_ISSUED에서 이탈하려면:
   → WAITING 자동 복귀
   → DELETE /api/v1/queues/:queueId/tokens/:tokenId → CANCELLED
 ```
+
+```
+✅ 확정 (§82)
+이탈 방법은 하나다 — 폴링을 멈춘다.
+  WAITING → (last-active가 inactiveTtl 초과) → 배치가 ZREM + HDEL → EXPIRED ✅
+  ADMIT_ISSUED → admitToken TTL 60초 만료 → WAITING 복귀(§36·§80) → 위와 같음
+
+명시적 이탈 요청 엔드포인트는 없다. 유저가 취소 버튼을 누르든 탭을 닫든,
+브라우저가 폴링을 멈추는 것으로 신호는 동일하다.
+```
+
+**`inactiveTtl`은 청소 주기가 아니라 유예 창이다.** 그 안에 돌아와 같은 identifier로 재-enqueue하면
+`enqueue_bulk.lua`의 `HSETNX` 게이트가 `EXISTS`를 돌려주어 **기존 `tokenId`·`seq`·`rank`가 그대로
+복원**된다. 배치가 `HDEL`로 그 필드를 지운 뒤에 돌아오면 신규로 판정되어 맨 뒤에 선다.
+그래서 이 값은 **"몇 초까지 자리를 지켜줄 것인가"** 이고, Tenant가 큐마다 정한다
+(`QueueCreateRequest.inactiveTtl`, 기본 300초).
 
 ---
 
@@ -1240,7 +1262,7 @@ DB 먼저 이유:
 해결: tokens 원본 직접 집계 (billing_events 불필요)
   BillingSnapshotJob (M+2월 초):
     SELECT COUNT(*) FROM tokens
-    WHERE issued_at BETWEEN M월 AND M+1월
+    WHERE issued_at BETWEEN M월 AND M+1월    -- 상태 술어 없음 (§82)
     GROUP BY tenant_id
     → billing_snapshots UPSERT (ON DUPLICATE KEY)
   tokens가 원본 → 항상 정확
@@ -1749,7 +1771,7 @@ server:
    → Enqueue p99 50ms 이하 달성
 
 ② Token 상태 변경 이벤트
-   COMPLETED / CANCELLED / EXPIRED 시 발행
+   COMPLETED / EXPIRED 시 발행
    → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
 
 ~~avgWaitingTime은 Kafka 없이 complete API에서 직접 갱신:~~   ⛔ **폐기 (§81)**
@@ -2070,7 +2092,7 @@ token-info 캐시 TTL: nextPollAfterSec + 2s
 변경: ZCARD Pipeline으로 현재 인원 조회
 
 이유:
-  queue-count 카운터 불일치 위험 (CANCELLED/EXPIRED 시 DECR 누락 가능)
+  queue-count 카운터 불일치 위험 (EXPIRED 시 DECR 누락 가능)
   ZCARD는 Sorted Set의 실제 크기 → 항상 정확
 
 Pipeline:
@@ -2625,7 +2647,7 @@ Step 1: queue_daily_stats 집계
 
 Step 2: billing_snapshots 집계
   SELECT COUNT(*) FROM tokens
-  WHERE issued_at BETWEEN M월 AND M+1월
+  WHERE issued_at BETWEEN M월 AND M+1월    -- 상태 술어 없음 (§82)
   GROUP BY tenant_id
   → tokens 원본 직접 집계 (billing_events 불필요)
   ON DUPLICATE KEY UPDATE count = VALUES(count)
@@ -3877,7 +3899,7 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 - → **seq는 Redis가 부여, DB는 저장만**. 부여는 Redis, 기억은 DB.
 
 **왜 복구를 waiting ZSet 스캔이 아니라 DB로 하나 / 왜 seq 순으로**:
-- waiting ZSet은 **mutable**(admit/cancel/만료 시 ZREM) → "현재 대기자"이지 "모든 enqueue 로그"가 아님 → 소스로 부적합
+- waiting ZSet은 **mutable**(admit/만료 시 ZREM) → "현재 대기자"이지 "모든 enqueue 로그"가 아님 → 소스로 부적합
 - DB `tokens.seq`로 `ZADD score=seq` → **원래 순서 그대로 복원**(rank 보존). seq를 DB에 저장한 값어치가 여기서 실현
 
 **왜 last-active는 복구 안 하나**:
@@ -4529,7 +4551,7 @@ MySQL 실측: `@@global.time_zone` = `@@session.time_zone` = `+09:00`,
 **둘 다 `DATETIME(3)`이라 타입으로 구분되지 않는다.** 각자 자기 컬럼만 볼 때는 무해하고,
 그래서 지금까지 문제가 드러나지 않았다.
 
-**드러날 시점이 정해져 있다.** `tokens`의 `completed_at` / `cancelled_at` / `expired_at`은
+**드러날 시점이 정해져 있다.** `tokens`의 `completed_at` / `expired_at`은
 DDL에 이미 있으나 Sprint 7 미구현이라 전부 NULL이다. 구현할 때 이 코드베이스의 다수 관행
 (`LocalDateTime.now()`)이나 `DEFAULT CURRENT_TIMESTAMP(3)`를 그대로 쓰면 **KST가 들어간다**.
 그러면
@@ -5498,7 +5520,7 @@ master 한 대에 몰립니다.**
 | claim-Lua의 leader election | **쓰지 않는다.** `EVAL` 자체가 claim이다 — `CLAUDE.md` "`@Scheduled` 단독 금지" 규칙의 **명시적 예외** (⑧) |
 | `tokens.admitted_at` | **추가** |
 | Kafka 이벤트 타입 | **판별 필드**(한 토픽·한 스키마 안에서 분기) |
-| `ADMIT_ISSUED → CANCELLED` | **409 유지** |
+| ~~`ADMIT_ISSUED → CANCELLED`~~ | 🔴 **무의미해졌다 — Cancel API를 만들지 않는다(§82).** 이탈은 admitToken TTL 만료 → WAITING 복귀 → `inactiveTtl` 판정을 거친다 |
 | 복귀가 `last-active`를 리셋하는가 | **안 한다** |
 | `count` 상한 | **100.** `@Max(100)` Bean Validation 한 줄 — 전용 검증 클래스를 만들지 않는다 (⑦) |
 | 포트 rename | **미룬다** (순수 미용) |
@@ -5512,7 +5534,7 @@ master 한 대에 몰립니다.**
 | `ADMITTED` | 0 | `IF(status = 0, 1, status)` |
 | `RETURNED` | 1 | `IF(status = 1, 0, status)` |
 | `COMPLETED` | 1 | `IF(status = 1, 2, status)` |
-| `CANCELLED` | 0 | `IF(status = 0, 3, status)` |
+| ~~`CANCELLED`~~ | — | 🔴 **발행처가 없다(§82).** `TokenJpaAdapter`의 맵 엔트리는 status 재번호 비용 때문에 남겨 둘 뿐이다 |
 | `EXPIRED` | 0 | `IF(status = 0, 4, status)` |
 
 **🔴 이 UPSERT에 함정이 둘 있다. 둘 다 조용히 깨진다.**
@@ -5953,6 +5975,146 @@ complete 경로의 `HINCRBYFLOAT` / `HINCRBY` 두 줄도 **만들지 않는다.*
 
 ---
 
+## §82 — Cancel API를 만들지 않는다 (이탈은 TTL 하나로, 과금은 상태를 보지 않는다)
+
+### Context
+
+두 개의 열린 질문이 하나로 합쳐졌다.
+
+**첫째, 과금 술어.** 집계는 `tokens` 원본을 직접 센다(§24 ⑥, §44 Step 2). 그 술어가
+`WHERE issued_at BETWEEN M월 AND M+1월` **하나뿐이라 상태를 보지 않는다.** 취소한 사람도
+만료된 사람도 아직 줄에 서 있는 사람도 전부 한 건으로 청구된다. 이게 맞는가?
+
+**둘째, Cancel API.** `DELETE /queues/:queueId/tokens/:tokenId`는 Sprint 6의 마지막 잔여
+항목으로 설계까지 끝나 있었다(`cancel.lua` + 동기 UPSERT). 구현은 착수 전이었다.
+
+한때 첫째의 답을 **"취소분은 뺀다(`status <> 3`)"** 로 정했으나, 그 결정은 **머지 전에
+뒤집혔다.** 뒤집은 것은 과금 계산이 아니라 **둘째의 전제**다 — 취소를 별도 개념으로 둘
+이유가 없다면 뺄 대상 자체가 없다.
+
+### Decision
+
+**① `DELETE /queues/:queueId/tokens/:tokenId`(Cancel API)를 만들지 않는다.**
+
+**② 이탈 회수는 `inactiveTtl` 판정 배치 하나가 전담하고, 도달 상태는 `EXPIRED(4)` 다.**
+
+**③ 과금 술어는 `issued_at` 범위 하나다. 상태를 보지 않는다.**
+
+```sql
+SELECT tenant_id, COUNT(*)
+FROM tokens
+WHERE issued_at >= M월 AND issued_at < M+1월
+GROUP BY tenant_id
+```
+
+### 왜 Cancel이 필요 없는가
+
+"안 만들면 무엇이 깨지는가"(협업 규칙 §4)에 답이 남지 않았다.
+
+| 이탈 경로 | Cancel이 잡나 | `inactiveTtl`이 잡나 |
+|---|---|---|
+| 유저가 취소 버튼을 누른다 | ✅ | ✅ (폴링이 멈춘다) |
+| 유저가 탭을 닫는다 | ❌ **Tenant가 그 사실을 모른다** | ✅ |
+| 네트워크가 끊긴다 · 기기가 꺼진다 | ❌ | ✅ |
+
+Cancel은 이탈의 **일부만** 덮는데, 덮는 그 일부조차 `inactiveTtl`이 이미 덮는다. 그리고
+**이탈 감지 배치는 Cancel이 있든 없든 어차피 필요하다** — 지금 그게 없어서 이탈자가
+`waiting` ZSet에 무기한 남는다(회수 배치 미구현).
+
+남는 차이는 **자리 반납이 즉시냐 최대 `inactiveTtl`이냐** 하나인데, `inactiveTtl`은 이미
+`QueueCreateRequest`로 Tenant가 큐마다 정한다. **조절 노브가 이미 있는데 엔드포인트를 더
+만드는 것**이 과설계다.
+
+⚠️ **브라우저가 직접 못 불러서 기각한 것이 아니다.** `GET /api/v1/queues/*/tokens/*`가
+`permitAll`(`SecurityConfig:46`)이므로 `DELETE`도 한 줄이면 열린다 — 폴링과 같은 경로,
+같은 인증 모델(tokenId 소지)이다. 기각 근거는 **덮는 범위가 없다**는 것이다.
+다만 열었다면 `permitAll` **쓰기**가 되어, tokenId 유출의 대가가 "순번 노출"에서
+**"타인 축출"** 로 올라갔을 것이다. `?seq=` 대조는 방어가 못 된다 — seq는 폴링 응답에
+함께 실려 같이 샌다. 이건 부차적 근거이지 주 근거가 아니다.
+
+### 왜 과금에서 아무것도 빼지 않는가
+
+**취소가 사라지면 남는 이탈은 전부 EXPIRED(4)이고, EXPIRED는 자리를 끝까지 점유했다.**
+`inactiveTtl`을 다 쓰고 밀려난 것이라 Platform이 쓴 자원은 정확히 그만큼이다.
+
+| 상태 | 과금 | 근거 |
+|---|---|---|
+| WAITING(0) · ADMIT_ISSUED(1) | ✅ | 집계 시점에 아직 살아 있는 줄이다. 빼면 월말에 걸친 큐가 통째로 무료가 된다 (§44가 1달 유예를 두는 이유와 충돌) |
+| COMPLETED(2) | ✅ | 설명 불필요 |
+| **EXPIRED(4)** | ✅ | **자리를 점유했다.** 서비스를 썼다 |
+| ~~CANCELLED(3)~~ | — | **도달하는 경로가 없다** |
+
+그리고 취소분 제외의 유일한 근거였던 *"취소를 과금하면 Tenant에게 취소 API를 안 붙일
+동기가 생긴다"* 는 **Cancel API가 존재할 때만 성립하는 논증**이다. API가 없으면 Tenant에게
+선택지 자체가 없으므로 왜곡될 동기가 없다. **전제가 사라지면 결론도 사라진다.**
+
+`inactiveTtl` 창을 넘겨 돌아온 사람이 새 `tokenId`로 다시 서면 **한 건이 더 청구된다.**
+이것도 의도한 결과다 — 줄을 두 번 섰고 자원도 두 번 썼다(§21의 유예 창 설명 참조).
+
+### Consequences
+
+**① `TokenStatus.CANCELED(3)`은 예약값으로 남긴다.** enum 상수와 `tokens.status` TINYINT
+값을 재번호하는 비용이 훨씬 크다. 발행처가 0이 될 뿐이다. `TokenEventType.CANCELLED`와
+`TokenJpaAdapter`의 해당 SQL 맵 엔트리도 같은 이유로 둔다 — **지우는 것이 이득이 되는
+시점은 없다.**
+
+**② `tokens.cancelled_at`과 `queue_daily_stats.total_cancelled`는 삭제한다.** 항상 NULL과
+0이 될 컬럼이고, `schema.sql`은 아직 미배포 DDL이라 지금이 유일하게 공짜인 시점이다.
+
+**③ 취소 경로의 `issued_at` 원본 전파 함정이 소멸한다.** `UNIQUE (token_id, issued_at)`이라
+1ms만 어긋나도 두 번째 행이 생기는 문제(§83 Context)는 **취소 경로에서만** 사라진다.
+`ADMITTED` · `RETURNED` · `COMPLETED` · `EXPIRED`는 여전히 원본을 그대로 실어야 한다.
+
+**④ §21이 대체된다.** 초판 이탈 정책은 폐기 표기와 함께 기록으로만 남는다.
+
+**⑤ 아직 코드가 없다.** `BillingSnapshotJob`은 미구현(Sprint 9)이고, 이 결정으로 **추가되는
+술어도 없다** — 원래 상태를 안 보는 쿼리를 그대로 두는 것이다. Cancel 쪽은 애초에 착수 전이라
+**삭제할 프로덕션 코드가 0줄**이다. 바뀌는 것은 문서와 `schema.sql` 뿐이다.
+
+**⑥ 새로 만들 것은 `inactiveTtl` 판정 배치 하나뿐이고, 그것도 신설이 아니다.** Sprint 9의
+회수 배치(`tokens` Hash `HDEL` 0건 · `last-active` ZSet `ZREM` 0건 누수 정리)가 그 자리다.
+거기에 "누구를 회수할지"의 판정 기준이 `last-active` score라는 것이 더해질 뿐이다.
+`admit_expire.lua`와 같은 claim 패턴(`ZRANGEBYSCORE` + `ZREM`을 한 EVAL에)을 그대로 쓴다.
+
+### Related
+
+- **§21** (이탈 정책) — **이 절이 대체한다.** 초판은 폐기 표기로 남긴다
+- **§36 · §80** (`admitToken` TTL 만료 → WAITING 복귀) — `AdmitTokenExpiryJob`이 복귀 시
+  `last-active`를 **일부러 갱신하지 않는** 이유가 바로 이 절이다. 갱신하면 브라우저를 닫은
+  사람이 복귀할 때마다 되살아나 영원히 회수되지 않는다
+- **§44** (파티션 유예) — Step 2 집계 쿼리에 "상태 술어 없음" 주석을 남겼다. 쿼리 자체는 불변
+- **§24 ⑥** (과금 누락) — 같은 쿼리가 복제돼 있어 같은 주석을 남겼다
+- **§66 D1** (자유 identifier) — 유예 창 안의 순번 복원이 성립하는 근거. Platform은 identifier가
+  같은지만 본다. 비로그인 유저의 identifier 유지는 **Tenant 책임**이다(§78 경계)
+- **§78** (클라이언트 경계) — enqueue가 Tenant인 것과 같은 이유로, 이탈 판정도 Platform이
+  관측한 사실(`last-active`)에 근거한다
+- **§83** (파티션 키) — `issued_at` 원본 전파 요구는 위 ③대로 **다른 이벤트에는 그대로** 유효하다
+- ⚠️ **§32의 `BillingConsumer` 예시 코드는 `COMPLETED`만 세는 다른 기준**이다. 초판 스케치이고
+  한 줄도 구현된 적이 없다. **집계 기준의 정본은 이 절**이다
+
+### Interview Point
+
+> "대기열에 취소 API를 안 만들었습니다. 이유는 취소가 이탈의 일부만 덮기 때문인데, 유저가
+> 취소 버튼을 누르면 API가 잡지만 탭을 닫거나 지하철에 들어가면 Tenant 서버는 그 사실을
+> 알 방법이 없습니다. 그래서 이탈 감지는 어차피 폴링 중단으로 판정하는 배치가 필요했고,
+> 그 배치가 있으면 취소 버튼도 '폴링을 멈춘다'로 같은 경로에 실립니다. 남는 차이는 자리를
+> 즉시 반납하느냐 최대 inactive TTL 뒤에 반납하느냐 하나인데, 그 TTL은 이미 큐 생성 API에
+> 노출돼 있어서 회전이 빠른 큐는 60초로 낮추면 됩니다. 조절 노브가 있는데 엔드포인트를
+> 더 만들 이유가 없다고 판단했습니다.
+>
+> 이 판단이 과금 정책도 같이 정리했습니다. 원래는 취소분을 과금에서 빼려고 했는데, 그
+> 근거가 '취소를 과금하면 Tenant가 취소 API를 안 붙일 동기가 생긴다'였습니다. API가 없어지면
+> 그 논증의 전제가 사라집니다. 그래서 과금은 상태를 보지 않고 enqueue 수 그대로 셉니다.
+> 만료를 과금하는 건 자리를 끝까지 점유했기 때문이고, 실제로 유예 창을 넘겨 돌아온 사람은
+> 줄을 두 번 선 것이라 두 건이 청구되는 게 맞습니다.
+>
+> 여기서 재미있는 게 inactive TTL의 의미가 바뀐다는 겁니다. 단순한 청소 주기가 아니라
+> '몇 초까지 자리를 지켜줄 것인가'라는 유예 창이 됩니다. 그 안에 돌아와서 같은 identifier로
+> 다시 enqueue하면 Redis Lua의 HSETNX 게이트가 EXISTS를 돌려주면서 원래 순번을 그대로
+> 복원해주고, 창을 넘기면 게이트가 이미 HDEL로 풀려 있어서 맨 뒤에 서게 됩니다."
+
+---
+
 ## §83 — 파티션 키를 바꾸지 않는다 (범위 조건 프루닝 실패의 실측)
 
 ### Context
@@ -5961,7 +6123,7 @@ complete 경로의 `HINCRBYFLOAT` / `HINCRBY` 두 줄도 **만들지 않는다.*
 **유니크 키가 파티션 표현식의 컬럼을 전부 포함**하도록 강제하므로 `UNIQUE (token_id, issued_at)`이
 됐다. `issued_at`이 `DATETIME(3)` **밀리초**라, 모든 상태 전이 이벤트가 그 값을 **원본 그대로**
 실어 날라야 한다 — 1ms만 어긋나면 유니크 충돌이 안 나 **같은 토큰의 두 번째 행**이 생기고,
-그 행은 `status = 0`이라 §82의 취소 제외를 빠져나가 **과금된다**.
+그 행은 같은 토큰의 **두 번째 청구 건**이 된다(§82 — 과금은 상태를 보지 않는다).
 
 여기서 두 질문이 나왔다. ① 이 제약을 없앨 수 있나? ② 애초에 프루닝은 되고 있나?
 
