@@ -16,7 +16,7 @@ stateDiagram-v2
 
     WAITING --> COMPLETED : POST /tokens/:tokenId/complete\nDB 적재 지연으로 아직 status=0인 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
 
-    ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nHDEL tokens (중복 게이트 해제)\n복귀하지 않는다 (§36)\n재접속 → 재-enqueue → 맨 뒤
+    ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nHDEL tokens (중복 게이트 해제)\n복귀하지 않는다 (§36)\n⚠️ DB status는 1로 남는다\n재접속 → 재-enqueue → 맨 뒤
 
     WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과\nZREM waiting + HDEL tokens\nKafka token-lifecycle 발행 (key=tokenId)
 
@@ -46,6 +46,12 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | `ADMITTED` | 0 WAITING | `IF(status = 0, 1, status)` |
 | `COMPLETED` | 1 ADMIT_ISSUED | `IF(status = 1, 2, status)` |
 | `EXPIRED` | 0 WAITING | `IF(status = 0, 4, status)` |
+
+> 🔴 **`admitToken` TTL 만료는 `4`에 도달하지 않는다.** 그 사람은 `status = 1`이고 가드가 `0`만
+> 받으므로 **no-op**이다. **의도된 동작이다** — `complete`의 술어가 `status IN (0, 1)`이고 유효 창이
+> 300초라, admitToken TTL(60초)이 지난 뒤 도착하는 **늦은 입장이 정상 경로로 실재**한다(§36).
+> 가드를 `IN (0, 1)`로 넓히면 그 경로가 죽는다. **넓히지 마라.**
+> `4`에 도달하는 것은 `waitingTtl`·`inactiveTtl` 만료(출발이 `0`)뿐이다.
 
 > **왜 파티션 순서에 기대지 않는가**: 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있다.
 > 특히 `ZADD`(enqueue Lua)가 Kafka 발행보다 먼저라 **`ENQUEUED`보다 `ADMITTED`가 먼저 도착**하는
@@ -82,10 +88,15 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 |----|------|------|------------|
 | `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms) |
 | `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) — **이탈 회수의 유일한 경로다(§82). 미구현** |
-| `ADMIT_TOKEN_TTL` | admitToken 60초 초과 → **`HDEL tokens` 후 종료**(§36). 복귀 없음 | ADMIT_ISSUED | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
+| ~~`ADMIT_TOKEN_TTL`~~ | 🔴 **성립하지 않는다.** admitToken 만료자는 `status = 1`에 머물러 **`EXPIRED(4)`에 도달하지 않는다**(위 가드 참조). `expiredReason`은 status가 4인 사람의 사유이므로 이 값은 쓰이지 않는다. 만료 자체는 §36대로 `HDEL tokens` 후 종료 | — | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
 
-> 🔴 **ADMIT_TOKEN_TTL은 복귀하지 않는다 (§36, 2026-08-21).** claim 잡이 `HDEL tokens`로
+> 🔴 **admitToken TTL 만료는 복귀하지 않는다 (§36, 2026-08-21).** claim 잡이 `HDEL tokens`로
 > 중복 게이트를 풀고 `EXPIRED`를 발행한다. 유저는 재접속해 새 seq로 맨 뒤에 선다.
+> 발행은 하되 **DB에서는 no-op**이다(위 가드) — 행이 아직 없는 랙 상황에서만 `INSERT`로 작용한다.
+>
+> ⚠️ **`expired_reason` 컬럼은 아직 어떤 경로로도 채워지지 않는다.** `TokenJpaAdapter`의
+> `TRANSITION_INSERT` 컬럼 목록에 없다. 위 표는 **Sprint 9 회수 배치의 설계 의도**이고, 실을지
+> 말지는 그때 결정한다 — 만료 배치가 하나뿐이면 구분할 사유가 없어 안 실어도 깨지지 않는다.
 
 ---
 
