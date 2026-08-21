@@ -2,7 +2,7 @@ package com.sonix.queue.batch.job;
 
 import com.sonix.queue.domain.queue.EnqueueEvent;
 import com.sonix.queue.domain.queue.EnqueueEventPublisher;
-import com.sonix.queue.domain.queue.ExpiredAdmit;
+import com.sonix.queue.domain.queue.ReclaimedToken;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
@@ -15,7 +15,17 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * admitToken TTL 만료 처리 (FRS §10 {@code AdmitTokenExpiryJob} · DECISIONS §36 · §80).
+ * 큐에서 사람을 회수하는 배치 — <b>두 경로</b> (FRS §10 · DECISIONS §36 · §80 · §82).
+ *
+ * <ol>
+ *   <li><b>admitToken TTL 만료</b>(§36) — Tenant가 뽑아갔는데 60초 안에 입장시키지 못한 사람</li>
+ *   <li><b>{@code inactiveTtl} 초과</b>(§82) — 폴링이 끊긴 사람. <b>이탈 회수의 유일한 경로</b>다.
+ *       §82가 Cancel API를 폐기해, 유저가 취소 버튼을 누르든 탭을 닫든 네트워크가 끊기든
+ *       Platform이 보는 신호는 "폴링이 멈춘다" 하나뿐이다</li>
+ * </ol>
+ *
+ * <p><b>한 잡에 둘을 넣는다.</b> 잡을 나누면 {@code queueRepository.findAll()}이 주기마다
+ * 두 번 돈다 — batch 3대면 큐 수 × 12회/분이다. 같은 루프에서 {@code EVAL} 두 번이 싸다.
  *
  * <p>Tenant가 admit으로 뽑아갔지만 60초 안에 입장시키지 못한 사람을 정리한다.
  * <b>🔴 대기열로 되돌리지 않는다 (§36).</b> Platform은 만료 원인(유저 이탈 / 네트워크 / Tenant
@@ -49,7 +59,7 @@ import java.util.List;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class AdmitTokenExpiryJob {
+public class TokenReclaimJob {
 
     /**
      * 한 큐에서 한 주기에 집어올 최대 건수.
@@ -75,21 +85,49 @@ public class AdmitTokenExpiryJob {
      * Redis 왕복만 배로 늘어난다.
      */
     @Scheduled(fixedDelayString = "${queue.batch.admit-expiry.interval-ms:10000}")
-    public void reclaimExpiredAdmits() {
+    public void reclaim() {
         // Clock 빈을 두지 않는다 — 이 값은 Lua에 넘길 "지금"일 뿐이고, 테스트는 만료 score를
         // 과거로 심어 결과를 결정한다. 시각 주입이 필요해지면 그때 빈을 만든다.
         long now = System.currentTimeMillis();
 
-        int returned = 0;
+        int admitExpired = 0;
+        int inactive = 0;
         for (Queue queue : queueRepository.findAll()) {
-            returned += reclaim(queue, now);
+            admitExpired += reclaimExpiredAdmits(queue, now);
+            inactive += reclaimInactive(queue, now);
         }
 
         // 0건일 때는 찍지 않는다. 주기 6회/분 × 큐 수만큼의 무의미한 줄이 쌓이면
-        // 정작 복귀가 일어난 줄을 찾을 수 없다 (로드 테스트 로그 98%가 한 줄이었던 전례).
-        if (returned > 0) {
-            log.info("admitToken TTL 만료 복귀 {}건", returned);
+        // 정작 회수가 일어난 줄을 찾을 수 없다 (로드 테스트 로그 98%가 한 줄이었던 전례).
+        if (admitExpired > 0 || inactive > 0) {
+            log.info("회수 admitTokenTTL={}건 inactiveTTL={}건", admitExpired, inactive);
         }
+    }
+
+    /**
+     * {@code inactiveTtl}이 지나도록 폴링이 없는 대기자를 회수한다 (§82).
+     *
+     * <p><b>cutoff는 큐마다 다르다</b> — {@code inactiveTtl}이 큐 설정이므로
+     * ({@code QueueCreateRequest.inactiveTtl}, 기본 300초) Java가 계산해 넘긴다.
+     *
+     * <p>예외를 삼키는 이유는 아래 {@code reclaimExpiredAdmits}와 같다. 다만 이쪽은 실패해도
+     * 대상이 {@code last-active}에 남아 있으므로 다음 주기가 다시 집는다.
+     */
+    private int reclaimInactive(Queue queue, long now) {
+        String queueId = queue.getQueueId();
+        long cutoff = now - queue.getInactiveTtl() * 1000L;
+        List<ReclaimedToken> claimed;
+        try {
+            claimed = queueEngine.claimInactive(queueId, cutoff, CLAIM_LIMIT);
+        } catch (RuntimeException e) {
+            log.error("inactive 회수 claim 실패 queueId={}", queueId, e);
+            return 0;
+        }
+
+        for (ReclaimedToken token : claimed) {
+            publishExpired(queue, token);
+        }
+        return claimed.size();
     }
 
     /**
@@ -97,9 +135,9 @@ public class AdmitTokenExpiryJob {
      * 복귀까지 막으면 안 된다. 다음 주기가 다시 시도하며, 그 사이 만료분은 {@code admitted}
      * ZSet에 그대로 남아 있으므로 유실되지 않는다.
      */
-    private int reclaim(Queue queue, long now) {
+    private int reclaimExpiredAdmits(Queue queue, long now) {
         String queueId = queue.getQueueId();
-        List<ExpiredAdmit> claimed;
+        List<ReclaimedToken> claimed;
         try {
             claimed = queueEngine.claimExpiredAdmits(queueId, now, CLAIM_LIMIT);
         } catch (RuntimeException e) {
@@ -107,7 +145,7 @@ public class AdmitTokenExpiryJob {
             return 0;
         }
 
-        for (ExpiredAdmit expired : claimed) {
+        for (ReclaimedToken expired : claimed) {
             publishExpired(queue, expired);
         }
         return claimed.size();
@@ -132,7 +170,7 @@ public class AdmitTokenExpiryJob {
      * (admit의 Kafka 발행과 같은 비대칭, §80 Consequences ③).
      * 피해는 {@code tokens.status}가 1에 머무는 것인데, 위 이유로 <b>발행에 성공해도 결과가 같다.</b>
      */
-    private void publishExpired(Queue queue, ExpiredAdmit expired) {
+    private void publishExpired(Queue queue, ReclaimedToken expired) {
         if (!expired.publishable()) {
             // tokens Hash 미스 = tokenId/issuedAt을 모른다. 컨슈머의 멱등 키가
             // (token_id, issued_at)이라 추측해 채우면 같은 토큰의 두 번째 행이 생긴다.

@@ -40,9 +40,11 @@ public class QueueEngineRedisTestConfig {
             @org.springframework.beans.factory.annotation.Qualifier("admitScript")
             org.springframework.data.redis.core.script.RedisScript<List> admitScript,
             @org.springframework.beans.factory.annotation.Qualifier("admitExpireScript")
-            org.springframework.data.redis.core.script.RedisScript<List> admitExpireScript
+            org.springframework.data.redis.core.script.RedisScript<List> admitExpireScript,
+            @org.springframework.beans.factory.annotation.Qualifier("inactiveExpireScript")
+            org.springframework.data.redis.core.script.RedisScript<List> inactiveExpireScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
     }
 
     @Bean

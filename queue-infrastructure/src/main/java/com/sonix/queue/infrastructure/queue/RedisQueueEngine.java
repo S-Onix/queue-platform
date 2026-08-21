@@ -6,7 +6,7 @@ import com.sonix.queue.common.util.IdGenerator;
 import com.sonix.queue.domain.queue.AdmitRef;
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
-import com.sonix.queue.domain.queue.ExpiredAdmit;
+import com.sonix.queue.domain.queue.ReclaimedToken;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.PacingTier;
@@ -91,6 +91,7 @@ public class RedisQueueEngine implements QueueEngine {
     private final RedisScript<Long> pollVerifyScript;
     private final RedisScript<List> admitScript;
     private final RedisScript<List> admitExpireScript;
+    private final RedisScript<List> inactiveExpireScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
@@ -113,7 +114,8 @@ public class RedisQueueEngine implements QueueEngine {
             @Qualifier("enqueueBulkScript") RedisScript<List> enqueueBulkScript,
             @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
             @Qualifier("admitScript") RedisScript<List> admitScript,
-            @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript
+            @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript,
+            @Qualifier("inactiveExpireScript") RedisScript<List> inactiveExpireScript
     ) {
         this.cluster1 = cluster1;
         this.cluster2 = cluster2;
@@ -122,6 +124,7 @@ public class RedisQueueEngine implements QueueEngine {
         this.pollVerifyScript = pollVerifyScript;
         this.admitScript = admitScript;
         this.admitExpireScript = admitExpireScript;
+        this.inactiveExpireScript = inactiveExpireScript;
     }
 
     /**
@@ -135,10 +138,11 @@ public class RedisQueueEngine implements QueueEngine {
             RedisScript<List> enqueueBulkScript,
             RedisScript<Long> pollVerifyScript,
             RedisScript<List> admitScript,
-            RedisScript<List> admitExpireScript
+            RedisScript<List> admitExpireScript,
+            RedisScript<List> inactiveExpireScript
     ) {
         this(redisTemplate, redisTemplate, null,
-                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
     }
 
     /**
@@ -421,7 +425,7 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     @Override
-    public List<ExpiredAdmit> claimExpiredAdmits(String queueId, long nowMillis, int limit) {
+    public List<ReclaimedToken> claimExpiredAdmits(String queueId, long nowMillis, int limit) {
         // ⚠️ routeForWrite 필수. 직접 템플릿을 쓰면 cluster2에 배정된 큐의 복귀가 cluster1에서 돌아
         //    빈 admitted ZSet을 보고 **조용히 0건**을 반환한다. 단일 클러스터 로컬에서는 무해해
         //    테스트로 안 잡히고, 만료된 토큰은 아무 에러도 없이 영원히 복귀하지 못한다.
@@ -440,14 +444,47 @@ public class RedisQueueEngine implements QueueEngine {
             return List.of();
         }
 
-        List<ExpiredAdmit> claimed = new ArrayList<>(raw.size());
+        List<ReclaimedToken> claimed = new ArrayList<>(raw.size());
         for (Object row : raw) {
             @SuppressWarnings("unchecked")
             List<String> f = (List<String>) row;
             // tokens Hash 미스는 빈 문자열로 온다(nil이면 배열 뒤가 잘린다). null로 바꿔
             // 호출자가 "발행 불가"로 읽게 한다.
             String tokenId = f.get(2).isEmpty() ? null : f.get(2);
-            claimed.add(new ExpiredAdmit(
+            claimed.add(new ReclaimedToken(
+                    f.get(0), Long.parseLong(f.get(1)), tokenId, parseIssuedAt(f.get(3))));
+        }
+        return claimed;
+    }
+
+    @Override
+    public List<ReclaimedToken> claimInactive(String queueId, long cutoffMillis, int limit) {
+        // ⚠️ routeForWrite 필수 — claimExpiredAdmits와 같은 이유다. 직접 템플릿을 쓰면 cluster2에
+        //    배정된 큐의 회수가 cluster1에서 돌아 **조용히 0건**을 반환하고, 이탈자는 아무 에러도
+        //    없이 영원히 큐에 남는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
+        @SuppressWarnings("unchecked")
+        List<Object> raw = routeForWrite(queueId).execute(
+                inactiveExpireScript,
+                List.of(QueueKeys.lastActive(queueId), QueueKeys.waiting(queueId), QueueKeys.tokens(queueId)),
+                Long.toString(cutoffMillis),
+                Integer.toString(limit)
+        );
+        return toReclaimed(raw);
+    }
+
+    /** claim 계열 두 스크립트의 반환 형식이 같다(원소 4개 고정) — 파싱을 공유한다. */
+    private List<ReclaimedToken> toReclaimed(List<Object> raw) {
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+        List<ReclaimedToken> claimed = new ArrayList<>(raw.size());
+        for (Object row : raw) {
+            @SuppressWarnings("unchecked")
+            List<String> f = (List<String>) row;
+            // tokens Hash 미스는 빈 문자열로 온다(nil이면 배열 뒤가 잘린다). null로 바꿔
+            // 호출자가 "발행 불가"로 읽게 한다.
+            String tokenId = f.get(2).isEmpty() ? null : f.get(2);
+            claimed.add(new ReclaimedToken(
                     f.get(0), Long.parseLong(f.get(1)), tokenId, parseIssuedAt(f.get(3))));
         }
         return claimed;

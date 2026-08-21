@@ -2046,7 +2046,7 @@ admit_expire.lua ZRANGEBYSCORE admitted 0 now   ← 이 EVAL 자체가 claim (§
                  ZREM admitted
                  HGET tokens {identifier}       ← issuedAt 원본 확보. HDEL보다 먼저
                  HDEL tokens {identifier}       ← 🔴 여기가 바뀐 곳. 옛 판은 ZADD waiting이었다
-AdmitTokenExpiryJob   EXPIRED 발행 (key = tokenId)
+TokenReclaimJob   EXPIRED 발행 (key = tokenId)
 
 유저: SDK가 404를 받고 종료 → 재접속 → Tenant가 enqueue 호출 → 새 seq → 맨 뒤
 ```
@@ -2119,13 +2119,13 @@ HDEL을 안 하면:
 identifier가 *"같은 사용자·같은 큐에는 항상 같은 UUIDv7"* 규약이라(§79) 그 사용자는 **그 큐에서
 영구 퇴출**된다. 규약을 어기고 새 identifier를 쓰면 게이트를 우회해 **과금 2건**이다.
 
-→ `admitted` ZSet · `admit_expire.lua` · `AdmitTokenExpiryJob` · `ExpiredAdmit` ·
+→ `admitted` ZSet · `admit_expire.lua` · `TokenReclaimJob` · `ExpiredAdmit` ·
 `QueueEngine.claimExpiredAdmits` 포트는 **전부 남는다.** 실제 변경은 아래 셋뿐이다.
 
 ```
 admit_expire.lua     ZADD waiting {seq} {id}  →  HDEL tokens {id}    (HGET이 먼저)
                      KEYS[2] waiting이 미사용이 되므로 KEYS 2개로 축소 + 호출부 1줄
-AdmitTokenExpiryJob  RETURNED  →  EXPIRED  (발행 타입 1개)
+TokenReclaimJob  RETURNED  →  EXPIRED  (발행 타입 1개)
 TokenEventType.RETURNED + TokenJpaAdapter SQL 맵 엔트리     (삭제)
 TokenEventType.CANCELLED + 맵 엔트리 · TokenStatus.CANCELED(3)  (삭제 — §82 ① 정정)
 ```
@@ -5749,7 +5749,7 @@ Platform은 그걸 모른다. `ADMIT_TTL`이 `private static final` 상수인 �
 | `admit_requests` 테이블 | 🔴 **폐기** (`schema.sql`에서 삭제) |
 | `admit.lua` 동적 키 조립 | **Java가 접두사까지 만들어 ARGV로 넘긴다** — `QueueKeys.admitByTokenPrefix(queueId)` 등. Lua는 `prefix .. tokenId`만 한다. Lua 파일에 접두사 리터럴 박기(B안)는 기각 (⑥) |
 | TTL 만료 트리거 | **`queue:{q}:admitted` ZSet + claim-Lua** (score = 만료 시각). ~~→ WAITING 복귀~~ → **EXPIRED + `HDEL tokens`**(§36) |
-| claim-Lua 실행 주체 | **`queue-batch`** — actuator·micrometer 추가 완료(`6647ca5`). `AdmitTokenExpiryJob`, 주기 10초 `fixedDelay` |
+| claim-Lua 실행 주체 | **`queue-batch`** — actuator·micrometer 추가 완료(`6647ca5`). `TokenReclaimJob`, 주기 10초 `fixedDelay` |
 | claim-Lua의 leader election | **쓰지 않는다.** `EVAL` 자체가 claim이다 — `CLAUDE.md` "`@Scheduled` 단독 금지" 규칙의 **명시적 예외** (⑧) |
 | `tokens.admitted_at` | **추가** |
 | Kafka 이벤트 타입 | **판별 필드**(한 토픽·한 스키마 안에서 분기) |
@@ -6405,20 +6405,39 @@ F가 이걸 크게 줄인다 — 복귀 후 첫 poll에 갱신되므로 사이�
 
 | 구멍 | 상태 |
 |---|---|
-| ① `ka` 신호가 클라이언트 자율 | 🔴 **그대로 남는다.** `ka`는 `waiting` 중인 사람의 생존 신호라 admit과 무관하다 |
+| ① `ka` 신호가 클라이언트 자율 | ✅ **닫혔다 — F안 채택**(`poll_verify.lua`의 `keepalive` 분기 삭제). 폴링이 오면 언제나 `last-active`를 갱신한다. `ka` 파라미터는 API 하위호환으로 자리만 남고 무시된다 |
 | ② `inactiveTtl` 하한 | ✅ **소멸.** 복귀가 없어 고아가 생기지 않는다 |
-| ③ 첫 `ka` 이전 이탈 | 🟡 **파괴력만 소멸.** admit이 좀비 청소기가 됐다. 뒤쪽 좀비의 `waiting`·`tokens` 잔류는 남는다 |
+| ③ 첫 폴링 이전 이탈 | 🟡 **파괴력만 소멸.** admit이 좀비 청소기가 됐다. 뒤쪽 좀비의 `waiting`·`tokens` 잔류는 남는다 — **A 미채택이라 열려 있다** |
 
-**남는 잔여 과제는 F와 A 둘뿐이다.**
-- **F**(`poll_verify.lua`의 `if keepalive == '1'` 분기 삭제) — ①을 닫는다. **코드가 줄어든다**
-- **A**(`enqueue_bulk.lua`에 `last-active` `ZADD` 한 줄) — ③의 잔류를 닫는다. 핫패스 쓰기 +1이 대가
+### ✅ 구현 완료 (2026-08-21) — `inactive_expire.lua` + `TokenReclaimJob`
+
+**F안 채택**으로 ①이 닫혔고, **회수 배치가 구현**되어 §82가 선언한 "이탈 회수의 유일한 경로"가
+실제로 존재한다. `admit_expire.lua`와 같은 claim 패턴(`ZRANGEBYSCORE` + `ZREM`을 한 `EVAL`에)이라
+ShedLock을 쓰지 않는다.
+
+```
+cutoff = now - queue.inactiveTtl * 1000      ← 큐 설정이라 Java가 계산한다
+ZRANGEBYSCORE last-active -inf (cutoff LIMIT 0 500   ← 이 EVAL이 claim
+  → ZREM last-active (먼저. 여기까지 오면 다른 인스턴스는 못 본다)
+  → seq마다: ZRANGEBYSCORE waiting seq seq 로 identifier 역산
+              HGET tokens (issuedAt 원본) → ZREM waiting → HDEL tokens
+  → EXPIRED 발행
+```
+
+🔴 **`waiting`에 없는 seq는 `last-active`에서만 뺀다**(§36 역산 미스 규약). 그 사람은 admit되어
+큐 밖이고, `tokens`를 지우면 중복 게이트가 풀려 재-enqueue가 새 자리를 받는다. 그렇다고 `last-active`에
+남겨두면 stale 멤버가 매 주기 한도의 앞자리를 먹어 진짜 대상을 굶긴다.
+
+**남는 것은 A 하나다.**
+- **A**(`enqueue_bulk.lua`에 `last-active` `ZADD` 한 줄) — ③(첫 폴링 이전 이탈)의 잔류를 닫는다.
+  핫패스 쓰기 +1이 대가라 **미채택**. `waitingTtl` 배치가 받아줄 수 있으나 그 판정도 아직 없다
 
 **C·D는 §36 폐기로 불필요해졌다.**
 
 ### Related
 
 - **§21** (이탈 정책) — **이 절이 대체한다.** 초판은 폐기 표기로 남긴다
-- **§36 · §80** (`admitToken` TTL 만료 → WAITING 복귀) — `AdmitTokenExpiryJob`이 복귀 시
+- **§36 · §80** (`admitToken` TTL 만료 → WAITING 복귀) — `TokenReclaimJob`이 복귀 시
   `last-active`를 **일부러 갱신하지 않는** 이유가 바로 이 절이다. 갱신하면 브라우저를 닫은
   사람이 복귀할 때마다 되살아나 영원히 회수되지 않는다
 - **§44** (파티션 유예) — Step 2 집계 쿼리에 "상태 술어 없음" 주석을 남겼다. 쿼리 자체는 불변
@@ -6523,7 +6542,7 @@ F가 이걸 크게 줄인다 — 복귀 후 첫 poll에 갱신되므로 사이�
 - **`issued_month`는 `issued_at`을 대체하지 못한다.** `issued_at`은 `NOT NULL`이고 전이 UPSERT는
   `INSERT ... ON DUPLICATE KEY`라 **행이 없으면 실제로 INSERT된다.** 그래서 Redis Hash 값이
   `tokenId|issuedAt|issuedMonth` **3원소로 늘어난다** — 줄이려던 것이 늘어난다
-- **없애려던 분기가 안 없어진다.** `admit.lua`·`admit_expire.lua`·`AdmitTokenExpiryJob`의
+- **없애려던 분기가 안 없어진다.** `admit.lua`·`admit_expire.lua`·`TokenReclaimJob`의
   "발행 생략" 게이트는 전부 **`HGET tokens` 미스**(= tokenId를 모름)지 `issuedAt` 유실이 아니다.
   Hash가 살아 있으면 `issuedAt`은 `tokenId`와 **같은 문자열에 붙어 공짜로** 따라오고, 죽으면
   tokenId가 없어 어차피 발행을 못 한다. **`issuedAt`만 유실되는 경로가 존재하지 않는다**

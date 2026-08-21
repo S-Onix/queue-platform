@@ -1,6 +1,6 @@
 package com.sonix.queue.infrastructure.queue;
 
-import com.sonix.queue.domain.queue.ExpiredAdmit;
+import com.sonix.queue.domain.queue.ReclaimedToken;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -61,6 +61,7 @@ class AdmitExpiryReclaimTest {
     @Autowired @Qualifier("pollVerifyScript") private RedisScript<Long> pollVerifyScript;
     @Autowired @Qualifier("admitScript") private RedisScript<List> admitScript;
     @Autowired @Qualifier("admitExpireScript") private RedisScript<List> admitExpireScript;
+    @Autowired @Qualifier("inactiveExpireScript") private RedisScript<List> inactiveExpireScript;
 
     @BeforeEach
     @AfterEach
@@ -82,11 +83,11 @@ class AdmitExpiryReclaimTest {
         seedAdmitted("id-b", 9, NOW);          // 경계 — score <= now 이므로 만료다
         seedAdmitted("id-c", 11, NOW + 1);     // 아직 유효
 
-        List<ExpiredAdmit> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW, 500);
+        List<ReclaimedToken> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW, 500);
 
         assertThat(claimed).containsExactly(
-                new ExpiredAdmit("id-a", 7, "tok_7", Instant.ofEpochMilli(ISSUED_AT)),
-                new ExpiredAdmit("id-b", 9, "tok_9", Instant.ofEpochMilli(ISSUED_AT)));
+                new ReclaimedToken("id-a", 7, "tok_7", Instant.ofEpochMilli(ISSUED_AT)),
+                new ReclaimedToken("id-b", 9, "tok_9", Instant.ofEpochMilli(ISSUED_AT)));
 
         // 🔴 되돌리지 않는다 — 되돌리면 좀비가 맨 앞으로 무한 재순환한다(§36)
         assertThat(redis.opsForZSet().zCard(WAITING))
@@ -108,10 +109,10 @@ class AdmitExpiryReclaimTest {
         String identifier = "user|42|kr";
         seedAdmitted(identifier, 3, NOW - 1);
 
-        List<ExpiredAdmit> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW, 500);
+        List<ReclaimedToken> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW, 500);
 
         assertThat(claimed).singleElement()
-                .extracting(ExpiredAdmit::identifier, ExpiredAdmit::seq)
+                .extracting(ReclaimedToken::identifier, ReclaimedToken::seq)
                 .containsExactly(identifier, 3L);
         assertThat(redis.opsForHash().hasKey(TOKENS, identifier))
                 .as("정확히 이 사람의 게이트가 풀렸다")
@@ -123,7 +124,7 @@ class AdmitExpiryReclaimTest {
     void hashMissStillLeavesAdmitted() {
         redis.opsForZSet().add(ADMITTED, "5|id-ghost", NOW - 1);   // tokens Hash 항목 없음
 
-        List<ExpiredAdmit> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW, 500);
+        List<ReclaimedToken> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW, 500);
 
         assertThat(claimed).singleElement().satisfies(e -> {
             assertThat(e.identifier()).isEqualTo("id-ghost");
@@ -184,7 +185,7 @@ class AdmitExpiryReclaimTest {
                     ready.countDown();
                     start.await();
                     while (true) {
-                        List<ExpiredAdmit> claimed = instance.claimExpiredAdmits(QUEUE_ID, NOW, 10);
+                        List<ReclaimedToken> claimed = instance.claimExpiredAdmits(QUEUE_ID, NOW, 10);
                         if (claimed.isEmpty()) {
                             return null;   // 다른 인스턴스가 다 가져갔거나 비었다
                         }
@@ -215,6 +216,6 @@ class AdmitExpiryReclaimTest {
 
     /** 별도 인스턴스(= 다른 서버의 queue-batch)를 흉내낸다. 공유하는 것은 Redis뿐이다. */
     private RedisQueueEngine newInstance() {
-        return new RedisQueueEngine(redis, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
+        return new RedisQueueEngine(redis, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
     }
 }

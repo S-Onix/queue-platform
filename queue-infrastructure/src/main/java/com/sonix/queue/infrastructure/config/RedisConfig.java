@@ -212,6 +212,12 @@ public class RedisConfig {
         return loadScript("lua/admit_expire.lua", List.class);
     }
 
+    /** inactiveTtl 초과 대기자 회수 (§82). 이탈 회수의 유일한 경로다. */
+    @Bean
+    public RedisScript<List> inactiveExpireScript() {
+        return loadScript("lua/inactive_expire.lua", List.class);
+    }
+
     @Bean
     public RateLimiter rateLimiter(
             @Qualifier("stringRedisTemplate") StringRedisTemplate redisTemplate,

@@ -2,7 +2,7 @@ package com.sonix.queue.batch.job;
 
 import com.sonix.queue.domain.queue.EnqueueEvent;
 import com.sonix.queue.domain.queue.EnqueueEventPublisher;
-import com.sonix.queue.domain.queue.ExpiredAdmit;
+import com.sonix.queue.domain.queue.ReclaimedToken;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
@@ -29,13 +29,13 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * {@link AdmitTokenExpiryJob} 단위 테스트.
+ * {@link TokenReclaimJob} 단위 테스트.
  *
  * <p>회수 자체(ZREM/HDEL)는 Lua가 하고 {@code AdmitExpiryReclaimTest}가 실제 Redis로 검증한다.
  * 여기서 보는 것은 잡의 책임인 <b>{@code EXPIRED} 발행 계약</b>과 <b>실패 격리</b>다.
  */
 @ExtendWith(MockitoExtension.class)
-class AdmitTokenExpiryJobTest {
+class TokenReclaimJobTest {
 
     private static final Instant ISSUED_AT = Instant.ofEpochMilli(1_700_000_000_000L);
 
@@ -43,11 +43,41 @@ class AdmitTokenExpiryJobTest {
     @Mock private QueueEngine queueEngine;
     @Mock private EnqueueEventPublisher eventPublisher;
 
-    @InjectMocks private AdmitTokenExpiryJob job;
+    @InjectMocks private TokenReclaimJob job;
 
     private static Queue queue(String queueId, long tenantId) {
         return Queue.reconstruct(1L, queueId, tenantId, "테스트큐", 100_000, 7200, 300,
                 QueueStatus.ACTIVE, LocalDateTime.now(), null);
+    }
+
+    /**
+     * 🔴 §82. {@code inactiveTtl}은 <b>큐 설정</b>이므로 cutoff를 Java가 계산해 넘겨야 한다 —
+     * Lua는 큐마다 다른 그 값을 알 수 없다. 상수를 박거나 {@code now}를 그대로 넘기면
+     * <b>대기자 전원이 즉시 회수된다.</b>
+     */
+    @Test
+    @DisplayName("inactive 회수의 cutoff = now - inactiveTtl*1000 (큐 설정을 쓴다) (§82)")
+    void inactiveCutoffUsesQueueInactiveTtl() {
+        // inactiveTtl = 300초인 큐
+        when(queueRepository.findAll()).thenReturn(List.of(queue("q_dev_a", 42L)));
+        when(queueEngine.claimInactive(eq("q_dev_a"), anyLong(), anyInt()))
+                .thenReturn(List.of(new ReclaimedToken("user-idle", 5L, "tok_5", ISSUED_AT)));
+
+        long before = System.currentTimeMillis();
+        job.reclaim();
+        long after = System.currentTimeMillis();
+
+        ArgumentCaptor<Long> cutoff = ArgumentCaptor.forClass(Long.class);
+        verify(queueEngine).claimInactive(eq("q_dev_a"), cutoff.capture(), anyInt());
+        assertThat(cutoff.getValue())
+                .as("300초 전이어야 한다 — now를 그대로 넘기면 대기자 전원이 회수된다")
+                .isBetween(before - 300_000L, after - 300_000L);
+
+        // 회수분도 EXPIRED로 발행된다 (admit 만료와 같은 이벤트)
+        ArgumentCaptor<EnqueueEvent> ev = ArgumentCaptor.forClass(EnqueueEvent.class);
+        verify(eventPublisher).publish(ev.capture());
+        assertThat(ev.getValue().eventType()).isEqualTo(TokenEventType.EXPIRED.name());
+        assertThat(ev.getValue().userId()).isEqualTo("user-idle");
     }
 
     @Test
@@ -55,9 +85,9 @@ class AdmitTokenExpiryJobTest {
     void publishesExpiredPerReclaimedToken() {
         when(queueRepository.findAll()).thenReturn(List.of(queue("q_dev_a", 42L)));
         when(queueEngine.claimExpiredAdmits(eq("q_dev_a"), anyLong(), anyInt()))
-                .thenReturn(List.of(new ExpiredAdmit("user-1", 7L, "tok_1", ISSUED_AT)));
+                .thenReturn(List.of(new ReclaimedToken("user-1", 7L, "tok_1", ISSUED_AT)));
 
-        job.reclaimExpiredAdmits();
+        job.reclaim();
 
         ArgumentCaptor<EnqueueEvent> captor = ArgumentCaptor.forClass(EnqueueEvent.class);
         verify(eventPublisher).publish(captor.capture());
@@ -80,9 +110,9 @@ class AdmitTokenExpiryJobTest {
     void skipsPublishWhenTokenIdUnknown() {
         when(queueRepository.findAll()).thenReturn(List.of(queue("q_dev_a", 42L)));
         when(queueEngine.claimExpiredAdmits(eq("q_dev_a"), anyLong(), anyInt()))
-                .thenReturn(List.of(new ExpiredAdmit("ghost", 5L, null, null)));
+                .thenReturn(List.of(new ReclaimedToken("ghost", 5L, null, null)));
 
-        job.reclaimExpiredAdmits();
+        job.reclaim();
 
         verify(eventPublisher, never()).publish(org.mockito.ArgumentMatchers.any());
     }
@@ -95,9 +125,9 @@ class AdmitTokenExpiryJobTest {
         when(queueEngine.claimExpiredAdmits(eq("q_dev_broken"), anyLong(), anyInt()))
                 .thenThrow(new IllegalStateException("redis down"));
         when(queueEngine.claimExpiredAdmits(eq("q_dev_ok"), anyLong(), anyInt()))
-                .thenReturn(List.of(new ExpiredAdmit("user-2", 9L, "tok_2", ISSUED_AT)));
+                .thenReturn(List.of(new ReclaimedToken("user-2", 9L, "tok_2", ISSUED_AT)));
 
-        job.reclaimExpiredAdmits();
+        job.reclaim();
 
         verify(eventPublisher).publish(org.mockito.ArgumentMatchers.argThat(
                 e -> "tok_2".equals(e.tokenId())));
@@ -109,14 +139,14 @@ class AdmitTokenExpiryJobTest {
         when(queueRepository.findAll())
                 .thenReturn(List.of(queue("q_dev_a", 1L), queue("q_dev_b", 2L)));
         when(queueEngine.claimExpiredAdmits(eq("q_dev_a"), anyLong(), anyInt()))
-                .thenReturn(List.of(new ExpiredAdmit("user-1", 1L, "tok_1", ISSUED_AT)));
+                .thenReturn(List.of(new ReclaimedToken("user-1", 1L, "tok_1", ISSUED_AT)));
         when(queueEngine.claimExpiredAdmits(eq("q_dev_b"), anyLong(), anyInt()))
-                .thenReturn(List.of(new ExpiredAdmit("user-2", 2L, "tok_2", ISSUED_AT)));
+                .thenReturn(List.of(new ReclaimedToken("user-2", 2L, "tok_2", ISSUED_AT)));
         org.mockito.Mockito.doThrow(new IllegalStateException("broker down"))
                 .when(eventPublisher).publish(org.mockito.ArgumentMatchers.argThat(
                         e -> "tok_1".equals(e.tokenId())));
 
-        job.reclaimExpiredAdmits();   // 예외가 새어 나오면 다음 주기까지 잡이 죽는다
+        job.reclaim();   // 예외가 새어 나오면 다음 주기까지 잡이 죽는다
 
         verify(eventPublisher).publish(org.mockito.ArgumentMatchers.argThat(
                 e -> "tok_2".equals(e.tokenId())));
