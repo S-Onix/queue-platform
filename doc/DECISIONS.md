@@ -135,6 +135,7 @@
 | §44 | 파티션 유예 전략 (월말 걸친 토큰) | ✅ |
 | §46 | LazyConnectionDataSourceProxy 필수 | ✅ |
 | §48 | schema.sql 수동 관리 | ✅ |
+| §83 | **파티션 키를 바꾸지 않는다** — 범위 조건 프루닝 실패의 실측과 4개 안 비교 | ✅ |
 
 **10. Kafka · 배치 · 비동기**
 
@@ -1435,10 +1436,18 @@ Range 파티션 (월별):
   파티션 DROP = 해당 월 토큰 전체 삭제
   → 일반 DELETE보다 수십~수백배 빠름 (락 없음)
 
-Partition Pruning:
-  TokenExpiryJob이 issued_at 조건으로 조회
-  → 해당 월 파티션만 스캔 → I/O 대폭 감소
+~~Partition Pruning: issued_at 조건으로 조회 → 해당 월 파티션만 스캔~~
+  ⛔ 사실이 아니다 (2026-08-21 실측, §83)
 ```
+
+> 🔴 **범위 조건으로는 프루닝이 걸리지 않는다.** 파티션식이 `YEAR(c)*100 + MONTH(c)`인데
+> MySQL 옵티마이저가 이 식을 `issued_at`에 대해 단조라고 인식하지 못한다.
+> `WHERE issued_at >= ... AND < ...`는 **13개 파티션을 전부 훑는다**(실측).
+> 등치(`=`)로 바꿔도, 파티션식을 그대로 써도 마찬가지다.
+>
+> **파티셔닝을 유지하는 이유는 `DROP PARTITION`이지 프루닝이 아니다.** 프루닝이 필요한
+> 월말 집계는 `FROM tokens PARTITION (p2026_04)`으로 파티션을 직접 지목한다
+> (배치는 대상 월을 안다). 근거·대안 비교는 **§83**.
 
 ### MySQL 파티션 제약
 ```
@@ -1451,8 +1460,10 @@ Partition Pruning:
 ### 면접 포인트
 > "샤딩은 복잡도가 급격히 올라가므로 적용하지 않았습니다.
 > tokens 테이블에 issued_at 기준 월별 Range 파티션을 적용해
-> 오래된 파티션을 DROP으로 빠르게 정리하고
-> TokenExpiryJob이 Partition Pruning으로 해당 월만 스캔합니다.
+> 오래된 파티션을 DROP으로 빠르게 정리합니다.
+> (⛔ 초판의 *"TokenExpiryJob이 Partition Pruning으로 해당 월만 스캔합니다"*는
+> **사실이 아니다** — §83. 면접에서 말하지 마라. 파티셔닝의 값은 `DROP PARTITION`이고,
+> 집계의 프루닝은 `PARTITION (pYYYY_MM)` 절로 따로 얻는다.)
 > Polling SELECT는 Read Replica로 분산하고
 > 인덱스는 최소화해 write 성능을 보호합니다."
 
@@ -2582,8 +2593,10 @@ Queue가 월말에 걸쳐 운영되는 경우:
   5/1 complete → 이미 파티션 없음 → 과금 누락
 
 파티션 키가 issued_at이므로:
-  completedAt 기준 집계 → Partition Pruning 불가 → 전체 풀스캔
-  issued_at 기준 집계 → Pruning 가능하지만 월말 걸침 문제 발생
+  completedAt 기준 집계 → 대상 파티션을 특정할 수 없음 → 전체 풀스캔
+  issued_at 기준 집계 → 대상 월을 특정할 수 있지만 월말 걸침 문제 발생
+  ※ "issued_at이면 Pruning 가능"은 사실이 아니다 (§83). 특정은 배치가 하고,
+    스캔 범위 축소는 PARTITION 절이 한다
 ```
 
 ### 결정: 1달 유예 (M월 파티션은 M+2월 초 DROP)
@@ -2606,7 +2619,8 @@ Queue가 월말에 걸쳐 운영되는 경우:
 Step 1: queue_daily_stats 집계
   SELECT issued_at 기준 M월 데이터
   GROUP BY tenant_id, queue_id, DATE(issued_at)
-  → Partition Pruning으로 M월 파티션만 스캔
+  → FROM tokens PARTITION (p2026_04) 로 M월 파티션만 스캔 (§83)
+    범위 조건만으로는 프루닝이 안 걸린다
   ON DUPLICATE KEY UPDATE id = id (멱등)
 
 Step 2: billing_snapshots 집계
@@ -2648,7 +2662,7 @@ queues → queue_daily_stats FK도 미적용:
 | 스토리지 | 약 2배 증가 |
 | 과금 정확도 | 월말 걸친 토큰도 누락 없음 |
 | DROP 타이밍 | M+2월 초 (1달 유예) |
-| 집계 방식 | issued_at 기준 Partition Pruning 활용 |
+| 집계 방식 | `FROM tokens PARTITION (pYYYY_MM)`으로 대상 월 지목 (§83) |
 
 ### 면접 포인트
 > "Queue가 월말에 걸쳐 운영되면
@@ -5936,3 +5950,121 @@ complete 경로의 `HINCRBYFLOAT` / `HINCRBY` 두 줄도 **만들지 않는다.*
 - **§5** (Redis 장애 복구) — 복구 불가 항목에서 제외
 - **§80** — complete 구현(`QueueEngineService.complete`)에는 이 갱신이 **처음부터 없다.**
   이 절은 코드를 바꾸는 결정이 아니라 **문서를 코드에 맞추는 결정**이다
+
+---
+
+## §83 — 파티션 키를 바꾸지 않는다 (범위 조건 프루닝 실패의 실측)
+
+### Context
+
+`tokens`는 `PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at))`이다. 그리고 MySQL은
+**유니크 키가 파티션 표현식의 컬럼을 전부 포함**하도록 강제하므로 `UNIQUE (token_id, issued_at)`이
+됐다. `issued_at`이 `DATETIME(3)` **밀리초**라, 모든 상태 전이 이벤트가 그 값을 **원본 그대로**
+실어 날라야 한다 — 1ms만 어긋나면 유니크 충돌이 안 나 **같은 토큰의 두 번째 행**이 생기고,
+그 행은 `status = 0`이라 §82의 취소 제외를 빠져나가 **과금된다**.
+
+여기서 두 질문이 나왔다. ① 이 제약을 없앨 수 있나? ② 애초에 프루닝은 되고 있나?
+
+`schema.sql`은 ②를 2026-08-17에 이미 정정해 뒀는데(파티션 운영 쿼리 절), **§26·§44·ROADMAP·README는
+반대를 말하고 있었다.** 이 절은 그 갈라짐을 닫고 ①의 판정을 남긴다.
+
+### 실측 (MySQL 8.0.46, `tokens` 160,808행, buffer pool warm)
+
+| # | 확인 | 결과 |
+|---|---|---|
+| 1 | `WHERE issued_at >= '2026-04-01' AND < '2026-05-01'` | 🔴 `partitions:` **13개 전부** |
+| 2 | `WHERE YEAR(issued_at)*100+MONTH(issued_at) = 202604` (파티션식과 동일하게) | 🔴 **여전히 13개** |
+| 3 | 범위 조건과 파티션식을 **병기** | 🔴 **여전히 13개** |
+| 4 | `FROM tokens PARTITION (p2026_08)` | ✅ **1개** |
+| 5 | 점 조회 3종(`findOneByTokenId`·`findAdmittedByAdmitToken`·`markCompleted`) | 🔴 **13개 전부.** 호출자가 월을 모르므로 **어떤 파티션 설계로도 못 고친다** |
+
+**원인:** 옵티마이저가 `YEAR(c)*100 + MONTH(c)`를 `c`에 대해 단조(monotonic)라고 증명하지 못한다.
+프루닝이 지원되는 것은 컬럼에 직접 적용된 제한된 함수 집합뿐이다.
+
+**그런데 손해가 작다:**
+
+| | 실행 시간 |
+|---|---|
+| §44 Step 2 집계, 현행(13개 스캔) | **54.4 ms** |
+| 〃 `PARTITION` 절 적용(1개) | **52.8 ms** |
+
+**차이 3%.** 13개 중 **12개가 0행**(데이터 16KB)이라 스캔해도 페이지 몇 개다. 운영 상태에서도
+§44의 M+2 유예가 데이터 있는 파티션을 `M`·`M+1`·`M+2` **3개로 제한**하므로 최악이 **상수배 3**이고,
+그것도 **월 1회**다. 점 조회는 파티션 13개일 때 0.036ms vs 비파티션 0.027ms로 **차이가 무의미**하다.
+
+### Decision
+
+**파티션 키를 바꾸지 않는다.** 프루닝이 필요한 월말 집계는 `FROM tokens PARTITION (pYYYY_MM)`으로
+파티션을 직접 지목한다 — **배치는 대상 월을 알고 있다.** `BillingSnapshotJob`은 미구현이므로
+작성 시점에 넣으면 되고 비용이 0이다.
+
+### 검토한 대안 4개
+
+| 안 | 앱 변경 | 프루닝 | 월경계 안전 | 판정 |
+|---|---|---|---|---|
+| **현행 유지** | 0 | `PARTITION` 절로 | ✅ | ✅ **채택** |
+| C: `RANGE COLUMNS(issued_at)` | **0** | ✅ 범위 조건 그대로 | ✅ | 🟡 유효하나 불필요 |
+| A: `issued_month` 실제 컬럼 | 본코드 14 + 테스트 11 | ✅ | ✅ | ⛔ 기각 |
+| B: `issued_month` 생성 컬럼 | 0 | ✅ | 🔴 실패 | ⛔ 기각 |
+
+**C안은 실제로 동작한다**(실측: PK·UNIQUE를 그대로 둔 채 범위 조건이 `partitions: p2026_04`로
+프루닝된다). `RANGE COLUMNS`는 표현식이 아니라 **컬럼 값을 직접 비교**하므로 단조성 증명이 필요 없다.
+재구축 1회(13.5초, `LOCK=SHARED`)면 되고 앱은 한 줄도 안 바뀐다. **채택하지 않은 이유는 이득이
+월 1회 배치의 3배 스캔뿐이고 그마저 `PARTITION` 절로 공짜이기 때문**이다. 필요해지면 그때 해도 된다
+— 다만 **비용이 행 수에 비례**하므로 미룰수록 비싸진다.
+
+**A·B안이 기각된 이유는 프루닝이 아니라 ①이 성립하지 않아서다:**
+
+- **`issued_month`는 `issued_at`을 대체하지 못한다.** `issued_at`은 `NOT NULL`이고 전이 UPSERT는
+  `INSERT ... ON DUPLICATE KEY`라 **행이 없으면 실제로 INSERT된다.** 그래서 Redis Hash 값이
+  `tokenId|issuedAt|issuedMonth` **3원소로 늘어난다** — 줄이려던 것이 늘어난다
+- **없애려던 분기가 안 없어진다.** `admit.lua`·`admit_expire.lua`·`AdmitTokenExpiryJob`의
+  "발행 생략" 게이트는 전부 **`HGET tokens` 미스**(= tokenId를 모름)지 `issuedAt` 유실이 아니다.
+  Hash가 살아 있으면 `issuedAt`은 `tokenId`와 **같은 문자열에 붙어 공짜로** 따라오고, 죽으면
+  tokenId가 없어 어차피 발행을 못 한다. **`issuedAt`만 유실되는 경로가 존재하지 않는다**
+- A안은 Hash 포맷을 또 바꾸므로 롤링 배포 중 **구포맷 이중 파싱 분기가 4곳 새로 생긴다**
+- **B안은 "전이 시점에 월을 계산해도 된다"는 유혹을 스키마에 심는다.** 그러면 §44가 보호하려는
+  바로 그 인구(월말에 걸친 토큰)에서 **2행이 생겨 이중 과금**된다(실측). 지금은 안전한데
+  **설계 의도대로 쓰는 순간 깨지는** 스키마다
+- 키 크기 절감은 **2.8%**이고, 인덱스 2개(`idx_tokens_queue_status_issued`·`idx_tokens_status_admit`)는
+  `issued_at`이 인덱스 컬럼으로 남아 **오히려 커진다**
+
+### Consequences
+
+**① 파티션 표현식 변경은 되돌리기 어렵다.** 실측한 제약:
+```
+ALGORITHM=INPLACE            → ERROR 1845 (COPY를 쓰라)
+COPY + LOCK=NONE             → ERROR 1846 (SHARED가 필요)
+PK만 먼저 바꾸고 파티션은 나중 → ERROR 1503 (PK는 파티션 함수 컬럼을 전부 포함해야 한다)
+```
+즉 **PK 변경과 파티션 재정의는 한 문장**이어야 하고 **쓰기가 차단**된다(읽기는 가능).
+160,808행에서 A안 3단계 10초 / C안 13.5초. 행당 40~80µs 규모라 1,000만 행이면 **7~14분 쓰기 차단**이다.
+그동안 enqueue API는 Redis+Kafka라 **무영향**이고 `queue-consumer`의 적재만 lag으로 쌓인다.
+
+**② 점 조회 3종은 어떤 안으로도 프루닝되지 않는다.** 호출자(Tenant)가 `tokenId`·`admitToken`만
+들고 오므로 월을 술어에 넣을 방법이 없다. 비용은 **보관 파티션 수에 비례**하며,
+**미리 만들어 둔 미래 파티션도 프로브 대상**이다. 현재 실측으로는 무해하다.
+
+**③ `issued_at`을 원본 그대로 싣는 제약은 남는다 — 그리고 그 비용은 0이다.** 모든 전이 경로가
+`tokenId`를 얻는 **같은 `HGET`**에서 `issuedAt`을 함께 받는다. 지킬 것이 없어 제약이랄 것도 없다.
+
+**④ 문서 4곳을 정정했다.** §26(선택 이유·면접 포인트), §44(문제 서술·Step 1·트레이드오프 표),
+`ROADMAP` Sprint 9 DoD, `README` 트레이드오프 표. `schema.sql`은 2026-08-17에 이미 정정돼 있었고
+**나머지가 그 정정을 반영하지 않아 정본끼리 반대를 말하고 있었다.**
+
+### Interview Point
+
+> "파티셔닝하면 Partition Pruning으로 빨라지지 않나요?"
+
+**저희는 안 됩니다.** 파티션식이 `YEAR(c)*100+MONTH(c)`인데 옵티마이저가 이 식을 단조라고 증명하지
+못해서, `issued_at` 범위 조건으로는 13개 파티션을 전부 훑습니다. 실측으로 확인했고 문서도 그렇게
+고쳤습니다.
+
+**그래도 파티셔닝을 유지합니다. 저희가 산 것은 프루닝이 아니라 `DROP PARTITION`이거든요.** 월별
+정리가 밀리초에 끝나고, 그게 없으면 수천만 행 `DELETE`가 binlog를 통째로 복제로 밀어 넣습니다.
+프루닝은 집계 배치에서 `PARTITION (p2026_04)`로 파티션을 직접 지목해 따로 얻습니다 — 배치는 어차피
+대상 월을 아니까요.
+
+`RANGE COLUMNS(issued_at)`로 바꾸면 범위 조건도 프루닝됩니다. 실측도 해봤습니다. 안 바꾼 이유는
+**이득이 월 1회 배치에서 54ms가 53ms 되는 것**이었기 때문입니다. 파티션 12개 중 11개가 비어 있어서
+스캔해도 페이지 몇 개거든요. 되돌리기 어려운 변경을 3% 때문에 하진 않았습니다.

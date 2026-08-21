@@ -638,7 +638,8 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - [ ] **파티션 운영 쿼리 dry-run 검증** (schema.sql의 Step 1~4 각 쿼리 실행 + EXPLAIN)
   - `INSERT INTO queue_daily_stats ... ON DUPLICATE KEY UPDATE id = id` 멱등성 확인
   - `INSERT INTO billing_snapshots ... ON DUPLICATE KEY UPDATE count = VALUES(count)` 멱등성 확인
-  - `EXPLAIN SELECT ... partitions: p2026_04` Partition Pruning 확인
+  - `EXPLAIN SELECT ... partitions: p2026_04` 확인 — **`FROM tokens PARTITION (p2026_04)`을 쓴 쿼리로** 검증한다.
+    범위 조건만으로는 13개 전부 나온다(§83). 옛 문구대로면 영원히 체크할 수 없는 DoD였다
 - [ ] Batch 2대 동시 기동 시 `batch-lock`으로 중복 실행 방지
 - [ ] Gap Lock 방지 (LIMIT 100 순차 처리)
 

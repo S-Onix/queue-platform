@@ -381,7 +381,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | `pacing` 구간표 | 서버 부하 절약 + 장애 시 서버가 전원 간격 조정 | SDK 구현 필요 | 순위 높을수록 Polling 드물게 (§79) |
 | Redis R/W 분리 미적용 | 설계 단순 | - | Lua 원자성. In-Memory 충분 |
 | MySQL R/W 분리 | SELECT 2,000 rps 분산 | Replica lag | token-info 캐시로 lag 최소화 |
-| tokens 파티셔닝 | 월별 DROP 빠른 정리 | PK에 파티션 키 | Partition Pruning 효과 |
+| tokens 파티셔닝 | 월별 DROP 빠른 정리 | PK에 파티션 키 + **범위 조건 프루닝 안 됨**(§83) | 집계는 `PARTITION` 절로 지목 |
 | RedisKeyFactory | 컴파일 타임 검사 | - | Enum: 가변인수 타입 안전성 없음 |
 
 ---
