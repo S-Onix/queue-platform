@@ -2118,10 +2118,24 @@ identifier가 *"같은 사용자·같은 큐에는 항상 같은 UUIDv7"* 규약
 `QueueEngine.claimExpiredAdmits` 포트는 **전부 남는다.** 실제 변경은 아래 셋뿐이다.
 
 ```
-admit_expire.lua     ZADD waiting {seq} {id}  →  HDEL tokens {id}    (1줄. HGET이 먼저)
-AdmitTokenExpiryJob  RETURNED  →  EXPIRED                            (상수 1개)
-TokenEventType.RETURNED + TokenJpaAdapter의 SQL 맵 엔트리              (삭제)
+admit_expire.lua     ZADD waiting {seq} {id}  →  HDEL tokens {id}    (HGET이 먼저)
+                     KEYS[2] waiting이 미사용이 되므로 KEYS 2개로 축소 + 호출부 1줄
+AdmitTokenExpiryJob  RETURNED  →  EXPIRED  (발행 타입 1개)
+TokenEventType.RETURNED + TokenJpaAdapter SQL 맵 엔트리   ← 🔴 **지우지 않는다**. 아래 참조
 ```
+
+**🔴 `TokenEventType.RETURNED`는 남긴다 — 발행처만 없앤다.**
+컨슈머는 모르는 타입을 `TokenEventType.from()`의 `null`로 판정해 `BatchListenerFailedException`으로
+**그 한 건만 DLT**로 보낸다. 상수를 지우면 **배포 순서 제약**이 생긴다 — consumer를 먼저 올리면
+아직 `RETURNED`를 발행 중인 batch의 이벤트가 전부 DLT로 간다. batch를 먼저 올려야만 안전하다.
+(게다가 `addNotRetryableExceptions(BatchListenerFailedException.class)`가 **아직 미결**이라, 안 붙은
+상태면 DLT까지 가는 데 백오프를 다 태운다.)
+
+**dead 상수 하나 대 배포 순서 제약**이면 남기는 쪽이 싸다. `TokenStatus.CANCELED(3)`을 예약값으로
+남긴 것(§82 ①)과 같은 판단이다. 남은 SQL 맵 엔트리(`IF(status = 1, 0, status)`)가 뒤늦은 `RETURNED`를
+받아 `1 → 0`으로 되돌려도 **무해하다** — `complete`의 술어가 `status IN (0, 1)`이라 어느 쪽이든 통과한다.
+
+→ 상수와 맵 엔트리에 **"발행처 없음(§36). 수신 전용"** 주석만 단다.
 
 ⚠️ **`HDEL`을 admit 시점에 하는 우회는 금지다.** 그러면 admit된 사람이 새로고침 한 번으로 새
 tokenId·새 seq를 받아 맨 뒤에 다시 선다(과금 2건 + `status = 1` 고아). 게이트를 `waiting`이 아니라
