@@ -26,7 +26,7 @@ stateDiagram-v2
 
 > 🔴 **`CANCELLED(3)`으로 가는 전이는 없다 (DECISIONS §82).** `DELETE /tokens/:tokenId`를
 > 만들지 않기로 확정했다. 유저가 취소 버튼을 누르든 탭을 닫든 신호는 **"폴링이 멈춘다"** 하나이고,
-> `inactiveTtl` 판정 배치가 그것을 잡아 **EXPIRED(4)** 로 보낸다. `status = 3`은 예약값으로만 남는다.
+> `inactiveTtl` 판정 배치가 그것을 잡아 **EXPIRED(4)** 로 보낸다. `status = 3`은 **결번**이다 — `TokenStatus.CANCELED` 상수도 삭제했다(재사용 금지, `schema.sql` 주석).
 >
 > **`inactiveTtl`은 유예 창이다.** 배치가 `HDEL tokens`를 하기 전에 같은 identifier로 재-enqueue하면
 > `enqueue_bulk.lua`의 `HSETNX` 게이트가 `EXISTS`를 돌려주어 **기존 `tokenId`·`seq`·`rank`가 복원**된다.

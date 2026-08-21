@@ -119,9 +119,9 @@ class QueueEnginePollTest {
     }
 
     @Test
-    @DisplayName("TTL 만료로 WAITING 복귀한 사람은 검증을 통과한다 → 정상 대기 응답(404도 ready도 아님)")
-    void returnedAfterAdmitExpiry_pollsNormally() {
-        // 복귀 배치가 원래 seq 그대로 되돌려 놨으므로 admit-by-token은 이미 만료돼 없다.
+    @DisplayName("아직 admit 안 된 대기자는 검증을 통과한다 → 정상 대기 응답(404도 ready도 아님)")
+    void stillWaiting_pollsNormally() {
+        // admit-by-token이 없다 = 아직 뽑히지 않았다. (§36으로 "복귀한 사람"이라는 경우는 사라졌다)
         when(queueEngine.verifyWaiting("q1", 100L, "tok_x", false, NOW)).thenReturn(true);
 
         PollResult r = service.poll("q1", "tok_x", 100L, false);

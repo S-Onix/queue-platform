@@ -2,6 +2,7 @@ package com.sonix.queue.infrastructure.queue;
 
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
+import com.sonix.queue.domain.queue.ExpiredAdmit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -30,6 +31,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ul>
  *   <li>admit된 사람이 다시 enqueue하면 <b>EXISTS + 같은 tokenId</b> (자리·과금이 늘지 않는다)</li>
  *   <li>{@code cleanupCompleted} 뒤에는 <b>OK + 새 tokenId</b> (게이트가 락아웃이 되지 않는다)</li>
+ *   <li>🔴 <b>admitToken TTL 만료 뒤에도 OK + 새 tokenId</b> (§36). 만료 claim이 {@code HDEL}로
+ *       게이트를 풀지 않으면 그 사람은 재-enqueue가 {@code EXISTS}(rank -1)로 갇혀
+ *       <b>영원히 재입장하지 못한다</b> — 폐기 검토에서 이 경로가 결정적이었다</li>
  * </ul>
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
@@ -89,6 +93,50 @@ class EnqueueAdmitReenqueueTest {
         issuedAdmitTokens.forEach(t -> keys.add(QueueKeys.admitByAdmit(QUEUE_ID, t)));
         redis.delete(keys);
         issuedAdmitTokens.clear();
+    }
+
+    /**
+     * 🔴 §36 회귀. admitToken TTL이 만료된 사람은 대기열로 <b>돌아오지 않는다</b>. 대신 claim-Lua가
+     * {@code tokens} Hash 필드를 지워 중복 게이트를 풀어, 그 사람이 <b>재접속 → 재-enqueue → 맨 뒤</b>로
+     * 다시 설 수 있게 한다.
+     *
+     * <p><b>이 단언이 깨지면 유저가 영구 락아웃된다.</b> {@code HDEL}이 빠지면 {@code HSETNX}가 계속
+     * 0을 돌려줘 재-enqueue가 {@code EXISTS} + rank −1을 받고, 그 tokenId로 폴링하면 404다.
+     * identifier가 "같은 사용자·같은 큐에는 항상 같은 UUIDv7"이라 새 identifier로 우회할 수도 없다.
+     */
+    @Test
+    @DisplayName("admitToken TTL 만료 뒤 재-enqueue는 OK + 새 tokenId — 복귀가 아니라 게이트 해제다 (§36)")
+    void reenqueueAfterAdmitExpiryGetsFreshToken() {
+        EnqueueResult first = engine.enqueue(QUEUE_ID, IDENTIFIER);
+        assertThat(first.isOk()).isTrue();
+        String firstTokenId = first.getTokenId();
+        long firstSeq = first.getSeq();
+
+        AdmitResult admitted = engine.admit(QUEUE_ID, "req-1", 1, NOW);
+        admitted.records().forEach(r -> issuedAdmitTokens.add(r.admitToken()));
+        assertThat(admitted.records()).hasSize(1);
+
+        // TTL 만료 — 배치가 claim한다. NOW보다 뒤 시각을 넘겨 만료 상태를 만든다.
+        List<ExpiredAdmit> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW + 60_001, 500);
+        assertThat(claimed).singleElement().satisfies(e -> {
+            assertThat(e.identifier()).isEqualTo(IDENTIFIER);
+            assertThat(e.seq()).isEqualTo(firstSeq);
+            assertThat(e.tokenId()).as("issuedAt 원본과 함께 나와야 EXPIRED를 발행할 수 있다")
+                    .isEqualTo(firstTokenId);
+            assertThat(e.publishable()).isTrue();
+        });
+
+        // 🔴 대기열로 되돌아가지 않는다 — 되돌리면 좀비가 맨 앞으로 무한 재순환한다
+        assertThat(redis.opsForZSet().score(QueueKeys.waiting(QUEUE_ID), IDENTIFIER)).isNull();
+        // 🔴 게이트가 풀렸다
+        assertThat(redis.opsForHash().hasKey(QueueKeys.tokens(QUEUE_ID), IDENTIFIER)).isFalse();
+
+        // 재-enqueue = 신규다. 새 tokenId·새 seq를 받아 맨 뒤에 선다.
+        EnqueueResult again = engine.enqueue(QUEUE_ID, IDENTIFIER);
+        assertThat(again.isOk()).as("EXISTS면 영구 락아웃이다").isTrue();
+        assertThat(again.getTokenId()).isNotEqualTo(firstTokenId);
+        assertThat(again.getSeq()).isGreaterThan(firstSeq);
+        assertThat(redis.opsForZSet().score(QueueKeys.waiting(QUEUE_ID), IDENTIFIER)).isNotNull();
     }
 
     @Test

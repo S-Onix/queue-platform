@@ -70,13 +70,12 @@ public class TokenJpaAdapter implements TokenRepository {
                 admit_token = IF(tokens.status = 0, new.admit_token, tokens.admit_token),
                 admitted_at = IF(tokens.status = 0, new.admitted_at, tokens.admitted_at),
                 status      = IF(tokens.status = 0, 1, tokens.status)""");
-        sql.put(TokenEventType.RETURNED, TRANSITION_INSERT +
-                "status = IF(tokens.status = 1, 0, tokens.status)");
         // completed_at은 건드리지 않는다 — complete API가 동기 UPDATE로 이미 채운 값이다(FRS §6.6).
         sql.put(TokenEventType.COMPLETED, TRANSITION_INSERT +
                 "status = IF(tokens.status = 1, 2, tokens.status)");
-        sql.put(TokenEventType.CANCELLED, TRANSITION_INSERT +
-                "status = IF(tokens.status = 0, 3, tokens.status)");
+        // 🔴 출발이 0뿐인 것은 의도다 (§36). admitToken TTL 만료자는 status = 1이라 여기서
+        //    no-op이 되고, 그래야 complete의 status IN (0, 1) + 300초 유효 창이 살아남는다.
+        //    IN (0, 1)로 넓히면 늦은 입장이 INVALID_ADMIT_TOKEN이 된다.
         sql.put(TokenEventType.EXPIRED, TRANSITION_INSERT +
                 "status = IF(tokens.status = 0, 4, tokens.status)");
         return Map.copyOf(sql);

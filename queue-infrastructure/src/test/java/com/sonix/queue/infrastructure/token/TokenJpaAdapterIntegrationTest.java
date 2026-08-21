@@ -247,24 +247,34 @@ class TokenJpaAdapterIntegrationTest {
         assertThat(statusOf(tokenId)).as("COMPLETED의 허용 출발은 1뿐").isZero();
     }
 
-    /** TTL 만료 복귀. 1에서만 0으로 돌아가야 한다 — 완료된 토큰이 대기열로 돌아가면 안 된다. */
+    /**
+     * 🔴 §36의 핵심 불변식. admitToken TTL 만료자는 {@code status = 1}인데 EXPIRED 가드가
+     * {@code status = 0} 전용이라 <b>no-op</b>이어야 한다.
+     *
+     * <p><b>이게 깨지면 complete가 죽는다.</b> {@code markCompleted}의 술어가
+     * {@code status IN (0, 1)}이고 유효 창이 300초인데 admitToken TTL은 60초라,
+     * <b>60~300초 구간의 늦은 입장이 정상 경로로 실재</b>한다. status가 4로 넘어가면
+     * 그 사람은 Tenant가 이미 사이트에 들여보냈는데도 {@code INVALID_ADMIT_TOKEN}을 받는다.
+     * 가드를 {@code IN (0, 1)}로 "고치면" 이 테스트가 잡는다.
+     */
     @Test
-    @DisplayName("RETURNED는 ADMIT_ISSUED(1)에서만 0으로 되돌린다")
-    void transition_returnedOnlyFromAdmitted() {
-        String admittedToken = "tok_ret_a_" + UUID.randomUUID();
-        String completedToken = "tok_ret_c_" + UUID.randomUUID();
-        adapter.saveAllIfAbsent(List.of(waiting(admittedToken, 1), waiting(completedToken, 2)));
-        adapter.applyTransition(TokenEventType.ADMITTED,
-                List.of(admitted(admittedToken, 1), admitted(completedToken, 2)));
-        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
-                transition(completedToken, 2, TokenStatus.COMPLETED, admitTokenFor(completedToken), null)));
+    @DisplayName("EXPIRED는 ADMIT_ISSUED(1)를 건드리지 않는다 — 늦은 complete를 살린다 (§36)")
+    void transition_expiredDoesNotTouchAdmitted() {
+        String admittedToken = "tok_exp_a_" + UUID.randomUUID();
+        String waitingToken = "tok_exp_w_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(admittedToken, 1), waiting(waitingToken, 2)));
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(admittedToken, 1)));
 
-        adapter.applyTransition(TokenEventType.RETURNED, List.of(
-                transition(admittedToken, 1, TokenStatus.WAITING, null, null),
-                transition(completedToken, 2, TokenStatus.WAITING, null, null)));
+        adapter.applyTransition(TokenEventType.EXPIRED, List.of(
+                transition(admittedToken, 1, TokenStatus.EXPIRED, null, null),
+                transition(waitingToken, 2, TokenStatus.EXPIRED, null, null)));
 
-        assertThat(statusOf(admittedToken)).isZero();
-        assertThat(statusOf(completedToken)).as("완료된 토큰은 되돌아가지 않는다").isEqualTo(2);
+        assertThat(statusOf(admittedToken))
+                .as("admitToken 만료자는 1에 머문다 — complete의 300초 창이 살아 있어야 한다")
+                .isEqualTo(1);
+        assertThat(statusOf(waitingToken))
+                .as("waitingTtl·inactiveTtl 만료(출발 0)만 4에 도달한다")
+                .isEqualTo(4);
     }
 
     /**
@@ -276,11 +286,11 @@ class TokenJpaAdapterIntegrationTest {
     void transition_insertsWhenAbsent() {
         String tokenId = "tok_new_" + UUID.randomUUID();
 
-        adapter.applyTransition(TokenEventType.CANCELLED, List.of(
-                transition(tokenId, 4, TokenStatus.CANCELED, null, null)));
+        adapter.applyTransition(TokenEventType.EXPIRED, List.of(
+                transition(tokenId, 4, TokenStatus.EXPIRED, null, null)));
 
         assertThat(countByTokenId(tokenId)).isEqualTo(1);
-        assertThat(statusOf(tokenId)).isEqualTo(3);
+        assertThat(statusOf(tokenId)).isEqualTo(4);
     }
 
     @Test

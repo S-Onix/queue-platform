@@ -31,14 +31,10 @@ public enum TokenEventType {
     /** admit 발급 — 대기열에서 빠지고 admitToken을 쥐었다. */
     ADMITTED(TokenStatus.ADMIT_ISSUED),
 
-    /** admitToken TTL 만료 → WAITING 복귀. */
-    RETURNED(TokenStatus.WAITING),
-
     /** Tenant가 입장 완료를 통보. */
     COMPLETED(TokenStatus.COMPLETED),
 
     /** 사용자가 대기를 취소. */
-    CANCELLED(TokenStatus.CANCELED),
 
     /** 대기 TTL 초과로 폐기. */
     EXPIRED(TokenStatus.EXPIRED);
@@ -57,10 +53,11 @@ public enum TokenEventType {
      * 목표값일 뿐이다. 예컨대 이미 {@code COMPLETED}(2)인 행에 {@code ADMITTED}가 재전달돼도
      * 2가 유지된다 — Kafka가 At-Least-Once라 재전달이 일상이기 때문이다.
      *
-     * <p>{@code ENQUEUED}와 {@code RETURNED}가 같은 {@code WAITING}을 가리키는 것은 우연이
-     * 아니다(복귀는 대기 상태로 돌아가는 것이다). 그래서 <b>도착 상태만으로는 두 이벤트를
-     * 구분할 수 없고</b>, 소비 측이 타입별로 다른 SQL을 골라야 한다 —
-     * {@code ENQUEUED}는 no-op, {@code RETURNED}는 1에서만 0으로.
+     * <p>🔴 {@code EXPIRED}는 <b>정상 경로에서 도달하지 않는다.</b> admitToken TTL 만료자는
+     * {@code status = 1}인데 소비 측 가드가 {@code IF(status = 0, 4, status)}라 no-op이다.
+     * 의도된 동작이다(§36) — {@code complete}의 술어가 {@code status IN (0, 1)}이고 유효 창이
+     * 300초라 <b>늦은 입장이 정상 경로로 실재</b>한다. 가드를 넓히면 그 경로가 죽는다.
+     * {@code 4}에 실제로 닿는 것은 {@code waitingTtl}·{@code inactiveTtl} 만료(출발이 0)뿐이다.
      */
     public TokenStatus targetStatus() {
         return targetStatus;

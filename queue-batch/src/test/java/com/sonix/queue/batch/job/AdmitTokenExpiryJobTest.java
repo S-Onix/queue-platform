@@ -31,8 +31,8 @@ import static org.mockito.Mockito.when;
 /**
  * {@link AdmitTokenExpiryJob} 단위 테스트.
  *
- * <p>복귀 자체(ZADD/ZREM)는 Lua가 하고 {@code AdmitExpiryReclaimTest}가 실제 Redis로 검증한다.
- * 여기서 보는 것은 잡의 책임인 <b>{@code RETURNED} 발행 계약</b>과 <b>실패 격리</b>다.
+ * <p>회수 자체(ZREM/HDEL)는 Lua가 하고 {@code AdmitExpiryReclaimTest}가 실제 Redis로 검증한다.
+ * 여기서 보는 것은 잡의 책임인 <b>{@code EXPIRED} 발행 계약</b>과 <b>실패 격리</b>다.
  */
 @ExtendWith(MockitoExtension.class)
 class AdmitTokenExpiryJobTest {
@@ -51,8 +51,8 @@ class AdmitTokenExpiryJobTest {
     }
 
     @Test
-    @DisplayName("복귀한 토큰마다 RETURNED를 발행한다 — admitToken·admittedAt은 둘 다 null")
-    void publishesReturnedPerReclaimedToken() {
+    @DisplayName("회수한 토큰마다 EXPIRED를 발행한다 — admitToken·admittedAt은 둘 다 null (§36)")
+    void publishesExpiredPerReclaimedToken() {
         when(queueRepository.findAll()).thenReturn(List.of(queue("q_dev_a", 42L)));
         when(queueEngine.claimExpiredAdmits(eq("q_dev_a"), anyLong(), anyInt()))
                 .thenReturn(List.of(new ExpiredAdmit("user-1", 7L, "tok_1", ISSUED_AT)));
@@ -63,12 +63,12 @@ class AdmitTokenExpiryJobTest {
         verify(eventPublisher).publish(captor.capture());
 
         EnqueueEvent event = captor.getValue();
-        assertThat(event.eventType()).isEqualTo(TokenEventType.RETURNED.name());
+        assertThat(event.eventType()).isEqualTo(TokenEventType.EXPIRED.name());
         assertThat(event.tokenId()).isEqualTo("tok_1");        // = Kafka 파티션 키
         assertThat(event.queueId()).isEqualTo("q_dev_a");
         assertThat(event.tenantId()).isEqualTo(42L);
         assertThat(event.userId()).isEqualTo("user-1");
-        assertThat(event.seq()).isEqualTo(7L);                 // 원래 seq 그대로
+        assertThat(event.seq()).isEqualTo(7L);                 // 관측용 — 되돌리지 않는다(§36)
         assertThat(event.issuedAt()).isEqualTo(ISSUED_AT);     // 멱등 키의 나머지 절반
         // 옛 admitToken을 실어 보내면 이미 무효가 된 값이 DB에 되살아난다 (§80 null 규약 표)
         assertThat(event.admitToken()).isNull();

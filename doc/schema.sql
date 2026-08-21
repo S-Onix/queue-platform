@@ -150,6 +150,11 @@ CREATE TABLE tokens (
     tenant_id         BIGINT       NOT NULL,
     user_id           VARCHAR(255) NOT NULL,
     seq               BIGINT       NOT NULL DEFAULT 0,
+    -- 0=WAITING 1=ADMIT_ISSUED 2=COMPLETED 4=EXPIRED
+    -- 🔴 3은 결번(CANCELLED). Cancel API를 만들지 않아(§82) 한 행도 존재한 적이 없고
+    --    TokenStatus 상수도 삭제했다. **3을 다른 의미로 재사용하지 마라.**
+    -- 🔴 admitToken TTL 만료자는 4가 아니라 **1에 머문다**(§36) — EXPIRED 가드가 status=0
+    --    전용이라 no-op이고, 그것이 complete의 status IN (0,1) + 300초 창을 살린다.
     status            TINYINT      NOT NULL DEFAULT 0,
     expired_reason    TINYINT      NULL,
     admit_token       VARCHAR(50)  NULL,

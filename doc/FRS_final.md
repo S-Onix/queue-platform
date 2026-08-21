@@ -1,6 +1,10 @@
 # 📄 Queue Platform — 기능 정의서 (FRS)
 
-> 버전: v1.15 | 상태: 확정 | 대상: 실제 구현 범위
+> 버전: v1.16 | 상태: 확정 | 대상: 실제 구현 범위
+>
+> v1.16 변경사항: **§6.2에 "세션 경계 3종" 신설** — ① `identifier` 매핑의 영속성 요구,
+> ② `tokenId`·`seq`의 브라우저 보관처(SDK 규약, 미정), ③ 비로그인 상태로 `admitToken`을
+> 받았을 때의 입장 처리와 그 보안 대가. 셋 다 Tenant·SDK 책임이고 Platform 코드는 0줄이다
 >
 > v1.15 변경사항 (DECISIONS §36): **admitToken TTL 만료 시 WAITING 복귀 폐기** — 만료는 종료이고
 > 재접속 → 재-enqueue → 맨 뒤다. `RETURNED` 이벤트 삭제, §6.3의 상태 B·B′와 그 미해결 `ErrorCode`
@@ -216,7 +220,7 @@ Redis (QueueKeys — §8 참조):
 0 = WAITING
 1 = ADMIT_ISSUED
 2 = COMPLETED
-3 = CANCELLED   ← 🔴 예약값. 도달하는 경로가 없다 (DECISIONS §82)
+3 = (결번)      ← 🔴 CANCELLED였다. Cancel 미구현으로 한 행도 없어 상수까지 삭제(§82). 재사용 금지
 4 = EXPIRED
 ```
 
@@ -275,6 +279,7 @@ Response 200:
 | 형식 | **UUIDv7**. Platform은 형식 가이드만 제시하고, 검증 책임은 **전적으로 Tenant** |
 | 생성·저장 | Tenant가 `userId → identifier(UUIDv7)` 매핑을 **저장**한다 |
 | 재사용 | **같은 사용자·같은 큐에는 항상 같은 UUID를 재사용**한다 |
+| **영속성** | 매핑은 **브라우저 종료를 견뎌야 한다** — 로그인 세션 또는 영속 쿠키. 세션 쿠키(비영속)만 쓰면 비로그인 유저는 재접속 시 새 사람이 되어 `inactiveTtl` 유예 창이 무의미해진다 (아래 "세션 경계 3종" ①) |
 
 ```
 ⚠️ 매 요청 새 UUID를 만들면 enqueue_bulk.lua의 HSETNX가 안 걸려
@@ -286,6 +291,65 @@ Response 200:
    남의 tokenId·seq — 즉 남의 폴링 자격 증명(§74) — 을 손에 넣는다.
    UUIDv7이면 이 경로가 죽는다.
 ```
+
+
+### 🔴 세션 경계 3종 — 브라우저 종료·로그아웃을 견디는가 (2026-08-21 신설)
+
+**§78이 유저 식별을 Tenant에 넘겼다. 넘기면서 "무엇을 견뎌야 하는가"를 말하지 않았다.**
+아래 셋이 비어 있으면 `inactiveTtl` 유예 창(§82)이 비로그인 유저에게 **사실상 무의미**해지고,
+그 사실이 Platform 버그로 오인된다. 셋 다 **Tenant·SDK 책임이고 Platform 코드는 0줄**이다.
+
+⚠️ 업계 제품(Queue-it · Cloudflare Waiting Room)은 **엣지에서 자기 영속 쿠키를 직접 심어** 이
+문제를 제품이 보장한다. 우리는 §78 경계 때문에 Tenant에 넘겼으므로, **넘긴다는 사실 자체를
+명시**해야 한다.
+
+#### ① `identifier` 매핑은 브라우저 종료를 견뎌야 한다
+
+| | |
+|---|---|
+| 요구 | `userId → identifier` 매핑을 **브라우저 종료 후에도 복원**할 수 있어야 한다 |
+| 수단 | 로그인 세션(DB) 또는 **영속 쿠키**(`Max-Age` 지정). **세션 쿠키(비영속)는 안 된다** |
+| 안 지키면 | 비로그인 유저가 브라우저를 끄고 돌아오면 Tenant가 **누구인지 모른다** → 새 `identifier` → 새 사람. `inactiveTtl`이 300초든 3000초든 자리를 못 찾아준다 |
+
+#### ② `tokenId`·`seq`의 브라우저 보관처를 정해야 한다 (SDK 규약)
+
+폴링(`GET /queues/:queueId/tokens/:tokenId?seq=`)은 **`permitAll`이라 로그인이 필요 없다** —
+`tokenId` 소지가 곧 자격이다(§74). 따라서 **재접속 후 폴링을 이어갈 수 있는지는 오직
+"브라우저가 `tokenId`·`seq`를 아직 갖고 있는가"에 달렸다.**
+
+| 보관처 | 브라우저 종료 후 |
+|---|---|
+| 메모리(JS 변수)만 | ❌ 소실 → 폴링 불가 → `last-active` 정지 → 유예 창을 못 쓴다 |
+| `localStorage` / 영속 쿠키 | ✅ 복원 → 폴링 재개 → 정상 대기자 |
+| `sessionStorage` | ⚠️ 탭 단위. 새로고침은 견디나 **브라우저 종료는 못 견딘다** |
+
+⬜ **미정.** SDK가 아직 한 줄도 없으므로(Sprint 10) **지금 정하면 공짜**다.
+🔴 `tokenId`는 **자격 증명**이다(§74). 보관처를 정할 때 XSS 노출 범위를 함께 본다 —
+`localStorage`는 스크립트가 읽을 수 있고, `HttpOnly` 쿠키는 SDK(JS)가 못 읽는다.
+
+#### ③ 비로그인 상태로 `admitToken`을 받았을 때의 입장 처리
+
+②가 충족되면 **로그아웃된 유저도 폴링을 이어가 `admitToken`을 받는다.** 그 사람이 Tenant에
+토큰을 들고 오는데, Tenant 세션은 없다.
+
+```
+유저(비로그인) → Tenant에 admitToken 전달
+Tenant → POST /admit-tokens/{admitToken}/verify (X-API-Key)
+      ← { valid: true, identifier: "0190e2c1-..." }
+Tenant는 identifier → userId 매핑을 갖고 있다 → 누구인지는 안다
+                     ↓
+             그래서 입장시킬 것인가?
+```
+
+| 선택 | 대가 |
+|---|---|
+| `identifier`로 로그인 세션을 복원한다 | 🔴 **`admitToken` 소지가 로그인 자격이 된다.** 토큰이 새면 계정 탈취 경로다 |
+| 재로그인을 요구한 뒤 입장시킨다 | 안전하다. 다만 `admitToken` TTL 60초 안에 로그인까지 끝나야 한다 |
+
+**Platform은 이 선택을 하지 않는다**(§78 — 입장 제어는 Tenant). 다만 **선택지가 존재한다는
+사실과 그 대가**는 여기 적어 둔다. 첫 번째를 고를 Tenant가 위험을 모르고 고르면 안 된다.
+
+📌 `verify`가 돌려주는 것은 `identifier`뿐이다. Platform은 `userId`를 모르고, 알 필요도 없다.
 
 ### 6.3 Polling — 엔드포인트 2분할 (DECISIONS §79. **구현 완료** — 404 ErrorCode 분리만 미해결)
 

@@ -1123,6 +1123,11 @@ ADMIT_ISSUED에서 이탈하려면:
 그래서 이 값은 **"몇 초까지 자리를 지켜줄 것인가"** 이고, Tenant가 큐마다 정한다
 (`QueueCreateRequest.inactiveTtl`, 기본 300초).
 
+🔴 **이 창은 두 전제 위에 선다** — ⓐ Tenant의 `identifier` 매핑이 브라우저 종료를 견디고,
+ⓑ 브라우저가 `tokenId`·`seq`를 복원해 폴링을 이어갈 수 있어야 한다. 둘 중 하나라도 깨지면
+돌아온 사람을 알아보지 못해 **창이 있어도 자리를 못 찾아준다.** 둘 다 Tenant·SDK 책임이고
+**`FRS_final.md` §6.2 "세션 경계 3종"** 에 적혀 있다.
+
 ⚠️ **재-enqueue는 생존 신호가 아니다.** `enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS는 `waiting`·`seq`·`tokens` 3종). 순번이 복원돼도 다음 `ka=1` 폴링이 오기 전에 배치가 돌면 그대로 회수된다. 창을 되살리는 유일한 신호는 **`ka=1` 폴링 재개**다.
 
 ---
@@ -2121,21 +2126,30 @@ identifier가 *"같은 사용자·같은 큐에는 항상 같은 UUIDv7"* 규약
 admit_expire.lua     ZADD waiting {seq} {id}  →  HDEL tokens {id}    (HGET이 먼저)
                      KEYS[2] waiting이 미사용이 되므로 KEYS 2개로 축소 + 호출부 1줄
 AdmitTokenExpiryJob  RETURNED  →  EXPIRED  (발행 타입 1개)
-TokenEventType.RETURNED + TokenJpaAdapter SQL 맵 엔트리   ← 🔴 **지우지 않는다**. 아래 참조
+TokenEventType.RETURNED + TokenJpaAdapter SQL 맵 엔트리     (삭제)
+TokenEventType.CANCELLED + 맵 엔트리 · TokenStatus.CANCELED(3)  (삭제 — §82 ① 정정)
 ```
 
-**🔴 `TokenEventType.RETURNED`는 남긴다 — 발행처만 없앤다.**
-컨슈머는 모르는 타입을 `TokenEventType.from()`의 `null`로 판정해 `BatchListenerFailedException`으로
-**그 한 건만 DLT**로 보낸다. 상수를 지우면 **배포 순서 제약**이 생긴다 — consumer를 먼저 올리면
-아직 `RETURNED`를 발행 중인 batch의 이벤트가 전부 DLT로 간다. batch를 먼저 올려야만 안전하다.
-(게다가 `addNotRetryableExceptions(BatchListenerFailedException.class)`가 **아직 미결**이라, 안 붙은
-상태면 DLT까지 가는 데 백오프를 다 태운다.)
+**🔴 `RETURNED`는 지운다.** 한때 "배포 순서 제약 때문에 남긴다"고 적었으나 번복한다.
+**개념이 사라진 상수를 남기면 다음 사람이 "복귀가 있나?"를 다시 묻는다** — `RETURNED`는 문자
+그대로 *"대기열로 다시 들어옴"* 이고, 그 일이 더는 일어나지 않는다.
 
-**dead 상수 하나 대 배포 순서 제약**이면 남기는 쪽이 싸다. `TokenStatus.CANCELED(3)`을 예약값으로
-남긴 것(§82 ①)과 같은 판단이다. 남은 SQL 맵 엔트리(`IF(status = 1, 0, status)`)가 뒤늦은 `RETURNED`를
-받아 `1 → 0`으로 되돌려도 **무해하다** — `complete`의 술어가 `status IN (0, 1)`이라 어느 쪽이든 통과한다.
+배포 순서 제약은 실재하지만(컨슈머가 모르는 타입을 `from()`의 `null`로 판정해
+`BatchListenerFailedException`으로 한 건씩 DLT로 보낸다) **이 프로젝트는 아직 프로덕션이 아니라
+in-flight `RETURNED`가 존재하지 않는다.** 이론상 제약은 **운영 주의사항**으로 적으면 될 것이지
+dead code로 남길 이유가 아니다.
 
-→ 상수와 맵 엔트리에 **"발행처 없음(§36). 수신 전용"** 주석만 단다.
+> ⚠️ **운영 주의**: 이후 프로덕션에서 이벤트 타입을 없앨 때는 **발행 측(batch)을 먼저** 올린다.
+> 소비 측을 먼저 올리면 아직 발행 중인 구 타입이 전부 DLT로 간다. 그리고
+> `addNotRetryableExceptions(BatchListenerFailedException.class)`가 **아직 미결**이라, 안 붙은
+> 상태면 DLT까지 가는 데 백오프를 다 태운다.
+
+**같은 이유로 `TokenEventType.CANCELLED`와 `TokenStatus.CANCELED(3)`도 지웠다.**
+🔴 **§82 ①이 남긴 근거("TINYINT 재번호 비용")는 틀렸다** — `TokenStatus`는 명시적 `statusCode`를
+갖는 enum이라 `CANCELED(3)`을 지워도 `EXPIRED(4)`는 그대로 4다. 재번호가 아예 일어나지 않는다.
+`status = 3`인 행은 한 번도 존재한 적이 없으므로(Cancel 미구현) `fromCode(3)`이 불릴 일도 없다.
+**결번 3은 `schema.sql`의 `status` 컬럼 주석으로 남긴다** — 재사용 금지 정보가 필요한 곳은
+enum이 아니라 DB 쪽이다.
 
 ⚠️ **`HDEL`을 admit 시점에 하는 우회는 금지다.** 그러면 admit된 사람이 새로고침 한 번으로 새
 tokenId·새 seq를 받아 맨 뒤에 다시 선다(과금 2건 + `status = 1` 고아). 게이트를 `waiting`이 아니라
@@ -5099,6 +5113,11 @@ Tenant가 받는 enqueue는 요청을 Platform으로 넘기고 `tokenId`를 돌�
 
 Platform은 **형식 가이드만 제시**하고, `identifier` 검증 책임은 **전적으로 Tenant**에 있다.
 
+🔴 **이 매핑은 브라우저 종료를 견뎌야 한다** — 세션 쿠키(비영속)만 쓰면 비로그인 유저가 재접속할 때
+Tenant가 누구인지 몰라 새 identifier를 만들고, 그러면 §82의 `inactiveTtl` 유예 창이 그 유저에게는
+무의미해진다. 이 요구와 나머지 두 경계(`tokenId` 보관처 · 비로그인 입장 처리)는
+**`FRS_final.md` §6.2 "세션 경계 3종"** 에 있다.
+
 **Tenant는 `userId → identifier(UUIDv7)` 매핑을 저장하고, 같은 사용자·같은 큐에는 항상 같은
 UUID를 재사용한다.** 매 요청 새로 생성하면 `enqueue_bulk.lua`의 `HSETNX`가 안 걸려
 **한 사람이 자리를 여러 개 차지한다.**
@@ -6267,10 +6286,16 @@ Cancel은 이탈의 **일부만** 덮는데, 덮는 그 일부조차 `inactiveTt
 
 ### Consequences
 
-**① `TokenStatus.CANCELED(3)`은 예약값으로 남긴다.** enum 상수와 `tokens.status` TINYINT
-값을 재번호하는 비용이 훨씬 크다. 발행처가 0이 될 뿐이다. `TokenEventType.CANCELLED`와
-`TokenJpaAdapter`의 해당 SQL 맵 엔트리도 같은 이유로 둔다 — **지우는 것이 이득이 되는
-시점은 없다.**
+**① ~~`TokenStatus.CANCELED(3)`은 예약값으로 남긴다~~ — 🔴 2026-08-21 정정. 지웠다.**
+당시 근거였던 *"enum 상수와 TINYINT 값을 재번호하는 비용"* 은 **틀렸다.** `TokenStatus`는
+명시적 `statusCode`를 갖는 enum이라(`CANCELED(3)`) 상수를 지워도 `EXPIRED(4)`는 그대로 4다 —
+**재번호가 일어나지 않는다.** `status = 3`인 행은 Cancel 미구현으로 한 번도 존재한 적이 없어
+`fromCode(3)`이 불릴 일도 없다.
+
+→ `TokenStatus.CANCELED`·`TokenEventType.CANCELLED`·`TokenJpaAdapter`의 SQL 맵 엔트리를 **전부
+삭제**했다. **결번 3은 `schema.sql`의 `status` 컬럼 주석으로 남긴다** — 재사용 금지 정보가
+필요한 곳은 enum이 아니라 DB 쪽이다. 개념이 사라진 상수를 남기면 읽는 사람이 "취소가 있나?"를
+다시 묻는다.
 
 **② `tokens.cancelled_at`과 `queue_daily_stats.total_cancelled`는 삭제한다.** 항상 NULL과
 0이 될 컬럼이고, `schema.sql`은 아직 미배포 DDL이라 지금이 유일하게 공짜인 시점이다.
