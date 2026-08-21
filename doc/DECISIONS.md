@@ -5434,8 +5434,43 @@ master 한 대에 몰립니다.**
 할 수가 없거든요 — 테넌트들이 각자 SDK를 재배포해야 하니까요. 부하 제어 플랫폼이 부하 제어
 레버를 클라이언트에 넘기면 안 된다고 봤고, 그 레버 값이 응답 필드 하나였습니다.
 
+### 🔴 사다리는 `admitToken` TTL과 결합돼 있다 (2026-08-21 추가 실측)
+
+**입장권을 늦게 받는 만큼 쓸 시간이 줄어든다.** 이 절과 §80이 따로 정해 놓은 세 값이 사실 한 덩어리다.
+
+```
+admit 발생 ──[유저의 다음 /status 폴링까지]──> admitToken 수령 ──[남은 시간]──> verify
+            └─ 이 절의 pacing 구간표가 정한다        └─ §80의 ADMIT_TTL 60초에서 깎인다
+```
+
+**핵심은 `rank <= 0`이 admit이 일어난 *뒤*의 상태라는 것이다.** admit 직전 그 사람의 rank는 0이
+아니라 **같이 뽑히는 인원수만큼** 크고, **그 rank가 폴링 간격을 정한다.** 즉 Tenant가 한 번에
+많이 뽑을수록 뒤쪽 사람의 수령이 늦어진다.
+
+| Tenant의 admit 방식 | 뽑히는 rank 범위 | 적용 구간 | 60초 중 손실 |
+|---|---|---|---|
+| `count=100` 1회 | 0~99 | 2초(≤50) / **5초**(51~99) | ~8% |
+| 100씩 연속 루프로 1,000명 | 0~999 | **5초** | ~8% |
+| 〃 5,000명 | 0~4,999 | **10초** | **~17%** |
+| 〃 10,000명 이상 | | **15~20초** | **~25-33%** |
+
+`AdmitRequest`의 `@Max(100)`은 **한 번에** 뽑는 것만 막는다. **연속 호출은 막지 않는다** —
+폴링 한 주기 안에 admit을 10번 부르면 1,000명을 한꺼번에 뽑은 것과 같다.
+
+**그래서 Platform은 이 손실을 계산할 수 없다.** 크기가 Tenant의 admit 배칭 방식에 달려 있고
+Platform은 그걸 모른다. `ADMIT_TTL`이 `private static final` 상수인 채로 "60초 안에 못 오면 탈락"을
+판정하면, **Platform이 자기가 만든 지연을 유저에게 청구**하는 셈이 된다.
+
+📌 현재는 `admitToken` TTL 만료가 **WAITING 복귀**(§36)라 이 손실이 드러나지 않는다. 복귀가
+결과를 되돌려주기 때문이다. **복귀 정책이 바뀌면 이 결합이 곧바로 유저 이탈로 나타난다.**
+
+⚠️ 세 값이 서로를 모른 채 **다른 층에 산다** — `count` 상한은 API DTO의 `@Max`, 사다리는 Redis
+오버라이드 키(큐 단위), TTL은 `QueueEngineService`·`RedisQueueEngine`의 **상수 2중복**
+(`QueueEngineService:22` 주석이 중복을 자인한다). 하나를 만질 때 나머지 둘을 같이 봐야 한다.
+
 ### Related
 
+- **§80** (Admit) — 사다리가 `ADMIT_TTL`과 결합돼 있다(위 실측). `count` 상한·사다리·TTL 셋은 한 덩어리다
 - **§74** (폴링 소유권 검증) — 이 결정이 §74가 만든 폴링 경로의 **응답 계약·엔드포인트를 변경**한다.
   개인 엔드포인트의 `poll_verify.lua` 검증 자체는 그대로 유지된다
 - **§36** (admitToken TTL 만료 → WAITING 복귀) — 🔴 가드레일과 상태 B가 **전적으로 이 결정에 기댄다.**
@@ -5524,7 +5559,7 @@ master 한 대에 몰립니다.**
 | Kafka 이벤트 타입 | **판별 필드**(한 토픽·한 스키마 안에서 분기) |
 | ~~`ADMIT_ISSUED → CANCELLED`~~ | 🔴 **무의미해졌다 — Cancel API를 만들지 않는다(§82).** 이탈은 admitToken TTL 만료 → WAITING 복귀 → `inactiveTtl` 판정을 거친다 |
 | 복귀가 `last-active`를 리셋하는가 | **안 한다** |
-| `count` 상한 | **100.** `@Max(100)` Bean Validation 한 줄 — 전용 검증 클래스를 만들지 않는다 (⑦) |
+| `count` 상한 | **100.** `@Max(100)` Bean Validation 한 줄 — 전용 검증 클래스를 만들지 않는다 (⑦). ⚠️ **한 번에** 뽑는 것만 막는다 — 연속 호출은 안 막으므로 폴링 한 주기에 수천 명이 뽑힐 수 있고, 그만큼 뒷사람의 입장권 수령이 늦어져 TTL에서 깎인다 (**§79의 결합 절**) |
 | 포트 rename | **미룬다** (순수 미용) |
 | admit이 `last-active` 정리 | **Sprint 9 회수 배치에서 일괄** |
 
@@ -6104,32 +6139,49 @@ admit되면 `admit.lua`의 `ZPOPMIN`으로 `waiting`에서 빠지고, 그러면 
 즉 admit 대기 중인 60초 동안 그 사람의 `last-active`가 언다. `inactiveTtl`이 짧으면:
 
 ```
-sweep이 admit 대기자를 회수 → HDEL tokens (중복 게이트가 풀린다)
-→ 60초 뒤 AdmitTokenExpiryJob이 원래 seq로 waiting에 복귀시킨다 (§36)
-→ tokens Hash에 필드가 없는 사람이 waiting에 앉아 있다
-→ poll_verify가 HGET 미스로 0을 반환 → 영구 404
-→ waiting에 회수 불가 고아 (last-active는 이미 ZREM돼서 다시 안 걸린다)
+sweep이 admit 대기자를 만난다 → ZRANGEBYSCORE waiting seq seq 미스(그 사람은 waiting에 없다)
+→ identifier를 모르므로 HDEL도 ZREM waiting도 할 수단이 없다
+→ 남는 선택은 "ZREM last-active만 하고 넘어간다"뿐
+→ 복귀 후 다음 ka=1 폴링이 오면 ZADD로 스스로 복구된다 (자가 치유)
+→ ka가 영영 안 오면 회수 신호를 잃은 채 waiting에 잔류 (= ③과 같은 누수)
 ```
+🔴 **sweep이 identifier를 다른 데서 얻으면(DB `user_id`, `admitted` ZSet) 파국이 부활한다** —
+`HDEL tokens`가 중복 게이트를 풀어 복귀자가 영구 404 + 회수 불가 고아가 된다.
+그래서 **sweep의 "역산 미스" 처리 규약을 착수 전에 못박아야 한다**: 미스면 `ZREM last-active`만.
 필요 여유 ≈ `admitTokenTtl`(60) + sweep 주기(10) + 복귀 후 첫 `ka`(30~60) = **130~150초.**
 기본 300초는 안전하지만 `QueueCreateRequest`에 `inactiveTtl` 검증이 **하나도 없다.**
 DB는 안전하다 — `IF(tokens.status = 0, 4, ...)` 가드가 status=1을 no-op으로 만든다.
 **위험은 오직 `HDEL tokens`가 중복 게이트를 푼다는 데서 온다.**
 
+🔴 **정적 하한으로는 ②를 원리적으로 완전히 닫을 수 없다.** 130~150초는 "admit 1회"를 가정한
+값인데, 실제로는 `admit(60s 언다) → 복귀 → 다음 ka까지 최대 60초 → 또 admit`이 반복된다.
+**사이클 3회면 기본값 300초를 넘는다.** 그리고 사이클이 도는 조건이 *"Tenant가 60초 안에
+입장 처리를 못 했다"* 라, **Tenant 서버가 느릴 때 정상 대기자가 무더기로 회수되는 장애 증폭**이다.
+F가 이걸 크게 줄인다 — 복귀 후 첫 poll에 갱신되므로 사이클마다 리셋된다.
+
 **③ 첫 `ka=1` 이전에 떠난 사람은 `last-active`에 멤버가 아예 없다.**
 `enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS 3종). enqueue 직후 30~60초 안에
 탭을 닫으면 `ZRANGEBYSCORE last-active`가 **영원히 못 찾는다** → `waiting`·`tokens`에 영구 잔류.
-받아 줄 `waitingTtl` 배치는 판정 소스 자체가 미정이다(`waiting`의 score는 `seq`, 시간축이 없다).
+🔴 **그리고 이건 조용한 누수가 아니다.** `admit.lua`는 `ZPOPMIN`이라 좀비를 그냥 뽑아가고,
+`admit_expire.lua:57`이 **원래 seq 그대로** 되돌린다(§36) → 좀비가 큐 맨 앞으로 복귀 →
+다음 admit에서 또 뽑힌다. 좀비 Z명, Tenant의 60초당 처리율 R명일 때 매 사이클 `min(Z,R)`의
+**admit 슬롯이 좀비에게 간다. Z ≥ R이면 정상 입장자가 0에 수렴한다.**
+`waitingTtl`(7200초)은 구제책이 못 된다 — 그 사이 좀비는 admit 사이클을 약 120회 돌고,
+**2시간 안에 끝나는 이벤트(티켓팅)에서는 한 번도 안 돈다.**
+⚠️ 다만 `waitingTtl`의 판정 소스는 **미정이 아니다** — `tokens` Hash 값이 `"tokenId\|issuedAt"`라
+같은 키 공간에 시간축이 이미 있다(`HSCAN` 커서). DB `tokens.issued_at`을 쓸 이유가 없다.
 **초반 이탈률이 높은 큐라면 회수 배치를 다 만들고도 누수가 남는다.**
 
 #### 선택지 (확정하지 않는다 — 사용자 판단)
 
 | 안 | 내용 | 닫는 구멍 | 대가 |
 |---|---|---|---|
-| **A** | `enqueue_bulk.lua`에 `KEYS[4] = last-active` + `ZADD` 한 줄 | ③ (①도 완화) | **10만/s 버스트 핫패스에 쓰기 1개 추가.** KEYS 시그니처가 바뀌어 롤링 배포 중 스크립트/호출부 불일치 창이 생긴다 |
+| **A** | `enqueue_bulk.lua`에 `KEYS[4] = last-active` + `ZADD` 한 줄 | ③ | 청크 500건당 `ZADD` +500. `last-active` 멤버가 "ka 보낸 사람" → "enqueue한 전원"으로 커진다(멤버가 짧은 seq 문자열이라 `waiting`보다 작다). ⚠️ **롤링 배포 불일치는 없다** — `DefaultRedisScript`가 본문에서 SHA를 계산하고 `NOSCRIPT`면 `EVAL` 폴백이라 구/신 WAS가 각자 실행한다. **①은 완화하지 않는다**(①은 반대 방향이다) |
 | **B** | sweep이 `waiting`을 소스로 돌고 `ZSCORE last-active` 미스를 "한 번도 폴링 안 함"으로 판정 | ③ | 큐 전체 스캔이 되어 `LIMIT` 기반 claim 설계가 바뀐다 |
 | **C** | `inactiveTtl` 하한 검증 한 줄 (`Queue.create`) | ② | 없음. 가장 싸다 |
 | **D** | sweep이 "`waiting`에 없는 seq"는 안 죽인다 | ② | ⚠️ **겉보기보다 비싸다.** `ZREM`까지 안 하면 stale 멤버가 매 주기 `LIMIT` 앞자리를 먹어 진짜 회수를 굶기고, `ZREM`만 하면 admit 복귀자의 유일한 회수 신호가 사라져 §80이 막으려던 좀비가 부활한다 |
 | **E** | 문서에만 하한·한계를 명시하고 넘어간다 | — | 깨지는 건 Tenant가 문서를 안 읽었을 때뿐 |
+| **F** | `poll_verify.lua`의 `if keepalive == '1'` **분기를 삭제**하고 항상 `ZADD` | ① (②의 연속-admit 잔여도 줄인다) | **코드가 줄어든다.** `ka`는 무시되므로 API 하위호환. §80과 충돌 없음 — §80이 금지한 건 *배치*가 리셋하는 것이고, F는 **사람이 폴링해야** 갱신된다. `/tokens/{tokenId}`는 rank 근접 + keepalive에만 오므로 증가분은 `ka=0` 몫뿐 |
 
 ⚠️ **되돌리기 어려운 지점**: `last-active`의 member 포맷(`seq`)이 sweep을 짜는 순간 굳는다.
 `"seq|identifier"`로 바꾸려면 폴링 핫패스(`poll_verify.lua`)를 고쳐야 하고 롤링 배포 중 두 포맷이
