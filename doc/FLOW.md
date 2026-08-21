@@ -189,7 +189,7 @@ flowchart TD
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
 
-    LUA -->|"admitToken TTL 60초 초과"| BACK["WAITING 복귀 — queue-batch (§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
+    LUA -->|"admitToken TTL 60초 초과"| BACK["종료 — queue-batch (§36·§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
 ```
 
 > **왜 DB WAITING 확인이 없나 (§80)**
@@ -205,20 +205,28 @@ flowchart TD
 
 ---
 
-## 이탈 → CANCELLED
+## 이탈 → EXPIRED
+
+> 🔴 **이탈 전용 엔드포인트는 없다 (DECISIONS §82).** `DELETE /queues/:queueId/tokens/:tokenId`는
+> 만들지 않는다. 유저가 취소 버튼을 누르든 탭을 닫든 네트워크가 끊기든, Platform이 관측하는
+> 신호는 **"폴링이 멈춘다"** 하나뿐이다. 아래 TTL 만료 Batch의 `inactiveTtl` 경로가 그것을 잡는다.
 
 ```mermaid
 flowchart TD
-    DQ(["DELETE /queues/:queueId/tokens/:tokenId\nTenant 서버 호출\n유저 대기 포기"])
-    --> CHK["상태 확인"]
+    U(["유저 이탈\n취소 버튼 · 탭 닫음 · 네트워크 끊김"])
+    --> STOP["브라우저가 폴링을 멈춘다\nqueue:{queueId}:last-active score가 늙는다"]
+    --> WAIT["유예 창 = inactiveTtl (기본 300초)\nTenant가 큐마다 정한다"]
 
-    CHK -->|"ADMIT_ISSUED(1)"| E409A(["409 QE_006_INVALID_STATUS\n입장토큰 발급 후 이탈 불가\nadmitToken TTL 60초 후\nWAITING 복귀 후 이탈 가능"])
-    CHK -->|"WAITING 아님\n(COMPLETED/EXPIRED/CANCELLED)"| E409B(["409 QE_006_INVALID_STATUS"])
-    CHK -->|"WAITING(0)"| ZREM["Redis ZREM\n뒤 순위 자동 당겨짐"]
-    --> DB["DB status = CANCELLED(3)\ncancelledAt 기록"]
-    --> DEL["HDEL queue:{queueId}:tokens {identifier}\nDEL token-info 캐시\n같은 identifier 재Enqueue 가능 (맨 뒤)"]
-    --> OK(["200 OK\n{ status: CANCELLED, cancelledAt }"])
+    WAIT -->|"창 안에 ka=1 폴링 재개"| BACK["poll_verify.lua가 ZADD last-active\n(재-enqueue는 순번만 복원할 뿐\nlast-active를 갱신하지 않는다)"]
+    WAIT -->|"창을 넘김"| JOB["TTL 만료 Batch가 회수\nlast-active member=seq → waiting에서 identifier 역산\nHGET tokens로 issuedAt 원본 확보(HDEL 전!)\nZREM waiting + ZREM last-active + HDEL tokens"]
+
+    JOB --> EXP["Kafka EXPIRED 발행 (key=tokenId)\nDB status = EXPIRED(4)\nexpiredReason = INACTIVE_TTL"]
+    EXP --> BILL(["과금 대상 — 자리를 끝까지 점유했다 (§82)"])
+    JOB --> NEW["이후 재-enqueue는 신규\n새 tokenId·새 seq → 맨 뒤\n과금 +1건"]
 ```
+
+**`HDEL tokens`가 곧 중복 게이트를 푸는 행위다.** 그래서 `inactiveTtl`은 단순한 청소 주기가
+아니라 **"몇 초까지 자리를 지켜줄 것인가"** 라는 유예 창이 된다.
 
 ---
 
@@ -238,7 +246,7 @@ flowchart TD
     W1 -->|"WAITING_TTL(0)"| EXP["DB UPDATE EXPIRED(4)\nexpiredReason 기록\nRedis ZREM\nDEL token-info 캐시\n100건씩 순차 처리\nLIMIT 100 → Gap Lock 방지"]
     W2 -->|"INACTIVE_TTL(1)"| EXP
 
-    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀 (queue-batch)\nmember에서 seq·identifier 파싱 (DB 조회 불필요)\nZADD queue:{queueId}:waiting {seq} {identifier}\nZREM queue:{queueId}:admitted\nKafka RETURNED 발행 → status 1→0\nDEL token-info 캐시\n※ last-active는 리셋하지 않는다 (§80)"]
+    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["종료 — 복귀 없음 (queue-batch, §36)\nmember에서 seq·identifier 파싱 (DB 조회 불필요)\nZADD queue:{queueId}:waiting {seq} {identifier}\nZREM queue:{queueId}:admitted\nKafka RETURNED 발행 → status 1→0\nDEL token-info 캐시\n※ last-active는 리셋하지 않는다 (§80)"]
 
     EXP --> DONE(["완료\n멱등: 상태 필터로 중복 처리 없음"])
     BACK --> DONE
@@ -320,11 +328,10 @@ flowchart TD
 |----------|------|------|------|
 | Tenant 서버 | 진입 시 | 1회 | 슬롯 여유 확인, 대기토큰 수신 |
 | Tenant 서버 | 입장 시 | 1회 | admitToken 전달, 세션 생성 |
-| Tenant 서버 | 이탈 시 | 1회 | 취소 요청 |
 | Platform (JS SDK) | 대기 중 | 2~30초마다 반복 | Polling (가장 빈번) |
 
 > Polling이 가장 빈번한 통신인데 JS SDK가 Platform과 직접 처리.
-> Tenant 서버는 진입/입장/이탈 3번만 관여.
+> Tenant 서버는 진입/입장 **2번만** 관여 (이탈은 API가 없다 — §82).
 > 이것이 "유저가 Platform에 직접 Polling" 원칙의 실제 구현.
 
 ---

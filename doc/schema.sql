@@ -154,11 +154,12 @@ CREATE TABLE tokens (
     expired_reason    TINYINT      NULL,
     admit_token       VARCHAR(50)  NULL,
     redis_sync_needed TINYINT      NOT NULL DEFAULT 0,
-    -- ⚠️ 아래 5개는 전부 UTC 벽시계다. 위 [시각 규약] 참조. DEFAULT를 붙이지 마라.
+    -- ⚠️ 아래 4개는 전부 UTC 벽시계다. 위 [시각 규약] 참조. DEFAULT를 붙이지 마라.
+    -- 🔴 cancelled_at 삭제 (DECISIONS §82) — Cancel API를 만들지 않아 status=3에 도달하는
+    --    경로가 없다. 이탈은 inactiveTtl 판정 배치가 잡고 expired_at에 기록된다.
     issued_at         DATETIME(3)  NOT NULL,
     admitted_at       DATETIME(3)  NULL,     -- admit 시각 (DECISIONS §80)
     completed_at      DATETIME(3)  NULL,
-    cancelled_at      DATETIME(3)  NULL,
     expired_at        DATETIME(3)  NULL,
 
     PRIMARY KEY (id, issued_at),
@@ -233,7 +234,7 @@ CREATE TABLE queue_daily_stats (
     stat_date         DATE        NOT NULL,
     total_enqueued    INT         NOT NULL DEFAULT 0,
     total_completed   INT         NOT NULL DEFAULT 0,
-    total_cancelled   INT         NOT NULL DEFAULT 0,
+    -- 🔴 total_cancelled 삭제 (DECISIONS §82) — 항상 0이 될 컬럼이다
     total_expired     INT         NOT NULL DEFAULT 0,
     total_admit_count INT         NOT NULL DEFAULT 0,
     avg_wait_sec      INT         NULL,
@@ -255,7 +256,7 @@ CREATE TABLE queue_daily_stats (
 -- Step 1: queue_daily_stats 집계 (파티션 DROP 전 필수)
 INSERT INTO queue_daily_stats
     (tenant_id, queue_id, stat_date,
-     total_enqueued, total_completed, total_cancelled,
+     total_enqueued, total_completed,
      total_expired, total_admit_count, avg_wait_sec, max_wait_sec)
 SELECT
     tenant_id,
@@ -263,7 +264,6 @@ SELECT
     DATE(issued_at)                                             AS stat_date,
     COUNT(*)                                                    AS total_enqueued,
     SUM(status = 2)                                             AS total_completed,
-    SUM(status = 3)                                             AS total_cancelled,
     SUM(status = 4)                                             AS total_expired,
     0                                                           AS total_admit_count,
     -- ⚠️ issued_at·completed_at 둘 다 UTC일 때만 맞다. completed_at은 Sprint 7 미구현이다.
@@ -278,6 +278,8 @@ GROUP BY tenant_id, queue_id, DATE(issued_at)
 ON DUPLICATE KEY UPDATE id = id; -- 멱등: 배치 재실행 안전
 
 -- Step 2: billing_snapshots 집계 (tokens 원본에서 직접)
+--   🔴 상태 술어를 넣지 마라 (DECISIONS §82). 과금은 status를 보지 않는다 —
+--      WAITING·ADMIT_ISSUED·COMPLETED·EXPIRED 전부 한 건이다. 취소는 개념 자체가 없다.
 INSERT INTO billing_snapshots (tenant_id, year_month, count)
 SELECT tenant_id, '202604', COUNT(*)
 FROM tokens

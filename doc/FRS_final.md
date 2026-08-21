@@ -1,6 +1,16 @@
 # 📄 Queue Platform — 기능 정의서 (FRS)
 
-> 버전: v1.13 | 상태: 확정 | 대상: 실제 구현 범위
+> 버전: v1.15 | 상태: 확정 | 대상: 실제 구현 범위
+>
+> v1.15 변경사항 (DECISIONS §36): **admitToken TTL 만료 시 WAITING 복귀 폐기** — 만료는 종료이고
+> 재접속 → 재-enqueue → 맨 뒤다. `RETURNED` 이벤트 삭제, §6.3의 상태 B·B′와 그 미해결 `ErrorCode`
+> 후속이 **소멸**, `AdmitTokenExpiryJob`은 `HDEL tokens` + `EXPIRED` 발행으로 바뀐다.
+> ⚠️ DB `status`는 `1`로 남는다(`EXPIRED` 가드가 `status = 0` 전용) — 그것이 complete 300초 창을 살린다
+>
+> v1.14 변경사항 (DECISIONS §82): **Cancel API(`DELETE /tokens/:tokenId`) 폐기** — 엔드포인트 표·
+> 상태 머신·소비 측 가드에서 삭제, §6.7을 "이탈 → EXPIRED"로 재작성(`inactiveTtl` 판정 배치가
+> 유일 경로, 유예 창 개념 추가), `status = 3`을 예약값으로 표기, `QE_006_INVALID_STATUS`를
+> **쓰이는 곳 없음**으로 정정
 >
 > v1.13 변경사항 (Sprint 7 구현 반영 — `dev` `ba21221`, PR #31~38): 중복 게이트 `HSETNX`(=`tokens` Hash)
 > 명시, verify는 **DB 읽기 0회**(§6.5), complete 유효 창 **300초 확정**(§6.6),
@@ -55,7 +65,7 @@ Tenant    → 슬롯 관리 + 입장 제어
 | ~~sliceCount~~ | 폐기 — 대기열을 여러 ZSet으로 쪼개던 값. ZSet 하나로 확정 (§66 D2) |
 | ~~global-seq~~ | 폐기 — 큐별 `INCR queue:{queueId}:seq`로 대체 (§70 D9) |
 | identifier | Tenant가 만드는 UUIDv7. `waiting` ZSet의 member이자 중복 판정 키 (§66 D1 · §78) |
-| seq | 토큰의 순번(= ZSet score). ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
+| seq | 토큰의 순번(= ZSet score). Redis 전손 시 DB 재구성용(§71). ~~복귀 시 score 복원~~은 §36이 폐기 |
 | pacing | `/status`가 내려주는 폴링 간격 구간표. rank로 조회 → SDK가 지터를 더해 사용 (§79) |
 | lastAdmittedSeq | 마지막으로 admit된 seq(전광판). `rank = mySeq − lastAdmittedSeq` (§79) |
 | ~~nextPollAfterSec~~ | 폐기 — 서버가 개인별 간격을 계산해 내려주던 필드. `pacing`으로 대체 (§79) |
@@ -122,7 +132,7 @@ Redis (QueueKeys — §8 참조):
    Platform: COMPLETED + ZREM + Kafka 발행
    ← { status: COMPLETED, completedAt }
 
-(admitToken TTL 60초 초과 시 → WAITING 복귀. seq 유지. 우선순위 보존)
+(admitToken TTL 60초 초과 시 → **종료**. 복귀하지 않는다 — §36. 재접속 → 재-enqueue → 맨 뒤)
 ```
 
 ---
@@ -154,7 +164,6 @@ Redis (QueueKeys — §8 참조):
 | `POST` | `/api/v1/queues/:queueId/admit` | X-API-Key | Tenant 서버 | N명 입장토큰 발급 |
 | `POST` | `/api/v1/queues/:queueId/admit-tokens/:admitToken/verify` | X-API-Key | Tenant 서버 | 입장토큰 유효성 확인 |
 | `POST` | `/api/v1/queues/:queueId/tokens/:tokenId/complete` | X-API-Key | Tenant 서버 | 입장 완료 통보 → COMPLETED |
-| `DELETE` | `/api/v1/queues/:queueId/tokens/:tokenId` | X-API-Key | Tenant 서버 | 이탈 → CANCELLED |
 
 > **verify·complete 경로에 `queueId`가 들어간 이유** (DECISIONS §79):
 > admitToken 관련 Redis 키를 `queue:{queueId}:...` 해시태그로 묶기 위해서다. Tenant 서버는
@@ -168,7 +177,7 @@ Redis (QueueKeys — §8 참조):
 > **인증 주체가 경로마다 다르다는 것이 함정이다** — `GET /{queueId}/tokens/{tokenId}`(폴링)는
 > **유저가 직접** 부르고 API Key가 없으며, `GET /{queueId}/status`는 `permitAll`이다.
 > 즉 `/tokens/{tokenId}/complete`와 `/tokens/{tokenId}`를 정규식으로 **구분**해야 하고, 뭉개면
-> **폴링이 401**이 된다. 아직 미구현인 `DELETE /{queueId}/tokens/{tokenId}`(이탈)도 같은 함정이다.
+> **폴링이 401**이 된다. (~~`DELETE /{queueId}/tokens/{tokenId}`~~는 §82로 폐기돼 이 함정이 하나 줄었다.)
 
 ### 4.2 관리 API
 
@@ -207,7 +216,7 @@ Redis (QueueKeys — §8 참조):
 0 = WAITING
 1 = ADMIT_ISSUED
 2 = COMPLETED
-3 = CANCELLED
+3 = CANCELLED   ← 🔴 예약값. 도달하는 경로가 없다 (DECISIONS §82)
 4 = EXPIRED
 ```
 
@@ -217,10 +226,8 @@ stateDiagram-v2
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
     ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-lifecycle 발행
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
-    WAITING --> CANCELLED : DELETE /token\nKafka token-lifecycle 발행
-    WAITING --> EXPIRED : Batch\nKafka token-lifecycle 발행
+    WAITING --> EXPIRED : Batch (waitingTtl · inactiveTtl)\nKafka token-lifecycle 발행
     COMPLETED --> [*]
-    CANCELLED --> [*]
     EXPIRED --> [*]
 ```
 
@@ -348,7 +355,7 @@ Response (ADMIT_ISSUED):  { "ready": true, "admitToken": "adm_..." }
 |---|---|---|
 | admit됐다 (`waiting`엔 없지만 `admit-by-token`에 있다) | — (200) | `ready:true` + `admitToken` |
 | 취소·만료로 토큰이 진짜 사라짐 | `TK001` (기존 `TOKEN_NOT_FOUND`) | **종료** |
-| admitToken TTL 만료 → WAITING 복귀 대기 중 (배치 반영 전) | **신규 ErrorCode (미구현)** | **백오프 후 재시도** |
+| ~~admitToken TTL 만료 → WAITING 복귀 대기 중~~ | 🔴 **소멸 (§36)** — 복귀가 없으므로 이 상태가 존재하지 않는다 | `TK001` → **재접속 안내** |
 
 > 🔴 **미해결.** 현재 `ErrorCode`에는 `TOKEN_NOT_FOUND` 하나뿐이라 아래 두 줄이 뭉개진다.
 > **판정 수단이 없는 것이 원인이다** — 복귀 대기 중인 사람은 `admitted` ZSet에 남아 있는데,
@@ -445,7 +452,8 @@ count 상한: 100. @Max(100) 한 줄로 강제한다 (전용 검증 클래스 �
   cap 100 × admit 10 rps = 1,000/s로 이미 24배다. 근거·상향 절차는 §80 ⑦.
 
 admitToken TTL: 60초
-만료 시: WAITING 복귀 (seq 유지 → 우선순위 보존). 트리거는 admitted ZSet claim (§36·§80)
+만료 시: **종료** (§36). claim 잡이 `HGET`→`HDEL tokens`로 중복 게이트를 풀고 `EXPIRED` 발행.
+           복귀하지 않는다. 트리거는 admitted ZSet claim (§80)
 
 admitToken 생성: tokenId와 동일하게 UUIDv7(랜덤 74비트). 짧은 랜덤 금지.
   verify가 이 값 하나만으로 통과하므로 admitToken 자체가 입장 자격이다.
@@ -572,18 +580,45 @@ Body: { admitToken: "at_xxx" }
 Response: { "status": "COMPLETED", "completedAt": "..." }
 ```
 
-### 6.7 이탈 → CANCELLED
+### 6.7 이탈 → EXPIRED
+
+> 🔴 **이탈 전용 엔드포인트는 없다 (DECISIONS §82).** `DELETE /tokens/:tokenId`를 만들지 않는다.
+> Cancel은 이탈의 일부(취소 버튼)만 덮는데 그 일부조차 `inactiveTtl`이 이미 덮고, 탭 닫기·네트워크
+> 끊김은 Tenant가 알 방법이 없어 Cancel로는 못 잡는다. 이탈 감지 배치는 어차피 필요하다.
 
 ```
-DELETE /api/v1/queues/:queueId/tokens/:tokenId
-조건: WAITING(0)만. ADMIT_ISSUED(1) → 409
+트리거: 브라우저가 ka=1 폴링을 멈춘다 (취소 버튼 · 탭 닫음 · 네트워크 끊김 — 신호는 하나다)
 
-처리:
-  Redis ZREM queue:{queueId}:waiting {identifier}
-  DB status = CANCELLED(3)
-  HDEL queue:{queueId}:tokens {identifier}   ← complete와 같은 이유로 마지막 (§6.6)
-  Kafka token-lifecycle 발행 (key=tokenId)
+판정:   seqs = ZRANGEBYSCORE queue:{queueId}:last-active -inf (now_ms - inactiveTtl_ms) LIMIT 0 N
+        🔴 last-active의 member는 **seq**다 (§8 키표 · poll_verify.lua). identifier가 아니다.
+        ※ EVAL 하나 안에서 판정+제거 → 그 자체가 claim (admit_expire.lua와 같은 근거, §80 ⑧).
+          Java로 쪼개면 batch N대의 유일한 동시성 방어가 사라진다.
+
+처리 (seq마다):
+  identifier = ZRANGEBYSCORE queue:{queueId}:waiting {seq} {seq}    ← seq→identifier 역산.
+        🔴 admit_expire.lua는 member가 "seq|identifier"라 이 단계가 없다. 복사하면 안 된다.
+        없으면(= admit되어 waiting에 없음) → 아래 "미해결 ②" 참조
+  stored = HGET queue:{queueId}:tokens {identifier}   → "tokenId|issuedAt"
+        🔴 HDEL보다 **먼저** 읽어야 한다. issuedAt 원본을 못 실으면 UNIQUE(token_id, issued_at)에
+          충돌이 안 나 **같은 토큰의 두 번째 행**이 생기고, 과금이 상태를 안 보므로(§82)
+          그 행이 한 건 더 청구된다. admit.lua가 같은 이유로 HGET을 먼저 한다.
+
+  Redis ZREM queue:{queueId}:waiting     {identifier}
+        ZREM queue:{queueId}:last-active {seq}
+        HDEL queue:{queueId}:tokens      {identifier}   ← complete와 같은 이유로 마지막 (§6.6)
+  DB status = EXPIRED(4)
+        ⚠️ expiredReason은 현재 TRANSITION_INSERT 컬럼에 없다 — 실으려면 별도 결정이 필요하다
+  Kafka token-lifecycle 발행 (key=tokenId, eventType=EXPIRED, issuedAt=원본)
 ```
+
+**`HDEL tokens`가 중복 게이트를 푸는 행위이므로, `inactiveTtl`은 곧 유예 창이다.**
+그 전에 같은 identifier로 재-enqueue하면 `enqueue_bulk.lua`의 `HSETNX`가 `EXISTS`를 돌려주어
+**기존 `tokenId`·`seq`·`rank`가 복원**된다(§6.2). 창을 넘기면 신규로 판정되어 맨 뒤에 선다.
+값은 `QueueCreateRequest.inactiveTtl`로 Tenant가 큐마다 정한다(기본 300초).
+
+⚠️ **재-enqueue는 생존 신호가 아니다.** `enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS는 `waiting`·`seq`·`tokens` 3종). 순번이 복원돼도 다음 `ka=1` 폴링이 오기 전에 배치가 돌면 그대로 회수된다. 창을 되살리는 유일한 신호는 **`ka=1` 폴링 재개**다.
+
+⬜ **미구현** — Sprint 9 회수 배치.
 
 ---
 
@@ -593,7 +628,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 
 | 토픽 | 파티션 키 | 파티션 | 설명 |
 |------|------------|------|------|
-| `token-lifecycle` | **`tokenId`** | 18 | 토큰 생명주기 **단일 토픽** — enqueue + 상태 전이(admit/complete/cancel/expire) |
+| `token-lifecycle` | **`tokenId`** | 18 | 토큰 생명주기 **단일 토픽** — enqueue + 상태 전이(admit/complete/expire) |
 | `token-lifecycle.DLT` | — | 18 | 격리된 실패 레코드 |
 
 **왜 단일 토픽 + `tokenId` 키인가 (DECISIONS §73 D16·D18)**
@@ -638,9 +673,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 |---|---|---|
 | `ENQUEUED` | (신규) | `ON DUPLICATE KEY UPDATE token_id = token_id` (no-op) |
 | `ADMITTED` | 0 | `IF(status = 0, 1, status)` |
-| `RETURNED` | 1 | `IF(status = 1, 0, status)` |
 | `COMPLETED` | 1 | `IF(status = 1, 2, status)` |
-| `CANCELLED` | 0 | `IF(status = 0, 3, status)` |
 | `EXPIRED` | 0 | `IF(status = 0, 4, status)` |
 
 > 🔴 **순서를 파티션에 기대지 않는다.** 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있고,
@@ -745,7 +778,7 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | Job | 주기 | 처리 |
 |-----|------|------|
 | `TokenExpiryJob` | 10초 | WAITING TTL 만료 → EXPIRED + Kafka 발행 |
-| `AdmitTokenExpiryJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → WAITING 복귀 (seq 유지) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
+| `AdmitTokenExpiryJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
 | `RedisSyncJob` | 5분 | redis_sync_needed=1 토큰 → Redis 재삽입 |
 | `BillingSnapshotJob` | M+2월 초 | tokens 원본 집계 → queue_daily_stats + billing_snapshots → 파티션 DROP |
 
@@ -794,8 +827,8 @@ DELETE /api/v1/queues/:queueId/tokens/:tokenId
 | 가칭 | HTTP | 상황 | 필요해지는 시점 |
 |------|------|------|---|
 | ~~`TK_002_INVALID_ADMIT_TOKEN`~~ | — | **구현됨** — 위 표의 `INVALID_ADMIT_TOKEN`(`TK002`) | — |
-| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 — **complete에는 쓰지 않는다.** §6.6이 원인(상태 불가 · admitToken 불일치 · 유효 창 초과)을 구분하지 않고 전부 `TK002` 404로 답하기로 확정했다. 남은 후보는 **이탈(`DELETE /tokens/:tokenId`)뿐**이고 그 API가 미구현이다 | 이탈 구현 시 |
-| (WAITING 복귀 대기) | 404 | admitToken TTL 만료 → 배치 반영 전 (§6.3 404 계약) | **미해결** — ErrorCode만 추가해선 던질 수 없다(§6.3 판정 수단 부재) |
+| `QE_006_INVALID_STATUS` | 409 | 상태 전환 불가 — **complete에는 쓰지 않는다.** §6.6이 원인(상태 불가 · admitToken 불일치 · 유효 창 초과)을 구분하지 않고 전부 `TK002` 404로 답하기로 확정했다. 남은 후보였던 이탈(`DELETE /tokens/:tokenId`)은 **§82로 폐기**됐다 → **쓰이는 곳이 없다** | 없음 |
+| ~~(WAITING 복귀 대기)~~ | 404 | 🔴 **소멸 (§36)** — 복귀가 없어 이 상태가 존재하지 않는다 | ~~**미해결** — ErrorCode만 추가해선 던질 수 없다(§6.3 판정 수단 부재) |
 
 ---
 
@@ -925,7 +958,7 @@ keepalive:
 ### MySQL Read/Write 분리
 
 ```
-Write → Master: UPDATE (complete, cancel, expire)
+Write → Master: UPDATE (complete, expire)
 Read  → Replica: SELECT (Polling, API Key)
 INSERT → Kafka Consumer → Master (비동기)
 @Transactional(readOnly = true) → Replica
@@ -974,5 +1007,5 @@ BCrypt → 별도 스케줄러 격리 불필요
 > 유저는 **Platform에 직접 Polling**한다 (`pacing` 구간표 기반 적응형, §79).
 > verify = 유효성 확인만. complete = COMPLETED + ZREM + Kafka 발행.
 > DB 먼저, ZREM 나중 — **잔류가 유실보다 안전**하다.
-> seq를 DB에 저장 — **ADMIT_ISSUED 복귀 시 순위 복원 가능**하다.
+> seq를 DB에 저장 — **Redis 전손 시 DB 재구성**(§71)이 주 용도다. ~~ADMIT_ISSUED 복귀 시 순위 복원~~은 §36이 폐기.
 > Kafka At-Least-Once — **DB INSERT는 반드시 보장**된다.

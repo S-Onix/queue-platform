@@ -49,11 +49,11 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ✅ Sprint 3   완료 (2026-04-23)
 ✅ Sprint 4   완료 (2026-04-24)
 🔄 Sprint 5   5-A/B/C/D/E 완료, 5-F(문서) 진행 중
-🔄 Sprint 6   Token 도메인 + Enqueue + Polling 구현 / Cancel(DELETE) 미착수
+✅ Sprint 6   Token 도메인 + Enqueue + Polling 구현 완료 (Cancel API는 §82로 폐기 — 범위에서 제거)
 ✅ Sprint 7   admit·verify·complete + §79(/status·watermark·pacing) 구현 완료 (dev ba21221, PR #31~38)
               ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
               ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
-🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·RETURNED·COMPLETED 발행까지 완료
+🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·COMPLETED 발행까지 완료 (~~RETURNED~~는 §36이 폐기)
 🔄 Sprint 9   queue-batch에 AdmitTokenExpiryJob 1개 (§80). 나머지 3개 잡·회수 경로는 미착수
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
@@ -421,14 +421,16 @@ flowchart TD
 
 ---
 
-### 🔄 Sprint 6 — Token 도메인 + Queue Engine API (Enqueue / Polling) — **Cancel만 남음**
+### ✅ Sprint 6 — Token 도메인 + Queue Engine API (Enqueue / Polling)
 
 **예상 기간:** 1.5주
 **카테고리:** MVP
 
 **주요 산출물:**
 - ✅ **Token 도메인 모델** (분할된 Sprint 3의 후반)
-  - Token Rich Domain (`complete`, `cancel`, `expire`, `returnToWaiting`, `waitingSeconds`)
+  - Token 도메인 — 실제 public 메서드는 `issue` · `transition` · `reconstruct` 셋이다.
+    ~~`complete`·`expire`·`returnToWaiting`·`waitingSeconds`·`cancel`~~은 초판 구상으로, **§80이 전이 강제를
+    Kafka 소비 측 UPSERT 가드로 옮기면서 만들지 않았다**
   - `TokenRepository` Port 인터페이스
   - JPA Entity 파티셔닝 고려 (PK = token_id + issued_at)
 - ✅ **Enqueue API**
@@ -438,16 +440,17 @@ flowchart TD
   - Kafka 적재는 Sprint 8에서 이미 붙었다 (동기 DB INSERT 단계를 거치지 않았다)
 - ✅ **Polling API**
   - `GET /queues/:queueId/tokens/:tokenId?seq=&ka=` — `poll_verify.lua` 소유권 검증 (§74)
-- ⬜ **Cancel API**
-  - `DELETE /queues/:queueId/tokens/:tokenId` → CANCELLED **(미착수 — 이 Sprint의 잔여 전부)**
+- 🔴 ~~**Cancel API** `DELETE /queues/:queueId/tokens/:tokenId`~~ — **범위에서 제거 (DECISIONS §82).**
+  이탈은 `inactiveTtl` 판정 배치가 전담하고 결과는 EXPIRED(4)다. 그 배치는 Sprint 9 회수 배치에 있다.
+  **이로써 Sprint 6은 잔여 없이 종료된다.**
 
 **완료 기준 (DoD):**
-- [x] Token 도메인 단위 테스트 (상태 전환 매트릭스 전체)
+- [x] 상태 전환 매트릭스 검증 — 도메인이 아니라 **`TokenJpaAdapterIntegrationTest`**(소비 측 가드 UPSERT)가 한다 (§80)
 - [x] 1,000명 동시 Enqueue → 순번 중복 0건 (실제 Redis)
 - [x] 중복 identifier Enqueue 시 기존 토큰 반환 (멱등 처리)
 - [x] 폴링 소유권 — 남의 `seq` + 내 `tokenId` → 404 (§74)
-- [ ] Cancel 후 같은 identifier 재Enqueue 가능 (맨 뒤로)
-- [ ] Polling 응답 시간 p99 < 50ms — **로컬 수치는 신뢰 구간이 아니다.** Sprint 10(k6)로 이관
+- [x] 같은 identifier 재Enqueue 시 기존 순번 복원 (`HSETNX` → `EXISTS`) — §82의 유예 창 근거
+- [x] ~~Polling 응답 시간 p99 < 50ms~~ — **로컬 수치는 신뢰 구간이 아니다.** Sprint 10(k6)로 **이관 완료**
 
 > ~~`nextPollAfterSec` 4단계(30/10/5/2초) 분기 테스트~~ — **§79가 이 필드를 응답에서 제거**하고
 > `/status`의 `pacing` 구간표 + SDK 계산으로 바꿨다. **2026-08-20 기준 구현 완료** —
@@ -489,8 +492,9 @@ flowchart TD
   (`admit_token = ?` + `status IN (0,1)` + `admitted_at` 유효 창) → Redis 정리는 나중
 - `queue:{queueId}:admitted` ZSet 신설 (score=만료 epoch ms, member=`"seq|identifier"`) — `QueueKeys` 경유
 - `tokens.admitted_at` 컬럼 추가
-- Kafka `ADMITTED`·`RETURNED` 이벤트 + **소비 측 전이 가드**(허용 출발 상태별 조건부 UPSERT)
-- **ADMIT_TOKEN_TTL 만료 → WAITING 복귀** — `admitted` ZSet claim-Lua, 실행 주체 **`queue-batch`**
+- Kafka `ADMITTED`·`EXPIRED` 이벤트 + **소비 측 전이 가드**(허용 출발 상태별 조건부 UPSERT). ~~`RETURNED`~~는 §36이 폐기
+- **ADMIT_TOKEN_TTL 만료 → 종료** — `admitted` ZSet claim-Lua, 실행 주체 **`queue-batch`**.
+  🔴 **§36(2026-08-21)이 복귀를 폐기**했다 — claim 후 `ZADD waiting`이 아니라 `HGET`→`HDEL tokens`+`EXPIRED` 발행
   ← 포트폴리오 차별 포인트
   - **ShedLock을 쓰지 않는다.** `ZRANGEBYSCORE 0 now` + `ZREM`이 한 Lua 안이면 **`EVAL` 자체가 claim**이라
     3대가 같은 초에 돌아도 한 대만 멤버를 가져간다. `CLAUDE.md` "`@Scheduled` 단독 금지" 규칙의
@@ -512,9 +516,10 @@ flowchart TD
   - `ZADD`가 Kafka 발행보다 먼저라 이 역전은 실재한다. `ENQUEUED`의 no-op upsert가 흡수해야 한다
 - [ ] **`COMPLETED` 행에 `ADMITTED`가 도착해도 되살아나지 않는다** (가드가 허용 출발 상태를 본다)
 - [ ] **WAS N대에서 동시 admit → watermark 단조증가, 후퇴 0건** (조건부 갱신이 없으면 늦게 도착한 작은 seq가 값을 되돌린다)
-- [ ] **TTL 만료로 WAITING 복귀한 토큰이 다음 admit 배치의 맨 앞에 온다** — `ZPOPMIN`이 곧 최소 seq이므로 자동으로 성립해야 한다
+- [x] ~~**TTL 만료로 WAITING 복귀한 토큰이 다음 admit 배치의 맨 앞에 온다**~~ — 🔴 **§36이 복귀를 폐기해 대상이 없다**
   - §79가 "watermark는 **표시 전용**"이라고 🔴 가드레일로 못 박았지만 **강제 수단이 없다.** 이 DoD가 그 수단이다. watermark를 커서로 쓰면 복귀 토큰(seq < watermark)이 영구히 건너뛰어진다
-- [ ] admitToken TTL 60초 경과 → `admitted` ZSet claim → WAITING 복귀 + seq 복원 검증
+- [ ] admitToken TTL 60초 경과 → `admitted` ZSet claim → **`HDEL tokens` + `EXPIRED` 발행** 검증 (§36)
+- [ ] 만료 후 같은 identifier로 재-enqueue → **새 tokenId·새 seq(맨 뒤)** 를 받는다 (게이트가 풀렸다는 증거)
 - [ ] TTL 만료 후 verify → **404**
 - [ ] complete가 `status = 0`(복귀 후)에도 성공한다 — 유효 창 안이면
 - [ ] 중복 complete 요청 → 1번만 성공 (조건부 UPDATE가 0행)
@@ -542,7 +547,7 @@ flowchart TD
 **참조 문서:** **DECISIONS §80 (이 Sprint의 설계 정본)**, §79 (watermark·pacing), §36 (TTL 복귀),
 FRS §6.4~6.6, STATE.md 전이 가드 표
 
-**Sprint 핵심 차별 포인트:** admitToken 만료 시 WAITING 복귀 (seq 기반 우선순위 보존)
+**Sprint 핵심 차별 포인트:** admitToken 만료 시 **종료**(§36) — Platform이 만료 원인을 구분할 수 없으므로 판정하지 않는다
 
 ---
 
@@ -556,7 +561,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 > 안에서만 성립하고, `queueId` 키는 한 큐 30만 명이 통째로 한 파티션에 몰려 파티션을 늘려도 소용이 없다.
 > **현행: 단일 토픽 `token-lifecycle` / 파티션 키 `tokenId` / 18 파티션 / RF 3 / min.insync 2**
 > (`scripts/kafka/create-topics.sh`). Enqueue 적재 경로는 **이미 구현·실측 완료**(100만건, §73)이며,
-> 남은 것은 **상태 전이 이벤트**(admit/complete/cancel/expire)로 Sprint 7과 함께 온다.
+> 남은 것은 **상태 전이 이벤트**(admit/complete/expire)로 Sprint 7과 함께 온다.
 
 **선행 인프라:** [INFRA_SETUP.md §3](INFRA_SETUP.md) — Kafka 3 브로커 KRaft 모드 (9092/9192/9292) WSL2 직접 설치
 
@@ -573,7 +578,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
   - `@EnableScheduling` 금지 (붙이면 infra의 `@Scheduled` 빈까지 돌아 이중 적재)
   - actuator + micrometer-prometheus 포함 (없으면 컨슈머 lag을 PromQL로 볼 수단이 사라진다)
 - ✅ `TokenLifecycleConsumer` (배치 적재 → `tokens` 멱등 INSERT) + `TokenPersistService`
-- ⬜ **상태 전이 이벤트 발행** (admit/complete/cancel/expire) — 같은 토픽·같은 키(`tokenId`). **Sprint 7과 동시**
+- ⬜ **상태 전이 이벤트 발행** (admit/complete/expire) — 같은 토픽·같은 키(`tokenId`). **Sprint 7과 동시**
 - ✅ admit 요청 전달 수단 — **명령 토픽을 만들지 않는 것으로 닫혔다(§80).** admit이 동기 처리라 전달할 명령이 없다. 구 `enqueue-admit`·`AdmitConsumer`·`admit_requests`는 전부 폐기
 - ⬜ `BillingConsumer` 스켈레톤 (실제 집계는 Sprint 9)
 
@@ -609,6 +614,12 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - `queue-batch` 모듈 활성화 (bootRun 가능)
 - `TokenExpiryJob` (10초 주기)
   - waitingTtl / inactiveTtl / admit-token TTL 3종 감지
+    - `admit-token TTL`은 **Sprint 7에서 `AdmitTokenExpiryJob`으로 이미 구현**됐다 (재사용)
+    - 🔴 `inactiveTtl`은 **§82로 이탈 회수의 유일한 경로**가 됐다 — 판정에 그치지 않고
+      `ZREM waiting` + `ZREM last-active` + `HDEL tokens` + **`EXPIRED` Kafka 발행**까지 한다.
+      `HDEL` 전에 `HGET tokens`로 `issuedAt` 원본을 확보해야 한다(§82 ③ · §83)
+    - ⬜ `waitingTtl` 판정 소스는 **미정**이다 — `waiting` ZSet의 score는 `seq`라 시간축이 없다.
+      DB `tokens.issued_at`이 유력하나 착수 시 결정한다
   - `batch-lock:{t}:{q}` 분산 락
 - `RedisSyncJob` (5분 주기)
   - `redis_sync_needed=1` 토큰 → Redis 재삽입
@@ -624,7 +635,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 | # | 과제 | 왜 지금인가 |
 |---|---|---|
 | 1 | **`queue-batch`에 actuator + micrometer-prometheus 추가** | **reconciliation의 선행 조건.** 현재 `queue-batch/build.gradle`에는 `starter-web`만 있고 actuator·micrometer가 **없다** → 만들어도 유령 토큰 수를 지표로 못 낸다. `queue-consumer`가 같은 이유로 이미 갖고 있다 |
-| 2 | **회수 배치** — `queue:{q}:last-active` ZSet `ZREM` / `queue:{q}:tokens` Hash `HDEL` | 두 명령 모두 **전 프로덕션 코드 0건**이다. 쓰기만 하고 지우지 않아 30만 큐가 한 바퀴 돌 때마다 멤버가 영구 누적된다. TokenExpiryJob이 만료를 판정하는 이 스프린트가 회수를 붙일 자리다 |
+| 2 | **회수 배치** — `queue:{q}:last-active` ZSet `ZREM` / `queue:{q}:tokens` Hash `HDEL` | 두 명령 모두 **전 프로덕션 코드 0건**이다. 쓰기만 하고 지우지 않아 30만 큐가 한 바퀴 돌 때마다 멤버가 영구 누적된다. 🔴 **§82로 무게가 커졌다** — 누수 정리에 그치지 않고 **이탈 회수의 유일한 경로**다. 상태 전이(EXPIRED)와 Kafka 발행을 빼먹으면 이탈자가 DB에 영원히 WAITING으로 남는다 |
 | 3 | **reconciliation 스위퍼** (Redis엔 있고 DB엔 없는 유령 토큰) | §73이 "Redis-Kafka 사이엔 분산 트랜잭션이 없어 발행 갭은 **영구적**"이라며 필수 후속으로 남겼다. 100만건 실측에서 실제로 835건 발생. **1번 다음에 온다** |
 | 4 | `ApiKeyCache.invalidate` 프로덕션 호출 연결 (revoke 경로) | 구현·포트 선언은 있는데 **호출부가 0건**이라 폐기된 키가 최대 60초 살아 있다. 배치가 아니라 revoke 서비스 쪽 한 줄이지만, 다른 정리 작업과 함께 처리 |
 
@@ -632,7 +643,9 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - [ ] Batch Server 기동 후 TokenExpiryJob 10초 주기 실행 로그 확인
 - [ ] `queue-batch`의 `/actuator/prometheus`가 200을 반환 (위 1번 — reconciliation 지표의 전제)
 - [ ] 만료 처리 후 `zcard last-active` ≤ `zcard waiting` 유지 (위 2번 — 누적이 멈췄다는 증거)
-- [ ] admitToken TTL 만료 케이스 → WAITING 복귀 동작 (Sprint 7 로직 재사용)
+- [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
+      `issued_at`이 원본과 같아 **두 번째 행이 생기지 않는지** 함께 확인 (§83 함정)
+- [ ] admitToken TTL 만료 케이스 → **종료 + 게이트 해제** 동작 (§36)
 - [ ] Redis 다운 시뮬레이션 → 복구 후 RedisSyncJob이 미반영 토큰 재삽입
 - [ ] **BillingSnapshotJob 수동 트리거 동작 확인** (예: HTTP endpoint 또는 테스트 프로파일)
 - [ ] **파티션 운영 쿼리 dry-run 검증** (schema.sql의 Step 1~4 각 쿼리 실행 + EXPLAIN)
@@ -960,7 +973,7 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 | 4 | Refresh Token 버전 기반 재사용 감지 + Rotation |
 | **5** | **Lua Script 원자성 + Sentinel Failover 실증 + Rate Limiter 알고리즘 분리 + Tenant Plan 동적 SLA** ⭐ |
 | 6 | 폴링 소유권 검증을 Lua 원자 1회로 (§74) — seq 존재 판정만으로는 남의 자리를 훔칠 수 있었다 |
-| **7** | **admitToken TTL 만료 → WAITING 복귀 (seq 기반 우선순위 보존)** ⭐ |
+| **7** | **admitToken TTL 만료 → 종료. 복귀하지 않는다(§36) — 재접속 → 맨 뒤** ⭐ |
 | 8 | Kafka KRaft + At-Least-Once + 동기→비동기 리팩토링 경험 |
 | 9 | 파티션 1달 유예 DROP 전략 (월말 과금 누락 방지) |
 | **10** | **k6 2,000 rps 로컬 실측 p99 < 50ms + Grafana 대시보드 + JS SDK 데모** ⭐ |
@@ -986,13 +999,15 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
   늘린다는 것이 통합테스트에서 확인됐다(14,747건 ≈30주기). 지금은 볼 수단이 없다 (§80 ⑦)
 - **`admit.lua`의 로컬 Cluster(7001-7008) 실행 검증** — 왜 지금인가: 동적 키 3종이 `KEYS[]`에
   없어 **CROSSSLOT 그물이 안 걸리는 첫 스크립트**다. 프로덕션 전환 전에만 하면 되지만 비용이 싸다
-- Sprint 6 잔여: Cancel(`DELETE /tokens/:tokenId`) — 왜 지금인가: `tokens` Hash 회수 경로가
-  complete 하나뿐이라, 이탈 API가 생겨야 "떠난 사람" 누수의 절반이 닫힌다. ⚠️ `ApiKeyAuthenticationFilter`
-  화이트리스트를 함께 고쳐야 한다(폴링 경로와 정규식이 겹친다 — `28106ba`와 같은 함정)
+- **`inactiveTtl` 판정 배치 (Sprint 9 회수 배치에 포함)** — 왜 지금인가: `tokens` Hash 회수 경로가
+  complete 하나뿐이라 "떠난 사람"이 `waiting` ZSet에 무기한 남는다. **§82로 Cancel API를 폐기했으므로
+  이 배치가 이탈 회수의 유일한 경로다.** 판정 = `ZRANGEBYSCORE last-active -inf (now - inactiveTtl)`,
+  회수 = `ZREM waiting` + `HDEL tokens` + `ZREM last-active`, 발행 = `EXPIRED`.
+  `admit_expire.lua`의 claim 패턴(한 EVAL 안에 조회+제거)을 그대로 쓴다
 - 5-F: Sprint 5 마무리 (문서 갱신 · 회고)
 
 ### 중기 (다음 Sprint)
-- Sprint 9: 회수 배치 + reconciliation (~~`queue-batch` actuator가 선행~~ → **선행 완료**, `6647ca5`)
+- Sprint 9: 회수 배치(= `inactiveTtl` 판정, §82) + reconciliation (~~`queue-batch` actuator가 선행~~ → **선행 완료**, `6647ca5`)
 - Sprint 8+: Cluster 프로덕션 도입 준비 (§75, 시점 미정 / 로컬 학습은 완료)
 
 ---

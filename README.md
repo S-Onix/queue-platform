@@ -18,7 +18,7 @@
 - **유저가 Platform에 직접 Polling** — `/status` 전광판 + `pacing` 구간표 (전원 동일 응답 → 캐시)
 - **Backpressure Pull** — Tenant가 소화 가능한 인원만 admit 요청
 - **admitToken TTL 60초** → verify(유효성 확인) → complete(COMPLETED+ZREM)
-- **admitToken 만료 시 WAITING 복귀** — seq 유지로 우선순위 보존
+- **admitToken 만료 시 종료** — 복귀하지 않는다(§36). 재접속 → 재-enqueue → 맨 뒤
 - **Kafka 버퍼** — Enqueue는 순번 확정 → Kafka 발행(동기) → 200 응답. **DB INSERT만 비동기**
 - **Virtual Thread** — Spring MVC + JPA blocking I/O를 OS Thread 고갈 없이 처리
 - **SDK 제공** — JS SDK(폴링·대기 UI 전용)만. Tenant 서버는 REST 직접 호출 (DECISIONS §35 · §78)
@@ -65,11 +65,13 @@ Tenant가 소화 가능한 만큼만 admit { count: N }
 Platform과 커플링 없음
 ```
 
-### 4. admitToken TTL 만료 → WAITING 복귀 (우선순위 보존)
+### 4. admitToken TTL 만료 → 종료 (복귀하지 않는다)
 ```
-TTL 60초 초과 → WAITING 복귀
-seq DB 저장 → Redis ZADD score 복원
-→ 다음 admit 호출 시 앞순서이면 재발급
+TTL 60초 초과 → claim 잡이 HGET → HDEL tokens (중복 게이트 해제) + EXPIRED 발행
+→ 유저는 404를 받고 재접속 → Tenant가 재-enqueue → 새 seq, 맨 뒤
+
+왜: Platform은 만료 원인(유저/불가항력/Tenant/Platform)을 구분할 수 없다.
+    Platform 귀책분(폴링 수령 지연)은 실측상 이미 60초 예산 안이므로 봐줄 이유가 없다.
 
 이유: 네트워크 지연 등 유저 귀책 아닐 수 있음
      EXPIRED 처리 시 유저가 맨 뒤로 → 불공평
@@ -121,7 +123,7 @@ flowchart TD
     Batch -->|"@Scheduled\n(ZRANGEBYSCORE, ZREM\nbatch-lock)"| Redis
     Batch -->|"DB UPDATE (expire)\n@Transactional"| DB_M
     API -->|"SELECT\n@Transactional(readOnly)"| DB_R
-    API -->|"UPDATE\n(complete, cancel)\n@Transactional"| DB_M
+    API -->|"UPDATE\n(complete)\n@Transactional"| DB_M
     DB_M -->|"복제"| DB_R
 ```
 
@@ -178,12 +180,15 @@ stateDiagram-v2
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
     ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka 발행
     ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
-    WAITING --> CANCELLED : DELETE /token
-    WAITING --> EXPIRED : Batch TTL 만료
+    WAITING --> EXPIRED : Batch TTL 만료\n(waitingTtl · inactiveTtl)
     COMPLETED --> [*]
-    CANCELLED --> [*]
     EXPIRED --> [*]
 ```
+
+> 🔴 **취소 전용 엔드포인트는 없다 (DECISIONS §82).** 유저가 취소 버튼을 누르든 탭을 닫든
+> 신호는 **"폴링이 멈춘다"** 하나이고, `inactiveTtl` 판정 배치가 EXPIRED(4)로 보낸다.
+> `inactiveTtl`은 **"몇 초까지 자리를 지켜줄 것인가"** 라는 유예 창이라, 그 안에 돌아오면
+> 같은 identifier로 재-enqueue해 **원래 순번이 복원**된다(창을 되살리는 신호는 `ka=1` 폴링 재개다).
 
 ---
 
@@ -368,7 +373,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 |------|------|------|------|
 | Spring MVC + Virtual Thread | 친숙한 생태계, 코드 단순 | blocking → VT 필요 | spring.threads.virtual.enabled=true 한 줄 적용 |
 | JPA + Virtual Thread | @Transactional 자연스러움 | blocking I/O | VT가 OS Thread 고갈 없이 처리 |
-| admitToken 만료 → WAITING 복귀 | 우선순위 보존. 유저 불이익 없음 | 슬롯 일시 점유 | seq DB 저장으로 score 복원 |
+| admitToken 만료 → **종료**(§36) | 좀비가 admit 슬롯을 재순환 점유하지 않는다 | 60초를 놓치면 맨 뒤 | Platform 귀책분(폴링 지연)이 이미 예산 안이라 봐줄 근거가 없다 |
 | Kafka Enqueue 버퍼 | DB 적재를 비동기로 흡수 | Eventually Consistent | At-Least-Once 보장 |
 | Kafka admit 처리 | admit 요청 영속성 | Consumer 처리 지연 | DB PENDING → 멱등성 보장 |
 | status TINYINT | 저장공간·비교 성능 | 가독성 (상수로 보완) | 대량 tokens 테이블 최적화 |
@@ -410,7 +415,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | [FRS v1.13](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
 | [STATE](doc/STATE.md) | Token · Queue · ApiKey 상태 머신 |
 | [FLOW](doc/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
-| [DECISIONS](doc/DECISIONS.md) | 81개 설계 결정 + 근거 + 면접 포인트 |
+| [DECISIONS](doc/DECISIONS.md) | 83개 설계 결정 + 근거 + 면접 포인트 |
 | [ROADMAP](doc/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
 | [CONCURRENCY](doc/CONCURRENCY.md) | 동시성 제어 우선순위 · `@DistributedLock` |
 
@@ -424,7 +429,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 ✅ Sprint 3:  관리 도메인 (Tenant + ApiKey + Queue) 헥사고날 구현
 ✅ Sprint 4:  JWT 인증 + 관리 API 12개 + Service/Controller 테스트
 🔄 Sprint 5:  Redis + Lua Script + Sentinel + Rate Limit
-🔄 Sprint 6:  Token 도메인 + Queue Engine API  (Enqueue·Polling 구현, Cancel 미구현)
+✅ Sprint 6:  Token 도메인 + Queue Engine API  (Enqueue·Polling 구현 / Cancel은 §82로 폐기)
 ⬜ Sprint 7:  Admit → Verify → Complete
 🔄 Sprint 8:  Kafka KRaft 연동  (token-lifecycle 적재 경로 구현)
 ⬜ Sprint 9:  Batch 모듈
