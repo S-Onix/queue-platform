@@ -102,11 +102,12 @@ public interface QueueEngine {
      * 것은 한 대뿐이고 나머지는 <b>빈 목록</b>을 받는다 — 그래서 ShedLock·leader election이
      * 필요 없다({@code CLAUDE.md} "{@code @Scheduled} 단독 금지" 규칙의 명시적 예외).
      *
-     * <p>되돌리는 일은 반환 시점에 이미 끝나 있다. 호출자가 할 일은 {@code RETURNED} 발행뿐이며,
-     * 그 발행이 실패해도 Redis를 되돌릴 수단은 없다(admit의 Kafka 발행과 같은 비대칭).
+     * <p><b>되돌리지 않는다</b>(§36). 중복 게이트 해제({@code HDEL tokens})는 반환 시점에 이미
+     * 끝나 있고, 호출자가 할 일은 {@code EXPIRED} 발행뿐이며 그 발행이 실패해도 Redis를 되돌릴
+     * 수단은 없다(admit의 Kafka 발행과 같은 비대칭).
      *
-     * <p><b>{@code last-active}는 건드리지 않는다</b>(§80 확정). 리셋하면 브라우저를 닫은 사람이
-     * 복귀할 때마다 되살아나 영원히 회수되지 않는다.
+     * <p><b>{@code last-active}는 건드리지 않는다</b>(§80 확정). §36으로 복귀가 사라져 리셋 논점
+     * 자체가 없어졌고, 만료자는 {@code waiting}에 없어 {@code inactiveTtl} sweep의 대상도 아니다.
      *
      * @param nowMillis 현재 epoch ms(UTC). <b>호출자가 넘긴다</b> — Lua의 {@code TIME}은 비결정적이다
      * @param limit     한 번에 집어올 최대 건수. 남은 몫은 다음 주기가 가져간다

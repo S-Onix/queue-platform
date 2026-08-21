@@ -244,7 +244,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 4. **Status는 TINYINT (0~4)**
    - VARCHAR 대비 저장공간·비교 성능 최적화
    - 0=WAITING, 1=ADMIT_ISSUED, 2=COMPLETED, 3=CANCELLED, 4=EXPIRED
-   - ⚠️ **3은 예약값이다** — Cancel API를 만들지 않아 도달 경로가 없다 (§82). 이탈은 전부 4로 간다
+   - ⚠️ **3은 결번이다** — Cancel API를 만들지 않아(§82) `TokenStatus.CANCELED` 상수를 삭제했다. 재사용 금지
+   - ⚠️ **admitToken TTL 만료자는 4가 아니라 1에 머문다**(§36) — complete의 300초 창을 살리기 위해서다
 
 5. **Kafka 비동기 처리**
    - Enqueue: Redis Lua(순번 확정) → **Kafka 발행(동기, ack 대기)** → **200 응답** → Consumer가 DB INSERT (At-Least-Once)

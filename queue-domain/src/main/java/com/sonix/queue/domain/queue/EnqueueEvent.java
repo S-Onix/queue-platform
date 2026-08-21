@@ -22,7 +22,7 @@ import java.time.Instant;
  *   <tr><td>{@code ENQUEUED}</td><td>null</td><td>null</td></tr>
  *   <tr><td>{@code ADMITTED}</td><td><b>필수</b></td><td><b>필수</b></td></tr>
  *   <tr><td>{@code COMPLETED}</td><td>필수(자격 증명)</td><td>null</td></tr>
- *   <tr><td>{@code RETURNED}·{@code CANCELLED}·{@code EXPIRED}</td><td>null</td><td>null</td></tr>
+ *   <tr><td>{@code EXPIRED}</td><td>null</td><td>null</td></tr>
  * </table>
  *
  * <p>여기서 강제하지 않는 이유: 이 record는 <b>역직렬화 경로</b>이기도 하다. 정식 생성자에서

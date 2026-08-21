@@ -430,7 +430,8 @@ public class RedisQueueEngine implements QueueEngine {
         @SuppressWarnings("unchecked")
         List<Object> raw = routeForWrite(queueId).execute(
                 admitExpireScript,
-                List.of(QueueKeys.admitted(queueId), QueueKeys.waiting(queueId), QueueKeys.tokens(queueId)),
+                // §36: 복귀가 없어져 waiting은 쓰이지 않는다. KEYS는 admitted·tokens 둘뿐이다.
+                List.of(QueueKeys.admitted(queueId), QueueKeys.tokens(queueId)),
                 Long.toString(nowMillis),
                 Integer.toString(limit)
         );

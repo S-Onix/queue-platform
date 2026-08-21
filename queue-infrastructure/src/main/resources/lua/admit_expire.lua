@@ -1,9 +1,12 @@
 -- admit_expire.lua
--- Queue Platform - admitToken TTL 만료 → WAITING 복귀 claim (FRS §10 / DECISIONS §36 · §80 ⑧)
+-- Queue Platform - admitToken TTL 만료 claim (FRS §10 / DECISIONS §36 · §80 ⑧)
+--   🔴 **복귀하지 않는다** (§36). 만료자를 waiting에 되돌리는 대신 tokens Hash 필드를 지워
+--   중복 게이트를 풀어준다 — 그래야 그 사람이 재접속해 재-enqueue로 맨 뒤에 설 수 있다.
+--   안 지우면 HSETNX가 계속 0을 돌려줘 EXISTS(rank -1)로 갇힌다(= 영구 락아웃).
 
 -- KEYS[1]: admitted key  (예: queue:{q_bts}:admitted) — ZSet, score=만료 epoch ms, member="seq|identifier"
--- KEYS[2]: waiting key   (예: queue:{q_bts}:waiting)  — ZSet, score=seq, member=identifier
--- KEYS[3]: tokens key    (예: queue:{q_bts}:tokens)   — Hash, identifier -> "tokenId|issuedAt"
+-- KEYS[2]: tokens key    (예: queue:{q_bts}:tokens)   — Hash, identifier -> "tokenId|issuedAt"
+--   ⚠️ waiting key는 더 이상 받지 않는다(§36으로 ZADD가 사라졌다). 호출부와 함께 바꿀 것.
 -- ARGV[1]: now (epoch ms 문자열). **Java가 넘긴다** — Lua의 TIME은 비결정적이라 쓰지 않는다
 -- ARGV[2]: limit (한 번에 집어올 최대 건수)
 
@@ -14,12 +17,11 @@
 -- 🔴 이 EVAL 자체가 claim이다 — ShedLock도 분산 락도 쓰지 않는다 (§80 ⑧).
 --   ZRANGEBYSCORE와 ZREM이 한 스크립트 안에 있으면 Redis 단일 스레드가 둘을 쪼개지 않는다.
 --   queue-batch가 N대여도 멤버를 가져가는 것은 한 대뿐이고 나머지는 빈 배열을 받는다.
---   중복 실행의 대가는 낭비된 EVAL 한 번이지 중복 복귀가 아니다.
+--   중복 실행의 대가는 낭비된 EVAL 한 번이지 중복 회수가 아니다.
 --   ⚠️ 그래서 ZRANGEBYSCORE와 ZREM을 Java로 쪼개면 그 순간 이 잡의 유일한 동시성 방어가 사라진다.
 
 local admittedKey = KEYS[1]
-local waitingKey = KEYS[2]
-local tokensKey = KEYS[3]
+local tokensKey = KEYS[2]
 
 local now = ARGV[1]
 local limit = tonumber(ARGV[2])
@@ -51,12 +53,12 @@ for i = 1, #expired do
 		                                             -- 포맷(%.14g)이 섞여 원래 score와 어긋난다
 		local identifier = string.sub(member, sep + 1)
 
-		-- 🔴 원래 seq 그대로 되돌린다. 이것이 §36의 핵심이다 — 새 seq를 받으면 60초 기다린
-		--    사람이 맨 뒤로 밀린다. ZADD(NX 아님)인 이유: 같은 identifier가 이미 대기 중이면
-		--    그건 재입장한 사람이고, 그 사람의 진짜 순번은 더 앞선 이 seq다.
-		redis.call('ZADD', waitingKey, seq, identifier)
+		-- 🔴 HGET이 HDEL보다 **먼저**다. 필드를 먼저 지우면 issuedAt 원본을 영영 못 읽고,
+		--    추측해 채우면 UNIQUE(token_id, issued_at)에 충돌이 안 나 **같은 토큰의 두 번째 행**이
+		--    생긴다. 과금이 상태를 보지 않으므로(§82) 그 행은 한 건 더 청구된다.
+		--    admit.lua가 같은 이유로 HGET을 먼저 한다.
 
-		-- RETURNED 이벤트의 멱등 키가 (token_id, issued_at)이라 둘 다 필요하다.
+		-- EXPIRED 이벤트의 멱등 키가 (token_id, issued_at)이라 둘 다 필요하다.
 		-- 미스면 빈 문자열로 두고 Java가 발행을 건너뛴다 — 추측해 채우면 같은 토큰의 두 번째
 		-- 행이 생긴다(admit.lua의 issuedAt 주석과 같은 이유).
 		local tokenId = ''
@@ -72,11 +74,14 @@ for i = 1, #expired do
 			-- 못하므로(멱등 키가 성립하지 않는다) 통째로 미스 취급한다 (§80 Consequences).
 		end
 
+		-- 🔴 중복 게이트 해제. **HGET 다음, 마지막**이다 (§36).
+		--    발행이 실패해도 이건 되돌리지 않는다 — 재-enqueue를 막는 것이 발행 누락보다 나쁘다.
+		redis.call('HDEL', tokensKey, identifier)
+
 		table.insert(records, { identifier, seq, tokenId, issuedAt })
 	end
 	-- sep이 없는 멤버는 admit.lua가 만들 수 없는 형태다(항상 seq..'|'..identifier로 넣는다).
-	-- 위에서 이미 ZREM됐고 되돌릴 seq를 알 수 없으므로 그대로 버린다. 남겨두면 주기마다
-	-- 집었다 되돌리는 무한 순환이 된다.
+	-- 위에서 이미 ZREM됐고 identifier를 알 수 없어 HDEL도 못 하므로 그대로 버린다.
 end
 
 return records

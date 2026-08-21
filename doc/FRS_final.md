@@ -216,7 +216,7 @@ Redis (QueueKeys — §8 참조):
 0 = WAITING
 1 = ADMIT_ISSUED
 2 = COMPLETED
-3 = CANCELLED   ← 🔴 예약값. 도달하는 경로가 없다 (DECISIONS §82)
+3 = (결번)      ← 🔴 CANCELLED였다. Cancel 미구현으로 한 행도 없어 상수까지 삭제(§82). 재사용 금지
 4 = EXPIRED
 ```
 
