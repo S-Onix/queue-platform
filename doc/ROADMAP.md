@@ -700,6 +700,10 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - Tenant 구현 가이드라인 (FRS §12.2) → OpenAPI description 반영
 
 **E. JS SDK 구현** (별도 레포 `queue-platform-sdk-js`)
+- 🔴 **착수 전 결정**: `tokenId`·`seq`의 **브라우저 보관처** (`FRS` §6.2 "세션 경계 3종" ②).
+  메모리만 쓰면 브라우저 종료로 폴링이 끊겨 `inactiveTtl` 유예 창을 못 쓴다. `sessionStorage`는
+  새로고침은 견디나 종료는 못 견딘다. `tokenId`가 **자격 증명**(§74)이라 XSS 노출 범위를 함께 본다
+- 🔴 **착수 전 결정**: 지터 규약이 §79 안에서 갈려 있다(대칭 ±20% vs 비대칭) — `FRS` §6.3
 - `PollingManager` (`/status`의 `pacing` 구간표로 간격 계산 + ±20% 지터, setTimeout 관리 — §79)
   - `rank = mySeq − lastAdmittedSeq`를 **SDK가** 계산한다. 서버는 rank를 계산하지 않는다
   - `rank <= 0`일 때만 개인 엔드포인트 호출 + 30~60초에 1회 `ka=1`

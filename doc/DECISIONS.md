@@ -1123,6 +1123,11 @@ ADMIT_ISSUED에서 이탈하려면:
 그래서 이 값은 **"몇 초까지 자리를 지켜줄 것인가"** 이고, Tenant가 큐마다 정한다
 (`QueueCreateRequest.inactiveTtl`, 기본 300초).
 
+🔴 **이 창은 두 전제 위에 선다** — ⓐ Tenant의 `identifier` 매핑이 브라우저 종료를 견디고,
+ⓑ 브라우저가 `tokenId`·`seq`를 복원해 폴링을 이어갈 수 있어야 한다. 둘 중 하나라도 깨지면
+돌아온 사람을 알아보지 못해 **창이 있어도 자리를 못 찾아준다.** 둘 다 Tenant·SDK 책임이고
+**`FRS_final.md` §6.2 "세션 경계 3종"** 에 적혀 있다.
+
 ⚠️ **재-enqueue는 생존 신호가 아니다.** `enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS는 `waiting`·`seq`·`tokens` 3종). 순번이 복원돼도 다음 `ka=1` 폴링이 오기 전에 배치가 돌면 그대로 회수된다. 창을 되살리는 유일한 신호는 **`ka=1` 폴링 재개**다.
 
 ---
@@ -5107,6 +5112,11 @@ Tenant가 받는 enqueue는 요청을 Platform으로 넘기고 `tokenId`를 돌�
 ### 🔴 `identifier` 형식 = UUIDv7. 생성·전달 주체는 Tenant
 
 Platform은 **형식 가이드만 제시**하고, `identifier` 검증 책임은 **전적으로 Tenant**에 있다.
+
+🔴 **이 매핑은 브라우저 종료를 견뎌야 한다** — 세션 쿠키(비영속)만 쓰면 비로그인 유저가 재접속할 때
+Tenant가 누구인지 몰라 새 identifier를 만들고, 그러면 §82의 `inactiveTtl` 유예 창이 그 유저에게는
+무의미해진다. 이 요구와 나머지 두 경계(`tokenId` 보관처 · 비로그인 입장 처리)는
+**`FRS_final.md` §6.2 "세션 경계 3종"** 에 있다.
 
 **Tenant는 `userId → identifier(UUIDv7)` 매핑을 저장하고, 같은 사용자·같은 큐에는 항상 같은
 UUID를 재사용한다.** 매 요청 새로 생성하면 `enqueue_bulk.lua`의 `HSETNX`가 안 걸려
