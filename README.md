@@ -186,7 +186,7 @@ stateDiagram-v2
 > 🔴 **취소 전용 엔드포인트는 없다 (DECISIONS §82).** 유저가 취소 버튼을 누르든 탭을 닫든
 > 신호는 **"폴링이 멈춘다"** 하나이고, `inactiveTtl` 판정 배치가 EXPIRED(4)로 보낸다.
 > `inactiveTtl`은 **"몇 초까지 자리를 지켜줄 것인가"** 라는 유예 창이라, 그 안에 돌아오면
-> 같은 identifier로 재-enqueue해 **원래 순번이 복원**된다.
+> 같은 identifier로 재-enqueue해 **원래 순번이 복원**된다(창을 되살리는 신호는 `ka=1` 폴링 재개다).
 
 ---
 
@@ -413,7 +413,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | [FRS v1.13](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
 | [STATE](doc/STATE.md) | Token · Queue · ApiKey 상태 머신 |
 | [FLOW](doc/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
-| [DECISIONS](doc/DECISIONS.md) | 81개 설계 결정 + 근거 + 면접 포인트 |
+| [DECISIONS](doc/DECISIONS.md) | 83개 설계 결정 + 근거 + 면접 포인트 |
 | [ROADMAP](doc/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
 | [CONCURRENCY](doc/CONCURRENCY.md) | 동시성 제어 우선순위 · `@DistributedLock` |
 

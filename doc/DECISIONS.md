@@ -1,6 +1,6 @@
 # Queue Platform — 설계 결정 문서
 
-> FRS v1.13 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
+> FRS v1.14 기준 | Entity 설계 / 보안 / 복구 전략 / 아키텍처
 
 ---
 
@@ -510,10 +510,7 @@ public CompleteResult complete(CompleteCommand command) {
 
 | Entity | 메서드 | 역할 |
 |--------|--------|------|
-| `Token` | `complete()` | ADMIT_ISSUED 확인 + COMPLETED 전환 |
-| `Token` | `expire(reason)` | WAITING 확인 + EXPIRED 전환 |
-| `Token` | `returnToWaiting()` | admitToken TTL 만료 → WAITING 복귀 |
-| `Token` | `waitingSeconds()` | issuedAt ~ completedAt 계산 |
+| ~~`Token.complete()` `expire()` `returnToWaiting()` `waitingSeconds()`~~ | — | 🔴 **초판 구상. 존재하지 않는 메서드다.** §80이 전이 강제를 도메인에서 **Kafka 소비 측 UPSERT 가드**로 옮겼다. `Token`의 실제 public 메서드는 `issue`·`transition`·`reconstruct` 셋뿐이다 |
 | `Queue` | `isEnqueueable()` | ACTIVE 상태 판단 |
 | `Queue` | `isCapacityExceeded(count)` | maxCapacity 초과 판단 |
 | ~~`Queue`~~ | ~~`assignSlice(seq)`~~ | **폐기 (§66 D2 — ZSet 하나).** 존재하지 않는 메서드다 |
@@ -1116,6 +1113,8 @@ ADMIT_ISSUED에서 이탈하려면:
 복원**된다. 배치가 `HDEL`로 그 필드를 지운 뒤에 돌아오면 신규로 판정되어 맨 뒤에 선다.
 그래서 이 값은 **"몇 초까지 자리를 지켜줄 것인가"** 이고, Tenant가 큐마다 정한다
 (`QueueCreateRequest.inactiveTtl`, 기본 300초).
+
+⚠️ **재-enqueue는 생존 신호가 아니다.** `enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS는 `waiting`·`seq`·`tokens` 3종). 순번이 복원돼도 다음 `ka=1` 폴링이 오기 전에 배치가 돌면 그대로 회수된다. 창을 되살리는 유일한 신호는 **`ka=1` 폴링 재개**다.
 
 ---
 
@@ -1761,6 +1760,9 @@ server:
 > `queueId` 키는 명시적으로 **기각**됐다 — 한 큐에 30만 명이 정상 시나리오라 트래픽 99%가 한 파티션에 몰린다.
 > 아래 "202 즉시 응답"도 실제로는 **200**이다(순번을 확정한 뒤 응답한다, `FRS_final.md` §6.2).
 > **Kafka를 쓰는 목적(버퍼 · At-Least-Once · DB 적재 비동기화)은 유효하다.**
+>
+> 🔴 **아래 `BillingConsumer` 예시의 집계 기준(`COMPLETED`만 카운트)은 폐기됐다.** 과금은 상태를
+> 보지 않는다 — **정본은 §82**다. 이 절만 보고 구현하면 EXPIRED·WAITING이 통째로 무료가 된다.
 
 ### 도입 용도
 
@@ -3921,7 +3923,7 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 - ADMIT_ISSUED-이나-60s-초과 토큰은 논리적으로 waiting 복귀 대상 → 배치가 재구성 후 정리
 
 ### Interview Point
-> "enqueue의 순번은 Redis가 `INCR`로 부여하고 DB `tokens.seq` 컬럼에 저장합니다. DB auto-increment를 안 쓴 이유는 세 가지인데, 첫째 위치는 사용자가 enqueue하는 순간 필요한데 DB 적재는 Kafka를 거쳐 수 초 뒤 비동기라 너무 늦고, 둘째 auto-increment는 insert 순서를 반영하는데 그건 Kafka 파티션 병렬·Consumer 배치 때문에 도착 순서와 달라 FIFO가 뒤집히며, 셋째 auto-increment는 테이블 전역이라 큐별 순번을 못 줍니다. 그래서 Redis가 도착 순간 원자적으로 부여하고 DB는 저장만 합니다. 이 저장이 복구의 핵심인데, Redis가 전손되면 복구는 3계층입니다. 대부분은 Sentinel failover로 replica가 승격해 복구가 필요 없고, 그다음이 AOF/RDB 재적재, 최후수단이 DB 재구성입니다. DB 재구성은 큐를 분산락으로 잠근 뒤 WAITING 토큰을 seq 순서로 ZADD하면 대기 순서까지 정확히 복원됩니다. 여기서 주의할 점은 복구 완전성이 DB 신선도만큼이라, 비동기 적재 지연 중 Redis엔 있었지만 DB에 아직 안 들어간 enqueue는 유실될 수 있다는 겁니다. 현재 발행이 fire-and-forget이라 이 gap이 존재하고, Redis Stream Outbox와 대사(reconciliation)로 보강하는 게 후속 과제입니다. 그리고 복구 소스로 live waiting ZSet을 쓰면 안 되는데, admit/cancel로 멤버가 빠져나가는 mutable 구조라 짧게 살다 간 토큰을 놓치기 때문입니다. append-only인 DB(또는 outbox)가 소스여야 합니다."
+> "enqueue의 순번은 Redis가 `INCR`로 부여하고 DB `tokens.seq` 컬럼에 저장합니다. DB auto-increment를 안 쓴 이유는 세 가지인데, 첫째 위치는 사용자가 enqueue하는 순간 필요한데 DB 적재는 Kafka를 거쳐 수 초 뒤 비동기라 너무 늦고, 둘째 auto-increment는 insert 순서를 반영하는데 그건 Kafka 파티션 병렬·Consumer 배치 때문에 도착 순서와 달라 FIFO가 뒤집히며, 셋째 auto-increment는 테이블 전역이라 큐별 순번을 못 줍니다. 그래서 Redis가 도착 순간 원자적으로 부여하고 DB는 저장만 합니다. 이 저장이 복구의 핵심인데, Redis가 전손되면 복구는 3계층입니다. 대부분은 Sentinel failover로 replica가 승격해 복구가 필요 없고, 그다음이 AOF/RDB 재적재, 최후수단이 DB 재구성입니다. DB 재구성은 큐를 분산락으로 잠근 뒤 WAITING 토큰을 seq 순서로 ZADD하면 대기 순서까지 정확히 복원됩니다. 여기서 주의할 점은 복구 완전성이 DB 신선도만큼이라, 비동기 적재 지연 중 Redis엔 있었지만 DB에 아직 안 들어간 enqueue는 유실될 수 있다는 겁니다. 현재 발행이 fire-and-forget이라 이 gap이 존재하고, Redis Stream Outbox와 대사(reconciliation)로 보강하는 게 후속 과제입니다. 그리고 복구 소스로 live waiting ZSet을 쓰면 안 되는데, admit·만료로 멤버가 빠져나가는 mutable 구조라 짧게 살다 간 토큰을 놓치기 때문입니다. append-only인 DB(또는 outbox)가 소스여야 합니다."
 
 ### Related
 - §70 (`INCR seq`·Hash Tag — 복구의 근거), §66 (Cluster/failover)
@@ -6074,7 +6076,68 @@ Cancel은 이탈의 **일부만** 덮는데, 덮는 그 일부조차 `inactiveTt
 **⑥ 새로 만들 것은 `inactiveTtl` 판정 배치 하나뿐이고, 그것도 신설이 아니다.** Sprint 9의
 회수 배치(`tokens` Hash `HDEL` 0건 · `last-active` ZSet `ZREM` 0건 누수 정리)가 그 자리다.
 거기에 "누구를 회수할지"의 판정 기준이 `last-active` score라는 것이 더해질 뿐이다.
-`admit_expire.lua`와 같은 claim 패턴(`ZRANGEBYSCORE` + `ZREM`을 한 EVAL에)을 그대로 쓴다.
+claim 패턴(`ZRANGEBYSCORE` + `ZREM`을 한 EVAL에)은 `admit_expire.lua`와 같지만 **스크립트를 복사할
+수는 없다** — `admitted`의 member는 `"seq|identifier"`라 조회 한 번으로 둘 다 나오지만, `last-active`의
+member는 **`seq`뿐**이라(`QueueKeys.lastActive` 주석 · `poll_verify.lua`) `ZRANGEBYSCORE waiting seq seq`로
+identifier를 역산하는 단계가 하나 더 필요하고, `HDEL` 전에 `HGET tokens`로 `issuedAt` 원본을 확보해야
+한다(위 ③). 필요한 키는 `last-active`·`waiting`·`tokens` 3종이며 **전부 `QueueKeys`에 이미 있고 같은
+해시태그**라 새 키도 CROSSSLOT 위험도 없다.
+
+### 🔴 미해결 — `last-active` 커버리지 구멍 3개 (2026-08-21 architect·planner 교차 검토)
+
+위 "왜 Cancel이 필요 없는가" 표는 *"탭 닫음 → `inactiveTtl`이 잡나 ✅"* 라고 단언했다.
+**그 단언은 세 경우에 거짓이다.** 원인은 하나다 — `last-active` ZSet을 채우는 코드가
+`poll_verify.lua`의 `ZADD` **한 곳뿐**이고, 그것도 `ka=1`일 때만 실행된다
+(`ka`는 30~60초에 1회, `@RequestParam(defaultValue = "false")`). 평상시 폴링은 `/status`가
+받으므로(§79) `/tokens/{tokenId}`는 자주 오지도 않는다.
+
+**§82 이전에는 무해했다** — `last-active`에 소비자가 없었기 때문이다. 이 절이 그 값을
+**사람을 회수하는 판정 기준으로 승격**시키면서 아래가 위험으로 바뀌었다.
+
+**① 생존 신호가 클라이언트 자율에 달려 있다.**
+"이 사람이 살아 있다"의 유일한 근거가 **인증 없는 엔드포인트의 쿼리 파라미터 하나**다.
+`ka`를 안 붙이는 클라이언트(구 SDK · 자작 클라이언트 · 버그)는 2초마다 폴링해도 회수된다.
+
+**② `inactiveTtl`에 하한이 있다 — 그런데 검증이 없다.**
+admit되면 `admit.lua`의 `ZPOPMIN`으로 `waiting`에서 빠지고, 그러면 `poll_verify.lua`가
+`ZRANGEBYSCORE waiting seq seq`에서 identifier를 못 찾아 **`ZADD last-active`에 도달하지 못한다.**
+즉 admit 대기 중인 60초 동안 그 사람의 `last-active`가 언다. `inactiveTtl`이 짧으면:
+
+```
+sweep이 admit 대기자를 회수 → HDEL tokens (중복 게이트가 풀린다)
+→ 60초 뒤 AdmitTokenExpiryJob이 원래 seq로 waiting에 복귀시킨다 (§36)
+→ tokens Hash에 필드가 없는 사람이 waiting에 앉아 있다
+→ poll_verify가 HGET 미스로 0을 반환 → 영구 404
+→ waiting에 회수 불가 고아 (last-active는 이미 ZREM돼서 다시 안 걸린다)
+```
+필요 여유 ≈ `admitTokenTtl`(60) + sweep 주기(10) + 복귀 후 첫 `ka`(30~60) = **130~150초.**
+기본 300초는 안전하지만 `QueueCreateRequest`에 `inactiveTtl` 검증이 **하나도 없다.**
+DB는 안전하다 — `IF(tokens.status = 0, 4, ...)` 가드가 status=1을 no-op으로 만든다.
+**위험은 오직 `HDEL tokens`가 중복 게이트를 푼다는 데서 온다.**
+
+**③ 첫 `ka=1` 이전에 떠난 사람은 `last-active`에 멤버가 아예 없다.**
+`enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS 3종). enqueue 직후 30~60초 안에
+탭을 닫으면 `ZRANGEBYSCORE last-active`가 **영원히 못 찾는다** → `waiting`·`tokens`에 영구 잔류.
+받아 줄 `waitingTtl` 배치는 판정 소스 자체가 미정이다(`waiting`의 score는 `seq`, 시간축이 없다).
+**초반 이탈률이 높은 큐라면 회수 배치를 다 만들고도 누수가 남는다.**
+
+#### 선택지 (확정하지 않는다 — 사용자 판단)
+
+| 안 | 내용 | 닫는 구멍 | 대가 |
+|---|---|---|---|
+| **A** | `enqueue_bulk.lua`에 `KEYS[4] = last-active` + `ZADD` 한 줄 | ③ (①도 완화) | **10만/s 버스트 핫패스에 쓰기 1개 추가.** KEYS 시그니처가 바뀌어 롤링 배포 중 스크립트/호출부 불일치 창이 생긴다 |
+| **B** | sweep이 `waiting`을 소스로 돌고 `ZSCORE last-active` 미스를 "한 번도 폴링 안 함"으로 판정 | ③ | 큐 전체 스캔이 되어 `LIMIT` 기반 claim 설계가 바뀐다 |
+| **C** | `inactiveTtl` 하한 검증 한 줄 (`Queue.create`) | ② | 없음. 가장 싸다 |
+| **D** | sweep이 "`waiting`에 없는 seq"는 안 죽인다 | ② | ⚠️ **겉보기보다 비싸다.** `ZREM`까지 안 하면 stale 멤버가 매 주기 `LIMIT` 앞자리를 먹어 진짜 회수를 굶기고, `ZREM`만 하면 admit 복귀자의 유일한 회수 신호가 사라져 §80이 막으려던 좀비가 부활한다 |
+| **E** | 문서에만 하한·한계를 명시하고 넘어간다 | — | 깨지는 건 Tenant가 문서를 안 읽었을 때뿐 |
+
+⚠️ **되돌리기 어려운 지점**: `last-active`의 member 포맷(`seq`)이 sweep을 짜는 순간 굳는다.
+`"seq|identifier"`로 바꾸려면 폴링 핫패스(`poll_verify.lua`)를 고쳐야 하고 롤링 배포 중 두 포맷이
+섞인다. **B·D를 검토한다면 sweep 작성 전이 유일하게 싼 시점이다.**
+
+📌 이 세 구멍은 **Cancel API가 있었어도 닫히지 않는다** — Cancel은 취소 버튼만 덮고, ①②③은
+전부 "폴링이 안 온다"를 정확히 판정하는 문제다. 즉 §82의 결론(Cancel 폐기)을 뒤집을 근거가
+아니라, **§82가 유일하게 남긴 경로를 실제로 작동시키기 위한 잔여 과제**다.
 
 ### Related
 
@@ -6111,7 +6174,11 @@ Cancel은 이탈의 **일부만** 덮는데, 덮는 그 일부조차 `inactiveTt
 > 여기서 재미있는 게 inactive TTL의 의미가 바뀐다는 겁니다. 단순한 청소 주기가 아니라
 > '몇 초까지 자리를 지켜줄 것인가'라는 유예 창이 됩니다. 그 안에 돌아와서 같은 identifier로
 > 다시 enqueue하면 Redis Lua의 HSETNX 게이트가 EXISTS를 돌려주면서 원래 순번을 그대로
-> 복원해주고, 창을 넘기면 게이트가 이미 HDEL로 풀려 있어서 맨 뒤에 서게 됩니다."
+> 복원해주고, 창을 넘기면 게이트가 이미 HDEL로 풀려 있어서 맨 뒤에 서게 됩니다.
+>
+> 다만 창의 하한이 있습니다. admit을 받은 사람은 waiting에서 빠져 있어서 폴링이 last-active를
+> 갱신하지 못하는데, admitToken TTL 60초와 배치 주기와 복귀 후 첫 keepalive까지 합치면
+> 130~150초는 있어야 admit 대기 중인 사람이 잘못 회수되지 않습니다."
 
 ---
 

@@ -217,8 +217,8 @@ flowchart TD
     --> STOP["브라우저가 폴링을 멈춘다\nqueue:{queueId}:last-active score가 늙는다"]
     --> WAIT["유예 창 = inactiveTtl (기본 300초)\nTenant가 큐마다 정한다"]
 
-    WAIT -->|"창 안에 재-enqueue"| BACK["enqueue_bulk.lua HSETNX → EXISTS\n기존 tokenId·seq·rank 복원\n순번 그대로 유지"]
-    WAIT -->|"창을 넘김"| JOB["TTL 만료 Batch가 회수\nZREM waiting + HDEL tokens + ZREM last-active"]
+    WAIT -->|"창 안에 ka=1 폴링 재개"| BACK["poll_verify.lua가 ZADD last-active\n(재-enqueue는 순번만 복원할 뿐\nlast-active를 갱신하지 않는다)"]
+    WAIT -->|"창을 넘김"| JOB["TTL 만료 Batch가 회수\nlast-active member=seq → waiting에서 identifier 역산\nHGET tokens로 issuedAt 원본 확보(HDEL 전!)\nZREM waiting + ZREM last-active + HDEL tokens"]
 
     JOB --> EXP["Kafka EXPIRED 발행 (key=tokenId)\nDB status = EXPIRED(4)\nexpiredReason = INACTIVE_TTL"]
     EXP --> BILL(["과금 대상 — 자리를 끝까지 점유했다 (§82)"])
@@ -328,11 +328,10 @@ flowchart TD
 |----------|------|------|------|
 | Tenant 서버 | 진입 시 | 1회 | 슬롯 여유 확인, 대기토큰 수신 |
 | Tenant 서버 | 입장 시 | 1회 | admitToken 전달, 세션 생성 |
-| Tenant 서버 | 이탈 시 | 1회 | 취소 요청 |
 | Platform (JS SDK) | 대기 중 | 2~30초마다 반복 | Polling (가장 빈번) |
 
 > Polling이 가장 빈번한 통신인데 JS SDK가 Platform과 직접 처리.
-> Tenant 서버는 진입/입장/이탈 3번만 관여.
+> Tenant 서버는 진입/입장 **2번만** 관여 (이탈은 API가 없다 — §82).
 > 이것이 "유저가 Platform에 직접 Polling" 원칙의 실제 구현.
 
 ---

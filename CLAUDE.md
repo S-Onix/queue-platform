@@ -454,7 +454,7 @@ mysql -u root -p -P 3307  # Replica
 |------|------|
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
-| `doc/DECISIONS.md` | 81개 설계 결정 + 근거 + 면접 포인트 (최신 §81 — avgWaitingTime·ETA 폐기) |
+| `doc/DECISIONS.md` | 83개 설계 결정 + 근거 + 면접 포인트 (최신 §83 — 파티션 키 유지) |
 | `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (⚠️ **§79가 구현돼 폴링 4문서가 낡았다** — 갱신 대상) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |

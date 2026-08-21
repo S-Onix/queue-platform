@@ -581,22 +581,36 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 > 끊김은 Tenant가 알 방법이 없어 Cancel로는 못 잡는다. 이탈 감지 배치는 어차피 필요하다.
 
 ```
-트리거: 브라우저가 폴링을 멈춘다 (취소 버튼 · 탭 닫음 · 네트워크 끊김 — 신호는 하나다)
-판정:   ZRANGEBYSCORE queue:{queueId}:last-active -inf (now_ms - inactiveTtl_ms)
-        ※ admit_expire.lua와 같은 claim 패턴 — 조회와 제거가 한 EVAL 안에 있다
+트리거: 브라우저가 ka=1 폴링을 멈춘다 (취소 버튼 · 탭 닫음 · 네트워크 끊김 — 신호는 하나다)
 
-처리:
+판정:   seqs = ZRANGEBYSCORE queue:{queueId}:last-active -inf (now_ms - inactiveTtl_ms) LIMIT 0 N
+        🔴 last-active의 member는 **seq**다 (§8 키표 · poll_verify.lua). identifier가 아니다.
+        ※ EVAL 하나 안에서 판정+제거 → 그 자체가 claim (admit_expire.lua와 같은 근거, §80 ⑧).
+          Java로 쪼개면 batch N대의 유일한 동시성 방어가 사라진다.
+
+처리 (seq마다):
+  identifier = ZRANGEBYSCORE queue:{queueId}:waiting {seq} {seq}    ← seq→identifier 역산.
+        🔴 admit_expire.lua는 member가 "seq|identifier"라 이 단계가 없다. 복사하면 안 된다.
+        없으면(= admit되어 waiting에 없음) → 아래 "미해결 ②" 참조
+  stored = HGET queue:{queueId}:tokens {identifier}   → "tokenId|issuedAt"
+        🔴 HDEL보다 **먼저** 읽어야 한다. issuedAt 원본을 못 실으면 UNIQUE(token_id, issued_at)에
+          충돌이 안 나 **같은 토큰의 두 번째 행**이 생기고, 과금이 상태를 안 보므로(§82)
+          그 행이 한 건 더 청구된다. admit.lua가 같은 이유로 HGET을 먼저 한다.
+
   Redis ZREM queue:{queueId}:waiting     {identifier}
-        ZREM queue:{queueId}:last-active {identifier}
+        ZREM queue:{queueId}:last-active {seq}
         HDEL queue:{queueId}:tokens      {identifier}   ← complete와 같은 이유로 마지막 (§6.6)
-  DB status = EXPIRED(4), expiredReason = INACTIVE_TTL
-  Kafka token-lifecycle 발행 (key=tokenId, eventType=EXPIRED)
+  DB status = EXPIRED(4)
+        ⚠️ expiredReason은 현재 TRANSITION_INSERT 컬럼에 없다 — 실으려면 별도 결정이 필요하다
+  Kafka token-lifecycle 발행 (key=tokenId, eventType=EXPIRED, issuedAt=원본)
 ```
 
 **`HDEL tokens`가 중복 게이트를 푸는 행위이므로, `inactiveTtl`은 곧 유예 창이다.**
 그 전에 같은 identifier로 재-enqueue하면 `enqueue_bulk.lua`의 `HSETNX`가 `EXISTS`를 돌려주어
 **기존 `tokenId`·`seq`·`rank`가 복원**된다(§6.2). 창을 넘기면 신규로 판정되어 맨 뒤에 선다.
 값은 `QueueCreateRequest.inactiveTtl`로 Tenant가 큐마다 정한다(기본 300초).
+
+⚠️ **재-enqueue는 생존 신호가 아니다.** `enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS는 `waiting`·`seq`·`tokens` 3종). 순번이 복원돼도 다음 `ka=1` 폴링이 오기 전에 배치가 돌면 그대로 회수된다. 창을 되살리는 유일한 신호는 **`ka=1` 폴링 재개**다.
 
 ⬜ **미구현** — Sprint 9 회수 배치.
 

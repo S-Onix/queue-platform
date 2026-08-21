@@ -428,7 +428,9 @@ flowchart TD
 
 **주요 산출물:**
 - ✅ **Token 도메인 모델** (분할된 Sprint 3의 후반)
-  - Token Rich Domain (`complete`, `expire`, `returnToWaiting`, `waitingSeconds`) — ~~`cancel`~~ (§82)
+  - Token 도메인 — 실제 public 메서드는 `issue` · `transition` · `reconstruct` 셋이다.
+    ~~`complete`·`expire`·`returnToWaiting`·`waitingSeconds`·`cancel`~~은 초판 구상으로, **§80이 전이 강제를
+    Kafka 소비 측 UPSERT 가드로 옮기면서 만들지 않았다**
   - `TokenRepository` Port 인터페이스
   - JPA Entity 파티셔닝 고려 (PK = token_id + issued_at)
 - ✅ **Enqueue API**
@@ -443,12 +445,12 @@ flowchart TD
   **이로써 Sprint 6은 잔여 없이 종료된다.**
 
 **완료 기준 (DoD):**
-- [x] Token 도메인 단위 테스트 (상태 전환 매트릭스 전체)
+- [x] 상태 전환 매트릭스 검증 — 도메인이 아니라 **`TokenJpaAdapterIntegrationTest`**(소비 측 가드 UPSERT)가 한다 (§80)
 - [x] 1,000명 동시 Enqueue → 순번 중복 0건 (실제 Redis)
 - [x] 중복 identifier Enqueue 시 기존 토큰 반환 (멱등 처리)
 - [x] 폴링 소유권 — 남의 `seq` + 내 `tokenId` → 404 (§74)
 - [x] 같은 identifier 재Enqueue 시 기존 순번 복원 (`HSETNX` → `EXISTS`) — §82의 유예 창 근거
-- [ ] Polling 응답 시간 p99 < 50ms — **로컬 수치는 신뢰 구간이 아니다.** Sprint 10(k6)로 이관
+- [x] ~~Polling 응답 시간 p99 < 50ms~~ — **로컬 수치는 신뢰 구간이 아니다.** Sprint 10(k6)로 **이관 완료**
 
 > ~~`nextPollAfterSec` 4단계(30/10/5/2초) 분기 테스트~~ — **§79가 이 필드를 응답에서 제거**하고
 > `/status`의 `pacing` 구간표 + SDK 계산으로 바꿨다. **2026-08-20 기준 구현 완료** —
@@ -610,6 +612,12 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - `queue-batch` 모듈 활성화 (bootRun 가능)
 - `TokenExpiryJob` (10초 주기)
   - waitingTtl / inactiveTtl / admit-token TTL 3종 감지
+    - `admit-token TTL`은 **Sprint 7에서 `AdmitTokenExpiryJob`으로 이미 구현**됐다 (재사용)
+    - 🔴 `inactiveTtl`은 **§82로 이탈 회수의 유일한 경로**가 됐다 — 판정에 그치지 않고
+      `ZREM waiting` + `ZREM last-active` + `HDEL tokens` + **`EXPIRED` Kafka 발행**까지 한다.
+      `HDEL` 전에 `HGET tokens`로 `issuedAt` 원본을 확보해야 한다(§82 ③ · §83)
+    - ⬜ `waitingTtl` 판정 소스는 **미정**이다 — `waiting` ZSet의 score는 `seq`라 시간축이 없다.
+      DB `tokens.issued_at`이 유력하나 착수 시 결정한다
   - `batch-lock:{t}:{q}` 분산 락
 - `RedisSyncJob` (5분 주기)
   - `redis_sync_needed=1` 토큰 → Redis 재삽입
@@ -625,7 +633,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 | # | 과제 | 왜 지금인가 |
 |---|---|---|
 | 1 | **`queue-batch`에 actuator + micrometer-prometheus 추가** | **reconciliation의 선행 조건.** 현재 `queue-batch/build.gradle`에는 `starter-web`만 있고 actuator·micrometer가 **없다** → 만들어도 유령 토큰 수를 지표로 못 낸다. `queue-consumer`가 같은 이유로 이미 갖고 있다 |
-| 2 | **회수 배치** — `queue:{q}:last-active` ZSet `ZREM` / `queue:{q}:tokens` Hash `HDEL` | 두 명령 모두 **전 프로덕션 코드 0건**이다. 쓰기만 하고 지우지 않아 30만 큐가 한 바퀴 돌 때마다 멤버가 영구 누적된다. TokenExpiryJob이 만료를 판정하는 이 스프린트가 회수를 붙일 자리다 |
+| 2 | **회수 배치** — `queue:{q}:last-active` ZSet `ZREM` / `queue:{q}:tokens` Hash `HDEL` | 두 명령 모두 **전 프로덕션 코드 0건**이다. 쓰기만 하고 지우지 않아 30만 큐가 한 바퀴 돌 때마다 멤버가 영구 누적된다. 🔴 **§82로 무게가 커졌다** — 누수 정리에 그치지 않고 **이탈 회수의 유일한 경로**다. 상태 전이(EXPIRED)와 Kafka 발행을 빼먹으면 이탈자가 DB에 영원히 WAITING으로 남는다 |
 | 3 | **reconciliation 스위퍼** (Redis엔 있고 DB엔 없는 유령 토큰) | §73이 "Redis-Kafka 사이엔 분산 트랜잭션이 없어 발행 갭은 **영구적**"이라며 필수 후속으로 남겼다. 100만건 실측에서 실제로 835건 발생. **1번 다음에 온다** |
 | 4 | `ApiKeyCache.invalidate` 프로덕션 호출 연결 (revoke 경로) | 구현·포트 선언은 있는데 **호출부가 0건**이라 폐기된 키가 최대 60초 살아 있다. 배치가 아니라 revoke 서비스 쪽 한 줄이지만, 다른 정리 작업과 함께 처리 |
 
@@ -633,6 +641,8 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - [ ] Batch Server 기동 후 TokenExpiryJob 10초 주기 실행 로그 확인
 - [ ] `queue-batch`의 `/actuator/prometheus`가 200을 반환 (위 1번 — reconciliation 지표의 전제)
 - [ ] 만료 처리 후 `zcard last-active` ≤ `zcard waiting` 유지 (위 2번 — 누적이 멈췄다는 증거)
+- [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
+      `issued_at`이 원본과 같아 **두 번째 행이 생기지 않는지** 함께 확인 (§83 함정)
 - [ ] admitToken TTL 만료 케이스 → WAITING 복귀 동작 (Sprint 7 로직 재사용)
 - [ ] Redis 다운 시뮬레이션 → 복구 후 RedisSyncJob이 미반영 토큰 재삽입
 - [ ] **BillingSnapshotJob 수동 트리거 동작 확인** (예: HTTP endpoint 또는 테스트 프로파일)

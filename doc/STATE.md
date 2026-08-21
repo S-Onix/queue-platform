@@ -1,6 +1,6 @@
 # 📊 Queue Platform — 상태 흐름도
 
-> FRS v1.13 기준 | 전이 가드는 DECISIONS §80
+> FRS v1.14 기준 | 전이 가드는 DECISIONS §80
 
 ---
 
@@ -31,6 +31,9 @@ stateDiagram-v2
 > **`inactiveTtl`은 유예 창이다.** 배치가 `HDEL tokens`를 하기 전에 같은 identifier로 재-enqueue하면
 > `enqueue_bulk.lua`의 `HSETNX` 게이트가 `EXISTS`를 돌려주어 **기존 `tokenId`·`seq`·`rank`가 복원**된다.
 > 창을 넘기면 신규로 판정되어 맨 뒤에 선다.
+>
+> ⚠️ 다만 **재-enqueue 자체는 생존 신호가 아니다** — `enqueue_bulk.lua`는 `last-active`를 갱신하지
+> 않는다. 창을 되살리는 것은 **`ka=1` 폴링 재개**뿐이다.
 
 ### 🔴 전이를 실제로 강제하는 것 = Kafka 소비 측 가드 (DECISIONS §80)
 
@@ -65,7 +68,7 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | verify | ADMIT_ISSUED 상태 유지. 유효성 확인만. 상태 변경 없음 |
 | complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
 | admitToken 만료 | WAITING 복귀 (EXPIRED 아님). seq 기반 순위 복원 |
-| 이탈 허용 | WAITING만. ADMIT_ISSUED → 409 (유저 귀책). ⬜ **API 미구현** — `DELETE /tokens/:tokenId`도 `QE_006_INVALID_STATUS`도 아직 없다 |
+| 이탈 | **전용 API 없음 (§82).** 폴링 중단 → `inactiveTtl` 판정 배치 → EXPIRED(4). `QE_006_INVALID_STATUS`는 쓰이는 곳이 없다 |
 | 세션 관리 | Tenant 책임. Platform 관여 안 함 |
 | complete 순서 | DB 먼저 → ZREM 나중 (잔류가 유실보다 안전) |
 | 복구 | Batch 10초 내 ZREM 재실행 (멱등) |
