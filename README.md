@@ -18,7 +18,7 @@
 - **유저가 Platform에 직접 Polling** — `/status` 전광판 + `pacing` 구간표 (전원 동일 응답 → 캐시)
 - **Backpressure Pull** — Tenant가 소화 가능한 인원만 admit 요청
 - **admitToken TTL 60초** → verify(유효성 확인) → complete(COMPLETED+ZREM)
-- **admitToken 만료 시 WAITING 복귀** — seq 유지로 우선순위 보존
+- **admitToken 만료 시 종료** — 복귀하지 않는다(§36). 재접속 → 재-enqueue → 맨 뒤
 - **Kafka 버퍼** — Enqueue는 순번 확정 → Kafka 발행(동기) → 200 응답. **DB INSERT만 비동기**
 - **Virtual Thread** — Spring MVC + JPA blocking I/O를 OS Thread 고갈 없이 처리
 - **SDK 제공** — JS SDK(폴링·대기 UI 전용)만. Tenant 서버는 REST 직접 호출 (DECISIONS §35 · §78)
@@ -65,7 +65,7 @@ Tenant가 소화 가능한 만큼만 admit { count: N }
 Platform과 커플링 없음
 ```
 
-### 4. admitToken TTL 만료 → WAITING 복귀 (우선순위 보존)
+### 4. admitToken TTL 만료 → 종료 (복귀하지 않는다)
 ```
 TTL 60초 초과 → WAITING 복귀
 seq DB 저장 → Redis ZADD score 복원

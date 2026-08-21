@@ -14,9 +14,9 @@ stateDiagram-v2
 
     ADMIT_ISSUED --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\nKafka token-lifecycle 발행 (key=tokenId)
 
-    WAITING --> COMPLETED : POST /tokens/:tokenId/complete\nTTL 만료로 복귀했지만 Tenant는 이미 입장시킨 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
+    WAITING --> COMPLETED : POST /tokens/:tokenId/complete\nDB 적재 지연으로 아직 status=0인 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
 
-    ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nWAITING 복귀 (EXPIRED 아님)\nseq 유지 → 우선순위 보존\nKafka RETURNED 발행 (key=tokenId)
+    ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nHDEL tokens (중복 게이트 해제)\n복귀하지 않는다 (§36)\n재접속 → 재-enqueue → 맨 뒤
 
     WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과\nZREM waiting + HDEL tokens\nKafka token-lifecycle 발행 (key=tokenId)
 
@@ -44,7 +44,6 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 |---|---|---|
 | `ENQUEUED` | (신규) | `ON DUPLICATE KEY UPDATE token_id = token_id` (no-op) |
 | `ADMITTED` | 0 WAITING | `IF(status = 0, 1, status)` |
-| `RETURNED` | 1 ADMIT_ISSUED | `IF(status = 1, 0, status)` |
 | `COMPLETED` | 1 ADMIT_ISSUED | `IF(status = 1, 2, status)` |
 | `EXPIRED` | 0 WAITING | `IF(status = 0, 4, status)` |
 
@@ -67,15 +66,15 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | ADMIT_ISSUED | 입장토큰 발급됨. 유저가 Polling으로 admitToken 수신 대기 |
 | verify | ADMIT_ISSUED 상태 유지. 유효성 확인만. 상태 변경 없음 |
 | complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
-| admitToken 만료 | WAITING 복귀 (EXPIRED 아님). seq 기반 순위 복원 |
+| admitToken 만료 | **복귀하지 않는다 (§36).** `HDEL tokens`로 게이트만 풀고 끝. 재접속 → 재-enqueue → 맨 뒤. ⚠️ **DB `status`는 `1`로 남는다** — `EXPIRED` 가드가 `status = 0` 전용이라 no-op이고, 그것이 `complete`의 300초 창을 살린다 |
 | 이탈 | **전용 API 없음 (§82).** 폴링 중단 → `inactiveTtl` 판정 배치 → EXPIRED(4). `QE_006_INVALID_STATUS`는 쓰이는 곳이 없다 |
 | 세션 관리 | Tenant 책임. Platform 관여 안 함 |
 | complete 순서 | DB 먼저 → ZREM 나중 (잔류가 유실보다 안전) |
 | 복구 | Batch 10초 내 ZREM 재실행 (멱등) |
-| seq 저장 | DB tokens.seq 컬럼 — ADMIT_ISSUED→WAITING 복귀 시 score 복원 |
+| seq 저장 | DB tokens.seq 컬럼 — **Redis 전손 시 DB 재구성**(§71). ~~복귀 시 score 복원~~은 §36이 폐기 |
 | admit_token 컬럼 | DB 저장 → Redis 미스 시 Fallback용 + verify DB Fallback |
 | redis_sync_needed | Redis 다운 중 INSERT된 토큰 추적 → 복구 배치 기준 |
-| Kafka 발행 | **모든 상태 변경**에서 발행 (ENQUEUED/ADMITTED/RETURNED/COMPLETED/EXPIRED). 단일 토픽 `token-lifecycle`, key=`tokenId` |
+| Kafka 발행 | **모든 상태 변경**에서 발행 (ENQUEUED/ADMITTED/COMPLETED/EXPIRED). 단일 토픽 `token-lifecycle`, key=`tokenId`. ~~RETURNED~~는 §36이 폐기 |
 
 ### expiredReason
 
@@ -83,10 +82,10 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 |----|------|------|------------|
 | `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms) |
 | `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) — **이탈 회수의 유일한 경로다(§82). 미구현** |
-| `ADMIT_TOKEN_TTL` | admitToken 60초 초과 → WAITING 복귀 (EXPIRED 아님) | ADMIT_ISSUED | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
+| `ADMIT_TOKEN_TTL` | admitToken 60초 초과 → **`HDEL tokens` 후 종료**(§36). 복귀 없음 | ADMIT_ISSUED | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
 
-> ADMIT_TOKEN_TTL은 EXPIRED 아닌 WAITING 복귀
-> DB tokens.seq 기반 Redis ZADD score 복원 → 우선순위 유지
+> 🔴 **ADMIT_TOKEN_TTL은 복귀하지 않는다 (§36, 2026-08-21).** claim 잡이 `HDEL tokens`로
+> 중복 게이트를 풀고 `EXPIRED`를 발행한다. 유저는 재접속해 새 seq로 맨 뒤에 선다.
 
 ---
 

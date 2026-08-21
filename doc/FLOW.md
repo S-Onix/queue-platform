@@ -189,7 +189,7 @@ flowchart TD
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
 
-    LUA -->|"admitToken TTL 60초 초과"| BACK["WAITING 복귀 — queue-batch (§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
+    LUA -->|"admitToken TTL 60초 초과"| BACK["종료 — queue-batch (§36·§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
 ```
 
 > **왜 DB WAITING 확인이 없나 (§80)**
@@ -246,7 +246,7 @@ flowchart TD
     W1 -->|"WAITING_TTL(0)"| EXP["DB UPDATE EXPIRED(4)\nexpiredReason 기록\nRedis ZREM\nDEL token-info 캐시\n100건씩 순차 처리\nLIMIT 100 → Gap Lock 방지"]
     W2 -->|"INACTIVE_TTL(1)"| EXP
 
-    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["WAITING 복귀 (queue-batch)\nmember에서 seq·identifier 파싱 (DB 조회 불필요)\nZADD queue:{queueId}:waiting {seq} {identifier}\nZREM queue:{queueId}:admitted\nKafka RETURNED 발행 → status 1→0\nDEL token-info 캐시\n※ last-active는 리셋하지 않는다 (§80)"]
+    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["종료 — 복귀 없음 (queue-batch, §36)\nmember에서 seq·identifier 파싱 (DB 조회 불필요)\nZADD queue:{queueId}:waiting {seq} {identifier}\nZREM queue:{queueId}:admitted\nKafka RETURNED 발행 → status 1→0\nDEL token-info 캐시\n※ last-active는 리셋하지 않는다 (§80)"]
 
     EXP --> DONE(["완료\n멱등: 상태 필터로 중복 처리 없음"])
     BACK --> DONE

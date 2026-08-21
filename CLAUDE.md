@@ -15,7 +15,7 @@
 2. 유저가 Platform에 직접 Polling (`/status`의 `pacing` 구간표 기반 적응형 간격, §79)
    - ⚠️ 현행 **코드**는 아직 `nextPollAfterSec`를 응답에 담는다. §79는 설계 확정·구현 미착수
 3. Backpressure Pull (Tenant가 admit으로 받을 수 있는 만큼만)
-4. admitToken TTL 만료 → WAITING 복귀 (seq 기반 우선순위 보존)
+4. admitToken TTL 만료 → **종료**(§36). 복귀하지 않는다 — 재접속 → 재-enqueue → 맨 뒤
 5. Spring MVC + Virtual Thread (JPA blocking I/O를 OS Thread 고갈 없이)
 6. **API 서버는 N대로 수평/수직 확장 가능 (Stateless 전제)**
 
@@ -82,7 +82,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  Enqueue · Polling · Kafka 적재(token-lifecycle + queue-consumer)  (Sprint 6·8)
   구현됨  admit · verify · complete — 엔드포인트 6개                        (Sprint 7 §80)
   구현됨  admit.lua · admit_expire.lua · 상태 전이 가드 UPSERT              (§80)
-  구현됨  queue-batch: AdmitTokenExpiryJob(TTL 만료 → WAITING 복귀)         (§80 · §36)
+  구현됨  queue-batch: AdmitTokenExpiryJob(TTL 만료 claim)                  (§80)
+  ⚠️수정  └ 복귀 → 종료로 바꿔야 한다 — ZADD waiting → HDEL tokens (§36)
   구현됨  /status 분할 · admitWatermark · pacing 구간표                     (§79)
   폐기    Cancel(DELETE /tokens/:id) — 이탈은 inactiveTtl 배치가 전담        (§82)
   미착수  inactiveTtl 판정 배치 — 이탈 회수 경로가 아직 0                    (§82 · Sprint 9)
@@ -238,7 +239,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 3. **admitToken TTL 60s + DB Fallback**
    - Redis 만료 시 DB에서 admit_token 컬럼으로 복구
-   - WAITING 복귀 시 seq 컬럼으로 score 복원 (EXPIRED 아님)
+   - **복귀하지 않는다(§36).** seq 컬럼은 Redis 전손 시 DB 재구성용(§71)
 
 4. **Status는 TINYINT (0~4)**
    - VARCHAR 대비 저장공간·비교 성능 최적화

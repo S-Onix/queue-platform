@@ -493,7 +493,8 @@ flowchart TD
 - `queue:{queueId}:admitted` ZSet 신설 (score=만료 epoch ms, member=`"seq|identifier"`) — `QueueKeys` 경유
 - `tokens.admitted_at` 컬럼 추가
 - Kafka `ADMITTED`·`RETURNED` 이벤트 + **소비 측 전이 가드**(허용 출발 상태별 조건부 UPSERT)
-- **ADMIT_TOKEN_TTL 만료 → WAITING 복귀** — `admitted` ZSet claim-Lua, 실행 주체 **`queue-batch`**
+- **ADMIT_TOKEN_TTL 만료 → 종료** — `admitted` ZSet claim-Lua, 실행 주체 **`queue-batch`**.
+  🔴 **§36(2026-08-21)이 복귀를 폐기**했다 — claim 후 `ZADD waiting`이 아니라 `HGET`→`HDEL tokens`+`EXPIRED` 발행
   ← 포트폴리오 차별 포인트
   - **ShedLock을 쓰지 않는다.** `ZRANGEBYSCORE 0 now` + `ZREM`이 한 Lua 안이면 **`EVAL` 자체가 claim**이라
     3대가 같은 초에 돌아도 한 대만 멤버를 가져간다. `CLAUDE.md` "`@Scheduled` 단독 금지" 규칙의
@@ -515,9 +516,10 @@ flowchart TD
   - `ZADD`가 Kafka 발행보다 먼저라 이 역전은 실재한다. `ENQUEUED`의 no-op upsert가 흡수해야 한다
 - [ ] **`COMPLETED` 행에 `ADMITTED`가 도착해도 되살아나지 않는다** (가드가 허용 출발 상태를 본다)
 - [ ] **WAS N대에서 동시 admit → watermark 단조증가, 후퇴 0건** (조건부 갱신이 없으면 늦게 도착한 작은 seq가 값을 되돌린다)
-- [ ] **TTL 만료로 WAITING 복귀한 토큰이 다음 admit 배치의 맨 앞에 온다** — `ZPOPMIN`이 곧 최소 seq이므로 자동으로 성립해야 한다
+- [x] ~~**TTL 만료로 WAITING 복귀한 토큰이 다음 admit 배치의 맨 앞에 온다**~~ — 🔴 **§36이 복귀를 폐기해 대상이 없다**
   - §79가 "watermark는 **표시 전용**"이라고 🔴 가드레일로 못 박았지만 **강제 수단이 없다.** 이 DoD가 그 수단이다. watermark를 커서로 쓰면 복귀 토큰(seq < watermark)이 영구히 건너뛰어진다
-- [ ] admitToken TTL 60초 경과 → `admitted` ZSet claim → WAITING 복귀 + seq 복원 검증
+- [ ] admitToken TTL 60초 경과 → `admitted` ZSet claim → **`HDEL tokens` + `EXPIRED` 발행** 검증 (§36)
+- [ ] 만료 후 같은 identifier로 재-enqueue → **새 tokenId·새 seq(맨 뒤)** 를 받는다 (게이트가 풀렸다는 증거)
 - [ ] TTL 만료 후 verify → **404**
 - [ ] complete가 `status = 0`(복귀 후)에도 성공한다 — 유효 창 안이면
 - [ ] 중복 complete 요청 → 1번만 성공 (조건부 UPDATE가 0행)
@@ -545,7 +547,7 @@ flowchart TD
 **참조 문서:** **DECISIONS §80 (이 Sprint의 설계 정본)**, §79 (watermark·pacing), §36 (TTL 복귀),
 FRS §6.4~6.6, STATE.md 전이 가드 표
 
-**Sprint 핵심 차별 포인트:** admitToken 만료 시 WAITING 복귀 (seq 기반 우선순위 보존)
+**Sprint 핵심 차별 포인트:** admitToken 만료 시 **종료**(§36) — Platform이 만료 원인을 구분할 수 없으므로 판정하지 않는다
 
 ---
 
@@ -643,7 +645,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - [ ] 만료 처리 후 `zcard last-active` ≤ `zcard waiting` 유지 (위 2번 — 누적이 멈췄다는 증거)
 - [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
       `issued_at`이 원본과 같아 **두 번째 행이 생기지 않는지** 함께 확인 (§83 함정)
-- [ ] admitToken TTL 만료 케이스 → WAITING 복귀 동작 (Sprint 7 로직 재사용)
+- [ ] admitToken TTL 만료 케이스 → **종료 + 게이트 해제** 동작 (§36)
 - [ ] Redis 다운 시뮬레이션 → 복구 후 RedisSyncJob이 미반영 토큰 재삽입
 - [ ] **BillingSnapshotJob 수동 트리거 동작 확인** (예: HTTP endpoint 또는 테스트 프로파일)
 - [ ] **파티션 운영 쿼리 dry-run 검증** (schema.sql의 Step 1~4 각 쿼리 실행 + EXPLAIN)
@@ -971,7 +973,7 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 | 4 | Refresh Token 버전 기반 재사용 감지 + Rotation |
 | **5** | **Lua Script 원자성 + Sentinel Failover 실증 + Rate Limiter 알고리즘 분리 + Tenant Plan 동적 SLA** ⭐ |
 | 6 | 폴링 소유권 검증을 Lua 원자 1회로 (§74) — seq 존재 판정만으로는 남의 자리를 훔칠 수 있었다 |
-| **7** | **admitToken TTL 만료 → WAITING 복귀 (seq 기반 우선순위 보존)** ⭐ |
+| **7** | **admitToken TTL 만료 → 종료. 복귀하지 않는다(§36) — 재접속 → 맨 뒤** ⭐ |
 | 8 | Kafka KRaft + At-Least-Once + 동기→비동기 리팩토링 경험 |
 | 9 | 파티션 1달 유예 DROP 전략 (월말 과금 누락 방지) |
 | **10** | **k6 2,000 rps 로컬 실측 p99 < 50ms + Grafana 대시보드 + JS SDK 데모** ⭐ |
