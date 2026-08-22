@@ -6407,7 +6407,7 @@ F가 이걸 크게 줄인다 — 복귀 후 첫 poll에 갱신되므로 사이�
 |---|---|
 | ① `ka` 신호가 클라이언트 자율 | ✅ **닫혔다 — F안 채택**(`poll_verify.lua`의 `keepalive` 분기 삭제). 폴링이 오면 언제나 `last-active`를 갱신한다. `ka` 파라미터는 API 하위호환으로 자리만 남고 무시된다 |
 | ② `inactiveTtl` 하한 | ✅ **소멸.** 복귀가 없어 고아가 생기지 않는다 |
-| ③ 첫 폴링 이전 이탈 | 🟡 **파괴력만 소멸.** admit이 좀비 청소기가 됐다. 뒤쪽 좀비의 `waiting`·`tokens` 잔류는 남는다 — **A 미채택이라 열려 있다** |
+| ③ 첫 폴링 이전 이탈 | 🔴 **열려 있다 (A 미채택).** 2026-08-21 실측으로 확인 — enqueue만 하고 **한 번도 폴링하지 않은 사람은 `last-active`에 멤버가 아예 없어** sweep이 훑는 ZSet에 나타나지 않는다. 27초를 기다려도 회수되지 않았고, 폴링을 1회라도 한 사람은 정상 회수됐다. admit이 지나가면 정리되므로 파괴력(슬롯 재순환)은 없지만 `waiting`·`tokens` 잔류는 남는다 |
 
 ### ✅ 구현 완료 (2026-08-21) — `inactive_expire.lua` + `TokenReclaimJob`
 
@@ -6431,6 +6431,8 @@ ZRANGEBYSCORE last-active -inf (cutoff LIMIT 0 500   ← 이 EVAL이 claim
 **남는 것은 A 하나다.**
 - **A**(`enqueue_bulk.lua`에 `last-active` `ZADD` 한 줄) — ③(첫 폴링 이전 이탈)의 잔류를 닫는다.
   핫패스 쓰기 +1이 대가라 **미채택**. `waitingTtl` 배치가 받아줄 수 있으나 그 판정도 아직 없다
+  (`waiting`의 score는 `seq`라 시간축이 없다 — 소스 후보는 `tokens` Hash의 `issuedAt`).
+  📌 **실측으로 재현된다** — 위 ③ 참조. "enqueue 직후 이탈"이 흔한 큐라면 A를 다시 검토해야 한다
 
 **C·D는 §36 폐기로 불필요해졌다.**
 
