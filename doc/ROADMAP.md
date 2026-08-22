@@ -642,7 +642,8 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 **완료 기준 (DoD):**
 - [ ] Batch Server 기동 후 TokenExpiryJob 10초 주기 실행 로그 확인
 - [ ] `queue-batch`의 `/actuator/prometheus`가 200을 반환 (위 1번 — reconciliation 지표의 전제)
-- [x] 만료 처리 후 `zcard last-active` ≤ `zcard waiting` 유지 — **`TokenReclaimJob`이 세 키를 함께 회수**(§82). `InactiveReclaimTest`가 실제 Redis로 단언
+- [x] 회수 후 `waiting`·`tokens`·`last-active` **세 키에서 모두 빠진다** — `InactiveReclaimTest`가 실제 Redis로 단언(§82)
+- [ ] `zcard last-active` ≤ `zcard waiting` **부등식 자체**는 아직 안 잰다 — 위 테스트는 개별 키의 잔존 멤버만 단언한다
 - [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
       `issued_at`이 원본과 같아 **두 번째 행이 생기지 않는지** 함께 확인 (§83 함정)
 - [ ] admitToken TTL 만료 케이스 → **종료 + 게이트 해제** 동작 (§36)

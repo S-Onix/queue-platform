@@ -440,21 +440,7 @@ public class RedisQueueEngine implements QueueEngine {
                 Integer.toString(limit)
         );
 
-        if (raw == null || raw.isEmpty()) {
-            return List.of();
-        }
-
-        List<ReclaimedToken> claimed = new ArrayList<>(raw.size());
-        for (Object row : raw) {
-            @SuppressWarnings("unchecked")
-            List<String> f = (List<String>) row;
-            // tokens Hash 미스는 빈 문자열로 온다(nil이면 배열 뒤가 잘린다). null로 바꿔
-            // 호출자가 "발행 불가"로 읽게 한다.
-            String tokenId = f.get(2).isEmpty() ? null : f.get(2);
-            claimed.add(new ReclaimedToken(
-                    f.get(0), Long.parseLong(f.get(1)), tokenId, parseIssuedAt(f.get(3))));
-        }
-        return claimed;
+        return toReclaimed(raw);
     }
 
     @Override

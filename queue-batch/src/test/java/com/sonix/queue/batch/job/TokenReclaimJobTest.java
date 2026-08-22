@@ -31,7 +31,8 @@ import static org.mockito.Mockito.when;
 /**
  * {@link TokenReclaimJob} 단위 테스트.
  *
- * <p>회수 자체(ZREM/HDEL)는 Lua가 하고 {@code AdmitExpiryReclaimTest}가 실제 Redis로 검증한다.
+ * <p>회수 자체(ZREM/HDEL)는 Lua가 하고 {@code AdmitExpiryReclaimTest}(§36) ·
+ * {@code InactiveReclaimTest}(§82)가 실제 Redis로 검증한다.
  * 여기서 보는 것은 잡의 책임인 <b>{@code EXPIRED} 발행 계약</b>과 <b>실패 격리</b>다.
  */
 @ExtendWith(MockitoExtension.class)
@@ -118,7 +119,7 @@ class TokenReclaimJobTest {
     }
 
     @Test
-    @DisplayName("한 큐의 Redis 장애가 다음 큐의 복귀를 막지 않는다")
+    @DisplayName("한 큐의 Redis 장애가 다음 큐의 회수를 막지 않는다")
     void oneQueueFailureDoesNotStopTheSweep() {
         when(queueRepository.findAll())
                 .thenReturn(List.of(queue("q_dev_broken", 1L), queue("q_dev_ok", 2L)));
@@ -133,8 +134,47 @@ class TokenReclaimJobTest {
                 e -> "tok_2".equals(e.tokenId())));
     }
 
+    /**
+     * 🔴 <b>같은 큐에서 admit 경로가 죽어도 이탈 회수는 돌아야 한다.</b>
+     *
+     * <p>루프 본문의 두 {@code EVAL}을 하나의 {@code try/catch}로 묶는 리팩터는 아주 자연스럽다.
+     * 그러면 admit-expire가 실패하는 큐는 <b>이탈 회수가 통째로 멈춘다</b> — §82가 남긴 유일한
+     * 경로가 조용히 죽는데 다른 테스트는 전부 초록이다. 이 단언이 그걸 잡는다.
+     */
     @Test
-    @DisplayName("발행 실패는 삼킨다 — 복귀는 Redis에서 이미 확정됐고 되돌릴 수단이 없다")
+    @DisplayName("같은 큐에서 admit 경로가 실패해도 inactive 회수는 계속된다 (§82)")
+    void admitPathFailureDoesNotBlockInactiveReclaim() {
+        when(queueRepository.findAll()).thenReturn(List.of(queue("q_dev_a", 42L)));
+        when(queueEngine.claimExpiredAdmits(eq("q_dev_a"), anyLong(), anyInt()))
+                .thenThrow(new IllegalStateException("admit claim 실패"));
+        when(queueEngine.claimInactive(eq("q_dev_a"), anyLong(), anyInt()))
+                .thenReturn(List.of(new ReclaimedToken("user-idle", 5L, "tok_5", ISSUED_AT)));
+
+        job.reclaim();
+
+        verify(eventPublisher).publish(org.mockito.ArgumentMatchers.argThat(
+                e -> "tok_5".equals(e.tokenId())));
+    }
+
+    /** 반대 방향도 같다 — inactive가 죽어도 다음 큐의 회수를 막지 않는다. */
+    @Test
+    @DisplayName("한 큐의 inactive 회수 실패가 다음 큐를 막지 않는다 (§82)")
+    void inactiveFailureDoesNotStopOtherQueues() {
+        when(queueRepository.findAll())
+                .thenReturn(List.of(queue("q_dev_broken", 1L), queue("q_dev_ok", 2L)));
+        when(queueEngine.claimInactive(eq("q_dev_broken"), anyLong(), anyInt()))
+                .thenThrow(new IllegalStateException("redis down"));
+        when(queueEngine.claimInactive(eq("q_dev_ok"), anyLong(), anyInt()))
+                .thenReturn(List.of(new ReclaimedToken("user-9", 9L, "tok_9", ISSUED_AT)));
+
+        job.reclaim();
+
+        verify(eventPublisher).publish(org.mockito.ArgumentMatchers.argThat(
+                e -> "tok_9".equals(e.tokenId())));
+    }
+
+    @Test
+    @DisplayName("발행 실패는 삼킨다 — 회수는 Redis에서 이미 확정됐고 되돌릴 수단이 없다")
     void publishFailureIsSwallowed() {
         when(queueRepository.findAll())
                 .thenReturn(List.of(queue("q_dev_a", 1L), queue("q_dev_b", 2L)));

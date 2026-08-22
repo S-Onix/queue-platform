@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
 class InactiveReclaimTest {
 
-    private static final String QUEUE_ID = "q_dev_inactive";
+    private static final String QUEUE_ID = "q_test_inactive";
     /** 컷오프. 이 값보다 **이전**에 마지막 폴링한 사람이 대상이다 (= now - inactiveTtl*1000). */
     private static final long CUTOFF = 1_755_530_000_000L;
     private static final long ISSUED_AT = 1_700_000_000_000L;

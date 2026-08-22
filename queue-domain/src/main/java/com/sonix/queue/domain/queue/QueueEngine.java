@@ -46,7 +46,9 @@ public interface QueueEngine {
      * seq는 큐별 INCR이라 추측이 자명하므로 seq 존재만으로 판정하면 남의 대기 항목을
      * 들여다보고 keepalive까지 걸 수 있다 — 검증과 갱신을 분리하지 말 것.
      *
-     * @param keepalive true면 검증 통과 시 last-active를 nowMillis로 갱신
+     * @param keepalive ⚠️ <b>무시된다</b>(§82 F안). 예전엔 이 값이 갱신을 결정했으나 지금은
+     *                  <b>폴링이 오면 언제나</b> {@code last-active}를 갱신한다. 호출부가 계속
+     *                  넘기지만 {@code poll_verify.lua}는 읽지 않는다 — API 하위호환용 자리다
      * @return 검증 통과 여부
      */
     boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis);
@@ -94,7 +96,7 @@ public interface QueueEngine {
     Optional<String> findAdmitTokenByTokenId(String queueId, String tokenId);
 
     /**
-     * admitToken TTL이 지난 항목을 <b>집어(claim)</b> 원래 seq 그대로 WAITING으로 되돌린다
+     * admitToken TTL이 지난 항목을 <b>집어(claim)</b> 큐에서 뺀다 (~~원래 seq 그대로 WAITING 복귀~~는 §36이 폐기)
      * (FRS §10 {@code TokenReclaimJob} · §36 · §80 ⑧).
      *
      * <p><b>이 호출 자체가 claim이다.</b> {@code ZRANGEBYSCORE 0 now} + {@code ZREM}이 한 Lua라

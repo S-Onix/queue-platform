@@ -39,6 +39,7 @@ class RedisQueueEngineShutdownTest {
 
     @Mock
     private RedisScript<List> admitExpireScript;
+    @Mock
     private RedisScript<List> inactiveExpireScript;
 
     @Test
