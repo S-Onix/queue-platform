@@ -1,3 +1,22 @@
+spring:
+  datasource:
+    # 🔴 이 블록이 없으면 기동 자체가 안 된다 — 베이스 application.yml에 datasource가 없어
+    #    프로필이 반드시 제공해야 한다. queue-api·queue-consumer는 갖고 있는데 여기만 빠져
+    #    있어서 batch는 local 프로필 밖에서 한 번도 뜬 적이 없었다(2026-08-24 컨테이너 검증에서 발견).
+    #    TokenReclaimJob이 queueRepository.findAll()로 큐 목록을 DB에서 읽으므로 필수다.
+    master:
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      username: ${DB_USERNAME}
+      password: ${DB_PASSWORD}
+      # api(50)·consumer(20)보다 작다. 이 앱은 주기(10초)마다 큐 목록을 한 번 읽고
+      # 회수는 Redis EVAL로 끝난다 — 커넥션을 오래 쥐지 않는다.
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+    replica:
+      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      username: ${DB_USERNAME}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 5
+
 logging:
   level:
     root: WARN
