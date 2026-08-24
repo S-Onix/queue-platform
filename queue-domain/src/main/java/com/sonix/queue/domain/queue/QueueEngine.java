@@ -143,6 +143,37 @@ public interface QueueEngine {
     List<ReclaimedToken> claimInactive(String queueId, long cutoffMillis, int limit);
 
     /**
+     * <b>관측 전용</b> — {@code waiting} 맨 앞에서 {@code tokens} Hash 항목이 <b>없는</b> 멤버 수
+     * (§80 U9 좀비 탐지). 아무것도 지우지 않는다.
+     *
+     * <p><b>고아의 정의는 위치가 아니라 Hash 미스다.</b> {@code admit.lua}는 {@code ZPOPMIN}으로
+     * 뽑은 사람의 {@code HGET tokens}가 미스면 <b>원래 seq로 되돌려 놓는다</b>. 그 사람은 매 admit
+     * 주기마다 뽑혔다 되돌아가며 {@code count} 슬롯을 하나씩 먹고, admit은 그를 지나가지 못한다.
+     * 판정은 그 조건을 <b>그대로</b> 본다 — {@code waiting}에 있는데 {@code tokens}에 없다.
+     *
+     * <p><b>맨 앞만 보면 되는 이유</b>: admit이 고아를 지나가지 못하므로 고아는 <b>항상 앞에 쌓인다</b>.
+     * {@code ZRANGE 0 N}으로 상한을 두면 큐가 30만이어도 훑는 양이 고정된다.
+     *
+     * <p><b>🪤 admit watermark로 판정하지 않는다 — 실측으로 기각됐다(2026-08-24).</b>
+     * 처음엔 "watermark보다 앞 순번인데 waiting에 있다"로 판정했는데, 실제 dev Redis에서
+     * <b>15,144건이 전부 오탐</b>이었다. {@code admit-watermark}가 {@code waiting}과 갈라져 있었기
+     * 때문이다(부하 테스트가 {@code waiting}을 재시드하며 watermark는 안 지웠다 —
+     * seq=20504 / watermark=101 / waiting score 범위 [1..20504]).
+     * 키를 선택적으로 지우는 경로(테스트 정리 · §71 복구 · 부분 유실)가 그 불변식을 깬다.
+     * <b>위치는 고아의 증거가 아니다.</b>
+     *
+     * <p>구현이 두 명령(범위 조회 + {@code HMGET})을 원자로 묶지 않아도 된다. 그 사이 누가
+     * {@code complete}하면 한 주기 동안만 1건이 더 세어지고 다음 주기에 사라진다 — gauge에 허용되는
+     * 오차다. 반대 방향(고아를 놓침)은 없다.
+     *
+     * <p>🪤 <b>"첫 폴링 전 이탈"(§82 구멍 ③)은 잡지 못한다.</b> 그 사람들은 {@code tokens} Hash가
+     * 멀쩡해 고아가 아니다 — 자기 차례가 오면 정상적으로 뽑힌다. 그쪽은 {@code waitingTtl}이 받는다.
+     *
+     * @return 맨 앞 구간에서 발견된 고아 수. 상한을 넘으면 그 값에서 포화한다(구현 상수 참조)
+     */
+    long countOrphanedWaiting(String queueId);
+
+    /**
      * complete: 대기열·admit 흔적 제거 (FRS §6.6 ②). 멱등 — 없는 키를 지워도 무해하다.
      *
      * <p>{@code admit-by-admit}은 TTL 말고 삭제 경로가 여기뿐이다. 지우지 않으면 완료된

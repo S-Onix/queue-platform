@@ -22,8 +22,10 @@ import org.springframework.stereotype.Component;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
@@ -456,6 +458,35 @@ public class RedisQueueEngine implements QueueEngine {
                 Integer.toString(limit)
         );
         return toReclaimed(raw);
+    }
+
+    /**
+     * 좀비 탐지가 한 번에 훑는 {@code waiting} 앞부분 크기.
+     *
+     * <p>고아는 admit이 지나가지 못해 앞에 쌓이므로 앞만 보면 된다. admit {@code count} 상한이
+     * 100이라 그 10배면 한 주기에 새로 생길 수 있는 양을 덮는다. 넘으면 이 값에서 포화하는데,
+     * 포화한 시점이면 이미 알람이 울고 남았을 값이라 정확한 숫자가 의미를 갖지 않는다.
+     */
+    private static final int ORPHAN_HEAD_SCAN = 1000;
+
+    @Override
+    public long countOrphanedWaiting(String queueId) {
+        // routeForRead다 — 세기만 하므로 쓰기 경로의 DB 조회(배정 기록)를 유발할 이유가 없다.
+        StringRedisTemplate redis = routeForRead(queueId);
+
+        // 맨 앞 = score(seq) 오름차순 앞쪽. 고아가 쌓이는 자리다.
+        Set<String> head = redis.opsForZSet().range(QueueKeys.waiting(queueId), 0, ORPHAN_HEAD_SCAN - 1);
+        if (head == null || head.isEmpty()) {
+            return 0L;
+        }
+
+        // 🔴 판정은 여기다 — waiting에 있는데 tokens Hash에 없으면 admit.lua가 되돌리는 고아다.
+        //    위치(watermark 비교)로 판정하면 안 된다. 포트 Javadoc의 실측 기각 사유 참조.
+        List<Object> stored = redis.opsForHash().multiGet(QueueKeys.tokens(queueId), List.copyOf(head));
+        if (stored == null) {
+            return 0L;
+        }
+        return stored.stream().filter(Objects::isNull).count();
     }
 
     /** claim 계열 두 스크립트의 반환 형식이 같다(원소 4개 고정) — 파싱을 공유한다. */
