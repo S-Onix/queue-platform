@@ -58,6 +58,18 @@ public class RedisQueueEngine implements QueueEngine {
     /** admitToken 유효 시간 (FRS §6.4). admit-by-* 키의 PX이자 admitted ZSet score의 기준. */
     private static final long ADMIT_TTL_MILLIS = 60_000L;
 
+    /**
+     * {@code admit-by-admit} 값이 신 포맷인지 가르는 issuedAt 하한 (2020-01-01T00:00:00Z).
+     *
+     * <p>구 포맷 {@code "tokenId|identifier"}의 identifier가 {@code "12|34|56"} 같은 모양이면
+     * 조각 수도 4개고 숫자 파싱도 성공해서 <b>신 포맷과 구분되지 않는다</b>. 그때 issuedAt이
+     * 1970년으로 잡히고, 멱등 키 {@code (token_id, issued_at)}가 어긋나 <b>중복 행 = 중복 청구</b>가 된다.
+     *
+     * <p>실제 issuedAt은 이 서비스가 존재하기 시작한 뒤의 값이고 <b>시간은 앞으로만 가므로</b>,
+     * 하한보다 작은 값은 신 포맷일 수 없다. 오분류가 원리적으로 생기지 않는 기준이다.
+     */
+    private static final long MIN_PLAUSIBLE_ISSUED_AT_MILLIS = 1_577_836_800_000L;
+
     /** admit 멱등 payload 보관 시간. Tenant 재시도가 끝났을 시점 이후로 잡는다 (§80). */
     private static final long ADMIT_IDEM_TTL_MILLIS = 300_000L;
 
@@ -94,6 +106,7 @@ public class RedisQueueEngine implements QueueEngine {
     private final RedisScript<List> admitScript;
     private final RedisScript<List> admitExpireScript;
     private final RedisScript<List> inactiveExpireScript;
+    private final RedisScript<List> waitingExpireScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
@@ -117,7 +130,8 @@ public class RedisQueueEngine implements QueueEngine {
             @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
             @Qualifier("admitScript") RedisScript<List> admitScript,
             @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript,
-            @Qualifier("inactiveExpireScript") RedisScript<List> inactiveExpireScript
+            @Qualifier("inactiveExpireScript") RedisScript<List> inactiveExpireScript,
+            @Qualifier("waitingExpireScript") RedisScript<List> waitingExpireScript
     ) {
         this.cluster1 = cluster1;
         this.cluster2 = cluster2;
@@ -127,6 +141,7 @@ public class RedisQueueEngine implements QueueEngine {
         this.admitScript = admitScript;
         this.admitExpireScript = admitExpireScript;
         this.inactiveExpireScript = inactiveExpireScript;
+        this.waitingExpireScript = waitingExpireScript;
     }
 
     /**
@@ -141,10 +156,12 @@ public class RedisQueueEngine implements QueueEngine {
             RedisScript<Long> pollVerifyScript,
             RedisScript<List> admitScript,
             RedisScript<List> admitExpireScript,
-            RedisScript<List> inactiveExpireScript
+            RedisScript<List> inactiveExpireScript,
+            RedisScript<List> waitingExpireScript
     ) {
         this(redisTemplate, redisTemplate, null,
-                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript,
+                inactiveExpireScript, waitingExpireScript);
     }
 
     /**
@@ -396,14 +413,38 @@ public class RedisQueueEngine implements QueueEngine {
         if (raw == null) {
             return Optional.empty();
         }
-        // ⚠️ **첫 '|'로만** 쪼갠다. identifier는 Tenant가 정하는 자유 문자열이라 '|'가 들어올 수
-        //    있고, tokenId는 'tok_' + UUID라 '|'를 포함할 수 없다 — 첫 구분자가 정확한 경계다.
-        //    구분자가 없으면 롤링 배포 중 남은 구 포맷(tokenId만)이다: 관용적으로 받아 주고
-        //    identifier는 null로 둔다(호출자가 DB 경로로 간다). admit_expire.lua·splitTokenValue와 같은 규약.
-        int sep = raw.indexOf('|');
-        return Optional.of(sep < 0
-                ? new AdmitRef(raw, null)
-                : new AdmitRef(raw.substring(0, sep), raw.substring(sep + 1)));
+        // 값은 "tokenId|seq|issuedAt|identifier"다 (admit.lua).
+        // identifier는 Tenant 자유 문자열이라 '|'가 들어올 수 있고 앞 세 값에는 없다 →
+        // 앞에서 세 번만 쪼개고 나머지 전부가 identifier다(limit=4).
+        //
+        // 🔴 **구 포맷을 필드 개수로 가르면 안 된다.** 구 포맷 "tokenId|identifier"의 identifier에도
+        //    '|'가 들어올 수 있어 조각이 4개가 될 수 있다. 실측으로 확인된 두 갈래:
+        //      "tok_A|user|with|pipes" → 개수만 보면 신 포맷 → 신원이 "pipes"로 잘린다
+        //      "tok_A|12|34|56"        → 숫자라 파싱까지 성공 → issuedAt이 1970년이 되고,
+        //                                멱등 키 (token_id, issued_at)가 어긋나 **중복 행**이
+        //                                INSERT된다. 과금은 행 수라(§82) 그게 곧 중복 청구다
+        //
+        //    그래서 **값의 타당성까지** 본다. issuedAt은 epoch millis이고 시간은 앞으로만 가므로,
+        //    하한보다 작으면 신 포맷일 수 없다. 오분류가 생길 수 없는 기준이다.
+        String[] f = raw.split("\\|", 4);
+        if (f.length < 2) {
+            // "tokenId"만 있던 더 옛날 포맷 — 신원도 모른다. 호출자가 DB 경로로 간다.
+            return Optional.of(new AdmitRef(raw, -1L, null, null));
+        }
+        if (f.length == 4) {
+            try {
+                long seq = Long.parseLong(f[1]);
+                long millis = Long.parseLong(f[2]);
+                if (seq >= 0 && millis >= MIN_PLAUSIBLE_ISSUED_AT_MILLIS) {
+                    return Optional.of(new AdmitRef(f[0], seq, Instant.ofEpochMilli(millis), f[3]));
+                }
+            } catch (NumberFormatException ignored) {
+                // 숫자가 아니면 구 포맷이다. 아래 폴백이 신원을 온전히 살린다.
+            }
+        }
+        // 구 포맷 "tokenId|identifier" — **첫 '|' 뒤 전부**가 신원이다(구 파서의 규약 그대로).
+        // seq·issuedAt이 없어 이벤트는 못 만들지만 verify의 답은 정확하다.
+        return Optional.of(new AdmitRef(f[0], -1L, null, raw.substring(raw.indexOf('|') + 1)));
     }
 
     /**
@@ -468,6 +509,29 @@ public class RedisQueueEngine implements QueueEngine {
      * 포화한 시점이면 이미 알람이 울고 남았을 값이라 정확한 숫자가 의미를 갖지 않는다.
      */
     private static final int ORPHAN_HEAD_SCAN = 1000;
+
+    @Override
+    public List<ReclaimedToken> claimExpiredWaiting(String queueId, long cutoffMillis, int limit) {
+        // ⚠️ routeForWrite 필수 — claimInactive와 같은 이유다. 직접 템플릿을 쓰면 cluster2에
+        //    배정된 큐의 회수가 cluster1에서 돌아 **조용히 0건**을 반환하고, 그 사람들은 아무
+        //    에러도 없이 영원히 큐에 남는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
+        @SuppressWarnings("unchecked")
+        List<Object> raw = routeForWrite(queueId).execute(
+                waitingExpireScript,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId)),
+                Long.toString(cutoffMillis),
+                Integer.toString(limit)
+        );
+        return toReclaimed(raw);
+    }
+
+    @Override
+    public long countWaitingUpTo(String queueId, long maxSeq) {
+        // 세기만 하므로 routeForRead다 — countOrphanedWaiting과 같은 이유.
+        Long count = routeForRead(queueId).opsForZSet()
+                .count(QueueKeys.waiting(queueId), Double.NEGATIVE_INFINITY, maxSeq);
+        return count == null ? 0L : count;
+    }
 
     @Override
     public long countOrphanedWaiting(String queueId) {

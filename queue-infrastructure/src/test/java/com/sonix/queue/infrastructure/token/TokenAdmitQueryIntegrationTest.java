@@ -1,6 +1,7 @@
 package com.sonix.queue.infrastructure.token;
 
 import com.sonix.queue.domain.queue.Token;
+import com.sonix.queue.domain.queue.TokenEventType;
 import com.sonix.queue.domain.queue.TokenStatus;
 import com.sonix.queue.infrastructure.adapter.TokenJpaAdapter;
 import org.junit.jupiter.api.AfterAll;
@@ -15,6 +16,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -199,6 +201,165 @@ class TokenAdmitQueryIntegrationTest {
 
         assertThat(adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_c5", "adm_dev_c5", at, 300)).isEqualTo(1);
         assertThat(adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_c5", "adm_dev_c5", at, 300)).isZero();
+    }
+
+    // ── verify가 완료시킨 토큰 (실 DB) ──
+
+    /**
+     * 🔴 <b>목이 숨겼던 결함을 잡는 자리다.</b>
+     *
+     * <p>verify가 완료를 확정하게 되면서 {@code complete} API를 거치지 않고 {@code status=2}가 되는
+     * 경로가 생겼다. 그 전이는 컨슈머의 ODKU가 적용하는데, 예전엔 {@code completed_at}을 건드리지
+     * 않았다("complete API가 이미 채운 값"이라는 전제였다). 그래서 값이 <b>NULL</b>로 남고,
+     * 이어지는 {@code complete}의 {@code findCompletedAt}이 빈 값을 읽어 <b>정상 Tenant가 404</b>를 받았다.
+     *
+     * <p>유닛 테스트는 {@code findCompletedAt}을 {@code Optional.of(...)}로 목킹해서 통과했다 —
+     * <b>실제 SQL만이 NULL을 드러낸다.</b> 그래서 이 검증은 실 DB에 있어야 한다.
+     *
+     * <p>더해서 이 값은 {@code schema.sql}의
+     * {@code AVG/MAX(TIMESTAMPDIFF(SECOND, issued_at, completed_at))} 집계에도 쓰인다.
+     * NULL이면 verify로 완료된 건이 통계에서 통째로 빠진다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("verify 경로(COMPLETED 이벤트)로 완료돼도 completed_at이 채워진다 — 그래야 complete가 멱등하다")
+    void completedAt_isFilledByConsumerTransition() {
+        seedAdmitted("tok_dev_v1", "adm_dev_v1", 3);
+
+        // verify가 발행한 COMPLETED를 컨슈머가 적용하는 것과 같은 경로다.
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                Token.reconstruct(null, "tok_dev_v1", QUEUE_ID, tenantId, "0190e2c1-user", 42L,
+                        TokenStatus.COMPLETED, null, "adm_dev_v1", false, ISSUED_AT, null)));
+
+        assertThat(statusOf("tok_dev_v1")).isEqualTo(2);
+        // 🔴 여기가 핵심 — NULL이면 complete가 404를 준다.
+        assertThat(adapter.findCompletedAt(QUEUE_ID, tenantId, "tok_dev_v1", "adm_dev_v1"))
+                .isPresent();
+    }
+
+    /**
+     * 위 전이 뒤에 Tenant가 {@code complete}를 부르는 상황 그대로다.
+     * {@code markCompleted}는 {@code status IN (0,1)}이라 0행이고, 그때 <b>최초 완료 시각</b>이
+     * 나와야 응답이 참이 된다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("verify 완료 후 complete → markCompleted는 0행, findCompletedAt이 값을 준다")
+    void completeAfterVerify_findsOriginalCompletedAt() {
+        seedAdmitted("tok_dev_v2", "adm_dev_v2", 3);
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                Token.reconstruct(null, "tok_dev_v2", QUEUE_ID, tenantId, "0190e2c1-user", 42L,
+                        TokenStatus.COMPLETED, null, "adm_dev_v2", false, ISSUED_AT, null)));
+
+        assertThat(adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_v2", "adm_dev_v2",
+                LocalDateTime.of(2026, 8, 24, 12, 0, 0), 300)).isZero();
+        assertThat(adapter.findCompletedAt(QUEUE_ID, tenantId, "tok_dev_v2", "adm_dev_v2"))
+                .isPresent();
+    }
+
+    /** admitToken이 다르면 남의 완료 시각을 읽지 못한다. */
+    @Test
+    @Transactional
+    @DisplayName("findCompletedAt: admitToken이 틀리면 빈 값")
+    void findCompletedAt_wrongAdmitToken() {
+        seedAdmitted("tok_dev_v3", "adm_dev_v3", 3);
+        adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_v3", "adm_dev_v3",
+                LocalDateTime.of(2026, 8, 24, 12, 0, 0), 300);
+
+        assertThat(adapter.findCompletedAt(QUEUE_ID, tenantId, "tok_dev_v3", "adm_dev_WRONG"))
+                .isEmpty();
+    }
+
+    // ── reconciliation (실 DB) ──
+
+    /**
+     * 🔑 <b>Tenant가 verify도 complete도 안 부른 토큰</b>이 여기로 온다.
+     *
+     * <p>🔴 기준이 {@code admitToken TTL(60초)}이 아니라
+     * {@link Token#COMPLETE_VALID_WINDOW_SECONDS}(300초)인 것이 핵심이다. 더 일찍 자르면
+     * <b>정상적인 늦은 통보가 404를 받는다</b> — 실측으로 확인된 경로다(admit 후 98초에도 200).
+     * 그래서 창 안(3초 전 admit)은 <b>건드리지 않아야</b> 하고, 창 밖(400초 전)만 만료된다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: complete 창 밖(300초 초과)만 만료된다 — 창 안은 건드리지 않는다")
+    void expireStaleAdmitted_onlyOutsideCompleteWindow() {
+        seedAdmitted("tok_dev_r1", "adm_dev_r1", 400);   // 창 밖 → 대상
+        seedAdmitted("tok_dev_r2", "adm_dev_r2", 3);     // 창 안 → 살아야 한다
+
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isEqualTo(1);
+
+        assertThat(statusOf("tok_dev_r1")).isEqualTo(4);   // EXPIRED
+        assertThat(statusOf("tok_dev_r2")).isEqualTo(1);   // ADMIT_ISSUED 유지
+    }
+
+    /**
+     * 술어 {@code status = 1}이 멱등성을 만든다 — batch가 N대여도 각 행은 한 번만 전이한다.
+     * 두 번째 호출이 0행이어야 그게 성립한다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: 두 번째 호출은 0행 — status = 1 술어가 멱등성을 만든다")
+    void expireStaleAdmitted_isIdempotent() {
+        seedAdmitted("tok_dev_r3", "adm_dev_r3", 400);
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isEqualTo(1);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isZero();
+    }
+
+    /** {@code LIMIT}이 실제로 걸려야 Gap Lock을 피한다. 남은 몫은 다음 주기가 가져간다. */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: LIMIT이 한 번에 고치는 행 수를 묶는다")
+    void expireStaleAdmitted_respectsLimit() {
+        for (int i = 0; i < 3; i++) {
+            seedAdmitted("tok_dev_r4_" + i, "adm_dev_r4_" + i, 400);
+        }
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 2)).isEqualTo(2);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 2)).isEqualTo(1);
+    }
+
+    /**
+     * 🔴 <b>COMPLETED(2)를 되돌리면 안 된다.</b> 술어가 {@code status = 1}이 아니라
+     * {@code status IN (1,2)}로 넓어지면 이미 완료된 원장이 만료로 뒤집힌다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: 이미 COMPLETED(2)인 행은 건드리지 않는다")
+    void expireStaleAdmitted_leavesCompletedAlone() {
+        seedAdmitted("tok_dev_r5", "adm_dev_r5", 400);
+        jdbc.update("UPDATE tokens SET status = 2 WHERE token_id = ?", "tok_dev_r5");
+
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isZero();
+        assertThat(statusOf("tok_dev_r5")).isEqualTo(2);
+    }
+
+    /** 대사의 DB 쪽 값 — {@code waiting} ZSet과 같은 집합(status = 0)이어야 한다. */
+    @Test
+    @Transactional
+    @DisplayName("countWaitingUpTo: status=0 · seq 이하만 센다 (admit된 사람은 빠진다)")
+    void countWaitingUpTo_countsOnlyWaiting() {
+        jdbc.update("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, "tok_dev_r6", QUEUE_ID, tenantId, "u6", 10L, ISSUED_AT);
+        jdbc.update("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, "tok_dev_r7", QUEUE_ID, tenantId, "u7", 20L, ISSUED_AT);
+        seedAdmitted("tok_dev_r8", "adm_dev_r8", 3);   // status=1 → 세면 안 된다
+
+        assertThat(adapter.countWaitingUpTo(QUEUE_ID, 15L)).isEqualTo(1L);
+        assertThat(adapter.countWaitingUpTo(QUEUE_ID, 100L)).isEqualTo(2L);
     }
 
     private int statusOf(String tokenId) {

@@ -84,7 +84,13 @@ public class QueueEngineController {
     }
 
     /**
-     * admitToken 유효성 확인 (Verify). <b>상태를 바꾸지 않는다.</b>
+     * admitToken 유효성 확인 (Verify).
+     *
+     * <p>🔑 <b>응답을 주는 시점이 곧 완료다.</b> Platform의 책임은 답을 돌려주는 데까지이고,
+     * 그 뒤 Tenant 안에서 좌석 배정·세션 생성이 어떻게 되는지는 관측할 수도 책임질 수도 없다
+     * ({@code CLAUDE.md} 원칙 1). 그래서 이 호출이 {@code COMPLETED}를 발행한다 —
+     * <b>예전 주석의 "상태를 바꾸지 않는다"는 더 이상 사실이 아니다.</b>
+     * DB·Redis는 직접 건드리지 않고 이벤트만 낸다.
      *
      * <p>POST /api/v1/queues/{queueId}/admit-tokens/{admitToken}/verify
      *

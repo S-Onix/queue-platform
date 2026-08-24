@@ -114,8 +114,12 @@ class AdmitLuaTest {
 
         assertThat(redis.opsForZSet().range(ADMITTED, 0, -1)).containsExactly("1|id-a", "2|id-b");
         assertThat(redis.opsForValue().get(QueueKeys.admitByToken(QUEUE_ID, "tok_a"))).isEqualTo("adm_1");
-        // 값이 "tokenId|identifier"다 — verify가 identifier를 DB 없이 답하기 위한 것(§80 ⑧)
-        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, "adm_1"))).isEqualTo("tok_a|id-a");
+        // 값이 "tokenId|seq|issuedAt|identifier"다 — verify가 **DB를 한 번도 읽지 않고**
+        // 신원(identifier)을 답하고 COMPLETED 이벤트(seq·issuedAt 필요)까지 만들기 위한 것이다.
+        // 🔴 identifier가 맨 뒤인 것이 규약이다 — Tenant 자유 문자열이라 '|'가 들어올 수 있고,
+        //    앞 세 값에는 없다. 가변 필드를 중간에 두면 읽는 쪽의 경계가 무너진다.
+        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, "adm_1")))
+                .isEqualTo("tok_a|1|1700000000000|id-a");
         assertThat(redis.opsForValue().get(WATERMARK)).isEqualTo("2");
 
         // 되돌린 사람 몫의 후보는 버려진다 (Java가 미리 만든 admitToken은 채택될 때만 쓴다)

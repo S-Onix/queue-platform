@@ -65,6 +65,7 @@ class InactiveReclaimTest {
     @Autowired @Qualifier("admitExpireScript") private RedisScript<List> admitExpireScript;
     @Autowired @Qualifier("inactiveExpireScript") private RedisScript<List> inactiveExpireScript;
 
+    @Autowired @Qualifier("waitingExpireScript") private RedisScript<List> waitingExpireScript;
     @BeforeEach
     @AfterEach
     void cleanUp() {
@@ -232,6 +233,6 @@ class InactiveReclaimTest {
     /** 별도 인스턴스(= 다른 서버의 queue-batch)를 흉내낸다. 공유하는 것은 Redis뿐이다. */
     private RedisQueueEngine newInstance() {
         return new RedisQueueEngine(redis, enqueueBulkScript, pollVerifyScript,
-                admitScript, admitExpireScript, inactiveExpireScript);
+                admitScript, admitExpireScript, inactiveExpireScript, waitingExpireScript);
     }
 }

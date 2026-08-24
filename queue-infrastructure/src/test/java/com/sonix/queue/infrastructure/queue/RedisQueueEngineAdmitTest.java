@@ -1,5 +1,6 @@
 package com.sonix.queue.infrastructure.queue;
 
+import com.sonix.queue.domain.queue.AdmitRef;
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.PacingTier;
 import com.sonix.queue.domain.queue.QueueBoard;
@@ -48,9 +49,14 @@ class RedisQueueEngineAdmitTest {
                 QueueKeys.seq(QUEUE_ID),
                 QueueKeys.admitIdem(QUEUE_ID, "req-1"),
                 QueueKeys.admitIdem(QUEUE_ID, "req-2"),
+                // ⚠️ 멱등키를 여기 안 넣으면 다음 실행의 admit이 REPLAY로 돌아 결과가 캐시에서 나온다.
+                //    그런데 admit-by-* 키는 PX 60s로 이미 만료돼 있어, 조회가 조용히 비고
+                //    "No value present"로 죽는다 — 원인이 이 클래스 밖처럼 보이는 실패다.
+                QueueKeys.admitIdem(QUEUE_ID, "req-pipe"),
                 QueueKeys.admitByToken(QUEUE_ID, "tok_a"),
                 QueueKeys.admitByToken(QUEUE_ID, "tok_b"),
-                QueueKeys.admitByToken(QUEUE_ID, "tok_c")));
+                QueueKeys.admitByToken(QUEUE_ID, "tok_c"),
+                QueueKeys.admitByToken(QUEUE_ID, "tok_w")));
         issuedAdmitTokens.forEach(t -> keys.add(QueueKeys.admitByAdmit(QUEUE_ID, t)));
         issuedAdmitTokens.clear();
         redis.delete(keys);
@@ -94,7 +100,10 @@ class RedisQueueEngineAdmitTest {
 
         // 양방향 매핑 + 만료 기준이 Redis에 실제로 남았는가
         assertThat(redis.opsForValue().get(QueueKeys.admitByToken(QUEUE_ID, "tok_a"))).isEqualTo(admitToken);
-        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, admitToken))).isEqualTo("tok_a|id-a");
+        // 값이 "tokenId|seq|issuedAt|identifier"다 — verify가 DB 없이 신원을 답하고
+        // COMPLETED 이벤트(seq·issuedAt 필요)까지 만들기 위한 것이다. identifier가 맨 뒤인 것이 규약.
+        assertThat(redis.opsForValue().get(QueueKeys.admitByAdmit(QUEUE_ID, admitToken)))
+                .isEqualTo("tok_a|1|1755000000000|id-a");
         assertThat(redis.opsForZSet().score(ADMITTED, "1|id-a")).isEqualTo(NOW + 60_000d);
         assertThat(redis.opsForValue().get(WATERMARK)).isEqualTo("2");
 
@@ -190,5 +199,74 @@ class RedisQueueEngineAdmitTest {
         assertThat(retry.records()).isEmpty();
         // 새 인원을 받고 싶으면 새 requestId를 쓴다
         assertThat(admit("req-2", 5).records()).hasSize(1);
+    }
+
+    /**
+     * 🔴 <b>identifier가 맨 뒤인 것이 규약이다.</b> identifier는 Tenant 자유 문자열이라 {@code '|'}가
+     * 들어올 수 있고, 앞 세 값(tokenId='tok_'+UUID, seq=숫자, issuedAt=숫자)에는 없다.
+     * 읽는 쪽이 앞에서 <b>세 번만</b> 쪼개고 나머지 전부를 identifier로 봐야 경계가 성립한다.
+     *
+     * <p>이 테스트가 없으면 {@code split("|")}처럼 전부 쪼개는 구현이 조용히 통과하고,
+     * {@code '|'}가 든 identifier를 쓰는 Tenant만 신원이 잘려 나간다.
+     */
+    @Test
+    @DisplayName("identifier에 '|'가 들어 있어도 온전히 복원된다 — 가변 필드가 맨 뒤인 이유")
+    void admitRef_identifierWithPipes_isRestoredWhole() {
+        String weird = "user|with|pipes";
+        redis.opsForZSet().add(WAITING, weird, 1);
+        redis.opsForHash().put(TOKENS, weird, "tok_w|1755000000000");
+
+        engine.admit(QUEUE_ID, "req-pipe", 1, 1_755_000_000_000L);
+
+        String admitToken = redis.opsForValue().get(QueueKeys.admitByToken(QUEUE_ID, "tok_w"));
+        AdmitRef ref = engine.findAdmitRefByAdmitToken(QUEUE_ID, admitToken).orElseThrow();
+
+        assertThat(ref.identifier()).isEqualTo(weird);
+        assertThat(ref.tokenId()).isEqualTo("tok_w");
+        assertThat(ref.seq()).isEqualTo(1L);
+        assertThat(ref.issuedAt()).isEqualTo(java.time.Instant.ofEpochMilli(1_755_000_000_000L));
+        assertThat(ref.complete()).isTrue();
+    }
+
+    /**
+     * 🔴 <b>구 포맷 하위호환 회귀 검출기.</b> 롤링 배포 중에는 {@code "tokenId|identifier"}(구 포맷)가
+     * 남아 있는데, <b>그 identifier에도 {@code '|'}가 들어올 수 있다</b>. 조각 수만 보면 신 포맷과
+     * 구분되지 않는다.
+     *
+     * <p>실측으로 확인된 두 갈래(§security 검토):
+     * <ul>
+     *   <li>{@code "tok_A|user|with|pipes"} → 신원이 {@code "pipes"}로 <b>잘린다</b></li>
+     *   <li>{@code "tok_A|12|34|56"} → 숫자라 파싱까지 성공해 {@code issuedAt}이 <b>1970년</b>이 된다.
+     *       멱등 키 {@code (token_id, issued_at)}가 어긋나 <b>중복 행 = 중복 청구</b>(§82)</li>
+     * </ul>
+     *
+     * <p>그래서 파서는 조각 수가 아니라 <b>값의 타당성</b>까지 본다. 이 테스트가 빨개지면 그 판정이
+     * 조각 수로 되돌아간 것이다.
+     */
+    @Test
+    @DisplayName("구 포맷의 identifier에 '|'가 있어도 온전히 복원한다 — 개수가 아니라 타당성으로 가른다")
+    void admitRef_legacyValueWithPipes_isNotMisreadAsNewFormat() {
+        String key = QueueKeys.admitByAdmit(QUEUE_ID, "adm_legacy");
+        issuedAdmitTokens.add("adm_legacy");
+
+        // ① 숫자가 아닌 조각 — parseLong이 걸러야 한다
+        redis.opsForValue().set(key, "tok_A|user|with|pipes");
+        AdmitRef a = engine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_legacy").orElseThrow();
+        assertThat(a.identifier()).isEqualTo("user|with|pipes");
+        assertThat(a.complete()).isFalse();
+
+        // ② 🔴 숫자라 파싱은 되지만 issuedAt이 1970년 — 타당성 검사가 걸러야 한다.
+        //    안 걸러지면 가짜 issuedAt으로 COMPLETED가 나가 중복 행이 생긴다.
+        redis.opsForValue().set(key, "tok_A|12|34|56");
+        AdmitRef b = engine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_legacy").orElseThrow();
+        assertThat(b.identifier()).isEqualTo("12|34|56");
+        assertThat(b.complete()).isFalse();
+
+        // ③ 진짜 신 포맷은 그대로 통과해야 한다 (타당성 검사가 과하게 걸러도 안 된다)
+        redis.opsForValue().set(key, "tok_A|1|1755000000000|user|with|pipes");
+        AdmitRef c = engine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_legacy").orElseThrow();
+        assertThat(c.identifier()).isEqualTo("user|with|pipes");
+        assertThat(c.seq()).isEqualTo(1L);
+        assertThat(c.complete()).isTrue();
     }
 }

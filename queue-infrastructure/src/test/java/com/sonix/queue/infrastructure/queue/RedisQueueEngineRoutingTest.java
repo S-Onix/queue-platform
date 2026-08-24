@@ -66,6 +66,10 @@ class RedisQueueEngineRoutingTest {
     @Qualifier("inactiveExpireScript")
     private RedisScript<List> inactiveExpireScript;
 
+    @Autowired
+    @Qualifier("waitingExpireScript")
+    private RedisScript<List> waitingExpireScript;
+
     private static final String ON_CLUSTER2 = "q_dev_route_on_b";
     private static final String BRAND_NEW = "q_dev_route_new";
     private static final String NOT_A_QUEUE = "q_dev_route_ghost";
@@ -75,7 +79,7 @@ class RedisQueueEngineRoutingTest {
 
     private RedisQueueEngine engine() {
         return new RedisQueueEngine(cluster1, cluster2, queueJpaRepository,
-                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript, waitingExpireScript);
     }
 
     @AfterEach
@@ -239,7 +243,7 @@ class RedisQueueEngineRoutingTest {
         when(dead.hasKey(anyString()))
                 .thenThrow(new RedisConnectionFailureException("cluster1 down"));
         return new RedisQueueEngine(dead, cluster2, queueJpaRepository,
-                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript, waitingExpireScript);
     }
 
     @Test

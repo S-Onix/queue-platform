@@ -57,6 +57,7 @@ class MultiInstanceEnqueueTest {
     @Autowired @Qualifier("admitScript") private RedisScript<List> admitScript;
     @Autowired @Qualifier("admitExpireScript") private RedisScript<List> admitExpireScript;
     @Autowired @Qualifier("inactiveExpireScript") private RedisScript<List> inactiveExpireScript;
+    @Autowired @Qualifier("waitingExpireScript") private RedisScript<List> waitingExpireScript;
     @Autowired private QueueRepository queueRepository;
     @Autowired private TenantRepository tenantRepository;
 
@@ -88,7 +89,7 @@ class MultiInstanceEnqueueTest {
         // WAS 3대: 각자 독립 engine(=독립 Global Queue) + 독립 batch, 공유 repo/redis
         running.set(true);
         for (int w = 0; w < WAS_COUNT; w++) {
-            RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
+            RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript, waitingExpireScript);
             BatchProcessor batch = new BatchProcessor(engine, queueRepository);
             // Kafka 브로커 없이 Enqueue(Redis) 흐름만 검증 → no-op 발행자
             // enqueue 경로는 TokenRepository를 쓰지 않는다(admit/verify/complete 전용) → null
