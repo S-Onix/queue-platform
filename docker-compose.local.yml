@@ -1,0 +1,87 @@
+# 로컬 검증용 — 이미지가 실제로 뜨고 호스트 인프라에 붙는지 확인한다.
+# 운영 배포용이 아니다(운영은 k8s 매니페스트 + 실제 호스트명·시크릿).
+#
+#   docker compose -f docker-compose.local.yml build
+#   docker compose -f docker-compose.local.yml up -d
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔴 network_mode: host 인 이유 — 로컬 인프라가 컨테이너에서 안 보이기 때문이다.
+#
+#   Redis Cluster : 127.0.0.1:700x 에만 바인드 + cluster-announce-ip 미설정
+#                   → MOVED 응답이 127.0.0.1:700x 를 돌려줘 컨테이너가 자기 자신을 찾아간다
+#   Kafka         : [::ffff:127.0.0.1]:9092 바인드 + advertised.listeners 도 같은 문제
+#   MySQL         : *:3306 이라 이것만은 172.17.0.1 로 닿는다
+#
+#   호스트 네트워크를 그대로 쓰면 컨테이너 안에서도 127.0.0.1 이 성립해 재설정이 필요 없다.
+#   대가는 포트 격리 상실인데, 세 앱이 이미 8080/8081/8082 로 갈려 있어 충돌하지 않는다.
+#
+#   ⚠️ 이건 로컬 한정 우회다. 운영에서는 같은 문제를 정공법으로 푼다 —
+#      Redis 는 cluster-announce-ip, Kafka 는 advertised.listeners 를 클라이언트가 실제로
+#      닿을 수 있는 주소로 설정한다. k8s 에서 파드 IP 와 announce 주소가 갈리는 그 문제다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  network_mode: host
+  restart: unless-stopped
+  environment: &common-env
+    # local 프로필이 아니라 prod 프로필 + 환경변수로 돈다.
+    # 이미지가 실제 배포와 같은 경로를 타는지 보려는 것이므로 local 로 도망가지 않는다.
+    SPRING_PROFILES_ACTIVE: prod
+    DB_MASTER_HOST: 127.0.0.1
+    DB_MASTER_PORT: "3306"
+    DB_REPLICA_HOST: 127.0.0.1
+    DB_REPLICA_PORT: "3307"
+    DB_USERNAME: queueapp
+    DB_PASSWORD: queueapp1234
+    REDIS_CLUSTER1_NODES: 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005,127.0.0.1:7006,127.0.0.1:7007,127.0.0.1:7008
+    REDIS_CLUSTER2_NODES: 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003,127.0.0.1:8004,127.0.0.1:8005,127.0.0.1:8006,127.0.0.1:8007,127.0.0.1:8008
+
+services:
+  queue-api:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MODULE: queue-api
+        APP_PORT: "8080"
+    image: queue-api:local
+    container_name: queue-api
+    environment:
+      <<: *common-env
+      SERVER_PORT: "8080"
+      # prod 프로필이 요구한다. 로컬 검증용 값이며 운영 시크릿이 아니다.
+      JWT_ACTIVE_KID: key-local-01
+      JWT_SECRET_CURRENT: queue-platform-LOCAL-current-secret-must-be-32-bytes-or-more
+
+  queue-batch:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MODULE: queue-batch
+        APP_PORT: "8081"
+    image: queue-batch:local
+    container_name: queue-batch
+    environment:
+      <<: *common-env
+      SERVER_PORT: "8081"
+
+  queue-consumer:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MODULE: queue-consumer
+        APP_PORT: "8082"
+    image: queue-consumer:local
+    container_name: queue-consumer
+    environment:
+      <<: *common-env
+      SERVER_PORT: "8082"
+      KAFKA_BOOTSTRAP: 127.0.0.1:9092

@@ -1,0 +1,14 @@
+# 빌드는 이미지 안에서 한다 — 호스트 산출물을 넣으면 캐시만 깨지고 재현성이 사라진다.
+**/build/
+.gradle/
+
+.git/
+.github/
+
+# 로컬 전용 (.gitignore 대상) — 에이전트 정의·블로그 초안
+.claude/
+doc/blog/
+
+.idea/
+*.iml
+*.log
