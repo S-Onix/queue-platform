@@ -17,17 +17,20 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 큐에서 사람을 회수하는 배치 — <b>두 경로</b> (FRS §10 · DECISIONS §36 · §80 · §82).
+ * 큐에서 사람을 회수하는 배치 — <b>세 경로</b> (FRS §10 · DECISIONS §36 · §80 · §82).
  *
  * <ol>
  *   <li><b>admitToken TTL 만료</b>(§36) — Tenant가 뽑아갔는데 60초 안에 입장시키지 못한 사람</li>
  *   <li><b>{@code inactiveTtl} 초과</b>(§82) — 폴링이 끊긴 사람. <b>이탈 회수의 유일한 경로</b>다.
  *       §82가 Cancel API를 폐기해, 유저가 취소 버튼을 누르든 탭을 닫든 네트워크가 끊기든
  *       Platform이 보는 신호는 "폴링이 멈춘다" 하나뿐이다</li>
+ *   <li><b>{@code waitingTtl} 초과</b> — 폴링을 계속해도 정해진 시간을 넘기면 자리를 비운다.
+ *       🔑 <b>§82 구멍 ③의 마지노선</b>이다 — enqueue만 하고 첫 폴링 전에 떠난 사람은
+ *       {@code last-active}에 멤버가 없어 inactive sweep이 영영 못 본다</li>
  * </ol>
  *
- * <p><b>한 잡에 둘을 넣는다.</b> 잡을 나누면 {@code queueRepository.findAll()}이 주기마다
- * 두 번 돈다 — batch 3대면 큐 수 × 12회/분이다. 같은 루프에서 {@code EVAL} 두 번이 싸다.
+ * <p><b>한 잡에 셋을 넣는다.</b> 잡을 나누면 {@code queueRepository.findAll()}이 주기마다
+ * 그만큼 더 돈다 — batch 3대면 큐 수 × 18회/분이다. 같은 루프에서 {@code EVAL} 세 번이 싸다.
  *
  * <p>Tenant가 admit으로 뽑아갔지만 60초 안에 입장시키지 못한 사람을 정리한다.
  * <b>🔴 대기열로 되돌리지 않는다 (§36).</b> Platform은 만료 원인(유저 이탈 / 네트워크 / Tenant
@@ -136,11 +139,13 @@ public class TokenReclaimJob {
 
         int admitExpired = 0;
         int inactive = 0;
+        int waitingExpired = 0;
         long orphanTotal = 0;
         List<String> orphanQueues = new ArrayList<>();
         for (Queue queue : queueRepository.findAll()) {
             admitExpired += reclaimExpiredAdmits(queue, now);
             inactive += reclaimInactive(queue, now);
+            waitingExpired += reclaimExpiredWaiting(queue, now);
 
             long orphanCount = countOrphans(queue);
             if (orphanCount > 0) {
@@ -153,8 +158,9 @@ public class TokenReclaimJob {
 
         // 0건일 때는 찍지 않는다. 주기 6회/분 × 큐 수만큼의 무의미한 줄이 쌓이면
         // 정작 회수가 일어난 줄을 찾을 수 없다 (로드 테스트 로그 98%가 한 줄이었던 전례).
-        if (admitExpired > 0 || inactive > 0) {
-            log.info("회수 admitTokenTTL={}건 inactiveTTL={}건", admitExpired, inactive);
+        if (admitExpired > 0 || inactive > 0 || waitingExpired > 0) {
+            log.info("회수 admitTokenTTL={}건 inactiveTTL={}건 waitingTTL={}건",
+                    admitExpired, inactive, waitingExpired);
         }
     }
 
@@ -201,6 +207,40 @@ public class TokenReclaimJob {
             log.info("좀비 대기자 0건으로 회복");
         }
         lastLoggedOrphans = total;
+    }
+
+    /**
+     * {@code waitingTtl}(절대 만료)을 넘긴 대기자를 회수한다 (FRS §10).
+     *
+     * <p>🔑 <b>§82 구멍 ③의 마지노선이다.</b> enqueue만 하고 첫 폴링 전에 떠난 사람은
+     * {@code last-active}에 멤버가 없어 {@link #reclaimInactive}가 영영 못 본다.
+     * 실측으로 재현된 구멍이며(2026-08-24), 그 사람을 큐에서 빼는 수단은 이 경로뿐이다.
+     *
+     * <p><b>cutoff는 큐마다 다르다</b> — {@code waitingTtl}이 큐 설정이므로
+     * ({@code QueueCreateRequest.waitingTtl}, 기본 7200초) Java가 계산해 넘긴다.
+     *
+     * <p><b>{@code CLAIM_LIMIT}의 의미가 다른 두 경로와 다르다.</b> 여기서는 <b>검사할</b>
+     * 최대 건수다(회수 건수가 아니다). 앞부분을 훑어 만료 여부를 판정하는 방식이라, 상한 안에
+     * 만료 대상이 하나도 없을 수 있다 — 그건 정상이고 다음 주기가 더 앞을 볼 일도 없다
+     * (만료 대상은 늘 앞에 모인다).
+     *
+     * <p>예외를 삼키는 이유와 재시도가 성립하는 범위는 {@link #reclaimInactive}와 같다.
+     */
+    private int reclaimExpiredWaiting(Queue queue, long now) {
+        String queueId = queue.getQueueId();
+        long cutoff = now - queue.getWaitingTtl() * 1000L;
+        List<ReclaimedToken> claimed;
+        try {
+            claimed = queueEngine.claimExpiredWaiting(queueId, cutoff, CLAIM_LIMIT);
+        } catch (RuntimeException e) {
+            log.error("waitingTtl 회수 claim 실패 queueId={}", queueId, e);
+            return 0;
+        }
+
+        for (ReclaimedToken token : claimed) {
+            publishExpired(queue, token);
+        }
+        return claimed.size();
     }
 
     /**
@@ -265,6 +305,8 @@ public class TokenReclaimJob {
      *       <td><b>no-op</b> — 발행에 실패해도 결과가 같다</td></tr>
      *   <tr><td>{@link #reclaimInactive}(§82)</td><td><b>0 (WAITING)</b></td>
      *       <td><b>실제로 0 → 4를 적용한다</b></td></tr>
+     *   <tr><td>{@link #reclaimExpiredWaiting}(waitingTtl)</td><td><b>0 (WAITING)</b></td>
+     *       <td><b>실제로 0 → 4를 적용한다</b> — inactive와 같다</td></tr>
      * </table>
      *
      * <p>admit 만료분이 {@code 1}에 머무는 것은 <b>의도된 동작이다</b>(§36) — {@code complete}의

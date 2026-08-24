@@ -25,6 +25,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -246,5 +247,45 @@ class TokenReclaimJobTest {
         job.reclaim();
 
         assertThat(meterRegistry.get("queue.waiting.orphans").gauge().value()).isEqualTo(7.0);
+    }
+
+    /**
+     * 🔴 §82 구멍 ③의 마지노선이 실제로 호출되는가. cutoff는 <b>큐 설정</b>({@code waitingTtl})으로
+     * 계산해야 한다 — 상수를 박거나 {@code now}를 그대로 넘기면 <b>대기자 전원이 즉시 회수된다.</b>
+     * {@code inactiveTtl}(300)이 아니라 {@code waitingTtl}(7200)을 쓰는지도 함께 못박는다.
+     * 둘을 바꿔 쓰면 절대 만료가 24배 빨라져 정상 대기자가 잘려나간다.
+     */
+    @Test
+    @DisplayName("waitingTtl 회수의 cutoff = now - waitingTtl*1000 (inactiveTtl이 아니다)")
+    void waitingCutoffUsesQueueWaitingTtl() {
+        when(queueRepository.findAll()).thenReturn(List.of(queue("q_dev_a", 42L)));
+
+        long before = System.currentTimeMillis();
+        job.reclaim();
+        long after = System.currentTimeMillis();
+
+        ArgumentCaptor<Long> cutoff = ArgumentCaptor.forClass(Long.class);
+        verify(queueEngine).claimExpiredWaiting(eq("q_dev_a"), cutoff.capture(), anyInt());
+
+        // queue()가 waitingTtl=7200, inactiveTtl=300으로 만든다.
+        assertThat(cutoff.getValue())
+                .isBetween(before - 7200_000L, after - 7200_000L);
+    }
+
+    /**
+     * 세 경로는 서로를 막지 않는다. 한 경로의 Redis 장애가 나머지를 멈추면, 정작 장애 때
+     * 회수가 통째로 멈춰 큐가 부풀어 오른다.
+     */
+    @Test
+    @DisplayName("waitingTtl 경로 실패가 admit·inactive 회수를 막지 않는다")
+    void waitingFailureDoesNotBlockOtherPaths() {
+        when(queueRepository.findAll()).thenReturn(List.of(queue("q_dev_a", 42L)));
+        when(queueEngine.claimExpiredWaiting(anyString(), anyLong(), anyInt()))
+                .thenThrow(new RuntimeException("cluster down"));
+
+        job.reclaim();
+
+        verify(queueEngine).claimExpiredAdmits(eq("q_dev_a"), anyLong(), anyInt());
+        verify(queueEngine).claimInactive(eq("q_dev_a"), anyLong(), anyInt());
     }
 }

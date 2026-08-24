@@ -94,6 +94,7 @@ public class RedisQueueEngine implements QueueEngine {
     private final RedisScript<List> admitScript;
     private final RedisScript<List> admitExpireScript;
     private final RedisScript<List> inactiveExpireScript;
+    private final RedisScript<List> waitingExpireScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
@@ -117,7 +118,8 @@ public class RedisQueueEngine implements QueueEngine {
             @Qualifier("pollVerifyScript") RedisScript<Long> pollVerifyScript,
             @Qualifier("admitScript") RedisScript<List> admitScript,
             @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript,
-            @Qualifier("inactiveExpireScript") RedisScript<List> inactiveExpireScript
+            @Qualifier("inactiveExpireScript") RedisScript<List> inactiveExpireScript,
+            @Qualifier("waitingExpireScript") RedisScript<List> waitingExpireScript
     ) {
         this.cluster1 = cluster1;
         this.cluster2 = cluster2;
@@ -127,6 +129,7 @@ public class RedisQueueEngine implements QueueEngine {
         this.admitScript = admitScript;
         this.admitExpireScript = admitExpireScript;
         this.inactiveExpireScript = inactiveExpireScript;
+        this.waitingExpireScript = waitingExpireScript;
     }
 
     /**
@@ -141,10 +144,12 @@ public class RedisQueueEngine implements QueueEngine {
             RedisScript<Long> pollVerifyScript,
             RedisScript<List> admitScript,
             RedisScript<List> admitExpireScript,
-            RedisScript<List> inactiveExpireScript
+            RedisScript<List> inactiveExpireScript,
+            RedisScript<List> waitingExpireScript
     ) {
         this(redisTemplate, redisTemplate, null,
-                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript,
+                inactiveExpireScript, waitingExpireScript);
     }
 
     /**
@@ -468,6 +473,21 @@ public class RedisQueueEngine implements QueueEngine {
      * 포화한 시점이면 이미 알람이 울고 남았을 값이라 정확한 숫자가 의미를 갖지 않는다.
      */
     private static final int ORPHAN_HEAD_SCAN = 1000;
+
+    @Override
+    public List<ReclaimedToken> claimExpiredWaiting(String queueId, long cutoffMillis, int limit) {
+        // ⚠️ routeForWrite 필수 — claimInactive와 같은 이유다. 직접 템플릿을 쓰면 cluster2에
+        //    배정된 큐의 회수가 cluster1에서 돌아 **조용히 0건**을 반환하고, 그 사람들은 아무
+        //    에러도 없이 영원히 큐에 남는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
+        @SuppressWarnings("unchecked")
+        List<Object> raw = routeForWrite(queueId).execute(
+                waitingExpireScript,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId)),
+                Long.toString(cutoffMillis),
+                Integer.toString(limit)
+        );
+        return toReclaimed(raw);
+    }
 
     @Override
     public long countOrphanedWaiting(String queueId) {

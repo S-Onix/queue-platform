@@ -218,6 +218,12 @@ public class RedisConfig {
         return loadScript("lua/inactive_expire.lua", List.class);
     }
 
+    /** waitingTtl(절대 만료) 초과 대기자 회수. §82 구멍 ③(첫 폴링 전 이탈)의 마지노선이다. */
+    @Bean
+    public RedisScript<List> waitingExpireScript() {
+        return loadScript("lua/waiting_expire.lua", List.class);
+    }
+
     @Bean
     public RateLimiter rateLimiter(
             @Qualifier("stringRedisTemplate") StringRedisTemplate redisTemplate,

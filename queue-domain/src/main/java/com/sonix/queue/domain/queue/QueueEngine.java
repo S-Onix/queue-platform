@@ -143,6 +143,36 @@ public interface QueueEngine {
     List<ReclaimedToken> claimInactive(String queueId, long cutoffMillis, int limit);
 
     /**
+     * {@code waitingTtl}(절대 만료)을 넘긴 대기자를 <b>집어(claim)</b> 큐에서 뺀다 (FRS §10).
+     *
+     * <p><b>{@code inactiveTtl}과 다른 점은 폴링이 리셋하지 않는다는 것</b>이다. 그래서 판정
+     * 기준이 마지막 폴링 시각이 아니라 <b>발급 시각</b>({@code tokens} Hash의 issuedAt)이다.
+     *
+     * <p>🔑 <b>이 경로가 §82 구멍 ③의 마지노선이다.</b> enqueue만 하고 첫 폴링 전에 떠난 사람은
+     * {@code last-active}에 멤버가 없어 {@link #claimInactive}가 영영 못 본다. 그 사람을 큐에서
+     * 빼는 수단은 이것뿐이다.
+     *
+     * <p><b>{@code waiting} 앞부분만 훑는다.</b> seq는 {@code INCR} 발급이라 시간과 단조증가하므로
+     * 오래된 사람은 항상 앞에 모여 있다. 전수 스캔({@code HSCAN tokens})도, 별도 timestamp ZSet도
+     * 필요 없다 — 후자는 enqueue 핫패스에 쓰기를 하나 더 얹는 대가가 있고 그건 §82 A안과 같은 값이다.
+     *
+     * <p>⚠️ <b>조기 종료를 하지 않는다.</b> {@code enqueue_bulk.lua}가 issuedAt을 <b>청크 단위</b>로
+     * 받아 청크 실행 순서에 따라 밀리초 역전이 가능하다. 7200초 TTL에서 역전 자체는 무해하지만
+     * 조기 종료를 넣으면 <b>영구 누락</b>으로 바뀐다. 상한까지 전부 검사한다.
+     *
+     * <p>🔴 <b>고아({@code tokens} Hash 미스)는 건드리지 않는다.</b> issuedAt을 모르므로 만료 판정이
+     * 성립하지 않고, 조용히 치우면 {@link #countOrphanedWaiting}이 영원히 0이 되어 탐지 수단이
+     * 무력화된다. 대가는 고아가 앞자리를 점유하면 뒤의 진짜 만료 대상이 상한 안에 안 들어온다는
+     * 것인데, <b>그 상황을 알려주는 것이 그 메트릭의 존재 이유</b>다.
+     *
+     * @param cutoffMillis 이 시각보다 <b>이전</b>에 발급된 사람이 대상이다
+     *                     (= {@code now - waitingTtl * 1000}). 큐 설정이라 호출자가 계산한다
+     * @param limit        한 번에 <b>검사할</b> 최대 건수(회수 건수가 아니다). 남은 몫은 다음 주기가 가져간다
+     * @return 회수한 항목들. 비어 있으면 대상이 없었거나 다른 인스턴스가 먼저 집어간 것이다
+     */
+    List<ReclaimedToken> claimExpiredWaiting(String queueId, long cutoffMillis, int limit);
+
+    /**
      * <b>관측 전용</b> — {@code waiting} 맨 앞에서 {@code tokens} Hash 항목이 <b>없는</b> 멤버 수
      * (§80 U9 좀비 탐지). 아무것도 지우지 않는다.
      *
