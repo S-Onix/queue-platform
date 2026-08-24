@@ -38,7 +38,6 @@ public class QueueEngineService {
      * <p>60초에 대해 5배 여유 = TTL 만료 후 복귀·재입장 처리에 4분을 준다는 뜻이다.
      * 늘리는 건 하위호환, 줄이는 건 파괴적 변경이므로 여기서도 "필요를 채우는 최소"를 잡았다.
      */
-    private static final int COMPLETE_VALID_WINDOW_SECONDS = 300;
 
     private final QueueRepository queueRepository;
     private final TokenRepository tokenRepository;
@@ -258,7 +257,7 @@ public class QueueEngineService {
         LocalDateTime completedAt = LocalDateTime.now(clock);
 
         int updated = tokenRepository.markCompleted(
-                queueId, tenantId, tokenId, admitToken, completedAt, COMPLETE_VALID_WINDOW_SECONDS);
+                queueId, tenantId, tokenId, admitToken, completedAt, Token.COMPLETE_VALID_WINDOW_SECONDS);
         if (updated == 0) {
             // 🔴 **이미 COMPLETED면 성공이다.** verify가 완료를 확정하게 되면서
             //    verify → complete를 둘 다 부르는 정상 Tenant가 여기 도달한다.

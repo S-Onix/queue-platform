@@ -204,6 +204,21 @@ public interface QueueEngine {
     long countOrphanedWaiting(String queueId);
 
     /**
+     * 대사의 Redis 쪽 값 — {@code waiting}에서 {@code score(seq) <= maxSeq}인 멤버 수 (관측 전용).
+     *
+     * <p>{@link TokenRepository#countWaitingUpTo}와 짝이다. 두 값의 <b>부호가 방향을 말해 준다</b>.
+     * <ul>
+     *   <li><b>양수</b>(Redis가 많다) — 유령 토큰. {@code ENQUEUED} 발행이 유실됐다(§73 D15).
+     *       100만건 실측에서 835건 발생한 그 갭이다</li>
+     *   <li><b>음수</b>(DB가 많다) — 종료 이벤트가 유실됐다. 🔴 <b>자동 복구가 위험하다</b> —
+     *       Redis 전손과 구분할 수단이 없어 전원을 만료로 오판할 수 있다</li>
+     * </ul>
+     *
+     * <p>{@code ZCOUNT}라 O(log N)이다. 갭이 0이면 여기서 끝나고, 0이 아닐 때만 비싼 스캔으로 넘어간다.
+     */
+    long countWaitingUpTo(String queueId, long maxSeq);
+
+    /**
      * complete: 대기열·admit 흔적 제거 (FRS §6.6 ②). 멱등 — 없는 키를 지워도 무해하다.
      *
      * <p>{@code admit-by-admit}은 TTL 말고 삭제 경로가 여기뿐이다. 지우지 않으면 완료된

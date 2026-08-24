@@ -526,6 +526,14 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     @Override
+    public long countWaitingUpTo(String queueId, long maxSeq) {
+        // 세기만 하므로 routeForRead다 — countOrphanedWaiting과 같은 이유.
+        Long count = routeForRead(queueId).opsForZSet()
+                .count(QueueKeys.waiting(queueId), Double.NEGATIVE_INFINITY, maxSeq);
+        return count == null ? 0L : count;
+    }
+
+    @Override
     public long countOrphanedWaiting(String queueId) {
         // routeForRead다 — 세기만 하므로 쓰기 경로의 DB 조회(배정 기록)를 유발할 이유가 없다.
         StringRedisTemplate redis = routeForRead(queueId);

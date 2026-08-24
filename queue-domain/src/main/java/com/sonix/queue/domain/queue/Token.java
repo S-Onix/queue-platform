@@ -33,6 +33,21 @@ import java.time.LocalDateTime;
 @Getter
 public class Token {
 
+    /**
+     * {@code complete}가 유효한 창(초). <b>이 값이 두 곳에서 쓰인다</b>.
+     *
+     * <ul>
+     *   <li>{@code QueueEngineService.complete} — {@code admitted_at > now - 이 값}인 토큰만 완료시킨다</li>
+     *   <li>reconciliation — 이 창이 <b>지난 뒤에야</b> 남은 {@code ADMIT_ISSUED}를 만료로 정리한다.
+     *       더 일찍 자르면 정상적인 늦은 통보가 404를 받는다</li>
+     * </ul>
+     *
+     * <p>🔴 <b>숫자를 각자 박지 말 것.</b> 갈라지는 순간 정상 {@code complete}가 404를 받는데
+     * 원인은 다른 파일에 있게 된다. 실측으로 확인된 경로다 — admit 후 98초(= admitToken TTL 60초를
+     * 넘긴 시점)에도 {@code complete}가 200을 돌려준다.
+     */
+    public static final int COMPLETE_VALID_WINDOW_SECONDS = 300;
+
     Long id;
     String tokenId;
     String queueId;

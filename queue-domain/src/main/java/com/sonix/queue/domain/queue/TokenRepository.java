@@ -85,4 +85,49 @@ public interface TokenRepository {
      * @return 완료 행이 없거나 admitToken이 다르면 빈 {@link Optional} → 호출자가 400
      */
     Optional<LocalDateTime> findCompletedAt(String queueId, long tenantId, String tokenId, String admitToken);
+
+    // ── reconciliation (Sprint 9) ──
+
+    /**
+     * {@code complete} 유효 창이 지나도록 {@code ADMIT_ISSUED}에 남은 토큰을 만료로 정리한다.
+     *
+     * <p><b>왜 필요한가</b>: Tenant가 {@code verify}도 {@code complete}도 안 부르면 그 행은
+     * {@code status = 1}로 <b>영원히 남는다</b>(실서버로 재현됨). 회수 배치는 Redis 게이트만 풀고
+     * status는 안 건드린다 — {@code EXPIRED} 소비 가드가 {@code IF(status = 0, 4, status)}라
+     * 1에서는 no-op이기 때문이고, 그건 {@code complete}의 유효 창을 살리려는 의도다(§36).
+     *
+     * <p>🔴 <b>Kafka 이벤트로는 고칠 수 없다.</b> 위 가드 때문이다. 가드를 넓히면 늦은 입장이 죽는다.
+     * 그래서 이것만은 <b>직접 UPDATE</b>다 — 도메인 전이가 아니라 <b>원장 교정</b>이라는 뜻이기도 하다.
+     *
+     * <p><b>Redis를 보지 않는다.</b> 판정이 DB만으로 성립하므로("창이 지났다") Redis 전손 시
+     * 전원을 만료로 오판하는 위험이 없다 — 다른 대사 방향과 갈리는 지점이다.
+     *
+     * <p><b>큐 단위다.</b> 전역으로 두면 한 큐의 백로그가 {@code limit}을 다 먹어 다른 큐를 굶긴다.
+     *
+     * @param admittedBefore 이 시각 <b>이전</b>에 admit된 것이 대상
+     *                       (= {@code now - }{@link Token#COMPLETE_VALID_WINDOW_SECONDS}).
+     *                       더 일찍 자르면 정상적인 늦은 통보가 404를 받는다
+     * @param limit          한 번에 고칠 최대 행 수. Gap Lock을 피하려면 작게 끊는다
+     * @return 실제로 만료 처리된 행 수
+     */
+    int expireStaleAdmitted(String queueId, LocalDateTime admittedBefore, int limit);
+
+    /**
+     * 대사 기준선 — 이 시각 이전에 발급된 것 중 가장 큰 seq.
+     *
+     * <p>정착 시간(settle window)을 seq로 환산하는 값이다. 방금 들어온 사람은 아직 Kafka를
+     * 타는 중이라 Redis에는 있고 DB에는 없는 게 <b>정상</b>이다. 그 구간을 갭으로 세면
+     * 컨슈머 지연이 곧 오탐이 된다(실측: 회수 중 앱을 끊자 -500이 찍혔다가 40초 만에 0으로 회복).
+     *
+     * @return 해당 토큰이 없으면 {@code 0}
+     */
+    long findSettledMaxSeq(String queueId, LocalDateTime issuedBefore);
+
+    /**
+     * 대사의 DB 쪽 값 — {@code seq <= maxSeq}인 {@code WAITING} 행 수.
+     *
+     * <p>{@code waiting} ZSet과 <b>정확히 같은 집합</b>이어야 한다. admit된 사람은 ZSet에서 빠지고
+     * DB에서도 {@code status = 1}이 되므로 양쪽에서 함께 빠진다.
+     */
+    long countWaitingUpTo(String queueId, long maxSeq);
 }

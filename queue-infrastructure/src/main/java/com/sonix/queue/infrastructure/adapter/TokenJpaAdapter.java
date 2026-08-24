@@ -9,6 +9,7 @@ import com.sonix.queue.infrastructure.repository.TokenJpaRepository;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -186,5 +187,22 @@ public class TokenJpaAdapter implements TokenRepository {
     public Optional<LocalDateTime> findCompletedAt(String queueId, long tenantId,
                                                    String tokenId, String admitToken) {
         return tokenJpaRepository.findCompletedAt(queueId, tenantId, tokenId, admitToken);
+    }
+
+    @Override
+    @Transactional
+    public int expireStaleAdmitted(String queueId, LocalDateTime admittedBefore, int limit) {
+        return tokenJpaRepository.expireStaleAdmitted(queueId, admittedBefore, limit);
+    }
+
+    @Override
+    public long findSettledMaxSeq(String queueId, LocalDateTime issuedBefore) {
+        Long max = tokenJpaRepository.findSettledMaxSeq(queueId, issuedBefore);
+        return max == null ? 0L : max;
+    }
+
+    @Override
+    public long countWaitingUpTo(String queueId, long maxSeq) {
+        return tokenJpaRepository.countWaitingUpTo(queueId, maxSeq);
     }
 }

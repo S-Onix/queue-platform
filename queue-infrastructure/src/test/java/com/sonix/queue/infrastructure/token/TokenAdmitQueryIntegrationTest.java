@@ -270,6 +270,98 @@ class TokenAdmitQueryIntegrationTest {
                 .isEmpty();
     }
 
+    // ── reconciliation (실 DB) ──
+
+    /**
+     * 🔑 <b>Tenant가 verify도 complete도 안 부른 토큰</b>이 여기로 온다.
+     *
+     * <p>🔴 기준이 {@code admitToken TTL(60초)}이 아니라
+     * {@link Token#COMPLETE_VALID_WINDOW_SECONDS}(300초)인 것이 핵심이다. 더 일찍 자르면
+     * <b>정상적인 늦은 통보가 404를 받는다</b> — 실측으로 확인된 경로다(admit 후 98초에도 200).
+     * 그래서 창 안(3초 전 admit)은 <b>건드리지 않아야</b> 하고, 창 밖(400초 전)만 만료된다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: complete 창 밖(300초 초과)만 만료된다 — 창 안은 건드리지 않는다")
+    void expireStaleAdmitted_onlyOutsideCompleteWindow() {
+        seedAdmitted("tok_dev_r1", "adm_dev_r1", 400);   // 창 밖 → 대상
+        seedAdmitted("tok_dev_r2", "adm_dev_r2", 3);     // 창 안 → 살아야 한다
+
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isEqualTo(1);
+
+        assertThat(statusOf("tok_dev_r1")).isEqualTo(4);   // EXPIRED
+        assertThat(statusOf("tok_dev_r2")).isEqualTo(1);   // ADMIT_ISSUED 유지
+    }
+
+    /**
+     * 술어 {@code status = 1}이 멱등성을 만든다 — batch가 N대여도 각 행은 한 번만 전이한다.
+     * 두 번째 호출이 0행이어야 그게 성립한다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: 두 번째 호출은 0행 — status = 1 술어가 멱등성을 만든다")
+    void expireStaleAdmitted_isIdempotent() {
+        seedAdmitted("tok_dev_r3", "adm_dev_r3", 400);
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isEqualTo(1);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isZero();
+    }
+
+    /** {@code LIMIT}이 실제로 걸려야 Gap Lock을 피한다. 남은 몫은 다음 주기가 가져간다. */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: LIMIT이 한 번에 고치는 행 수를 묶는다")
+    void expireStaleAdmitted_respectsLimit() {
+        for (int i = 0; i < 3; i++) {
+            seedAdmitted("tok_dev_r4_" + i, "adm_dev_r4_" + i, 400);
+        }
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 2)).isEqualTo(2);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 2)).isEqualTo(1);
+    }
+
+    /**
+     * 🔴 <b>COMPLETED(2)를 되돌리면 안 된다.</b> 술어가 {@code status = 1}이 아니라
+     * {@code status IN (1,2)}로 넓어지면 이미 완료된 원장이 만료로 뒤집힌다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("expireStaleAdmitted: 이미 COMPLETED(2)인 행은 건드리지 않는다")
+    void expireStaleAdmitted_leavesCompletedAlone() {
+        seedAdmitted("tok_dev_r5", "adm_dev_r5", 400);
+        jdbc.update("UPDATE tokens SET status = 2 WHERE token_id = ?", "tok_dev_r5");
+
+        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
+                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isZero();
+        assertThat(statusOf("tok_dev_r5")).isEqualTo(2);
+    }
+
+    /** 대사의 DB 쪽 값 — {@code waiting} ZSet과 같은 집합(status = 0)이어야 한다. */
+    @Test
+    @Transactional
+    @DisplayName("countWaitingUpTo: status=0 · seq 이하만 센다 (admit된 사람은 빠진다)")
+    void countWaitingUpTo_countsOnlyWaiting() {
+        jdbc.update("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, "tok_dev_r6", QUEUE_ID, tenantId, "u6", 10L, ISSUED_AT);
+        jdbc.update("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, "tok_dev_r7", QUEUE_ID, tenantId, "u7", 20L, ISSUED_AT);
+        seedAdmitted("tok_dev_r8", "adm_dev_r8", 3);   // status=1 → 세면 안 된다
+
+        assertThat(adapter.countWaitingUpTo(QUEUE_ID, 15L)).isEqualTo(1L);
+        assertThat(adapter.countWaitingUpTo(QUEUE_ID, 100L)).isEqualTo(2L);
+    }
+
     private int statusOf(String tokenId) {
         return jdbc.queryForObject("SELECT status FROM tokens WHERE token_id = ?", Integer.class, tokenId);
     }

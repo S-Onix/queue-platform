@@ -91,4 +91,48 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
                                             @Param("tenantId") long tenantId,
                                             @Param("tokenId") String tokenId,
                                             @Param("admitToken") String admitToken);
+
+    // ── reconciliation (Sprint 9) ──
+
+    /**
+     * complete 유효 창이 지나도록 ADMIT_ISSUED에 남은 행을 만료로 정리한다.
+     *
+     * <p>🔴 이벤트가 아니라 직접 UPDATE인 이유는 {@code EXPIRED} 소비 가드가
+     * {@code IF(tokens.status = 0, 4, ...)}라 {@code status = 1}에서 no-op이기 때문이다.
+     * 가드를 넓히면 늦은 입장(§36)이 죽는다.
+     *
+     * <p><b>큐 단위다.</b> 이 레포의 토큰 쿼리는 전부 {@code queue_id} 술어로 격리돼 있고
+     * ({@code markCompleted}·{@code findByTokenId} 등) 여기만 전역이면 한 큐의 백로그가
+     * {@code LIMIT}을 다 먹어 다른 큐를 굶긴다. 잡이 어차피 큐를 순회하므로 추가 비용도 없다.
+     *
+     * <p>{@code status = 1} 술어가 멱등성을 만든다 — batch가 N대여도 각 행은 한 번만 전이한다.
+     * {@code LIMIT}은 Gap Lock을 피하려고 끊는 것이고, 남은 몫은 다음 주기가 가져간다.
+     */
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            UPDATE tokens
+               SET status = 4
+             WHERE queue_id = :queueId
+               AND status = 1
+               AND admitted_at < :admittedBefore
+             LIMIT :limit
+            """, nativeQuery = true)
+    int expireStaleAdmitted(@Param("queueId") String queueId,
+                            @Param("admittedBefore") LocalDateTime admittedBefore,
+                            @Param("limit") int limit);
+
+    /** 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq. 없으면 NULL이라 호출자가 0으로 바꾼다. */
+    @Query(value = """
+            SELECT MAX(seq) FROM tokens
+             WHERE queue_id = :queueId AND issued_at < :issuedBefore
+            """, nativeQuery = true)
+    Long findSettledMaxSeq(@Param("queueId") String queueId,
+                           @Param("issuedBefore") LocalDateTime issuedBefore);
+
+    /** 대사의 DB 쪽 값 — waiting ZSet과 같은 집합이어야 한다(status = 0). */
+    @Query(value = """
+            SELECT COUNT(*) FROM tokens
+             WHERE queue_id = :queueId AND status = 0 AND seq <= :maxSeq
+            """, nativeQuery = true)
+    long countWaitingUpTo(@Param("queueId") String queueId, @Param("maxSeq") long maxSeq);
 }
