@@ -8,11 +8,13 @@ import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.QueueStatus;
 import com.sonix.queue.domain.queue.TokenEventType;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -44,7 +46,16 @@ class TokenReclaimJobTest {
     @Mock private QueueEngine queueEngine;
     @Mock private EnqueueEventPublisher eventPublisher;
 
-    @InjectMocks private TokenReclaimJob job;
+    // 목이 아니라 진짜 레지스트리다 — gauge 등록·값 반영이 이 테스트가 보려는 것이다.
+    private final MeterRegistry meterRegistry = new SimpleMeterRegistry();
+
+    private TokenReclaimJob job;
+
+    @BeforeEach
+    void setUp() {
+        // 생성자에서 gauge를 등록하므로 @InjectMocks 대신 직접 만든다.
+        job = new TokenReclaimJob(queueRepository, queueEngine, eventPublisher, meterRegistry);
+    }
 
     private static Queue queue(String queueId, long tenantId) {
         return Queue.reconstruct(1L, queueId, tenantId, "테스트큐", 100_000, 7200, 300,
@@ -190,5 +201,50 @@ class TokenReclaimJobTest {
 
         verify(eventPublisher).publish(org.mockito.ArgumentMatchers.argThat(
                 e -> "tok_2".equals(e.tokenId())));
+    }
+
+    /**
+     * U9 좀비 탐지. gauge는 <b>큐별 합</b>이고 판정 여유값은 {@link TokenReclaimJob#ORPHAN_LAG}다.
+     *
+     * <p>이 테스트가 지키는 것 — 잡이 관측을 실제로 호출하고 <b>그 반환값을 쓰는가</b>.
+     * 호출을 빠뜨리면 gauge가 영원히 0이라 <b>초록인 채로 탐지 수단이 없다</b>. 스텁 값을 3/2로
+     * 서로 다르게 둔 것은 의도다 — 합(5)·마지막(2)·최댓값(3)이 전부 구분된다.
+     *
+     * <p>⚠️ 판정 로직 자체는 {@code RedisQueueEngine}에 있고 여기선 목이다.
+     * 판정 자체는 {@code OrphanWaitingCountTest}(실 Redis)가 잡는다.
+     */
+    @Test
+    @DisplayName("좀비 gauge = 큐별 countOrphanedWaiting의 합 (U9)")
+    void orphanGaugeSumsPerQueue() {
+        when(queueRepository.findAll())
+                .thenReturn(List.of(queue("q_dev_a", 42L), queue("q_dev_b", 42L)));
+        when(queueEngine.countOrphanedWaiting("q_dev_a")).thenReturn(3L);
+        when(queueEngine.countOrphanedWaiting("q_dev_b")).thenReturn(2L);
+
+        job.reclaim();
+
+        assertThat(meterRegistry.get("queue.waiting.orphans").gauge().value()).isEqualTo(5.0);
+    }
+
+    /**
+     * 관측은 <b>부가 기능</b>이다. 한 큐의 Redis 장애로 {@code reclaim()} 전체가 죽으면 나머지 큐의
+     * 관측까지 함께 멈춘다.
+     *
+     * <p>⚠️ 이 테스트가 못박는 계약은 딱 그것뿐이다 — <b>실패한 큐는 0으로 집계된다</b>(7.0이지
+     * 그 이상이 아니다). 즉 클러스터 장애 중 총합은 조용히 내려가 더 건강해 보인다.
+     * 그 한계는 의도된 것이고 {@code countOrphans} Javadoc에 적혀 있다.
+     */
+    @Test
+    @DisplayName("한 큐의 관측 실패가 나머지 큐의 좀비 집계를 막지 않는다 (U9)")
+    void orphanCountFailureDoesNotStopOtherQueues() {
+        when(queueRepository.findAll())
+                .thenReturn(List.of(queue("q_dev_a", 42L), queue("q_dev_b", 42L)));
+        when(queueEngine.countOrphanedWaiting("q_dev_a"))
+                .thenThrow(new RuntimeException("cluster1 down"));
+        when(queueEngine.countOrphanedWaiting("q_dev_b")).thenReturn(7L);
+
+        job.reclaim();
+
+        assertThat(meterRegistry.get("queue.waiting.orphans").gauge().value()).isEqualTo(7.0);
     }
 }

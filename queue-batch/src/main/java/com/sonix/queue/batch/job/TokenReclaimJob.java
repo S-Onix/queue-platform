@@ -7,12 +7,14 @@ import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.TokenEventType;
-import lombok.RequiredArgsConstructor;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 큐에서 사람을 회수하는 배치 — <b>두 경로</b> (FRS §10 · DECISIONS §36 · §80 · §82).
@@ -58,7 +60,6 @@ import java.util.List;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class TokenReclaimJob {
 
     /**
@@ -78,6 +79,47 @@ public class TokenReclaimJob {
     private final EnqueueEventPublisher eventPublisher;
 
     /**
+     * 마지막 주기에 관측한 좀비 총합. <b>Gauge가 이 값을 읽는다.</b>
+     *
+     * <p>Micrometer의 gauge는 스크레이프 시점에 함수를 호출하는 pull 방식이라, Redis 조회를
+     * 직접 물리면 <b>Prometheus 주기마다</b> 큐 수만큼 왕복이 생긴다. 관측은 이 잡의 주기(10초)에
+     * 묶고 gauge는 그 결과만 읽게 한다.
+     *
+     * <p>⚠️ <b>PromQL에서 {@code sum}이 아니라 {@code max}로 본다.</b> 회수와 달리 이건 순수
+     * 읽기라 claim이 없다 — queue-batch가 3대면 <b>세 대가 같은 값을 각자 보고한다.</b>
+     */
+    private final AtomicLong orphans = new AtomicLong();
+
+    /**
+     * 직전에 로그로 남긴 좀비 수. <b>값이 바뀔 때만</b> 찍기 위한 것이다.
+     *
+     * <p>고아는 정리 로직이 없어 <b>스스로 회복되지 않는다</b> — 조건이 참인 동안 10초마다,
+     * batch 3대면 하루 2만 줄이 쌓인다. 바로 아래 {@code reclaim}이 0건 회수를 안 찍는 이유와
+     * 같은 사고이고(로드 테스트 로그 98%가 한 줄이었던 전례), 조사해야 할 순간에 다른 큐의 단서가
+     * 이 줄에 덮인다. <b>추이는 gauge가 갖고 로그는 전이만 기록한다.</b>
+     *
+     * <p>인스턴스 지역 상태다 — 분산 상태가 아니라 이 JVM의 로그 중복 억제일 뿐이라
+     * {@code CLAUDE.md}의 "static/메모리 상태 금지"(분산 가정 훼손) 대상이 아니다.
+     */
+    private long lastLoggedOrphans;
+
+    /**
+     * 생성자 주입. Lombok을 쓰지 않는 이유는 여기서 <b>gauge를 등록</b>하기 때문이다 —
+     * 등록은 한 번이면 되고, 이후로는 위 {@link #orphans}를 갱신하는 것으로 값이 반영된다.
+     */
+    public TokenReclaimJob(QueueRepository queueRepository,
+                           QueueEngine queueEngine,
+                           EnqueueEventPublisher eventPublisher,
+                           MeterRegistry meterRegistry) {
+        this.queueRepository = queueRepository;
+        this.queueEngine = queueEngine;
+        this.eventPublisher = eventPublisher;
+        // queue_waiting_orphans — "지금 몇 명인가"라 counter가 아니라 gauge다.
+        // 알람은 임계 없이 `max(queue_waiting_orphans) > 0` 하나면 된다.
+        meterRegistry.gauge("queue.waiting.orphans", orphans);
+    }
+
+    /**
      * 주기 10초 (FRS §10).
      *
      * <p>{@code fixedDelay}인 이유: 큐가 많아 한 바퀴가 10초를 넘으면 {@code fixedRate}는 틱을
@@ -94,16 +136,71 @@ public class TokenReclaimJob {
 
         int admitExpired = 0;
         int inactive = 0;
+        long orphanTotal = 0;
+        List<String> orphanQueues = new ArrayList<>();
         for (Queue queue : queueRepository.findAll()) {
             admitExpired += reclaimExpiredAdmits(queue, now);
             inactive += reclaimInactive(queue, now);
+
+            long orphanCount = countOrphans(queue);
+            if (orphanCount > 0) {
+                orphanQueues.add(queue.getQueueId() + "=" + orphanCount);
+            }
+            orphanTotal += orphanCount;
         }
+        orphans.set(orphanTotal);
+        logOrphanTransition(orphanTotal, orphanQueues);
 
         // 0건일 때는 찍지 않는다. 주기 6회/분 × 큐 수만큼의 무의미한 줄이 쌓이면
         // 정작 회수가 일어난 줄을 찾을 수 없다 (로드 테스트 로그 98%가 한 줄이었던 전례).
         if (admitExpired > 0 || inactive > 0) {
             log.info("회수 admitTokenTTL={}건 inactiveTTL={}건", admitExpired, inactive);
         }
+    }
+
+    /**
+     * <b>관측만 한다 — 아무것도 지우지 않는다</b> (§80 U9 좀비 탐지).
+     *
+     * <p>판정 근거·한계는 {@link QueueEngine#countOrphanedWaiting} Javadoc에 있다. 요지는
+     * {@code waiting} 맨 앞에서 {@code tokens} Hash 항목이 <b>없는</b> 사람을 센다는 것이다 —
+     * {@code admit.lua}가 되돌려 놓는 조건 그대로다.
+     *
+     * <p><b>정리 로직을 붙이지 않는 이유</b>: 정상 경로({@code ZREM waiting} → {@code HDEL tokens}
+     * 순서)에서는 고아가 생기지 않는다. Redis 부분 유실·eviction에서만 생기므로 <b>실제로 생기는지
+     * 아직 모른다.</b> 관측되지 않은 것에 삭제 코드를 먼저 쓰지 않는다.
+     *
+     * <p>큐 이름은 <b>로그로만</b> 남긴다. gauge에 queueId 태그를 달면 큐 수만큼 시계열이 늘어난다.
+     *
+     * <p>⚠️ <b>예외를 삼키면 그 큐는 정확히 0으로 집계된다.</b> 즉 한 클러스터가 죽으면 총합이
+     * 조용히 <b>내려가</b> 더 건강해 보인다("못 찾으면 통과"). 이 메서드가 보장하는 것은
+     * <b>나머지 큐의 관측이 계속된다</b>는 것뿐이고, 실패 자체의 단서는 아래 에러 로그가 유일하다.
+     * 실패 카운터를 따로 만들지 않는 것은 batch의 {@code up} 알람이 먼저 울려야 할 사안이기 때문이다.
+     */
+    private long countOrphans(Queue queue) {
+        try {
+            return queueEngine.countOrphanedWaiting(queue.getQueueId());
+        } catch (RuntimeException e) {
+            log.error("좀비 관측 실패 queueId={}", queue.getQueueId(), e);
+            return 0;
+        }
+    }
+
+    /**
+     * 좀비 수가 <b>바뀐 순간에만</b> 찍는다. 이유는 {@link #lastLoggedOrphans} 참조.
+     *
+     * <p>0으로 돌아온 것도 한 번은 찍는다 — 알람이 꺼진 근거가 로그에 남아야 "고쳐진 것"과
+     * "관측이 죽은 것"을 나중에 구분할 수 있다.
+     */
+    private void logOrphanTransition(long total, List<String> queues) {
+        if (total == lastLoggedOrphans) {
+            return;
+        }
+        if (total > 0) {
+            log.warn("좀비 대기자 {}건 — watermark보다 앞 순번인데 waiting에 남아 있다 {}", total, queues);
+        } else {
+            log.info("좀비 대기자 0건으로 회복");
+        }
+        lastLoggedOrphans = total;
     }
 
     /**
