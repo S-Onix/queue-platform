@@ -70,4 +70,25 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
                       @Param("admitToken") String admitToken,
                       @Param("completedAt") LocalDateTime completedAt,
                       @Param("validWindowSeconds") int validWindowSeconds);
+
+    /**
+     * 이미 완료된 토큰의 {@code completed_at}. {@link #markCompleted}가 0행을 돌려준 뒤에만 쓴다.
+     *
+     * <p>verify가 완료를 확정하게 되면서 {@code verify → complete}를 둘 다 부르는 정상 Tenant가
+     * 0행 경로에 도달한다. 그때 <b>처음 완료된 시각</b>을 그대로 돌려줘야 재시도에도 같은 답이
+     * 나온다. 지금 시각을 대신 주면 응답이 거짓이 된다.
+     *
+     * <p>{@code admit_token}까지 대조하는 이유는 남의 토큰 완료 시각을 읽지 못하게 하기 위해서다.
+     */
+    @Query(value = """
+            SELECT completed_at
+              FROM tokens
+             WHERE queue_id = :queueId AND tenant_id = :tenantId AND token_id = :tokenId
+               AND admit_token = :admitToken
+               AND status = 2
+            """, nativeQuery = true)
+    Optional<LocalDateTime> findCompletedAt(@Param("queueId") String queueId,
+                                            @Param("tenantId") long tenantId,
+                                            @Param("tokenId") String tokenId,
+                                            @Param("admitToken") String admitToken);
 }

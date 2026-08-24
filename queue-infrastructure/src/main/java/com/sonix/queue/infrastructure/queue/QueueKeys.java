@@ -122,7 +122,7 @@ public final class QueueKeys {
     /**
      * {@code admit-by-admit} 접두사 (뒤에 admitToken이 붙는다). verify용 역참조.
      *
-     * <p><b>값은 {@code "tokenId|identifier"}</b>다. tokenId만 담으면 verify가 돌려줄 identifier를
+     * <p><b>값은 {@code "tokenId|seq|issuedAt|identifier"}</b>다. tokenId만 담으면 verify가 돌려줄 identifier를
      * DB에서만 얻을 수 있어, Kafka 적재가 아직 안 끝난 정상 토큰이 404가 된다. 읽는 쪽은
      * <b>첫 {@code '|'}로만</b> 쪼갠다(identifier는 Tenant 자유 문자열이라 {@code '|'}가 들어올 수 있다).
      */

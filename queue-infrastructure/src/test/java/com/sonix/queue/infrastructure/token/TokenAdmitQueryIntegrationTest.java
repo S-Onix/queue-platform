@@ -1,6 +1,7 @@
 package com.sonix.queue.infrastructure.token;
 
 import com.sonix.queue.domain.queue.Token;
+import com.sonix.queue.domain.queue.TokenEventType;
 import com.sonix.queue.domain.queue.TokenStatus;
 import com.sonix.queue.infrastructure.adapter.TokenJpaAdapter;
 import org.junit.jupiter.api.AfterAll;
@@ -15,6 +16,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -199,6 +201,73 @@ class TokenAdmitQueryIntegrationTest {
 
         assertThat(adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_c5", "adm_dev_c5", at, 300)).isEqualTo(1);
         assertThat(adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_c5", "adm_dev_c5", at, 300)).isZero();
+    }
+
+    // ── verify가 완료시킨 토큰 (실 DB) ──
+
+    /**
+     * 🔴 <b>목이 숨겼던 결함을 잡는 자리다.</b>
+     *
+     * <p>verify가 완료를 확정하게 되면서 {@code complete} API를 거치지 않고 {@code status=2}가 되는
+     * 경로가 생겼다. 그 전이는 컨슈머의 ODKU가 적용하는데, 예전엔 {@code completed_at}을 건드리지
+     * 않았다("complete API가 이미 채운 값"이라는 전제였다). 그래서 값이 <b>NULL</b>로 남고,
+     * 이어지는 {@code complete}의 {@code findCompletedAt}이 빈 값을 읽어 <b>정상 Tenant가 404</b>를 받았다.
+     *
+     * <p>유닛 테스트는 {@code findCompletedAt}을 {@code Optional.of(...)}로 목킹해서 통과했다 —
+     * <b>실제 SQL만이 NULL을 드러낸다.</b> 그래서 이 검증은 실 DB에 있어야 한다.
+     *
+     * <p>더해서 이 값은 {@code schema.sql}의
+     * {@code AVG/MAX(TIMESTAMPDIFF(SECOND, issued_at, completed_at))} 집계에도 쓰인다.
+     * NULL이면 verify로 완료된 건이 통계에서 통째로 빠진다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("verify 경로(COMPLETED 이벤트)로 완료돼도 completed_at이 채워진다 — 그래야 complete가 멱등하다")
+    void completedAt_isFilledByConsumerTransition() {
+        seedAdmitted("tok_dev_v1", "adm_dev_v1", 3);
+
+        // verify가 발행한 COMPLETED를 컨슈머가 적용하는 것과 같은 경로다.
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                Token.reconstruct(null, "tok_dev_v1", QUEUE_ID, tenantId, "0190e2c1-user", 42L,
+                        TokenStatus.COMPLETED, null, "adm_dev_v1", false, ISSUED_AT, null)));
+
+        assertThat(statusOf("tok_dev_v1")).isEqualTo(2);
+        // 🔴 여기가 핵심 — NULL이면 complete가 404를 준다.
+        assertThat(adapter.findCompletedAt(QUEUE_ID, tenantId, "tok_dev_v1", "adm_dev_v1"))
+                .isPresent();
+    }
+
+    /**
+     * 위 전이 뒤에 Tenant가 {@code complete}를 부르는 상황 그대로다.
+     * {@code markCompleted}는 {@code status IN (0,1)}이라 0행이고, 그때 <b>최초 완료 시각</b>이
+     * 나와야 응답이 참이 된다.
+     */
+    @Test
+    @Transactional
+    @DisplayName("verify 완료 후 complete → markCompleted는 0행, findCompletedAt이 값을 준다")
+    void completeAfterVerify_findsOriginalCompletedAt() {
+        seedAdmitted("tok_dev_v2", "adm_dev_v2", 3);
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                Token.reconstruct(null, "tok_dev_v2", QUEUE_ID, tenantId, "0190e2c1-user", 42L,
+                        TokenStatus.COMPLETED, null, "adm_dev_v2", false, ISSUED_AT, null)));
+
+        assertThat(adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_v2", "adm_dev_v2",
+                LocalDateTime.of(2026, 8, 24, 12, 0, 0), 300)).isZero();
+        assertThat(adapter.findCompletedAt(QUEUE_ID, tenantId, "tok_dev_v2", "adm_dev_v2"))
+                .isPresent();
+    }
+
+    /** admitToken이 다르면 남의 완료 시각을 읽지 못한다. */
+    @Test
+    @Transactional
+    @DisplayName("findCompletedAt: admitToken이 틀리면 빈 값")
+    void findCompletedAt_wrongAdmitToken() {
+        seedAdmitted("tok_dev_v3", "adm_dev_v3", 3);
+        adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_v3", "adm_dev_v3",
+                LocalDateTime.of(2026, 8, 24, 12, 0, 0), 300);
+
+        assertThat(adapter.findCompletedAt(QUEUE_ID, tenantId, "tok_dev_v3", "adm_dev_WRONG"))
+                .isEmpty();
     }
 
     private int statusOf(String tokenId) {

@@ -74,4 +74,15 @@ public interface TokenRepository {
      */
     int markCompleted(String queueId, long tenantId, String tokenId, String admitToken,
                       LocalDateTime completedAt, int validWindowSeconds);
+
+    /**
+     * 이미 완료된 토큰의 완료 시각. {@link #markCompleted}가 0행을 돌려준 뒤에만 쓴다.
+     *
+     * <p>verify가 완료를 확정하게 되면서 {@code verify → complete}를 둘 다 부르는 정상 Tenant가
+     * 0행 경로에 도달한다({@code markCompleted}의 술어가 {@code status IN (0,1)}이다).
+     * 이때 400을 주면 아무 잘못 없는 통합이 깨지므로, <b>처음 완료된 시각</b>을 돌려준다.
+     *
+     * @return 완료 행이 없거나 admitToken이 다르면 빈 {@link Optional} → 호출자가 400
+     */
+    Optional<LocalDateTime> findCompletedAt(String queueId, long tenantId, String tokenId, String admitToken);
 }

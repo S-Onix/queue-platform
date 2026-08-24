@@ -163,12 +163,17 @@ public class QueueEngineService {
     }
 
     /**
-     * Verify — admitToken이 지금 유효한지만 답한다 (FRS §6.5). <b>Redis 쓰기 0회, DB 쓰기 0회.</b>
+     * Verify — admitToken이 지금 유효한지만 답한다 (FRS §6.5). <b>Redis 쓰기 0회, DB 쓰기 0회.</b> 다만 <b>부수효과가 0은 아니다</b> — 응답과 함께 {@code COMPLETED}를 발행한다(그 근거는 아래).
      *
      * @return identifier (Tenant가 어느 사용자인지 알아야 하므로)
      * @throws BusinessException 유효하지 않으면 404 {@code INVALID_ADMIT_TOKEN}
      */
-    @Transactional(readOnly = true)
+    // 🔴 **트랜잭션을 걸지 않는다.** verify는 이제 Kafka를 동기로 기다리는데(send-timeout 12초),
+    //    트랜잭션 안이면 LazyConnectionDataSourceProxy가 커넥션을 **트랜잭션이 끝날 때까지 쥔다**.
+    //    브로커가 느려지면 Replica 풀이 verify에 12초씩 묶이고, verify는 게이트 개방 순간
+    //    입장자 수만큼 몰리는 엔드포인트라 그게 곧 자해가 된다.
+    //    Redis 히트 경로는 DB를 아예 안 읽고, 폴백 경로의 단건 조회는 Spring Data 리포지토리가
+    //    자체 readOnly 트랜잭션을 갖고 있어 Replica 라우팅도 그대로다.
     public String verify(long tenantId, String queueId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 
@@ -181,6 +186,21 @@ public class QueueEngineService {
         // 예전 경로는, 컨슈머 백로그로 행이 아직 없는 정상 토큰을 404로 만들었다.
         Optional<String> fromRedis = ref.map(AdmitRef::identifier).filter(id -> !id.isBlank());
         if (fromRedis.isPresent()) {
+            // 🔑 **verify 응답을 주는 시점이 완료다.** Platform의 책임은 답을 돌려주는 데까지이고,
+            //    그 뒤 Tenant 안에서 좌석 배정·세션 생성이 어떻게 되는지는 관측할 수도 책임질 수도
+            //    없다 (CLAUDE.md 원칙 1 — Platform은 순서만, Tenant가 입장 제어).
+            //    이 전이가 없으면 complete를 안 부르는 Tenant의 행이 status=1로 영원히 남는다.
+            //
+            //    🔴 **DB를 직접 쓰지 않고 이벤트만 발행한다.** 이 메서드는
+            //    @Transactional(readOnly = true)라 Replica로 라우팅되고, Replica는
+            //    super-read-only=ON이라 UPDATE가 실패한다. 쓰기 트랜잭션으로 바꾸면 Redis 히트로
+            //    끝나는 정상 경로까지 Master 트랜잭션을 열게 되어, verify가 DB를 안 읽게 만든
+            //    설계(§6.4)가 되돌아간다.
+            //
+            //    이벤트 경로가 오히려 안전하다 — 파티션 키가 tokenId라
+            //    ENQUEUED → ADMITTED → COMPLETED 순서가 보장되므로, 컨슈머 백로그 구간이어도
+            //    ADMITTED가 먼저 적용된 뒤에 이 전이가 얹힌다.
+            publishCompletedOnVerify(tenantId, queueId, admitToken, ref.get());
             return fromRedis.get();
         }
 
@@ -192,7 +212,30 @@ public class QueueEngineService {
                         queueId, tenantId, admitToken, ADMIT_TTL_SECONDS))
                 .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN));
 
+        // 폴백 경로도 완료 판정은 같다. 여기는 이미 DB를 읽은 뒤라 seq·issuedAt이 손에 있다.
+        publishQuietly(new EnqueueEvent(
+                TokenEventType.COMPLETED.name(), token.getTokenId(), queueId, tenantId,
+                token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC),
+                admitToken, null));
+
         return token.getUserId();
+    }
+
+    /**
+     * verify가 답을 돌려주는 시점에 {@code COMPLETED}를 발행한다.
+     *
+     * <p>구 포맷 값(롤링 배포 중)이면 {@code seq}·{@code issuedAt}이 없어 이벤트를 만들 수 없다.
+     * 그때는 <b>건너뛴다</b> — verify의 계약(identifier 반환)은 지켜야 하고, 그 구간의 누락은
+     * Tenant가 {@code complete}를 부르거나 reconciliation이 메운다.
+     */
+    private void publishCompletedOnVerify(long tenantId, String queueId, String admitToken, AdmitRef ref) {
+        if (!ref.complete()) {
+            log.warn("구 포맷 admit-by-admit — 완료 발행 생략 queueId={} tokenId={}", queueId, ref.tokenId());
+            return;
+        }
+        publishQuietly(new EnqueueEvent(
+                TokenEventType.COMPLETED.name(), ref.tokenId(), queueId, tenantId,
+                ref.identifier(), ref.seq(), ref.issuedAt(), admitToken, null));
     }
 
     /**
@@ -217,7 +260,13 @@ public class QueueEngineService {
         int updated = tokenRepository.markCompleted(
                 queueId, tenantId, tokenId, admitToken, completedAt, COMPLETE_VALID_WINDOW_SECONDS);
         if (updated == 0) {
-            throw new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN);
+            // 🔴 **이미 COMPLETED면 성공이다.** verify가 완료를 확정하게 되면서
+            //    verify → complete를 둘 다 부르는 정상 Tenant가 여기 도달한다.
+            //    markCompleted의 술어가 status IN (0,1)이라 0행이 되는데, 이걸 400으로 돌려주면
+            //    아무 잘못 없는 통합이 깨진다. admitToken이 일치하는 완료 행이면 그때의
+            //    completedAt을 그대로 돌려준다 — 재시도에도 같은 답이 나온다.
+            return tokenRepository.findCompletedAt(queueId, tenantId, tokenId, admitToken)
+                    .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN));
         }
 
         // 정리·발행에 identifier·seq·issuedAt이 필요하다. UPDATE가 1행을 갱신했으므로 반드시 있다.

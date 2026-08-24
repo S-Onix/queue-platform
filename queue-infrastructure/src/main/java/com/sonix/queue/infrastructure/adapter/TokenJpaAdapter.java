@@ -70,9 +70,25 @@ public class TokenJpaAdapter implements TokenRepository {
                 admit_token = IF(tokens.status = 0, new.admit_token, tokens.admit_token),
                 admitted_at = IF(tokens.status = 0, new.admitted_at, tokens.admitted_at),
                 status      = IF(tokens.status = 0, 1, tokens.status)""");
-        // completed_at은 건드리지 않는다 — complete API가 동기 UPDATE로 이미 채운 값이다(FRS §6.6).
-        sql.put(TokenEventType.COMPLETED, TRANSITION_INSERT +
-                "status = IF(tokens.status = 1, 2, tokens.status)");
+        // 🔴 completed_at을 **여기서 찍는다.** 예전엔 "complete API가 동기 UPDATE로 이미 채운
+        //    값"이라 안 건드렸는데, verify가 완료를 확정하게 되면서 complete API를 거치지 않고
+        //    status가 2가 되는 경로가 생겼다. 안 채우면 그 행의 completed_at이 영원히 NULL이라
+        //      ① complete의 findCompletedAt이 빈 값을 읽어 정상 Tenant가 404를 받고
+        //      ② schema.sql의 AVG/MAX(TIMESTAMPDIFF(SECOND, issued_at, completed_at))에서 통째로 빠진다
+        //
+        //    값을 이벤트로 실어오지 않고 UTC_TIMESTAMP(3)을 쓰는 이유는 둘이다.
+        //      · EnqueueEvent에 필드를 더하면 생성 지점 15곳 + Token.reconstruct 5곳 + INSERT 컬럼
+        //        + 바인더 + 컨슈머 매핑으로 번진다
+        //      · 🪤 ODKU의 SET 절에 '?'를 쓰면 rewriteBatchedStatements가 **조용히 꺼진다**.
+        //        함수 호출은 그 문제가 아예 없다
+        //    대가는 "verify 응답 시각"이 아니라 "컨슈머 적용 시각"이 되는 것인데(보통 1초 미만),
+        //    소비자가 초 단위 일별 집계 하나뿐이라 실질 차이가 없다.
+        //
+        //    complete API 경로는 영향이 없다 — 동기 UPDATE가 이미 status=2로 만들어 놓아
+        //    IF(tokens.status = 1, ...)이 거짓이 되고 자기가 찍은 값이 보존된다.
+        sql.put(TokenEventType.COMPLETED, TRANSITION_INSERT + """
+                completed_at = IF(tokens.status = 1, UTC_TIMESTAMP(3), tokens.completed_at),
+                status       = IF(tokens.status = 1, 2, tokens.status)""");
         // 🔴 출발이 0뿐인 것은 의도다 (§36). admitToken TTL 만료자는 status = 1이라 여기서
         //    no-op이 되고, 그래야 complete의 status IN (0, 1) + 300초 유효 창이 살아남는다.
         //    IN (0, 1)로 넓히면 늦은 입장이 INVALID_ADMIT_TOKEN이 된다.
@@ -164,5 +180,11 @@ public class TokenJpaAdapter implements TokenRepository {
                              LocalDateTime completedAt, int validWindowSeconds) {
         return tokenJpaRepository.markCompleted(
                 queueId, tenantId, tokenId, admitToken, completedAt, validWindowSeconds);
+    }
+
+    @Override
+    public Optional<LocalDateTime> findCompletedAt(String queueId, long tenantId,
+                                                   String tokenId, String admitToken) {
+        return tokenJpaRepository.findCompletedAt(queueId, tenantId, tokenId, admitToken);
     }
 }

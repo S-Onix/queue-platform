@@ -16,6 +16,7 @@ import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.Token;
 import com.sonix.queue.domain.queue.TokenRepository;
+import com.sonix.queue.domain.queue.TokenEventType;
 import com.sonix.queue.domain.queue.TokenStatus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -210,10 +211,11 @@ class AdmitApiTest {
     @Test
     @DisplayName("verify Redis 히트 → 200 valid + identifier. DB는 아예 읽지 않는다")
     void verify_redisHit() throws Exception {
-        // 값이 "tokenId|identifier"라 신원이 Redis에 이미 있다. 예전처럼 tokenId로 DB 행을 찾으면
-        // 컨슈머 백로그 구간(= 적재 전)의 정상 토큰이 404가 된다.
+        // 값이 "tokenId|seq|issuedAt|identifier"라 신원도 이벤트 재료도 Redis에 이미 있다.
+        // 예전처럼 tokenId로 DB 행을 찾으면 컨슈머 백로그 구간(= 적재 전)의 정상 토큰이 404가 된다.
         when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
-                .thenReturn(Optional.of(new AdmitRef("tok_a", "0190e2c1-user")));
+                .thenReturn(Optional.of(new AdmitRef(
+                        "tok_a", 7L, Instant.ofEpochMilli(1_700_000_000_000L), "0190e2c1-user")));
 
         mockMvc.perform(post("/api/v1/queues/{q}/admit-tokens/{a}/verify", QUEUE_ID, "adm_1"))
                 .andExpect(status().isOk())
@@ -227,7 +229,7 @@ class AdmitApiTest {
     @DisplayName("verify 구 포맷(tokenId만) → 기존 DB 경로로 폴백 (롤링 배포 중 60초)")
     void verify_legacyValue_fallsBackToDb() throws Exception {
         when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
-                .thenReturn(Optional.of(new AdmitRef("tok_a", null)));
+                .thenReturn(Optional.of(new AdmitRef("tok_a", -1L, null, null)));
         when(tokenRepository.findByTokenId(QUEUE_ID, TENANT_ID, "tok_a"))
                 .thenReturn(Optional.of(token(TokenStatus.ADMIT_ISSUED, "adm_1")));
 
@@ -322,5 +324,79 @@ class AdmitApiTest {
                         .content("{\"admitToken\":\"adm_1\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.status").value("COMPLETED"));
+    }
+
+    /**
+     * 🔑 <b>verify 응답을 주는 시점이 완료다.</b> Platform의 책임은 답을 돌려주는 데까지이고,
+     * 그 뒤 Tenant 안에서 벌어지는 일은 관측할 수도 책임질 수도 없다.
+     *
+     * <p>🔴 <b>그런데 DB를 쓰면 안 된다.</b> verify는 {@code @Transactional(readOnly = true)}라
+     * Replica로 라우팅되고 Replica는 {@code super-read-only=ON}이다. 그래서 이벤트만 발행한다 —
+     * {@code verifyNoInteractions(tokenRepository)}가 그 계약을 못박는다.
+     */
+    @Test
+    @DisplayName("verify 성공 = 완료 — COMPLETED를 발행하되 DB는 건드리지 않는다")
+    void verify_publishesCompleted_withoutTouchingDb() throws Exception {
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
+                .thenReturn(Optional.of(new AdmitRef(
+                        "tok_a", 7L, Instant.ofEpochMilli(1_700_000_000_000L), "user-a")));
+
+        mockMvc.perform(post("/api/v1/queues/{q}/admit-tokens/{a}/verify", QUEUE_ID, "adm_1"))
+                .andExpect(status().isOk());
+
+        ArgumentCaptor<EnqueueEvent> ev = ArgumentCaptor.forClass(EnqueueEvent.class);
+        verify(eventPublisher).publish(ev.capture());
+        assertThat(ev.getValue().eventType()).isEqualTo(TokenEventType.COMPLETED.name());
+        assertThat(ev.getValue().tokenId()).isEqualTo("tok_a");
+        assertThat(ev.getValue().seq()).isEqualTo(7L);
+        assertThat(ev.getValue().issuedAt()).isEqualTo(Instant.ofEpochMilli(1_700_000_000_000L));
+
+        verifyNoInteractions(tokenRepository);
+    }
+
+    /**
+     * 🪤 구 포맷(seq·issuedAt 없음)은 이벤트를 만들 수 없다. 그때도 <b>verify의 계약(identifier
+     * 반환)은 지켜야 한다</b> — 완료 발행만 건너뛴다. 롤링 배포 60초 구간의 동작이다.
+     */
+    @Test
+    @DisplayName("구 포맷(신원만 있는 값) — 완료 발행은 건너뛰고 identifier는 답한다")
+    void verify_legacyTwoFieldValue_skipsCompletionButStillAnswers() throws Exception {
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
+                .thenReturn(Optional.of(new AdmitRef("tok_a", -1L, null, "user-a")));
+
+        mockMvc.perform(post("/api/v1/queues/{q}/admit-tokens/{a}/verify", QUEUE_ID, "adm_1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.identifier").value("user-a"));
+
+        verifyNoInteractions(eventPublisher);
+        verifyNoInteractions(tokenRepository);
+    }
+
+    /**
+     * 🔴 <b>verify가 완료를 확정하게 되면서 생긴 경로다.</b> {@code verify → complete}를 둘 다 부르는
+     * 정상 Tenant는 complete 시점에 이미 {@code status=2}라, {@code markCompleted}의 술어
+     * ({@code status IN (0,1)})에 걸려 <b>0행</b>을 받는다.
+     *
+     * <p>이걸 400/404로 돌려주면 <b>아무 잘못 없는 통합이 깨진다.</b> 그리고 돌려주는 시각은
+     * <b>처음 완료된 시각</b>이어야 한다 — 지금 시각을 주면 응답이 거짓이고 재시도마다 값이 바뀐다.
+     */
+    @Test
+    @DisplayName("verify로 이미 완료된 토큰의 complete → 200 + 처음 완료 시각 (멱등)")
+    void complete_alreadyCompletedByVerify_isIdempotent() throws Exception {
+        LocalDateTime firstCompletedAt = LocalDateTime.of(2026, 8, 24, 1, 2, 3);
+        when(tokenRepository.markCompleted(anyString(), anyLong(), anyString(), anyString(), any(), anyInt()))
+                .thenReturn(0);
+        when(tokenRepository.findCompletedAt(QUEUE_ID, TENANT_ID, "tok_a", "adm_1"))
+                .thenReturn(Optional.of(firstCompletedAt));
+
+        mockMvc.perform(post("/api/v1/queues/{q}/tokens/{t}/complete", QUEUE_ID, "tok_a")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"admitToken\":\"adm_1\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.data.completedAt").value("2026-08-24T01:02:03"));
+
+        // 이미 끝난 건이라 Redis를 다시 정리하거나 이벤트를 또 발행하지 않는다.
+        verifyNoInteractions(eventPublisher);
     }
 }

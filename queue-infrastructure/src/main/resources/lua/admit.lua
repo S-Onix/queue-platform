@@ -85,12 +85,20 @@ for i = 1, #popped, 2 do
 		local admitToken = ARGV[ADMIT_TOKEN_OFFSET + (i + 1) / 2]
 
 		redis.call('SET', byTokenPrefix .. tokenId, admitToken, 'PX', admitTtl)
-		-- 값이 "tokenId|identifier"인 이유: verify는 Tenant에게 identifier를 돌려줘야 하는데,
-		-- tokenId만 담으면 identifier를 DB에서만 얻을 수 있어 컨슈머 백로그 구간(= Kafka 적재가
-		-- 아직 안 끝난 정상 토큰)에 404가 난다. 그 값은 지금 이 자리에 이미 있다.
-		-- ⚠️ 읽는 쪽은 **첫 '|'로만** 쪼갠다 — identifier는 Tenant 자유 문자열이라 '|'가 들어올
-		--    수 있고, tokenId('tok_'+UUID)에는 없다. admit_expire.lua의 member 규약과 같다.
-		redis.call('SET', byAdmitPrefix .. admitToken, tokenId .. '|' .. identifier, 'PX', admitTtl)
+		-- 값이 "tokenId|seq|issuedAt|identifier"인 이유: verify가 이 네 값만으로 답과 완료 처리를
+		-- 모두 끝내 **DB를 한 번도 읽지 않게** 하기 위해서다.
+		--   identifier — Tenant에게 돌려줄 신원. DB에서만 얻으면 컨슈머 백로그 구간(= Kafka 적재가
+		--                아직 안 끝난 정상 토큰)에 404가 난다
+		--   seq·issuedAt — verify가 COMPLETED 이벤트를 만들 때 필요하다. 없으면 verify가 DB를
+		--                읽어야 하고, verify는 @Transactional(readOnly)라 그 읽기가 Replica로 간다
+		-- 넷 다 지금 이 자리에 이미 있다 — 새로 조회하는 값이 하나도 없다.
+		--
+		-- ⚠️ **identifier가 맨 뒤인 것이 규약이다.** identifier는 Tenant 자유 문자열이라 '|'가
+		--    들어올 수 있다. 앞 세 값(tokenId='tok_'+UUID, seq=숫자, issuedAt=숫자)에는 '|'가
+		--    없으므로, 읽는 쪽은 **앞에서 세 번만 쪼개고 나머지 전부를 identifier로 본다.**
+		--    가변 필드를 중간에 두면 경계가 무너진다.
+		redis.call('SET', byAdmitPrefix .. admitToken,
+			tokenId .. '|' .. seq .. '|' .. issuedAt .. '|' .. identifier, 'PX', admitTtl)
 		redis.call('ZADD', admittedKey, expiresAt, seq .. '|' .. identifier)
 
 		table.insert(records, { identifier, tokenId, seq, admitToken, issuedAt })
