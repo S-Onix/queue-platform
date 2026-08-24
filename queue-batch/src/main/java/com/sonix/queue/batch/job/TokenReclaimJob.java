@@ -2,7 +2,7 @@ package com.sonix.queue.batch.job;
 
 import com.sonix.queue.domain.queue.EnqueueEvent;
 import com.sonix.queue.domain.queue.EnqueueEventPublisher;
-import com.sonix.queue.domain.queue.ExpiredAdmit;
+import com.sonix.queue.domain.queue.ReclaimedToken;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
@@ -15,7 +15,17 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * admitToken TTL 만료 처리 (FRS §10 {@code AdmitTokenExpiryJob} · DECISIONS §36 · §80).
+ * 큐에서 사람을 회수하는 배치 — <b>두 경로</b> (FRS §10 · DECISIONS §36 · §80 · §82).
+ *
+ * <ol>
+ *   <li><b>admitToken TTL 만료</b>(§36) — Tenant가 뽑아갔는데 60초 안에 입장시키지 못한 사람</li>
+ *   <li><b>{@code inactiveTtl} 초과</b>(§82) — 폴링이 끊긴 사람. <b>이탈 회수의 유일한 경로</b>다.
+ *       §82가 Cancel API를 폐기해, 유저가 취소 버튼을 누르든 탭을 닫든 네트워크가 끊기든
+ *       Platform이 보는 신호는 "폴링이 멈춘다" 하나뿐이다</li>
+ * </ol>
+ *
+ * <p><b>한 잡에 둘을 넣는다.</b> 잡을 나누면 {@code queueRepository.findAll()}이 주기마다
+ * 두 번 돈다 — batch 3대면 큐 수 × 12회/분이다. 같은 루프에서 {@code EVAL} 두 번이 싸다.
  *
  * <p>Tenant가 admit으로 뽑아갔지만 60초 안에 입장시키지 못한 사람을 정리한다.
  * <b>🔴 대기열로 되돌리지 않는다 (§36).</b> Platform은 만료 원인(유저 이탈 / 네트워크 / Tenant
@@ -49,7 +59,7 @@ import java.util.List;
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class AdmitTokenExpiryJob {
+public class TokenReclaimJob {
 
     /**
      * 한 큐에서 한 주기에 집어올 최대 건수.
@@ -74,22 +84,55 @@ public class AdmitTokenExpiryJob {
      * 겹쳐 쌓는다. 이 잡은 늦어도 되지만 겹치면 안 된다 — 겹쳐도 정합성은 claim이 지키지만
      * Redis 왕복만 배로 늘어난다.
      */
-    @Scheduled(fixedDelayString = "${queue.batch.admit-expiry.interval-ms:10000}")
-    public void reclaimExpiredAdmits() {
+    // 키가 reclaim인 이유: 이 잡은 admit 만료와 inactive 이탈 **둘 다** 회수한다.
+    //   admit-expiry로 두면 운영자가 "admit만 늦춘다"고 생각하고 값을 키워 이탈 회수까지 늦춘다.
+    @Scheduled(fixedDelayString = "${queue.batch.reclaim.interval-ms:10000}")
+    public void reclaim() {
         // Clock 빈을 두지 않는다 — 이 값은 Lua에 넘길 "지금"일 뿐이고, 테스트는 만료 score를
         // 과거로 심어 결과를 결정한다. 시각 주입이 필요해지면 그때 빈을 만든다.
         long now = System.currentTimeMillis();
 
-        int returned = 0;
+        int admitExpired = 0;
+        int inactive = 0;
         for (Queue queue : queueRepository.findAll()) {
-            returned += reclaim(queue, now);
+            admitExpired += reclaimExpiredAdmits(queue, now);
+            inactive += reclaimInactive(queue, now);
         }
 
         // 0건일 때는 찍지 않는다. 주기 6회/분 × 큐 수만큼의 무의미한 줄이 쌓이면
-        // 정작 복귀가 일어난 줄을 찾을 수 없다 (로드 테스트 로그 98%가 한 줄이었던 전례).
-        if (returned > 0) {
-            log.info("admitToken TTL 만료 복귀 {}건", returned);
+        // 정작 회수가 일어난 줄을 찾을 수 없다 (로드 테스트 로그 98%가 한 줄이었던 전례).
+        if (admitExpired > 0 || inactive > 0) {
+            log.info("회수 admitTokenTTL={}건 inactiveTTL={}건", admitExpired, inactive);
         }
+    }
+
+    /**
+     * {@code inactiveTtl}이 지나도록 폴링이 없는 대기자를 회수한다 (§82).
+     *
+     * <p><b>cutoff는 큐마다 다르다</b> — {@code inactiveTtl}이 큐 설정이므로
+     * ({@code QueueCreateRequest.inactiveTtl}, 기본 300초) Java가 계산해 넘긴다.
+     *
+     * <p>예외를 삼키는 이유는 아래 {@code reclaimExpiredAdmits}와 같다. 다만 <b>재시도가 성립하는
+     * 범위가 좁다</b> — {@code EVAL}이 <b>도달하지 못했을 때만</b> 대상이 {@code last-active}에 남아
+     * 다음 주기가 다시 집는다. {@code EVAL}은 성공했는데 <b>응답만 유실된 경우</b>(read timeout ·
+     * 커넥션 리셋) 멤버는 이미 세 키에서 다 빠졌고 반환 record도 잃어 <b>다음 주기가 집을 대상이
+     * 없다</b>. {@code admit_expire}도 같은 구조적 한계다.
+     */
+    private int reclaimInactive(Queue queue, long now) {
+        String queueId = queue.getQueueId();
+        long cutoff = now - queue.getInactiveTtl() * 1000L;
+        List<ReclaimedToken> claimed;
+        try {
+            claimed = queueEngine.claimInactive(queueId, cutoff, CLAIM_LIMIT);
+        } catch (RuntimeException e) {
+            log.error("inactive 회수 claim 실패 queueId={}", queueId, e);
+            return 0;
+        }
+
+        for (ReclaimedToken token : claimed) {
+            publishExpired(queue, token);
+        }
+        return claimed.size();
     }
 
     /**
@@ -97,9 +140,9 @@ public class AdmitTokenExpiryJob {
      * 복귀까지 막으면 안 된다. 다음 주기가 다시 시도하며, 그 사이 만료분은 {@code admitted}
      * ZSet에 그대로 남아 있으므로 유실되지 않는다.
      */
-    private int reclaim(Queue queue, long now) {
+    private int reclaimExpiredAdmits(Queue queue, long now) {
         String queueId = queue.getQueueId();
-        List<ExpiredAdmit> claimed;
+        List<ReclaimedToken> claimed;
         try {
             claimed = queueEngine.claimExpiredAdmits(queueId, now, CLAIM_LIMIT);
         } catch (RuntimeException e) {
@@ -107,7 +150,7 @@ public class AdmitTokenExpiryJob {
             return 0;
         }
 
-        for (ExpiredAdmit expired : claimed) {
+        for (ReclaimedToken expired : claimed) {
             publishExpired(queue, expired);
         }
         return claimed.size();
@@ -116,23 +159,36 @@ public class AdmitTokenExpiryJob {
     /**
      * {@code EXPIRED} 발행 (key = tokenId).
      *
-     * <p><b>🔴 정상 경로에서 DB는 바뀌지 않는다.</b> 소비 측 가드가
-     * {@code status = IF(tokens.status = 0, 4, tokens.status)}인데 만료자는 {@code status = 1}이라
-     * <b>no-op</b>이다. <b>의도된 동작이다</b>(§36) — {@code complete}의 술어가
-     * {@code status IN (0, 1)}이고 유효 창이 300초라, admitToken TTL(60초)이 지난 뒤 도착하는
+     * <p><b>🔴 두 호출자에게 효과가 다르다.</b> 소비 측 가드가
+     * {@code status = IF(tokens.status = 0, 4, tokens.status)}이기 때문이다.
+     *
+     * <table><caption>경로별 효과</caption>
+     *   <tr><th>호출자</th><th>회수 시점 status</th><th>발행의 효과</th></tr>
+     *   <tr><td>{@link #reclaimExpiredAdmits}(§36)</td><td>1 (ADMIT_ISSUED)</td>
+     *       <td><b>no-op</b> — 발행에 실패해도 결과가 같다</td></tr>
+     *   <tr><td>{@link #reclaimInactive}(§82)</td><td><b>0 (WAITING)</b></td>
+     *       <td><b>실제로 0 → 4를 적용한다</b></td></tr>
+     * </table>
+     *
+     * <p>admit 만료분이 {@code 1}에 머무는 것은 <b>의도된 동작이다</b>(§36) — {@code complete}의
+     * 술어가 {@code status IN (0, 1)}이고 유효 창이 300초라, admitToken TTL(60초)이 지난 뒤 도착하는
      * <b>늦은 입장이 정상 경로로 실재</b>한다. 가드를 {@code IN (0, 1)}로 넓히면 그 경로가 죽는다.
-     * 발행이 실제로 작용하는 것은 컨슈머 지연으로 <b>행이 아직 없을 때</b>({@code INSERT})뿐이다.
      *
      * <p><b>{@code admitToken}·{@code admittedAt}은 둘 다 null이다</b> —
      * {@link EnqueueEvent}의 타입별 null 규약 표 그대로다. 여기서 옛 admitToken을 실어 보내면
      * 이미 무효가 된 값이 DB에 되살아난다.
      *
-     * <p><b>발행 실패를 삼킨다.</b> Redis는 이미 커밋됐다 — {@code admitted}에서 빠졌고
+     * <p><b>발행 실패를 삼킨다.</b> Redis는 이미 커밋됐다 — 회수 대상이 키에서 빠졌고
      * {@code tokens} 필드도 지워졌다. 되돌릴 수단이 없으므로 재시도해봐야 상태가 나아지지 않는다
      * (admit의 Kafka 발행과 같은 비대칭, §80 Consequences ③).
-     * 피해는 {@code tokens.status}가 1에 머무는 것인데, 위 이유로 <b>발행에 성공해도 결과가 같다.</b>
+     *
+     * <p><b>🔴 그러나 삼킴의 대가도 경로마다 다르다.</b> admit 만료분은 위 표대로 발행에 성공해도
+     * 결과가 같아 <b>피해가 없다</b>. inactive 회수분은 다르다 — 발행이 유실되면 Redis 세 키에서는
+     * 사라졌는데 DB는 <b>영원히 {@code WAITING(0)}</b>으로 남고, Redis에 흔적이 없어
+     * <b>reconciliation이 대조할 원본조차 없다</b>. 삼키는 선택은 유지하되(되돌릴 수단이 없다)
+     * 이 갭은 Sprint 9 reconciliation의 몫이며 <b>지금은 에러 로그가 유일한 단서</b>다.
      */
-    private void publishExpired(Queue queue, ExpiredAdmit expired) {
+    private void publishExpired(Queue queue, ReclaimedToken expired) {
         if (!expired.publishable()) {
             // tokens Hash 미스 = tokenId/issuedAt을 모른다. 컨슈머의 멱등 키가
             // (token_id, issued_at)이라 추측해 채우면 같은 토큰의 두 번째 행이 생긴다.

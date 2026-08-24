@@ -31,7 +31,7 @@ spring:
           batch_size: 500          # 배치 INSERT 크기 (CHUNK와 맞춤)
         order_inserts: true        # 같은 테이블 INSERT 모아 배치 효율↑
 
-  # AdmitTokenExpiryJob이 RETURNED를 발행한다 (§36 · §80). 이 블록이 없으면 기본값
+  # TokenReclaimJob이 EXPIRED를 발행한다 (§36 · §82). 이 블록이 없으면 기본값
   # (value-serializer = StringSerializer)이라 EnqueueEvent 직렬화가 런타임에 실패한다.
   #
   # ⚠️ spring.json.add.type.headers=false 는 협상 불가다 — 컨슈머가
@@ -59,7 +59,7 @@ server:
 
 # Redis 독립 2 Cluster (DECISIONS §75). 프로파일별 노드 목록은 application-{local,prod}.yml.
 #
-# ⚠️ AdmitTokenExpiryJob이 claim-Lua를 돌리므로 batch도 Redis를 직접 쓴다(§80).
+# ⚠️ TokenReclaimJob이 claim-Lua를 돌리므로 batch도 Redis를 직접 쓴다(§80).
 #    게다가 scanBasePackages가 com.sonix.queue 전체라 queue-infrastructure의 Redis 빈이
 #    함께 생성된다. 이제 클러스터가 둘이므로
 #    이 프로세스는 Lettuce 클라이언트를 2벌 문다(각각 토폴로지 갱신 타이머 포함).

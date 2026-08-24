@@ -39,11 +39,13 @@ class RedisQueueEngineShutdownTest {
 
     @Mock
     private RedisScript<List> admitExpireScript;
+    @Mock
+    private RedisScript<List> inactiveExpireScript;
 
     @Test
     @DisplayName("종료 표시 후 도착한 enqueue는 대기 없이 즉시 실패하고 Global Queue에 남지 않는다")
     void enqueueAfterShutdown_failsFastAndLeavesNothingBehind() {
-        RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
+        RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
         engine.markShuttingDown();
 
         long startedAt = System.nanoTime();

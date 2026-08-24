@@ -74,7 +74,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 > **일정의 정본은 `doc/ROADMAP.md`다.** 여기엔 "지금 어디인지"만 둔다 — 두 곳에 적으면 갈라진다.
 
 ```
-현재 위치: Sprint 7(Admit) 완료.  다음 = 통합테스트 잔여 · Sprint 9(회수 배치 + reconciliation)
+현재 위치: Sprint 7(Admit) 완료 + Sprint 9 회수 배치 완료.  다음 = reconciliation · U9 메트릭
 
 코드로 확인되는 상태 (2026-08-20, dev 기준 재실측):
   구현됨  Redis 독립 2 Cluster + 큐 단위 라우팅                            (§75)
@@ -82,12 +82,14 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  Enqueue · Polling · Kafka 적재(token-lifecycle + queue-consumer)  (Sprint 6·8)
   구현됨  admit · verify · complete — 엔드포인트 6개                        (Sprint 7 §80)
   구현됨  admit.lua · admit_expire.lua · 상태 전이 가드 UPSERT              (§80)
-  구현됨  queue-batch: AdmitTokenExpiryJob(TTL 만료 claim)                  (§80)
-  ⚠️수정  └ 복귀 → 종료로 바꿔야 한다 — ZADD waiting → HDEL tokens (§36)
+  구현됨  queue-batch: TokenReclaimJob — 회수 2경로                        (§36 · §82)
+          ├ admitToken TTL 만료 → HDEL tokens + EXPIRED (복귀 안 함)
+          └ inactiveTtl 초과   → ZREM waiting/last-active + HDEL + EXPIRED
   구현됨  /status 분할 · admitWatermark · pacing 구간표                     (§79)
+  구현됨  poll_verify의 keepalive 분기 삭제 — 폴링이 곧 생존 신호            (§82 F안)
   폐기    Cancel(DELETE /tokens/:id) — 이탈은 inactiveTtl 배치가 전담        (§82)
-  미착수  inactiveTtl 판정 배치 — 이탈 회수 경로가 아직 0                    (§82 · Sprint 9)
-  미착수  관측 메트릭 2종(queue_admit_*) — 좀비 탐지 수단이 아직 0          (§80 U9)
+  미착수  waitingTtl(7200s) 판정 — 판정 소스 미정                            (Sprint 9)
+  미착수  관측 메트릭 3종(queue_admit_*) — 좀비 탐지 수단이 아직 0          (§80 U9)
 
 ⚠️ 중복 게이트는 `tokens` Hash의 **HSETNX**다. `waiting` ZSet이 아니다 —
    admit되면 waiting에서 빠지므로 게이트로 쓰면 재-enqueue가 신규로 판정된다(과금 중복).

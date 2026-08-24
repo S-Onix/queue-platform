@@ -54,7 +54,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
               ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
               ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
 🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·COMPLETED 발행까지 완료 (~~RETURNED~~는 §36이 폐기)
-🔄 Sprint 9   queue-batch에 AdmitTokenExpiryJob 1개 (§80). 나머지 3개 잡·회수 경로는 미착수
+🔄 Sprint 9   queue-batch에 TokenReclaimJob 1개 (§80). 나머지 3개 잡·회수 경로는 미착수
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
 🎯 Cluster 로컬 실습 완료 (2026-07-08, 병행 학습) — 프로덕션 도입은 §75, 시점 미정
@@ -77,11 +77,11 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 | 확인한 것 | 명령 | 결과 |
 |---|---|---|
 | Queue Engine 엔드포인트 | `grep -rn "Mapping(" queue-api/src/main` | `QueueEngineController`에 **6개** — enqueue · admit · verify · complete · `/status` · 폴링. **`DELETE /tokens/{tokenId}`만 여전히 0건** |
-| `queue-batch` 내용물 | `find queue-batch/src -name "*.java"` | `QueueBatchApplication` + **`AdmitTokenExpiryJob`** (+ 그 테스트) |
+| `queue-batch` 내용물 | `find queue-batch/src -name "*.java"` | `QueueBatchApplication` + **`TokenReclaimJob`** (+ 그 테스트) |
 | Lua 스크립트 | `ls .../resources/lua/` | **6개** — `admit` · `admit_expire`가 추가됐다 |
 | §79 구현됨 | `cat PollResponse.java` | 필드가 `ready` · `admitToken` **둘뿐**. `frontSeq` · `total` · `nextPollAfterSec` 소멸 |
 | `QueueSnapshotCache` 제거 | `find . -name "QueueSnapshotCache*"` | **0건** (§79 D1대로 제거됨) |
-| 회수 경로 | `grep -rln "ZREM\|HDEL" */src/main` | **6파일** — `admit.lua` · `admit_expire.lua` · `enqueue_bulk.lua` · `RedisQueueEngine` · `AdmitTokenExpiryJob` · `QueueKeys`. ⚠️ 다만 **complete 경로에만** 있다. 이탈·TTL 만료로 떠난 사람의 `tokens` Hash 필드는 여전히 누적 (§79 후속) |
+| 회수 경로 | `grep -rln "ZREM\|HDEL" */src/main` | **6파일** — `admit.lua` · `admit_expire.lua` · `enqueue_bulk.lua` · `RedisQueueEngine` · `TokenReclaimJob` · `QueueKeys`. ⚠️ 다만 **complete 경로에만** 있다. 이탈·TTL 만료로 떠난 사람의 `tokens` Hash 필드는 여전히 누적 (§79 후속) |
 | `queue-batch` actuator | `grep actuator queue-batch/build.gradle` | **있다** — `starter-actuator` + `micrometer-registry-prometheus` (`6647ca5`) |
 
 **주요 학습 자산 축적**: 총 88개 통찰 (Line Pay Plus 시니어 백엔드 지원 자산)
@@ -614,7 +614,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - `queue-batch` 모듈 활성화 (bootRun 가능)
 - `TokenExpiryJob` (10초 주기)
   - waitingTtl / inactiveTtl / admit-token TTL 3종 감지
-    - `admit-token TTL`은 **Sprint 7에서 `AdmitTokenExpiryJob`으로 이미 구현**됐다 (재사용)
+    - `admit-token TTL`은 **Sprint 7에서 `TokenReclaimJob`으로 이미 구현**됐다 (재사용)
     - 🔴 `inactiveTtl`은 **§82로 이탈 회수의 유일한 경로**가 됐다 — 판정에 그치지 않고
       `ZREM waiting` + `ZREM last-active` + `HDEL tokens` + **`EXPIRED` Kafka 발행**까지 한다.
       `HDEL` 전에 `HGET tokens`로 `issuedAt` 원본을 확보해야 한다(§82 ③ · §83)
@@ -642,7 +642,8 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 **완료 기준 (DoD):**
 - [ ] Batch Server 기동 후 TokenExpiryJob 10초 주기 실행 로그 확인
 - [ ] `queue-batch`의 `/actuator/prometheus`가 200을 반환 (위 1번 — reconciliation 지표의 전제)
-- [ ] 만료 처리 후 `zcard last-active` ≤ `zcard waiting` 유지 (위 2번 — 누적이 멈췄다는 증거)
+- [x] 회수 후 `waiting`·`tokens`·`last-active` **세 키에서 모두 빠진다** — `InactiveReclaimTest`가 실제 Redis로 단언(§82)
+- [ ] `zcard last-active` ≤ `zcard waiting` **부등식 자체**는 아직 안 잰다 — 위 테스트는 개별 키의 잔존 멤버만 단언한다
 - [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
       `issued_at`이 원본과 같아 **두 번째 행이 생기지 않는지** 함께 확인 (§83 함정)
 - [ ] admitToken TTL 만료 케이스 → **종료 + 게이트 해제** 동작 (§36)

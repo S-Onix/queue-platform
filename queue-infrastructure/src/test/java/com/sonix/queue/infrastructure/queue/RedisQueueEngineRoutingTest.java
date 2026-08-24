@@ -3,6 +3,7 @@ package com.sonix.queue.infrastructure.queue;
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.QueueBoard;
+import com.sonix.queue.domain.queue.ReclaimedToken;
 import com.sonix.queue.infrastructure.repository.QueueJpaRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -61,6 +62,9 @@ class RedisQueueEngineRoutingTest {
     @Autowired
     @Qualifier("admitExpireScript")
     private RedisScript<List> admitExpireScript;
+    @Autowired
+    @Qualifier("inactiveExpireScript")
+    private RedisScript<List> inactiveExpireScript;
 
     private static final String ON_CLUSTER2 = "q_dev_route_on_b";
     private static final String BRAND_NEW = "q_dev_route_new";
@@ -71,7 +75,7 @@ class RedisQueueEngineRoutingTest {
 
     private RedisQueueEngine engine() {
         return new RedisQueueEngine(cluster1, cluster2, queueJpaRepository,
-                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
     }
 
     @AfterEach
@@ -126,6 +130,35 @@ class RedisQueueEngineRoutingTest {
                 .isEqualTo((double) NOW);
         assertThat(cluster1.hasKey(QueueKeys.lastActive(ON_CLUSTER2))).isFalse();
         verifyNoInteractions(queueJpaRepository);
+    }
+
+    /**
+     * 🔴 §82의 이탈 회수는 <b>유일한 경로</b>다. 라우팅을 건너뛰면 cluster2에 배정된 큐의
+     * 이탈자가 <b>아무 에러 없이 영원히 회수되지 않는다</b> — cluster1의 빈 `last-active`를 보고
+     * 0건을 돌려줄 뿐이라 로그도 지표도 남지 않는다.
+     *
+     * <p>단일 클러스터 통합 테스트({@code InactiveReclaimTest})는 이 분기를 한 줄도 지나지
+     * 않으므로({@code cluster1 == cluster2}에서 즉시 반환) <b>여기가 유일한 방어선</b>이다.
+     */
+    @Test
+    @DisplayName("쓰기: claimInactive(EVAL)도 소유 클러스터에서 실행된다 — cluster1로 가면 조용히 0건이다 (§82)")
+    void claimInactive_runsOnOwningCluster() {
+        seedOnCluster2(ON_CLUSTER2);
+        // 마지막 폴링이 컷오프보다 오래됐다 = 회수 대상
+        cluster2.opsForZSet().add(QueueKeys.lastActive(ON_CLUSTER2), "1", NOW - 1);
+        RedisQueueEngine engine = engine();
+
+        List<ReclaimedToken> claimed = engine.claimInactive(ON_CLUSTER2, NOW, 500);
+
+        assertThat(claimed).singleElement()
+                .extracting(ReclaimedToken::identifier, ReclaimedToken::tokenId)
+                .containsExactly("user_1", "tok_1");
+
+        // 부수효과가 cluster2에만 남았다 = 스크립트가 거기서 돌았다는 직접 증거.
+        // (라우팅을 건너뛰면 cluster1의 빈 키에서 0건이 나오고 아래 셋이 전부 뒤집힌다)
+        assertThat(cluster2.opsForZSet().score(QueueKeys.waiting(ON_CLUSTER2), "user_1")).isNull();
+        assertThat(cluster2.opsForHash().hasKey(QueueKeys.tokens(ON_CLUSTER2), "user_1")).isFalse();
+        assertThat(cluster1.hasKey(QueueKeys.lastActive(ON_CLUSTER2))).isFalse();
     }
 
     @Test
@@ -206,7 +239,7 @@ class RedisQueueEngineRoutingTest {
         when(dead.hasKey(anyString()))
                 .thenThrow(new RedisConnectionFailureException("cluster1 down"));
         return new RedisQueueEngine(dead, cluster2, queueJpaRepository,
-                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
+                enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
     }
 
     @Test

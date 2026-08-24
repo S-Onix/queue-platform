@@ -87,7 +87,7 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | 값 | 원인 | 대상 | Batch 감지 |
 |----|------|------|------------|
 | `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms) |
-| `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) — **이탈 회수의 유일한 경로다(§82). 미구현** |
+| `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) — **이탈 회수의 유일한 경로다(§82). ✅ 구현 완료** |
 | ~~`ADMIT_TOKEN_TTL`~~ | 🔴 **성립하지 않는다.** admitToken 만료자는 `status = 1`에 머물러 **`EXPIRED(4)`에 도달하지 않는다**(위 가드 참조). `expiredReason`은 status가 4인 사람의 사유이므로 이 값은 쓰이지 않는다. 만료 자체는 §36대로 `HDEL tokens` 후 종료 | — | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
 
 > 🔴 **admitToken TTL 만료는 복귀하지 않는다 (§36, 2026-08-21).** claim 잡이 `HDEL tokens`로

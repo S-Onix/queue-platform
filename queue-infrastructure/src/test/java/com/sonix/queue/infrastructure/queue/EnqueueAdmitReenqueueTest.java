@@ -2,7 +2,7 @@ package com.sonix.queue.infrastructure.queue;
 
 import com.sonix.queue.domain.queue.AdmitResult;
 import com.sonix.queue.domain.queue.EnqueueResult;
-import com.sonix.queue.domain.queue.ExpiredAdmit;
+import com.sonix.queue.domain.queue.ReclaimedToken;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -117,7 +117,7 @@ class EnqueueAdmitReenqueueTest {
         assertThat(admitted.records()).hasSize(1);
 
         // TTL 만료 — 배치가 claim한다. NOW보다 뒤 시각을 넘겨 만료 상태를 만든다.
-        List<ExpiredAdmit> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW + 60_001, 500);
+        List<ReclaimedToken> claimed = engine.claimExpiredAdmits(QUEUE_ID, NOW + 60_001, 500);
         assertThat(claimed).singleElement().satisfies(e -> {
             assertThat(e.identifier()).isEqualTo(IDENTIFIER);
             assertThat(e.seq()).isEqualTo(firstSeq);

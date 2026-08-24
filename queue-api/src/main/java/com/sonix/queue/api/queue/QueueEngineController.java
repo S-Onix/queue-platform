@@ -162,7 +162,9 @@ public class QueueEngineController {
      * @param tokenId 대기 토큰(자격 증명)
      * @param seq     enqueue 때 발급된 내 순번(mySeq) — 소유권 대조/keepalive 기준.
      *                <b>뺄 수 없다</b> — {@code poll_verify.lua}가 이 값으로 대기 항목을 찾는다
-     * @param ka      keepalive 플래그(30~60s에 1회만 1) — inactive_ttl 갱신
+     * @param ka      ⚠️ <b>무시된다</b>(§82 F안). 예전엔 이 값이 {@code last-active} 갱신을
+     *                결정했으나, 지금은 <b>폴링이 오면 언제나 갱신</b>한다 — 클라이언트가 안 붙이면
+     *                살아 있는 대기자가 회수됐다. API 하위호환으로 파라미터만 남는다
      */
     @GetMapping("/{queueId}/tokens/{tokenId}")
     public ResponseEntity<ApiResponse<PollResponse>> poll(

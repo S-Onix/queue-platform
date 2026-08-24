@@ -51,11 +51,13 @@ class RedisQueueEngineShutdownRaceTest {
 
     @Mock
     private RedisScript<List> admitExpireScript;
+    @Mock
+    private RedisScript<List> inactiveExpireScript;
 
     @Test
     @DisplayName("fast path 통과 직후 종료가 시작돼도 enqueue는 대기 없이 실패하고 큐에 흔적을 남기지 않는다")
     void enqueue_whenShutdownStartsAfterFastPath_stillFailsFastAndLeavesNothingBehind() {
-        RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript);
+        RedisQueueEngine engine = new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript);
 
         try (MockedStatic<IdGenerator> ids = mockStatic(IdGenerator.class)) {
             // fast path 검사를 통과한 뒤, offer 하기 전에 종료가 시작된 상황

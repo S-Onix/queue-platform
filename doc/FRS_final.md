@@ -8,7 +8,7 @@
 >
 > v1.15 변경사항 (DECISIONS §36): **admitToken TTL 만료 시 WAITING 복귀 폐기** — 만료는 종료이고
 > 재접속 → 재-enqueue → 맨 뒤다. `RETURNED` 이벤트 삭제, §6.3의 상태 B·B′와 그 미해결 `ErrorCode`
-> 후속이 **소멸**, `AdmitTokenExpiryJob`은 `HDEL tokens` + `EXPIRED` 발행으로 바뀐다.
+> 후속이 **소멸**, `TokenReclaimJob`은 `HDEL tokens` + `EXPIRED` 발행으로 바뀐다.
 > ⚠️ DB `status`는 `1`로 남는다(`EXPIRED` 가드가 `status = 0` 전용) — 그것이 complete 300초 창을 살린다
 >
 > v1.14 변경사항 (DECISIONS §82): **Cancel API(`DELETE /tokens/:tokenId`) 폐기** — 엔드포인트 표·
@@ -682,7 +682,9 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 
 ⚠️ **재-enqueue는 생존 신호가 아니다.** `enqueue_bulk.lua`는 `last-active`를 건드리지 않는다(KEYS는 `waiting`·`seq`·`tokens` 3종). 순번이 복원돼도 다음 `ka=1` 폴링이 오기 전에 배치가 돌면 그대로 회수된다. 창을 되살리는 유일한 신호는 **`ka=1` 폴링 재개**다.
 
-⬜ **미구현** — Sprint 9 회수 배치.
+✅ **구현 완료** (2026-08-21) — `inactive_expire.lua` + `TokenReclaimJob`. `cutoff`는 큐별
+`inactiveTtl`로 Java가 계산한다. `waiting`에 없는 `seq`(= admit 대기자)는 `last-active`에서만 빼고
+건드리지 않는다(§36 역산 미스 규약).
 
 ---
 
@@ -842,11 +844,11 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | Job | 주기 | 처리 |
 |-----|------|------|
 | `TokenExpiryJob` | 10초 | WAITING TTL 만료 → EXPIRED + Kafka 발행 |
-| `AdmitTokenExpiryJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
+| `TokenReclaimJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
 | `RedisSyncJob` | 5분 | redis_sync_needed=1 토큰 → Redis 재삽입 |
 | `BillingSnapshotJob` | M+2월 초 | tokens 원본 집계 → queue_daily_stats + billing_snapshots → 파티션 DROP |
 
-> 🔴 **`AdmitTokenExpiryJob`의 한 주기 상한은 큐당 `CLAIM_LIMIT = 500`이고, 적체는 실재한다.**
+> 🔴 **`TokenReclaimJob`의 한 주기 상한은 큐당 `CLAIM_LIMIT = 500`이고, 적체는 실재한다.**
 > 통합테스트에서 **14,747건이 약 30주기(≈300초)에 걸쳐** 복귀했다. **에러도 경고도 없이 지연만
 > 늘어난다** — 관측 없이는 보이지 않는다. 상한을 두는 이유는 두 가지다: `ZREM`이 `unpack`으로
 > 인자를 펴므로 Lua 스택 상한(≈8000)을 넘으면 안 되고, 만료가 몰려도 Redis 단일 스레드를 오래

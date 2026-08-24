@@ -5,7 +5,7 @@ dependencies {
     implementation project(':queue-infrastructure')
     implementation project(':queue-common')
 
-    // AdmitTokenExpiryJob이 RETURNED를 발행한다(§80). 어댑터는 infra에 있지만 KafkaTemplate
+    // TokenReclaimJob이 EXPIRED를 발행한다(§80). 어댑터는 infra에 있지만 KafkaTemplate
     // 오토컨피그가 이 모듈의 런타임 클래스패스에 있어야 하므로 전이 의존에 기대지 않고 명시한다
     // (queue-consumer의 spring-tx 주석과 같은 이유 — 조용히 사라지면 발행 경로가 통째로 죽는다).
     implementation 'org.springframework.kafka:spring-kafka'

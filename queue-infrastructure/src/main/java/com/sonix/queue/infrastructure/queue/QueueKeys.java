@@ -50,8 +50,9 @@ public final class QueueKeys {
      * 새 tokenId·새 seq를 받는다(폴링 404 · {@code billing_snapshots}의 {@code COUNT(*)} 과금
      * 중복 · {@code status=1} 고아 행).
      *
-     * <p>따라서 <b>사람을 큐에서 빼는 경로는 반드시 이 필드를 {@code HDEL}한다.</b> 현재 그 경로는
-     * {@code cleanupCompleted} 하나이며, 거기서 HDEL은 <b>맨 마지막 명령</b>이어야 한다(이유는
+     * <p>따라서 <b>사람을 큐에서 빼는 경로는 반드시 이 필드를 {@code HDEL}한다.</b> 현재 그 경로는 셋이다 —
+     * {@code cleanupCompleted}(complete) · {@code admit_expire.lua}(§36) · {@code inactive_expire.lua}(§82).
+     * 그중 {@code cleanupCompleted}에서는, 거기서 HDEL은 <b>맨 마지막 명령</b>이어야 한다(이유는
      * 해당 구현 주석 참조). 새 경로(예: cancel)를 만들 때도 같은 규칙이다 — 안 지우면 그 사람은
      * 영영 재입장하지 못하고, 먼저 지우면 아직 큐에 있는 사람이 폴링에서 404가 된다.
      */

@@ -157,12 +157,24 @@ public class PollRedisAdapterIntegrationTest {
         assertThat(redisTemplate.opsForZSet().size(LAST_ACTIVE_KEY)).isEqualTo(1L);
     }
 
+    /**
+     * 🔴 §82 F안 회귀. <b>{@code ka=false}여도 갱신한다.</b>
+     *
+     * <p>분기가 있던 시절엔 "이 사람이 살아 있다"의 유일한 근거가 클라이언트가 자발적으로 붙이는
+     * {@code ka} 쿼리 파라미터였다({@code @RequestParam(defaultValue = "false")}). {@code inactiveTtl}
+     * 회수(§82)가 생긴 뒤로는 그 분기가 <b>살아 있는 대기자를 죽이는 스위치</b>가 된다 —
+     * {@code ka}를 안 붙이는 클라이언트(구 SDK·자작 클라이언트·버그)는 2초마다 폴링해도 회수된다.
+     * 원인이 쿼리 파라미터라 서버 로그로는 정상 회수와 구분되지 않는다.
+     */
     @Test
-    @DisplayName("verifyWaiting: keepalive=false면 검증만 하고 last-active는 남기지 않는다")
-    void verifyWaiting_noKeepalive() {
+    @DisplayName("verifyWaiting: ka=false여도 last-active를 갱신한다 — 폴링이 곧 생존 신호다 (§82 F)")
+    void verifyWaiting_updatesLastActiveEvenWithoutKeepalive() {
         assertThat(queueEngine.verifyWaiting(QUEUE_ID, 5000, tokenOf(5000), false, NOW)).isTrue();
 
-        assertThat(redisTemplate.opsForZSet().size(LAST_ACTIVE_KEY)).isZero();
+        Double score = redisTemplate.opsForZSet().score(LAST_ACTIVE_KEY, "5000");
+        assertThat(score).as("ka를 안 붙였다고 죽이면 안 된다").isNotNull();
+        assertThat(score.longValue()).isEqualTo(NOW);
+        assertThat(redisTemplate.opsForZSet().size(LAST_ACTIVE_KEY)).isEqualTo(1L);
     }
 
     @Test

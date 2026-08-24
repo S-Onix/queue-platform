@@ -46,7 +46,9 @@ public interface QueueEngine {
      * seq는 큐별 INCR이라 추측이 자명하므로 seq 존재만으로 판정하면 남의 대기 항목을
      * 들여다보고 keepalive까지 걸 수 있다 — 검증과 갱신을 분리하지 말 것.
      *
-     * @param keepalive true면 검증 통과 시 last-active를 nowMillis로 갱신
+     * @param keepalive ⚠️ <b>무시된다</b>(§82 F안). 예전엔 이 값이 갱신을 결정했으나 지금은
+     *                  <b>폴링이 오면 언제나</b> {@code last-active}를 갱신한다. 호출부가 계속
+     *                  넘기지만 {@code poll_verify.lua}는 읽지 않는다 — API 하위호환용 자리다
      * @return 검증 통과 여부
      */
     boolean verifyWaiting(String queueId, long seq, String tokenId, boolean keepalive, long nowMillis);
@@ -94,8 +96,8 @@ public interface QueueEngine {
     Optional<String> findAdmitTokenByTokenId(String queueId, String tokenId);
 
     /**
-     * admitToken TTL이 지난 항목을 <b>집어(claim)</b> 원래 seq 그대로 WAITING으로 되돌린다
-     * (FRS §10 {@code AdmitTokenExpiryJob} · §36 · §80 ⑧).
+     * admitToken TTL이 지난 항목을 <b>집어(claim)</b> 큐에서 뺀다 (~~원래 seq 그대로 WAITING 복귀~~는 §36이 폐기)
+     * (FRS §10 {@code TokenReclaimJob} · §36 · §80 ⑧).
      *
      * <p><b>이 호출 자체가 claim이다.</b> {@code ZRANGEBYSCORE 0 now} + {@code ZREM}이 한 Lua라
      * Redis 단일 스레드가 둘을 쪼개지 않는다. 실행 주체(queue-batch)가 N대여도 멤버를 가져가는
@@ -113,7 +115,32 @@ public interface QueueEngine {
      * @param limit     한 번에 집어올 최대 건수. 남은 몫은 다음 주기가 가져간다
      * @return 되돌아간 항목들. 비어 있으면 만료분이 없었거나 다른 인스턴스가 먼저 집어간 것이다
      */
-    List<ExpiredAdmit> claimExpiredAdmits(String queueId, long nowMillis, int limit);
+    List<ReclaimedToken> claimExpiredAdmits(String queueId, long nowMillis, int limit);
+
+    /**
+     * {@code inactiveTtl}이 지나도록 폴링이 없는 대기자를 <b>집어(claim)</b> 큐에서 뺀다
+     * (DECISIONS §82 · FRS §6.7).
+     *
+     * <p>🔴 <b>§82가 Cancel API를 폐기하면서 이탈 회수의 유일한 경로가 됐다.</b> 유저가 취소
+     * 버튼을 누르든 탭을 닫든 네트워크가 끊기든, Platform이 관측하는 신호는 <b>"폴링이 멈춘다"</b>
+     * 하나뿐이고 그 신호가 {@code last-active} ZSet이다.
+     *
+     * <p><b>이 호출 자체가 claim이다</b> — {@code claimExpiredAdmits}와 같은 근거다.
+     *
+     * <p><b>{@code cutoffMillis}는 호출자가 계산한다.</b> {@code inactiveTtl}이 큐마다 다르므로
+     * ({@code Queue.getInactiveTtl()}) Lua는 그 값을 알 수 없다.
+     *
+     * <p><b>{@code waiting}에 없는 seq는 건너뛴다</b>(§36 역산 미스 규약). 그 사람은 admit되어
+     * 큐 밖이거나 이미 정리된 사람이고, 둘 다 이 잡이 건드리면 안 된다 — admit 대기자를 지우면
+     * 중복 게이트가 풀려 재-enqueue가 새 자리를 받고 원래 자리는 유령이 된다.
+     * 다만 {@code last-active}에서는 빼므로 그 멤버가 다음 주기의 한도를 먹지 않는다.
+     *
+     * @param cutoffMillis 이 시각보다 <b>이전</b>에 마지막으로 폴링한 사람이 대상이다
+     *                     (= {@code now - inactiveTtl * 1000})
+     * @param limit        한 번에 집어올 최대 건수. 남은 몫은 다음 주기가 가져간다
+     * @return 회수한 항목들. 비어 있으면 대상이 없었거나 다른 인스턴스가 먼저 집어간 것이다
+     */
+    List<ReclaimedToken> claimInactive(String queueId, long cutoffMillis, int limit);
 
     /**
      * complete: 대기열·admit 흔적 제거 (FRS §6.6 ②). 멱등 — 없는 키를 지워도 무해하다.
