@@ -1,3 +1,17 @@
+spring:
+  datasource:
+    # prod와 같은 이유로 필수다 — 베이스에 datasource가 없다. 형태는 queue-api dev와 맞춘다.
+    master:
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST:localhost}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      username: ${DB_USERNAME:queueapp}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 10
+    replica:
+      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST:localhost}:${DB_REPLICA_PORT:3307}/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      username: ${DB_USERNAME:queueapp}
+      password: ${DB_PASSWORD}
+      maximum-pool-size: 5
+
 logging:
   level:
     root: INFO
