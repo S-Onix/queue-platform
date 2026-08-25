@@ -44,6 +44,7 @@ import static org.assertj.core.api.Assertions.*;
  * </ul>
  */
 @SpringBootTest(classes = EnqueueE2ETestConfig.class)
+@Tag("redis")
 class EnqueueE2EIntegrationTest {
 
     @Autowired private QueueEngineService queueEngineService;

@@ -7,6 +7,7 @@ import com.sonix.queue.domain.queue.QueueBoard;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -26,6 +27,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 특히 <b>REPLAY 경로는 cjson 왕복</b>을 거치므로 OK 경로와 파싱이 갈릴 수 있어 따로 본다.
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
+@Tag("redis")
 class RedisQueueEngineAdmitTest {
 
     private static final String QUEUE_ID = "q_dev_admit_engine";

@@ -31,7 +31,22 @@ subprojects {
     }
 
     test {
-        useJUnitPlatform()
+        // 태그로 인프라 의존을 코드에 표시한다 (@Tag("mysql") / @Tag("redis")).
+        //
+        // 기본값은 "전부 실행"이다 — 로컬에는 인프라가 떠 있고, 개발자가 옵션을 기억해야만
+        // 전부 도는 구조면 언젠가 아무도 안 붙인다. 줄이는 쪽에 플래그를 둔다.
+        //
+        //   ./gradlew test              전부 (로컬 기본. MySQL + Redis Cluster 2개 필요)
+        //   ./gradlew test -PunitOnly   인프라 불필요분만 (CI 단위 레인이 쓴다)
+        //
+        // ⚠️ 모듈 단위로 가르지 않는 이유: queue-infrastructure·queue-api에는 순수 테스트와
+        //    인프라 테스트가 섞여 있다. 모듈로 자르면 새로 추가되는 순수 테스트가 통째로
+        //    CI 밖에 남는다 — 실제로 그 상태였다(384건 중 104건만 돌았다).
+        useJUnitPlatform {
+            if (project.hasProperty('unitOnly')) {
+                excludeTags 'mysql', 'redis'
+            }
+        }
 
         // 테스트 JVM도 운영과 같은 UTC로 돌린다.
         //

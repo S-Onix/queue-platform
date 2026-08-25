@@ -3,6 +3,7 @@ package com.sonix.queue.infrastructure.queue;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -25,6 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 실제로 그런 일이 있었다 — 아래 {@link #doesNotCountHealthyMembers} 참조.
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
+@Tag("redis")
 class OrphanWaitingCountTest {
 
     private static final String QUEUE_ID = "q_test_orphan";

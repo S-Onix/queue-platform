@@ -217,16 +217,20 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
 
 -- billing_snapshots: Tenant별 월별 과금 집계 (청구 기준)
 -- tokens 원본에서 직접 집계 → billing_events 불필요
+--   🔴 `year_month` 는 예약어(YEAR_MONTH, INTERVAL 단위)라 백틱이 없으면 ERROR 1064다.
+--      컬럼 '정의' 자리도 예외가 아니다 — 이 CREATE TABLE 은 백틱 없이는 실행되지 않는다
+--      (MySQL 8.0.46 실측, 2026-08-25). 그런데도 로컬 DB에 테이블이 존재했다 = 이 파일이
+--      아닌 경로로 만들어졌다는 뜻이다. CI 통합 레인이 스키마를 주입하면서 드러났다.
 CREATE TABLE billing_snapshots (
-    id          BIGINT      NOT NULL AUTO_INCREMENT,
-    tenant_id   BIGINT      NOT NULL,
-    year_month  CHAR(6)     NOT NULL,
-    count       BIGINT      NOT NULL DEFAULT 0,
-    updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-                            ON UPDATE CURRENT_TIMESTAMP(3),
+    id            BIGINT      NOT NULL AUTO_INCREMENT,
+    tenant_id     BIGINT      NOT NULL,
+    `year_month`  CHAR(6)     NOT NULL,
+    `count`       BIGINT      NOT NULL DEFAULT 0,
+    updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                              ON UPDATE CURRENT_TIMESTAMP(3),
 
     PRIMARY KEY (id),
-    UNIQUE KEY uq_billing_tenant_month (tenant_id, year_month)
+    UNIQUE KEY uq_billing_tenant_month (tenant_id, `year_month`)
 );
 
 

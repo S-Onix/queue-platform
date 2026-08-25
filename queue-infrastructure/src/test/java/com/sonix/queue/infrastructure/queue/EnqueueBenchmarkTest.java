@@ -3,6 +3,7 @@ package com.sonix.queue.infrastructure.queue;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -44,6 +45,7 @@ import java.util.concurrent.TimeUnit;
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
 @EnabledIfEnvironmentVariable(named = "BENCH", matches = "true")
+@Tag("redis")
 public class EnqueueBenchmarkTest {
 
     @Autowired private RedisQueueEngine queueEngine;
