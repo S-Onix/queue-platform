@@ -285,13 +285,22 @@ ON DUPLICATE KEY UPDATE id = id; -- 멱등: 배치 재실행 안전
 -- Step 2: billing_snapshots 집계 (tokens 원본에서 직접)
 --   🔴 상태 술어를 넣지 마라 (DECISIONS §82). 과금은 status를 보지 않는다 —
 --      WAITING·ADMIT_ISSUED·COMPLETED·EXPIRED 전부 한 건이다. 취소는 개념 자체가 없다.
-INSERT INTO billing_snapshots (tenant_id, year_month, count)
-SELECT tenant_id, '202604', COUNT(*)
-FROM tokens
-WHERE issued_at >= '2026-04-01'
-  AND issued_at <  '2026-05-01'
-GROUP BY tenant_id
-ON DUPLICATE KEY UPDATE count = VALUES(count), updated_at = NOW(3);
+--   🔴 아래 세 곳은 "고쳐 쓴" 것이 아니라 **원래 문장이 실행되면 죽어서** 고친 것이다.
+--      정본 구현은 BillingJdbcAdapter.UPSERT_MONTHLY 이고, 여기는 그것과 같은 모양을 유지한다.
+--      ① `year_month` 백틱 — YEAR_MONTH 는 예약어라 없으면 ERROR 1064.
+--         컬럼 '정의' 자리에서는 통과해서 위 CREATE TABLE 은 멀쩡히 성공한다 (그래서 안 보인다)
+--      ② PARTITION (pYYYY_MM) — 범위 조건만으로는 13개 전부 스캔한다 (§83). 프루닝은 이 절로만 얻는다
+--      ③ updated_at = NOW(3) 를 뺐다 — NOW() 는 세션 TZ를 따르는데 mysql CLI 세션은 KST라
+--         UTC 컬럼에 KST가 들어간다 (위 [시각 규약]이 경고하는 그 함정).
+--         빼면 ON UPDATE CURRENT_TIMESTAMP(3) 이 '값이 실제로 바뀔 때만' 찍어 준다
+INSERT INTO billing_snapshots (tenant_id, `year_month`, `count`)
+SELECT agg.tenant_id, '202604', agg.cnt
+  FROM (SELECT tenant_id, COUNT(*) AS cnt
+          FROM tokens PARTITION (p2026_04)
+         WHERE issued_at >= '2026-04-01'
+           AND issued_at <  '2026-05-01'
+         GROUP BY tenant_id) AS agg
+ON DUPLICATE KEY UPDATE `count` = agg.cnt;
 
 -- Step 3: 파티션 DROP (Step 1,2 완료 후 실행)
 ALTER TABLE tokens DROP PARTITION p2026_04;
