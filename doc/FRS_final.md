@@ -534,7 +534,12 @@ admitToken 생성: tokenId와 동일하게 UUIDv7(랜덤 74비트). 짧은 랜�
 **대가**: 브라우저를 닫은 좀비도 뽑힌다(10자리 → 실입장 9명). DB를 봐도 해결되지 않으므로
 (DB에도 좀비 여부는 없다) 막는 대신 **발급 수 대비 완료 수 격차로 관측**한다.
 
-### 6.5 Verify (유효성 확인만 — 상태 변경 없음)
+### 6.5 Verify (유효성 확인 + **완료 확정**)
+
+> ✏️ **구 제목 "유효성 확인만 — 상태 변경 없음"은 더 이상 사실이 아니다.** verify는 **응답을 주는
+> 시점에 `COMPLETED`를 발행한다**(PR #48). Platform의 책임이 답을 돌려주는 데까지이기 때문이다.
+> 아래 "2. Redis 쓰기 0회, DB 쓰기 0회"는 **여전히 참**이다 — 직접 쓰지 않고 **이벤트만** 낸다
+> (`@Transactional(readOnly = true)`라 Replica로 가고, Replica는 `super-read-only=ON`이다).
 
 ```
 POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
@@ -908,13 +913,24 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 
 ### Tenant 서버 (REST 직접 호출)
 
-SDK가 없으므로 아래 제약은 **명세에 명시하고 서버가 방어**한다 (DECISIONS §35 Consequences).
+SDK가 없으므로 아래 제약은 **명세에 명시**한다. 순서를 지키게 만드는 것은 **Tenant 책임**이다.
+
+> ✏️ **"서버가 방어한다"는 §80이 철회했다.** 그 방어는 `verified-token` 플래그에 기대고 있었는데
+> §80이 그 키를 폐기했고, 애초에 독립적인 실효가 없었다 — `complete` 자체가 `admitToken`을
+> 검증하므로 verify를 건너뛴 호출도 정당하다. "Tenant 책임을 명세로 못박는다"는 원칙은 유지된다.
+
+> 📖 **Tenant가 읽어야 하는 문서는 [`TENANT_INTEGRATION.md`](TENANT_INTEGRATION.md)다.**
+> 통합 순서, 계약 5건(완료 호출 / 429 / 폴링 한도 / 세션 경계 / 창 비대칭), 흔한 실수가 거기 있다.
+> 아래 표는 그 계약의 **요약**이다.
 
 | Tenant가 지켜야 할 것 | 위반 시 | Platform의 대응 |
 |---|---|---|
-| verify를 **Tenant 내부 처리 전에** 먼저 호출 | 내부 처리가 길면 admitToken TTL 60초 초과 → `TK002` 404 | 순서 강제 불가(Tenant 책임). OpenAPI description에 명시 |
-| complete는 admitToken TTL 60초 내 호출 | 만료된 admitToken → 404 | 위와 동일 |
-| **verify 후 지체 없이 complete** | 내부 처리가 길어 `admitted_at` 유효 창을 넘기면 complete가 404 | **강제 불가 — Tenant 책임.** OpenAPI description에 명시 |
+| verify를 **Tenant 내부 처리 전에** 먼저 호출 | 내부 처리가 길면 verify 창 **60초** 초과 → `TK002` 404 | 순서 강제 불가(Tenant 책임). 가이드 계약 ⑤ |
+| complete는 **300초** 안에 호출 | 창 밖이면 404 | 🔑 **verify 60초 / complete 300초 — 창이 다르다.** 늦은 완료 통보를 받아 주려는 의도다(실측: admit 후 98초 complete가 200) |
+| **verify·complete 중 최소 하나**를 호출 | 둘 다 안 부르면 원장이 `ADMIT_ISSUED`로 남고 대사가 300초 뒤 만료 처리 | 요금은 안 변하지만(과금은 상태 무관) **완료율 지표가 틀어진다.** 가이드 계약 ① |
+| 브라우저는 **탭 하나만** 폴링 | 버킷 키가 `tokenId` 하나(용량 5·초당 1) → 탭 2개면 여유 0, 3개면 10초 안에 429 | 강제 불가. `BroadcastChannel` 리더 탭 권고. 가이드 계약 ③ |
+| `429`는 **재시도 신호**로 처리 | 오류 화면을 띄우면 자리를 잃지 않은 사용자가 이탈한다 | `Retry-After` 항상 제공(폴링은 2초). 가이드 계약 ② |
+| `admitToken`을 **세션으로 쓰지 않는다** | Platform은 세션을 만들지도 동시 접속을 세지도 않는다 | verify가 준 `identifier`로 Tenant가 자기 세션을 만든다. 가이드 계약 ④ |
 | `identifier`는 **UUIDv7**, 사용자·큐당 **같은 값을 재사용** | §6.2 참조 — 자리 중복 점유 / 자격 증명 유출 | 형식 가이드만 제시. 검증은 Tenant 책임 |
 
 ### JS SDK (브라우저용)
