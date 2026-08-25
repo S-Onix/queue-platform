@@ -623,12 +623,20 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
   - `batch-lock:{t}:{q}` 분산 락
 - `RedisSyncJob` (5분 주기)
   - `redis_sync_needed=1` 토큰 → Redis 재삽입
-- `BillingSnapshotJob` (월 1회, M+2월 초)
-  - `queue_daily_stats` 집계
-  - `billing_snapshots` UPSERT
-  - 파티션 DROP + REORGANIZE
-  - > **실제 월 1회 스케줄 대기 대신 수동 트리거 + dry-run 쿼리로 검증**
-- ShedLock 또는 `batch-lock` 기반 멀티 인스턴스 분산
+- `BillingSnapshotJob` — ✅ **구현 완료**. 단, 원안과 **셋이 다르다**
+  - 🔄 **월 1회 → 매일 UTC 00:30, 전월 + 당월 재집계.** M+2월 초는 **파티션 DROP**의 일정이지
+    집계의 일정이 아니다. 집계만 떼어 매일 돌리면 ① 테넌트가 당월 사용량을 그날 보고
+    ② 한 번 실패해도 다음 날이 가져간다(월 1회는 그 한 번이 곧 한 달치 미청구)
+    ③ 16만 행 115ms 실측이라 비용이 반박 근거가 못 된다.
+    **더 과거는 안 본다** — 파티션이 DROP된 달을 집계하면 남은 행만 세어 이미 청구한 금액을 깎는다
+  - 🔄 **`queue_daily_stats` 집계 · 파티션 DROP/REORGANIZE는 이 잡에서 뺐다.**
+    과금이 아니라 **파티션 운영**이고 DDL이라 성격이 다르다. 별건으로 남는다 (⬜ 미착수)
+  - ✅ `billing_snapshots` UPSERT — `FROM tokens PARTITION (pYYYY_MM)` 적용(§83 준수, 실측 `partitions: p2026_08` 1개)
+  - ✅ `READ COMMITTED` 격리 — 안 걸면 집계가 `tokens` 적재를 막는다(실측: INSERT가 6초 대기 후 `ERROR 1205`, RC에서는 0.033초)
+- 🔄 **ShedLock·`batch-lock`을 쓰지 않는다.** UPSERT가 멱등이라 batch N대가 각자 같은 값을 쓸 뿐이고,
+  동시에 돌아도 둘 다 같은 SELECT의 결과라 어느 쪽이 이겨도 정답이다
+  (실측: 가상 스레드 8개 동시 UPSERT에서 데드락 0). `ReconcileJob`이 같은 논리의 선례다.
+  나머지 잡(`RedisSyncJob` 등)에는 여전히 필요할 수 있다 — 잡마다 따로 판단한다
 
 **후속 과제 배치** (`doc/reviews/2026-08-17-pr26-agent-review.md` §7 등재분 — 새 항목이 아니라 일정에 얹는 것)
 
@@ -654,12 +662,14 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
   - `INSERT INTO billing_snapshots ... ON DUPLICATE KEY UPDATE count = VALUES(count)` 멱등성 확인
   - `EXPLAIN SELECT ... partitions: p2026_04` 확인 — **`FROM tokens PARTITION (p2026_04)`을 쓴 쿼리로** 검증한다.
     범위 조건만으로는 13개 전부 나온다(§83). 옛 문구대로면 영원히 체크할 수 없는 DoD였다
-- [ ] Batch 2대 동시 기동 시 `batch-lock`으로 중복 실행 방지
+- [x] ~~Batch 2대 동시 기동 시 `batch-lock`으로 중복 실행 방지~~ → **`BillingSnapshotJob`은 락 없이 안전**(위 참조).
+      다른 잡에는 이 DoD가 그대로 살아 있다
 - [ ] Gap Lock 방지 (LIMIT 100 순차 처리)
 
 **참조 문서:** schema.sql의 파티션 운영 섹션, DECISIONS §39 (RedisSyncJob), §43 (Queue 삭제 흐름), §44 (파티션 유예 전략)
 
-**주의:** BillingSnapshotJob은 월 1회 스케줄이라 실제 시간 기반 검증 불가. 수동 트리거 + dry-run 쿼리로 대체. 실제 프로덕션에서는 ShedLock으로 배타 실행 보장.
+**주의:** ~~BillingSnapshotJob은 월 1회 스케줄이라 실제 시간 기반 검증 불가~~ → **매일 스케줄로 바꿔 이 제약이 사라졌다.** 집계 로직은 실 MySQL 통합 테스트 7건이 덮는다. ~~실제 프로덕션에서는 ShedLock으로 배타 실행 보장~~ → **쓰지 않는다**(위 참조).
+**미검증:** cron `zone = "UTC"`의 실제 발화 시각은 테스트로 못 박지 못했다 — 어노테이션 값을 어노테이션 값과 비교하는 동어반복이라 만들지 않았다.
 
 ---
 
