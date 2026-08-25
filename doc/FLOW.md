@@ -189,7 +189,7 @@ flowchart TD
 
     DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
 
-    LUA -->|"admitToken TTL 60초 초과"| BACK["종료 — queue-batch (§36·§80)\nclaim-Lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ 'seq|identifier' 파싱\n→ ZADD queue:{queueId}:waiting {seq} {identifier}\n→ ZREM queue:{queueId}:admitted\n→ Kafka RETURNED 발행 (status 1→0)\n※ last-active는 리셋하지 않는다\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
+    LUA -->|"admitToken TTL 60초 초과"| BACK["종료 — 복귀 없음 (queue-batch, §36·§80)\nadmit_expire.lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ ZREM queue:{queueId}:admitted\n→ HGET queue:{queueId}:tokens {identifier} (tokenId·issuedAt 확보)\n→ HDEL queue:{queueId}:tokens {identifier} ← 중복 게이트 해제\n→ Kafka EXPIRED 발행\n※ waiting으로 ZADD 하지 않는다 — 재접속하면 맨 뒤다\n※ DB status는 1에 머문다 — EXPIRED 소비 가드가\n   IF(status=0,4,status)라 1에서는 no-op (complete 300초 창을 살리려는 의도)\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
 ```
 
 > **왜 DB WAITING 확인이 없나 (§80)**
@@ -217,7 +217,7 @@ flowchart TD
     --> STOP["브라우저가 폴링을 멈춘다\nqueue:{queueId}:last-active score가 늙는다"]
     --> WAIT["유예 창 = inactiveTtl (기본 300초)\nTenant가 큐마다 정한다"]
 
-    WAIT -->|"창 안에 ka=1 폴링 재개"| BACK["poll_verify.lua가 ZADD last-active\n(재-enqueue는 순번만 복원할 뿐\nlast-active를 갱신하지 않는다)"]
+    WAIT -->|"창 안에 개인 폴링 재개(ka 무관)"| BACK["poll_verify.lua가 ZADD last-active\n(재-enqueue는 순번만 복원할 뿐\nlast-active를 갱신하지 않는다)"]
     WAIT -->|"창을 넘김"| JOB["TTL 만료 Batch가 회수\nlast-active member=seq → waiting에서 identifier 역산\nHGET tokens로 issuedAt 원본 확보(HDEL 전!)\nZREM waiting + ZREM last-active + HDEL tokens"]
 
     JOB --> EXP["Kafka EXPIRED 발행 (key=tokenId)\nDB status = EXPIRED(4)\nexpiredReason = INACTIVE_TTL"]
@@ -234,7 +234,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    JOB(["TokenExpiryJob\n10초 주기"])
+    JOB(["TokenReclaimJob\n10초 주기\n※ TokenExpiryJob이라는 클래스는 없다 —\n   세 판정이 이 잡 하나에 들어갔다"])
     --> ALIST["활성 큐 목록 조회\nACTIVE · PAUSED · DRAINING\n큐별 병렬 처리 (동시 10개 / 8초 타임아웃)\nbatch-lock:{t}:{q} NX EX 15 → 분산 처리"]
 
     ALIST --> W1 & W2 & W3
@@ -243,10 +243,10 @@ flowchart TD
     W2["inactiveTtl 체크 (WAITING)\nZRANGEBYSCORE queue:{queueId}:last-active\n0 ~ now_ms - inactiveTtl_ms\n(member=seq, score=마지막 ka 시각)"]
     W3["admitToken TTL 체크 (ADMIT_ISSUED) — claim-Lua (§80)\nZRANGEBYSCORE queue:{queueId}:admitted 0 now\n(score=만료 epoch ms, member='seq|identifier')\n※ EXISTS 스캔 폐기 — 만료된 키는 이미 사라져\n   무엇이 만료됐는지 알 수단이 없었다"]
 
-    W1 -->|"WAITING_TTL(0)"| EXP["DB UPDATE EXPIRED(4)\nexpiredReason 기록\nRedis ZREM\nDEL token-info 캐시\n100건씩 순차 처리\nLIMIT 100 → Gap Lock 방지"]
+    W1 -->|"WAITING_TTL(0)"| EXP["waiting_expire.lua / inactive_expire.lua\nZREM waiting + ZREM last-active + HGET/HDEL tokens\n→ Kafka EXPIRED 발행 → 컨슈머가 DB status=4\n※ DB를 직접 UPDATE하지 않는다 — 이벤트 경로다\n※ expiredReason은 이벤트에 싣지 않는다 (컬럼은 있으나 미사용)\n※ 큐당 상한으로 끊는다 (한 주기가 다른 큐를 굶기지 않게)"]
     W2 -->|"INACTIVE_TTL(1)"| EXP
 
-    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["종료 — 복귀 없음 (queue-batch, §36)\nmember에서 seq·identifier 파싱 (DB 조회 불필요)\nZADD queue:{queueId}:waiting {seq} {identifier}\nZREM queue:{queueId}:admitted\nKafka RETURNED 발행 → status 1→0\nDEL token-info 캐시\n※ last-active는 리셋하지 않는다 (§80)"]
+    W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["종료 — 복귀 없음 (queue-batch, §36)\nadmit_expire.lua 한 스크립트: ZREM admitted → HGET/HDEL tokens\nKafka EXPIRED 발행\n※ waiting으로 되돌리지 않는다\n※ DB status는 1에 머문다 (소비 가드가 1에서 no-op)\n   → 잔류분은 ReconcileJob이 complete 창 300초 뒤 4로 정리"]
 
     EXP --> DONE(["완료\n멱등: 상태 필터로 중복 처리 없음"])
     BACK --> DONE
@@ -303,7 +303,7 @@ flowchart TD
     --> RESP["응답\n{ lastAdmittedSeq, pacing }"]
 
     RESP --> CALC["JS SDK 계산\nrank = mySeq − lastAdmittedSeq\n간격 = pacing 표 + ±20% 지터"]
-    CALC -->|"rank > 0"| TIMER["setTimeout(간격 × 1000)\n→ poll() 재호출\n탭 비활성화 시 자동 중단\n30~60초마다 ka=1로 개인 호출"]
+    CALC -->|"rank > 0"| TIMER["setTimeout(간격 × 1000)\n→ poll() 재호출\n탭 비활성화 시 자동 중단\n30~60초마다 개인 호출"]
     TIMER --> POLL
 
     CALC -->|"rank <= 0"| ME["GET /queues/:queueId/tokens/:tokenId?seq=&ka=\n(§74 소유권 검증)"]

@@ -13,7 +13,8 @@
 ### 핵심 설계 원칙
 1. **Platform**은 순서만 관리, **Tenant**가 슬롯·입장 제어
 2. 유저가 Platform에 직접 Polling (`/status`의 `pacing` 구간표 기반 적응형 간격, §79)
-   - ⚠️ 현행 **코드**는 아직 `nextPollAfterSec`를 응답에 담는다. §79는 설계 확정·구현 미착수
+   - ✅ **구현 완료.** `PollResponse`는 `{ready, admitToken}` 둘뿐이고 `nextPollAfterSec`·`frontSeq`는
+     주석에만 남았다. 간격 계산은 `/status`의 `pacing` 표로 **클라이언트가** 한다
 3. Backpressure Pull (Tenant가 admit으로 받을 수 있는 만큼만)
 4. admitToken TTL 만료 → **종료**(§36). 복귀하지 않는다 — 재접속 → 재-enqueue → 맨 뒤
 5. Spring MVC + Virtual Thread (JPA blocking I/O를 OS Thread 고갈 없이)
@@ -28,9 +29,10 @@ Language: Java 21 (Virtual Thread, Record, Pattern Matching)
 Framework: Spring Boot 3.3.4 + MVC + Tomcat (NOT WebFlux)
 ORM: JPA (Hibernate) + JDBC
 DB: MySQL 8.0 (Master 3306 + Replica 3307, GTID 복제)
-Cache: Redis — 현재 구현 Sentinel (Master + Slave 2 + Sentinel 3)
-       목표 확정: 독립 2 Cluster + 큐 단위 이중 라우팅 (DECISIONS §75, 전환 시점 미정)
-       Sentinel은 폐기가 아니라 학습·로컬 자산으로 격하 (§75 D28)
+Cache: Redis — **독립 2 Cluster + 큐 단위 이중 라우팅** (DECISIONS §75, 구현 완료)
+       `RedisConfig`는 Cluster 전용이다 — **Sentinel 분기를 코드에서 제거했다.**
+       프로파일로 나누면 해시태그 누락처럼 "Cluster에서만 터지는" 결함이 숨을 통로가 생긴다.
+       Sentinel 인프라·문서는 학습·로컬 자산으로 보존 (§75 D28)
 Messaging: Spring Kafka (KRaft)
 Build: Gradle 멀티모듈 (6개 — common/domain/infrastructure/api/batch/consumer)
 Architecture: Hexagonal + DDD
@@ -48,7 +50,7 @@ queue-platform/
 ├── queue-domain/          # Rich Domain Model + Port 인터페이스 (Spring 의존성 없음!)
 ├── queue-infrastructure/  # JPA Adapter, Redis Adapter, Kafka Adapter, AOP Aspect 구현
 ├── queue-api/             # REST Controller + Security + JWT
-├── queue-batch/           # @Scheduled Jobs (현재 껍데기 — Sprint 7·9에서 채움)
+├── queue-batch/           # @Scheduled Jobs 3개 — TokenReclaimJob · ReconcileJob · BillingSnapshotJob
 └── queue-consumer/        # Kafka 소비 전담 독립 앱. token-lifecycle → tokens DB 적재
 ```
 
@@ -82,14 +84,19 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  Enqueue · Polling · Kafka 적재(token-lifecycle + queue-consumer)  (Sprint 6·8)
   구현됨  admit · verify · complete — 엔드포인트 6개                        (Sprint 7 §80)
   구현됨  admit.lua · admit_expire.lua · 상태 전이 가드 UPSERT              (§80)
-  구현됨  queue-batch: TokenReclaimJob — 회수 2경로                        (§36 · §82)
-          ├ admitToken TTL 만료 → HDEL tokens + EXPIRED (복귀 안 함)
-          └ inactiveTtl 초과   → ZREM waiting/last-active + HDEL + EXPIRED
+  구현됨  queue-batch: TokenReclaimJob — 회수 3경로                   (§36 · §82 · PR #48)
+          ├ admitToken TTL 만료 → ZREM admitted + HDEL tokens + EXPIRED (복귀 안 함)
+          │                       ⚠️ DB status는 1에 머문다 — 소비 가드가 1에서 no-op
+          ├ inactiveTtl 초과   → ZREM waiting/last-active + HDEL + EXPIRED
+          └ waitingTtl 초과    → 앞부분 스캔(seq가 시간과 단조증가) → 같은 정리 + EXPIRED
+  구현됨  queue-batch: ReconcileJob — Redis↔DB 대사 + status=1 잔류 정리   (PR #48)
+  구현됨  queue-batch: BillingSnapshotJob — 월별 과금 스냅샷               (§84 · PR #49)
   구현됨  /status 분할 · admitWatermark · pacing 구간표                     (§79)
   구현됨  poll_verify의 keepalive 분기 삭제 — 폴링이 곧 생존 신호            (§82 F안)
   폐기    Cancel(DELETE /tokens/:id) — 이탈은 inactiveTtl 배치가 전담        (§82)
-  미착수  waitingTtl(7200s) 판정 — 판정 소스 미정                            (Sprint 9)
   미착수  관측 메트릭 3종(queue_admit_*) — 좀비 탐지 수단이 아직 0          (§80 U9)
+  미착수  RedisSyncJob — redis_sync_needed 컬럼은 쓰지만 잡이 없다          (Sprint 9)
+  미착수  JS SDK — 리더 탭(BroadcastChannel) 확정만 되고 코드 0             (§78)
 
 ⚠️ 중복 게이트는 `tokens` Hash의 **HSETNX**다. `waiting` ZSet이 아니다 —
    admit되면 waiting에서 빠지므로 게이트로 쓰면 재-enqueue가 신규로 판정된다(과금 중복).
@@ -460,7 +467,7 @@ mysql -u root -p -P 3307  # Replica
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
 | `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 5건 + 흔한 실수 |
 | `doc/DECISIONS.md` | 84개 설계 결정 + 근거 + 면접 포인트 (최신 §84 — BillingSnapshotJob) |
-| `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (⚠️ **§79가 구현돼 폴링 4문서가 낡았다** — 갱신 대상) |
+| `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (§79 분할은 **반영 완료**) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |
 | `doc/STATE.md` | Token, Queue, ApiKey 상태 머신 |

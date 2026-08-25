@@ -20,8 +20,9 @@ import java.util.stream.Collectors;
  * <p>이름 문자열이 곧 계약이다 — <b>상수 이름을 바꾸면 흘러가는 메시지가 깨진다.</b>
  * 순서·개수는 바꿔도 되지만 이름은 못 바꾼다(ordinal이 아니라 name으로 직렬화된다).
  *
- * <p>현재 발행되는 것은 {@link #ENQUEUED} 뿐이다. 나머지는 Sprint 7(admit)·9(복귀/만료)에서
- * 발행되며, 소비 측 처리도 그때 붙는다.
+ * <p><b>넷 다 발행된다.</b> {@code ENQUEUED}(enqueue) · {@code ADMITTED}(admit) ·
+ * {@code COMPLETED}(verify 또는 complete) · {@code EXPIRED}(회수 배치 3경로).
+ * {@code RETURNED}는 <b>만든 적이 없다</b> — §36이 WAITING 복귀 자체를 폐기했다.
  */
 public enum TokenEventType {
 

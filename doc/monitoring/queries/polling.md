@@ -121,7 +121,8 @@ RW slowlog get 10
 | `evalsha usec_per_call` | **기준선 수집 필요.** 평상시 폴링 3일치 p50/p95를 재고 p95×3을 경고선으로 |
 | `slowlog` 신규 항목 | 0건/시간이 정상 |
 
-> `poll_verify.lua`는 `ka=1`일 때 `ZADD`를 하므로 **쓰기다. replica로 뺄 수 없다.**
+> `poll_verify.lua`는 **항상** `ZADD`를 하므로 **쓰기다. replica로 뺄 수 없다.**
+> (`ka` 분기는 §82 F안이 삭제했다 — 폴링이 곧 생존 신호다.)
 > `token-bucket.lua`도 `HMSET`+`EXPIRE`라 쓰기다. 둘 다 master 부하로 직행한다.
 > **`/status`의 `MGET`만이 순수 읽기**이며, §79가 엔드포인트를 쪼갠 이유가 이것이다 —
 > 평상시 트래픽을 `EVAL`(master 고정)에서 빼냈다. 다만 replica로 실제로 보내려면
