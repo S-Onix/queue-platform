@@ -18,17 +18,22 @@
 ├── JDK 21
 ├── Git
 ├── MySQL 8.0 (Master 3306 + Replica 3307)
-├── Redis Sentinel
-│   ├── Master (6379)
-│   ├── Slave 1 (6380)
-│   ├── Slave 2 (6381)
-│   ├── Sentinel 1 (26379)
-│   ├── Sentinel 2 (26380)
-│   └── Sentinel 3 (26381)
+├── Redis Cluster A (7001-7008)   ★ 앱이 실제로 붙는 곳 — 4 Master + 4 Replica
+├── Redis Cluster B (8001-8008)   ★ A와 완전히 독립. 큐 단위로 둘 중 하나에 배정된다
+├── Kafka KRaft (9092)            token-lifecycle 적재
 ├── Prometheus (9090)
 ├── Grafana (3000)
-└── (Sprint 8+) Kafka KRaft
+└── Redis Sentinel (6379-6381 + 26379-26381)   ← 학습·로컬 자산. 앱은 안 붙는다
 ```
+
+> 🔴 **앱이 붙는 Redis는 Cluster A·B다.** `RedisConfig`는 **Cluster 전용**이고 Sentinel 분기를
+> 코드에서 제거했다(§75 D28) — 프로파일로 나누면 해시태그 누락처럼 "Cluster에서만 터지는"
+> 결함이 Sentinel 경로로 숨을 통로가 생기기 때문이다.
+>
+> **Sentinel 절(§6)을 지우지 않은 이유**는 failover 실증과 quorum 학습 자산이 거기 있어서다.
+> 지금도 띄울 수 있지만 **애플리케이션과는 무관하다.** 구축 절차는 §6.5를 보라.
+>
+> Cluster A/B는 systemd에 등록돼 있다: `sudo systemctl start redis-cluster-a-{1..8}` (B도 동일).
 
 ---
 
@@ -264,7 +269,7 @@ SOURCE /home/sonix/queue-platform/docs/schema.sql;
 
 ---
 
-## 6. Redis Sentinel 클러스터 ⭐ (Sprint 5 핵심)
+## 6. Redis Sentinel 클러스터 (Sprint 5 핵심 — **현행 아님. 학습·로컬 자산이다. 앱이 붙는 곳은 §6.5**)
 
 ### 6-1. Redis 설치
 
@@ -529,9 +534,11 @@ redis_start
 
 ## 6.5. Redis Cluster (Sprint 8+ 학습 환경) ⭐
 
-> **작성일**: 2026-07-08 (Sprint 5-D 완료 후)
-> **목적**: Sentinel과 병행 실습 가능한 Redis Cluster 구축
-> **최종 목표**: Sprint 10 프로덕션 Cluster 도입 사전 학습
+> **작성일**: 2026-07-08 (Sprint 5-D 완료 후) · **최신화**: 2026-08-26
+> **🔴 이 절이 현행 인프라다.** 작성 당시엔 "학습 환경"이었으나 §75로 **앱이 실제로 쓰는 구성**이 됐다.
+> `RedisConfig`의 `@Value` 기본값이 여기의 포트 목록(7001-7008 / 8001-8008)이고,
+> CI 통합 레인도 같은 포트로 띄운다(`scripts/ci/redis-cluster-up.sh`).
+> **최종 목표**: 프로덕션은 4x4x4GB (시점 미정)
 
 ### 6.5-1. Cluster 구성 개요
 
@@ -1770,7 +1777,7 @@ sudo cp /var/lib/grafana/grafana.db ~/backups/grafana_$(date +%Y%m%d).db
 - Sentinel 유지
 - Failover 검증 완료
 
-### Sprint 10: Redis Cluster 프로덕션 도입
+### ~~Sprint 10~~: Redis Cluster 프로덕션 도입 — **로컬은 이미 Cluster다**(§75). 남은 것은 AWS 배포뿐
 
 ```
 [프로덕션 최소 구성]
@@ -1785,7 +1792,7 @@ sudo cp /var/lib/grafana/grafana.db ~/backups/grafana_$(date +%Y%m%d).db
 - 관리 부담 낮음
 ```
 
-### Sprint 11: Kafka KRaft
+### ~~Sprint 11~~: Kafka KRaft — **Sprint 8에 구현 완료** (`token-lifecycle`, 18 파티션, 100만건 실측)
 
 ```bash
 # Kafka 3.5+ KRaft 모드 설치 (Zookeeper 없이)

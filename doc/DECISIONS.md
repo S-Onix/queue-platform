@@ -3727,6 +3727,18 @@ public RedisScript<Long> fixedWindowScript() {
 
 ## §67 Sprint 12+ — 이중 라우팅 아키텍처 (Cluster + Hash Tag)
 
+> ✏️ **Layer 2(`{shard_X}` 태그)는 철회됐다 (2026-08-26 표시, 근거는 `QueueKeys.java` javadoc).**
+> Layer 1(Application이 클러스터를 고른다)은 **§75로 구현 완료**다 — `RedisClusterAssigner`가
+> `queueId` 해시로 A/B를 정한다.
+>
+> **왜 Layer 2가 성립하지 않나:** 라우팅은 *소유자를 모를 때* `queueId`를 해싱해 클러스터를
+> 정한다. 그런데 키 이름에 `shard`를 넣으면 **키를 만들려면 shard를 이미 알아야 하고, shard를
+> 알려면 라우팅을 이미 돌렸어야 한다.** 순환이다.
+>
+> 아래 본문의 `queue:{shard_A2}:q_bts_002:waiting` 예시와 "부하 기반 Shard 결정"은
+> **그 순환을 안 보고 쓴 것**이다. 현행 키 형식은 `queue:{queueId}:waiting`이며
+> 태그 기준은 **`queueId`로 확정**됐다(§70 D10).
+
 > ⚠️ **§75(2026-08-11)에서 확정·구체화됨.**
 > 이 절이 "Sprint 12+ 계획"으로 적어둔 Layer 1(Cluster 선택)이 **채택 확정**되었고,
 > §75가 두 가지를 못 박았다: **라우팅 단위 = 큐 1개**(D26), **큐 생성 시 배정 후 고정**(D27).
@@ -4028,7 +4040,8 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 
 **중립**:
 - **큐 1개 = 슬롯 1개 = 마스터 1대 고정.** D2(ZSet 하나)의 필연적 귀결이며 해시태그가 만든 문제가 아님. 1,000만 대기 시 ZSet 실측 **114.5 bytes/멤버 → 약 1.07 GB**가 단일 마스터에 집중 (§69의 128 bytes 추정과 근사)
-- §67 이중 라우팅 도입 시 태그가 shard로 이동: `queue:{shard_A2}:q_bts_002:waiting`
+- ~~§67 이중 라우팅 도입 시 태그가 shard로 이동: `queue:{shard_A2}:q_bts_002:waiting`~~
+  → 🔴 **철회.** 태그 기준은 `queueId`로 확정됐다 — shard를 키에 넣으면 라우팅이 순환한다(§67 머리말)
 
 ### Interview Point
 
@@ -4036,7 +4049,7 @@ queue:{q_bts}:seq       → slot 10592  → 포트 7003   ┘ → 정상 실행
 
 ### Related
 
-- §66 (Cluster 도입), §67 (이중 라우팅 — 태그가 shard로 이동), §69 (ZSet 128 bytes 추정)
+- §66 (Cluster 도입), §67 (이중 라우팅 — ~~태그가 shard로 이동~~ **Layer 2 철회**), §69 (ZSet 128 bytes 추정)
 - `doc/CONCURRENCY.md` §6.5 (Multi-key Lua + Hash Tag)
 - `doc/FLOW.md` (Enqueue 결정 근거 D1-D10)
 - `queue-infrastructure/.../queue/QueueKeys.java`, `ratelimit/RateLimitKeys.java` (선례)

@@ -8,6 +8,25 @@
 
 ---
 
+> ## 🔴 이 문서를 읽기 전에 (2026-08-26 추가)
+>
+> **이 문서의 Sprint 번호는 옛 계획이고, 정본은 [`ROADMAP.md`](ROADMAP.md)다.** 실제 진행은
+> 계획대로 가지 않았다 — 특히 **Kafka·Cluster가 여기 적힌 것보다 훨씬 먼저 들어왔다.**
+>
+> | 이 문서 | 실제 (ROADMAP.md 기준) |
+> |---|---|
+> | Sprint 6 = ApiKey 인증 | Token 도메인 + Enqueue + Polling |
+> | Sprint 7 = WAS 확장 + DLock | admit · verify · complete (§80) |
+> | Sprint 10 = Cluster 도입 | **이미 구현 완료** (§75, 독립 2 Cluster) |
+> | Sprint 11-12 = Kafka 도입 | **Sprint 8에 완료** (`token-lifecycle`, 100만건 실측) |
+> | Phase 3 = Kafka + SSE | Kafka는 끝났고 **SSE는 착수도 안 했다**(폴링 유지, §79) |
+>
+> **그래서 이 문서에서 지금도 유효한 것은 "무엇을 왜 하는가"이지 "언제 하는가"가 아니다.**
+> 부록 C·D·E(Cluster 명령어·설정·실습)와 G·H·I(사이징 계산)는 **참조 자료라 그대로 유효**하다.
+> 아래 §2 Phase 0은 현재 상태로 갱신했다.
+
+---
+
 ## 목차
 
 1. [전체 진화 개괄](#1-전체-진화-개괄)
@@ -74,47 +93,55 @@ Phase 4: Multi-Region + Hybrid Redis
 
 ## 2. Phase 0 - 현재 상태
 
+> ✏️ **이 절은 원래 Sprint 5-D 시점에 얼어 있었다**(앱 1대 · "MySQL Sentinel" · Redis Sentinel ·
+> Kafka 없음). 2026-08-26에 코드와 대조해 갱신했다.
+
 ### 2.1 아키텍처 다이어그램
 
 ```
-Client
-  ↓ HTTP
-[Spring Boot Application (1대)]
-  ├─→ MySQL Sentinel
-  │   ├─ Master (3306)
-  │   └─ Replica (3307)
+Client (브라우저)
+  │  GET /status · GET /tokens/{tokenId}   ← 인증 없음. 유저가 Platform을 직접 폴링
+  ↓
+[queue-api  N대]  ←── Tenant 서버 (X-API-Key: enqueue · admit · verify · complete)
+  ├─→ MySQL 8.0 (GTID 복제)
+  │   ├─ Master  (3306)   쓰기 · readOnly 아닌 트랜잭션
+  │   └─ Replica (3307)   @Transactional(readOnly = true) 라우팅
   │
-  └─→ Redis Sentinel
-      ├─ Master (6379)
-      ├─ Replica 1 (6380)
-      ├─ Replica 2 (6381)
-      ├─ Sentinel 1 (26379)
-      ├─ Sentinel 2 (26380)
-      └─ Sentinel 3 (26381)
+  ├─→ Redis Cluster A (7001-7008)  ┐ 큐 단위로 둘 중 하나에 배정 (§75)
+  ├─→ Redis Cluster B (8001-8008)  ┘ 한 큐의 키 4종은 같은 클러스터 (해시태그는 경계를 못 넘는다)
+  │
+  └─→ Kafka KRaft (token-lifecycle, key = tokenId)
+        ↓
+      [queue-consumer  N대]  → tokens 배치 적재 (At-Least-Once, 가드 UPSERT)
 
-[모니터링]
-Prometheus + Grafana
+[queue-batch  N대]  잡 3개 — TokenReclaimJob(10초) · ReconcileJob(5분) · BillingSnapshotJob(매일)
+                    ShedLock 없음. 근거는 CONCURRENCY.md 적용 매트릭스
+
+[모니터링] Prometheus + Grafana        [학습 자산] Redis Sentinel (앱은 안 붙는다)
 ```
 
-### 2.2 완료된 학습 요소
+### 2.2 완료된 것
 
-- **Sprint 1-2**: 도메인 설계, 헥사고날 아키텍처
-- **Sprint 3-4**: JWT 인증, Refresh Token Rotation
-- **Sprint 5-A**: Rate Limiter (Fixed Window, Token Bucket)
-- **Sprint 5-B**: Redis Sentinel 인프라
-- **Sprint 5-C**: Redis Sorted Set 기초
-- **Sprint 5-D**: 캐시 인프라 (Tenant + ApiKey, Negative Caching)
+- **Sprint 1-4**: 도메인 설계, 헥사고날, JWT + Refresh Rotation
+- **Sprint 5**: Rate Limiter(2종) · Redis 캐시 · Enqueue Bulk Lua + Hash Tag
+- **Sprint 6**: Token 도메인 · Enqueue · Polling (Cancel API는 §82로 폐기)
+- **Sprint 7**: admit · verify · complete + `/status` 분할 · admitWatermark · pacing (§79 · §80)
+- **Sprint 8**: Kafka `token-lifecycle` + `queue-consumer` (100만건 실측)
+- **Sprint 9(진행 중)**: 회수 3경로 · Redis↔DB 대사 · 과금 스냅샷(§84). `RedisSyncJob`은 미착수
+- **인프라 전환**: Sentinel → **독립 2 Cluster + 큐 단위 라우팅** (§75, 코드에서 Sentinel 분기 제거)
+- **배포**: Dockerfile 3종 + compose + GitHub Actions CI(단위 · 통합 · 이미지 3종)
 
 ### 2.3 도구 스택
 
 | Layer | Technology |
 |-------|-----------|
-| Language | Java 21 |
-| Framework | Spring Boot 3.3.4 (MVC) |
-| WAS | Apache Tomcat (Virtual Thread) |
-| Persistence | JPA + MySQL Sentinel |
-| Cache | Redis Sentinel |
-| Build | Gradle Multi-Module |
+| Language | Java 21 (Virtual Thread) |
+| Framework | Spring Boot 3.3.4 (MVC — **WebFlux 아님**) |
+| WAS | Apache Tomcat (`spring.threads.virtual.enabled=true`) |
+| Persistence | JPA + MySQL 8.0 Master/Replica (GTID 복제 — *"MySQL Sentinel"이라는 것은 없다*) |
+| Cache · Queue 상태 | **Redis 독립 2 Cluster** (Sentinel 폐기, §75) |
+| Messaging | Kafka KRaft (단일 토픽 `token-lifecycle`, key = `tokenId`) |
+| Build | Gradle Multi-Module (6개) |
 | Architecture | Hexagonal (Ports & Adapters) |
 
 ### 2.4 학습 자산
@@ -136,7 +163,7 @@ Client
 [Nginx / Load Balancer]
   ↓
 [Spring Boot 2-3대]
-  ├─→ MySQL Sentinel (동일)
+  ├─→ MySQL Master/Replica (동일)   ※ 구 서술 "MySQL Sentinel"은 잘못된 표현 — GTID 복제다
   │
   └─→ Redis Sentinel (동일)
       + Bulk 단독 Enqueue Engine (Global Queue + BatchProcessor)
@@ -241,7 +268,7 @@ Client
 [CDN / Load Balancer]
   ↓
 [Spring Boot 3-5대]
-  ├─→ MySQL Sentinel (Read Replica 활용)
+  ├─→ MySQL Master/Replica (Read Replica 활용)   ※ "MySQL Sentinel"은 잘못된 표현 — GTID 복제다
   │
   ├─→ Redis Cluster (신규) ⭐
   │   ├─ Master 1 (Slot 0-5461)
@@ -1039,6 +1066,10 @@ Adaptive Batching을 "경로 분기"로 오독한 것이 최초 설계의 뿌리
 ---
 
 ## 9. Sprint 계획 요약표
+
+> ⚠️ **아래 표는 옛 계획이다.** Sprint 번호·순서 모두 실제와 다르다 — 문서 맨 위의 대조표를 보라.
+> 정본은 [`ROADMAP.md`](ROADMAP.md)다. 남겨 두는 이유는 **당시 무엇을 어느 크기로 봤는지**가
+> 기록으로서 의미가 있어서다.
 
 | Sprint | 목표 | 기술 | 예상 시간 |
 |--------|------|------|-----------|

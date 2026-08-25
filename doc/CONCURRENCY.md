@@ -16,9 +16,10 @@
 
 ### Redis 배포 방식별 확장성 (Sprint 5-D → Sprint 10+)
 
-| 배포 방식 | 저장 확장 | 처리량 확장 | 도입 Sprint |
+| 배포 방식 | 저장 확장 | 처리량 확장 | 상태 |
 |-----------|-----------|-------------|-------------|
-| Sentinel | Scale-Up만 (Master 메모리) | Single Thread 한계 (40k ops/s) | Sprint 5-A (완료) |
+| ~~Sentinel~~ | Scale-Up만 (Master 메모리) | Single Thread 한계 (40k ops/s) | **현행 아님.** `RedisConfig`에서 Sentinel 분기를 제거했다 — 학습·로컬 자산으로만 보존(§75 D28) |
+| **독립 2 Cluster + 큐 단위 라우팅** | Scale-Out | 클러스터 수만큼 | ✅ **구현 완료** (§75). 로컬 7001-7008 / 8001-8008 |
 | Cluster (3 Master) | Scale-Out (Master 추가) | 3배 (120k ops/s) | ~~Sprint 10~~ **미정** |
 | Cluster (5-7 Master) | 유연한 확장 | 5-7배 (200-280k ops/s) | ~~Sprint 12~~ **미정** |
 | 4x4x4GB 극대 분산 | 최대 유연성 | 16배 (640k ops/s) | ~~Sprint 15+~~ **미정** |
@@ -37,7 +38,7 @@
 | 세션 저장 | Redis, JWT(stateless) | JVM 메모리, HttpSession |
 | 동시성 제어 | DB, Redis, Kafka | `synchronized`, `ReentrantLock` (락 대용) |
 | 캐시 | Redis | JVM 로컬 캐시 (읽기 전용 정적 데이터 제외) |
-| 스케줄러 | Leader election 필수 | `@Scheduled` 단독 사용 |
+| 스케줄러 | Leader election **또는 그와 동등한 원자적 claim** | 아무 보호 없는 `@Scheduled` 단독 사용 |
 | ID 생성 | DB AUTO_INCREMENT, Snowflake | JVM 카운터 |
 | 파일 저장 | S3 등 오브젝트 스토리지 | 로컬 디스크 |
 
@@ -188,11 +189,20 @@ Optional<Tenant> findByIdForUpdate(@Param("id") Long id);
 | createQueue (quota 검증) | 비관적 락 | DB만 건드림, 짧은 트랜잭션 |
 | Queue 생성 + Redis/Kafka 초기화 | 분산 락 | 외부 시스템 포함 |
 | ApiKey rotate | 분산 락 | 캐시 무효화 등 외부 영향 |
-| 일별 통계 집계 (스케줄러) | ShedLock | leader election 성격 |
+| 일별 통계 집계 (`queue_daily_stats`, **미착수**) | ShedLock | leader election 성격. INSERT-only 누적이라 중복 실행이 곧 중복 행이다 |
 | enqueue (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
 | admit (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
 | admitToken TTL 만료 배치 (스케줄러, ~~복귀~~ → 종료 §36) | **락 없음 (claim-Lua)** | `ZRANGEBYSCORE 0 now` + `ZREM`이 한 Lua = **`EVAL` 자체가 claim**. N대가 동시에 돌아도 한 대만 가져가고 나머지는 빈 배열 → 사다리 2단이 5단을 이긴다. `@Scheduled` + leader election 규칙의 **명시적 예외** (DECISIONS §80 ⑧) |
+| **`inactiveTtl`·`waitingTtl` 회수 배치** (스케줄러) | **락 없음 (claim-Lua)** | 위와 같은 구조다 — `inactive_expire.lua`·`waiting_expire.lua` 안에서 조회와 `ZREM`이 한 `EVAL`이라 **가져간 놈만 처리**한다 (§82) |
+| **`ReconcileJob`** (대사, 5분) | **락 없음** | 두 숫자를 **읽기만** 한다(부수효과 없음 — N대가 같은 값을 각자 보고할 뿐이라 PromQL에서 `sum`이 아니라 `max`로 본다). 유일한 쓰기인 잔류 정리는 술어 `status = 1`이 멱등성을 만들어 각 행이 한 번만 전이한다 |
+| **`BillingSnapshotJob`** (과금, 매일) | **락 없음** | UPSERT가 멱등이라 N대가 같은 값을 쓸 뿐이고, 동시에 돌아도 둘 다 같은 SELECT의 결과라 어느 쪽이 이겨도 정답이다 (§84). ⚠️ **정확성만 같고 비용은 다르다** — 파티션 스캔이 인스턴스 수만큼 곱해진다 |
 | 파티션 DROP | 분산 락 | 관리 작업, 단일 실행 보장 |
+
+> 🔑 **스케줄러 4행이 전부 "락 없음"인 것은 규칙 위반이 아니라 사다리를 지킨 결과다.**
+> 동시성 제어 우선순위에서 분산 락은 **5단**이고, 위 넷은 전부 **2단(Redis 원자 연산)이나
+> 1단(DB 제약·멱등 술어)에서 이미 해결됐다.** 2단으로 되는 일에 5단을 쓰면 그게 과설계다.
+> 반대로 **`queue_daily_stats`처럼 INSERT-only 누적은 멱등하지 않아** 여전히 ShedLock이 필요하다 —
+> "스케줄러니까 락 없이 된다"로 일반화하면 안 된다.
 
 ---
 
@@ -476,7 +486,7 @@ else
 end
 ```
 
-### 6.5 Cluster 환경에서 Multi-key Lua Script (Sprint 10+ 대비)
+### 6.5 Cluster 환경에서 Multi-key Lua Script (**현행** — 2 Cluster 구현 완료, §75)
 
 Redis Cluster는 Lua Script 내 여러 key 사용 시 제약 있음.
 
@@ -517,7 +527,8 @@ Redis Cluster는 Lua Script 내 여러 key 사용 시 제약 있음.
   ```
 - Sentinel 환경에서는 슬롯 개념이 없어 해시태그가 **무해** → 선제 적용해도 안전
 - Sprint 8+ Cluster 도입 시 **무변경으로 작동** (로컬 Cluster A에서 실제 스크립트 실행 검증 완료)
-- Sprint 12+ 이중 라우팅 도입 시 태그가 shard로 이동: `queue:{shard_X}:{queueId}:waiting`
+- ~~Sprint 12+ 이중 라우팅 도입 시 태그가 shard로 이동: `queue:{shard_X}:{queueId}:waiting`~~
+  → 🔴 **철회** — 태그 기준은 `queueId`로 확정됐다(§70 D10). 키 이름에 shard를 넣으면 라우팅이 순환한다(`QueueKeys.java` javadoc · `DECISIONS §67` 머리말)
 
 ### 6.6 Cluster Failover 중 짧은 순간 데이터 불일치
 
@@ -628,18 +639,20 @@ class QueueCreationConcurrencyTest {
 - §57: 동시성 제어 우선순위 정책
 - §58: Queue 생성 동시성 처리 방식 (비관적 락 + UNIQUE 제약)
 - §59: `@DistributedLock` 도입 및 모듈 배치
-- §66: Redis Cluster 도입 결정 (Sprint 10+)
+- §66: Redis Cluster 도입 결정 (~~Sprint 10+~~ → **§75로 확정·구현 완료**)
+- §75: 독립 2 Cluster + 큐 단위 이중 라우팅 (**현행 구성**)
+- §80·§82·§84: 스케줄 배치가 락 없이 도는 근거 (claim-Lua · 멱등 술어 · 멱등 UPSERT)
 - §67: 이중 라우팅 아키텍처 (Cluster + Hash Tag)
 - §68: Master 크기 최적화 원리
 - §69: 극대 분산 4x4x4GB 최종 구성
 
-### Cluster 환경 요약 (전환 확정 · 시점 미정, §75)
+### Cluster 환경 요약 (**전환 완료**, §75)
 
 > **§75 추가 제약**: 이중 라우팅에서 **한 큐의 키 4종은 같은 클러스터**에 놓인다(라우팅 단위 = 큐 1개).
 > 해시태그는 *한 클러스터 안의* 슬롯만 정렬하며 **클러스터 경계는 못 넘기 때문**에, 큐가 두 클러스터에
 > 걸치면 3키 Lua(`enqueue_bulk`·`poll_verify`)를 같은 EVAL로 보낼 수조차 없다.
 
-| 항목 | Sentinel (현재 구현) | Cluster (확정, 시점 미정) | 이중 라우팅 (§75 — 큐 단위) |
+| 항목 | Sentinel (~~현재 구현~~ **폐기**) | Cluster (일반) | **이중 라우팅 (§75 — 현행 구성)** |
 |------|-----------------|---------------------|-------------------------|
 | Redis 원자성 | Master 하나 | 각 Master 개별 원자 | 각 Master 개별 원자 |
 | Lua Script | 모든 key 자유 | 단일 key 또는 Hash Tag | Hash Tag 필수 |
@@ -654,10 +667,13 @@ class QueueCreationConcurrencyTest {
 - `@DistributedLock` key 패턴 (`lock:{domain}:{id}:{action}`) → Cluster 무변경
 - Rate Limiter Lua Script → 단일 key 사용, 무변경 (`rl:tenant:{id}`, `rl:{action}:ip:{ip}`)
 
-**Sprint 12+ 변경 예상**:
-- ~~필요 시~~ Lua Script Hash Tag → **Sprint 5-E에서 이미 도입 완료**. Sprint 12+엔 태그 기준이 queueId → shard로 이동
-- `@DistributedLock` key도 Hash Tag 활용
-- 이중 라우팅 정보 도메인에 반영
+**남은 변경 예상**:
+- ~~Lua Script Hash Tag~~ → **Sprint 5-E에서 도입 완료**
+- ~~태그 기준이 queueId → shard로 이동~~ → 🔴 **기각됐다.** 근거는 `QueueKeys.java` javadoc에 있다 —
+  라우팅은 소유자를 모를 때 `queueId`를 해싱해 클러스터를 정하는데, **키 이름에 shard가 들어가면
+  질문을 만들려면 답을 이미 알아야 한다.** 순환이라 성립하지 않는다. (`DECISIONS §67`의 서술은 이 점에서 낡았다)
+- `@DistributedLock` key도 Hash Tag 활용 — 미착수
+- 이중 라우팅 정보 도메인에 반영 — 미착수(현재는 `RedisClusterAssigner`가 `queueId` 해시로 결정)
 
 ---
 
