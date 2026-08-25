@@ -2,14 +2,34 @@
 
 > RunBook: [`doc/monitoring/runbook/rate-limit.md`](../runbook/rate-limit.md)
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
 ## 0. 준비
 
 ```bash
 export DB_PASSWORD=queueapp1234
 alias MYR='mysql -h127.0.0.1 -P3307 -uqueueapp -p"$DB_PASSWORD" queue_platform -t'
 alias MYW='mysql -h127.0.0.1 -P3306 -uqueueapp -p"$DB_PASSWORD" queue_platform -t'
-alias RR='redis-cli -p 6380'    # 조회
-alias RW='redis-cli -p 6379'    # 쓰기
+alias RR='redis-cli -c -p 7001'    # 조회
+alias RW='redis-cli -c -p 7001'    # 쓰기
 ```
 
 **위험 명령 금지**: `KEYS rl:*` (키가 수백만 개면 그 한 줄로 Redis가 멈춘다) · `FLUSHDB`/`FLUSHALL` (같은 DB에 대기열 ZSet이 있다) · `--scan` 결과를 파이프 없이 통째로 받는 것(수백만 줄).
@@ -104,7 +124,7 @@ grep -rn "forward-headers-strategy" queue-api/src/main/resources/
 
 **즉시 조치** (60초짜리 임시방편):
 ```bash
-RR --scan --pattern 'rl:signup:ip10.0.1.7*' -i 0.01 | xargs -r -n 200 redis-cli -p 6379 del
+RR --scan --pattern 'rl:signup:ip10.0.1.7*' -i 0.01 | xargs -r -n 200 redis-cli -c -p 7001 del
 ```
 **근본 조치**: `application-prod.yml`에 `server.forward-headers-strategy: native` 추가 + 재배포. (앱 코드 수정 아님.)
 
@@ -147,7 +167,7 @@ SELECT tenant_id, plan, status FROM tenants WHERE tenant_id = 't_xxx';
 RR info keyspace                                     # db0: keys=..., expires=...
 # 표본 50개의 TTL만 확인. 전수 스캔 금지
 RR --scan --pattern 'rl:*' -i 0.01 | head -50 | \
-  while read k; do echo "$(redis-cli -p 6380 ttl "$k") $k"; done | sort -n | head -10
+  while read k; do echo "$(redis-cli -c -p 7001 ttl "$k") $k"; done | sort -n | head -10
 ```
 
 | 관찰 | 판정 |
@@ -158,7 +178,7 @@ RR --scan --pattern 'rl:*' -i 0.01 | head -50 | \
 
 ```bash
 # 대량 정리가 꼭 필요할 때 — --scan 사용. KEYS 절대 금지
-RR --scan --pattern 'rl:poll:token:*' -i 0.01 | xargs -r -n 500 redis-cli -p 6379 del
+RR --scan --pattern 'rl:poll:token:*' -i 0.01 | xargs -r -n 500 redis-cli -c -p 7001 del
 ```
 되돌리기 불필요(전원 한도가 초기화되어 잠시 관대해질 뿐).
 

@@ -54,7 +54,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
               ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
               ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
 🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·COMPLETED 발행까지 완료 (~~RETURNED~~는 §36이 폐기)
-🔄 Sprint 9   queue-batch에 TokenReclaimJob 1개 (§80). 나머지 3개 잡·회수 경로는 미착수
+🔄 Sprint 9   잡 3개 구현(TokenReclaimJob·ReconcileJob·BillingSnapshotJob) + 회수 3경로 완료. RedisSyncJob만 미착수
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
 🎯 Cluster 로컬 실습 완료 (2026-07-08, 병행 학습) — 프로덕션 도입은 §75, 시점 미정
@@ -78,7 +78,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 |---|---|---|
 | Queue Engine 엔드포인트 | `grep -rn "Mapping(" queue-api/src/main` | `QueueEngineController`에 **6개** — enqueue · admit · verify · complete · `/status` · 폴링. **`DELETE /tokens/{tokenId}`만 여전히 0건** |
 | `queue-batch` 내용물 | `find queue-batch/src -name "*.java"` | `QueueBatchApplication` + **`TokenReclaimJob`** (+ 그 테스트) |
-| Lua 스크립트 | `ls .../resources/lua/` | **6개** — `admit` · `admit_expire`가 추가됐다 |
+| Lua 스크립트 | `ls .../resources/lua/` | **8개** — `admit` · `admit_expire`가 추가됐다 |
 | §79 구현됨 | `cat PollResponse.java` | 필드가 `ready` · `admitToken` **둘뿐**. `frontSeq` · `total` · `nextPollAfterSec` 소멸 |
 | `QueueSnapshotCache` 제거 | `find . -name "QueueSnapshotCache*"` | **0건** (§79 D1대로 제거됨) |
 | 회수 경로 | `grep -rln "ZREM\|HDEL" */src/main` | **6파일** — `admit.lua` · `admit_expire.lua` · `enqueue_bulk.lua` · `RedisQueueEngine` · `TokenReclaimJob` · `QueueKeys`. ⚠️ 다만 **complete 경로에만** 있다. 이탈·TTL 만료로 떠난 사람의 `tokens` Hash 필드는 여전히 누적 (§79 후속) |
@@ -487,7 +487,7 @@ flowchart TD
     올리는 건 하위호환이지만 **내리는 건 파괴적 변경**이라 시작값은 "필요를 채우는 최소"다 —
     30만/2h = 42/s인데 cap 100 × 10 rps = 1,000/s로 24배다 (§80 ⑦)
 - `POST /queues/:queueId/admit-tokens/:admitToken/verify` — DB Fallback 술어는 **`admitted_at`** 기준
-  - **Redis·DB 쓰기 0회.** "상태 변경 없음"이 문자 그대로가 된다
+  - **Redis·DB 직접 쓰기 0회.** 다만 ~~"상태 변경 없음"~~은 아니다 — **verify가 완료를 확정한다**(응답 시점에 `COMPLETED` 발행, PR #48). Redis·DB **직접** 쓰기는 0회 — 이벤트만 낸다
 - `POST /queues/:queueId/tokens/:tokenId/complete` — **DB 권위** 조건부 UPDATE
   (`admit_token = ?` + `status IN (0,1)` + `admitted_at` 유효 창) → Redis 정리는 나중
 - `queue:{queueId}:admitted` ZSet 신설 (score=만료 epoch ms, member=`"seq|identifier"`) — `QueueKeys` 경유
@@ -622,9 +622,9 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
     - 🔴 `inactiveTtl`은 **§82로 이탈 회수의 유일한 경로**가 됐다 — 판정에 그치지 않고
       `ZREM waiting` + `ZREM last-active` + `HDEL tokens` + **`EXPIRED` Kafka 발행**까지 한다.
       `HDEL` 전에 `HGET tokens`로 `issuedAt` 원본을 확보해야 한다(§82 ③ · §83)
-    - ⬜ `waitingTtl` 판정 소스는 **미정**이다 — `waiting` ZSet의 score는 `seq`라 시간축이 없다.
+    - ✅ ~~`waitingTtl` 판정 소스는 **미정**~~ → **확정·구현**(`waiting_expire.lua` — 앞부분 스캔 + `tokens`의 `issuedAt` 비교)이다 — `waiting` ZSet의 score는 `seq`라 시간축이 없다.
       DB `tokens.issued_at`이 유력하나 착수 시 결정한다
-  - `batch-lock:{t}:{q}` 분산 락
+  - ~~`batch-lock:{t}:{q}` 분산 락~~ → 🔴 **만들지 않았다.** `EVAL`이 곧 claim이라 불필요(§80·CONCURRENCY 매트릭스)
 - `RedisSyncJob` (5분 주기)
   - `redis_sync_needed=1` 토큰 → Redis 재삽입
 - `BillingSnapshotJob` — ✅ **구현 완료**. 단, 원안과 **셋이 다르다**
@@ -646,7 +646,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 
 | # | 과제 | 왜 지금인가 |
 |---|---|---|
-| 1 | **`queue-batch`에 actuator + micrometer-prometheus 추가** | **reconciliation의 선행 조건.** 현재 `queue-batch/build.gradle`에는 `starter-web`만 있고 actuator·micrometer가 **없다** → 만들어도 유령 토큰 수를 지표로 못 낸다. `queue-consumer`가 같은 이유로 이미 갖고 있다 |
+| 1 | **`queue-batch`에 actuator + micrometer-prometheus 추가** | **reconciliation의 선행 조건.** ~~현재 `queue-batch/build.gradle`에는 `starter-web`만 있고 actuator·micrometer가 **없다**~~ → ✅ **둘 다 있다**(`6647ca5`) → 만들어도 유령 토큰 수를 지표로 못 낸다. `queue-consumer`가 같은 이유로 이미 갖고 있다 |
 | 2 | **회수 배치** — `queue:{q}:last-active` ZSet `ZREM` / `queue:{q}:tokens` Hash `HDEL` | 두 명령 모두 **전 프로덕션 코드 0건**이다. 쓰기만 하고 지우지 않아 30만 큐가 한 바퀴 돌 때마다 멤버가 영구 누적된다. 🔴 **§82로 무게가 커졌다** — 누수 정리에 그치지 않고 **이탈 회수의 유일한 경로**다. 상태 전이(EXPIRED)와 Kafka 발행을 빼먹으면 이탈자가 DB에 영원히 WAITING으로 남는다 |
 | 3 | **reconciliation 스위퍼** (Redis엔 있고 DB엔 없는 유령 토큰) | §73이 "Redis-Kafka 사이엔 분산 트랜잭션이 없어 발행 갭은 **영구적**"이라며 필수 후속으로 남겼다. 100만건 실측에서 실제로 835건 발생. **1번 다음에 온다** |
 | 4 | `ApiKeyCache.invalidate` 프로덕션 호출 연결 (revoke 경로) | 구현·포트 선언은 있는데 **호출부가 0건**이라 폐기된 키가 최대 60초 살아 있다. 배치가 아니라 revoke 서비스 쪽 한 줄이지만, 다른 정리 작업과 함께 처리 |
@@ -1035,8 +1035,8 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 
 - [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis Sentinel/Cluster/Kafka/k6/Prometheus/Grafana)
 - `AWS_LEARNING_PATH.md` — **미작성.** Sprint 11 대비 AWS 병렬 학습 경로 (파일 없음, 링크 걸지 말 것)
-- [FRS v1.13](FRS_final.md) — 기능 정의
-- [DECISIONS](DECISIONS.md) — 81개 설계 결정 (기능별 목차는 문서 맨 앞)
+- [FRS v1.16](FRS_final.md) — 기능 정의
+- [DECISIONS](DECISIONS.md) — 84개 설계 결정 (기능별 목차는 문서 맨 앞)
 - [FLOW](FLOW.md) — 상세 흐름도
 - [STATE](STATE.md) — 상태 머신
 - [CONCURRENCY](CONCURRENCY.md) — 동시성 제어

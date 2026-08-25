@@ -4,6 +4,37 @@
 > 쿼리 모음: [`doc/monitoring/queries/kafka-persistence.md`](../queries/kafka-persistence.md)
 > 카테고리 체계: [`MONITORING_DESIGN.md` 2-3 / 4-6](../MONITORING_DESIGN.md)
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
+> 🔴 **`hlen tokens` 와 `zcard waiting` 은 같지 않은 것이 정상이다 (2026-08-26 정정).**
+> `admit.lua`는 `ZPOPMIN waitingKey`로 **waiting에서만 빼고 `tokens` Hash는 일부러 남긴다**
+> (중복 게이트 = `HSETNX`). 그래서 **admit이 한 번이라도 일어난 큐는 항상 `hlen > zcard`다.**
+> 반대로 회수 3경로는 `HDEL tokens`를 하지만 DB 행은 남으므로 **`db > hlen`도 정상**이다.
+>
+> **차이를 유령 토큰으로 세지 마라.** 정본은 `ReconcileJob.gapOf()`이고 모집단이 다르다 —
+> `ZCOUNT(waiting, ≤settledSeq)` − `COUNT(tokens WHERE status=0 AND seq ≤ settledSeq)`.
+> 게이지 `queue_reconcile_ghosts`가 그 값이다. **여기 절차의 `hlen-db`와 게이지는 같은 수가 아니다.**
+
+---
+
 ## 30초 요약
 
 ```
@@ -31,7 +62,7 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 - **1분 안에 확인** — 3자 대조 한 줄:
   ```bash
   Q=q_xxx
-  redis-cli -p 6380 zcard "queue:{$Q}:waiting"; redis-cli -p 6380 hlen "queue:{$Q}:tokens"; redis-cli -p 6380 get "queue:{$Q}:seq"
+  redis-cli -c -p 7001 zcard "queue:{$Q}:waiting"; redis-cli -c -p 7001 hlen "queue:{$Q}:tokens"; redis-cli -c -p 7001 get "queue:{$Q}:seq"
   mysql -h127.0.0.1 -P3307 -uqueueapp -p queue_platform -N -e \
     "SELECT COUNT(*) FROM tokens WHERE queue_id='$Q' AND issued_at >= UTC_DATE()"
   ```

@@ -3,6 +3,37 @@
 > RunBook: [`doc/monitoring/runbook/enqueue.md`](../runbook/enqueue.md)
 > 3자 대조(HTTP ↔ Redis ↔ MySQL)는 중복을 피해 [`queries/kafka-persistence.md` §3](kafka-persistence.md)에 한 벌만 둔다.
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
+> 🔴 **`hlen tokens` 와 `zcard waiting` 은 같지 않은 것이 정상이다 (2026-08-26 정정).**
+> `admit.lua`는 `ZPOPMIN waitingKey`로 **waiting에서만 빼고 `tokens` Hash는 일부러 남긴다**
+> (중복 게이트 = `HSETNX`). 그래서 **admit이 한 번이라도 일어난 큐는 항상 `hlen > zcard`다.**
+> 반대로 회수 3경로는 `HDEL tokens`를 하지만 DB 행은 남으므로 **`db > hlen`도 정상**이다.
+>
+> **차이를 유령 토큰으로 세지 마라.** 정본은 `ReconcileJob.gapOf()`이고 모집단이 다르다 —
+> `ZCOUNT(waiting, ≤settledSeq)` − `COUNT(tokens WHERE status=0 AND seq ≤ settledSeq)`.
+> 게이지 `queue_reconcile_ghosts`가 그 값이다. **여기 절차의 `hlen-db`와 게이지는 같은 수가 아니다.**
+
+---
+
 ## 0. 준비 — 복붙 전에 이것부터
 
 ```bash
@@ -10,8 +41,8 @@ Q=q_xxx                                  # 예: q_bts2026
 export DB_PASSWORD=queueapp1234          # local 기본값 (queue-consumer/application-local.yml)
 alias MYR='mysql -h127.0.0.1 -P3307 -uqueueapp -p"$DB_PASSWORD" queue_platform -t'   # ← Replica(3307). 조회는 전부 여기로
 alias MYW='mysql -h127.0.0.1 -P3306 -uqueueapp -p"$DB_PASSWORD" queue_platform -t'   # ← Master. 쓰기 전용
-alias RR='redis-cli -p 6380'             # ← Replica. 조회는 전부 여기로
-alias RW='redis-cli -p 6379'             # ← Master. 쓰기/설정 전용
+alias RR='redis-cli -c -p 7001'             # ← Replica. 조회는 전부 여기로
+alias RW='redis-cli -c -p 7001'             # ← Master. 쓰기/설정 전용
 ```
 
 **위험 명령 — 운영에서 절대 금지**

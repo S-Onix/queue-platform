@@ -4,6 +4,26 @@
 > 쿼리 모음: [`doc/monitoring/queries/rate-limit.md`](../queries/rate-limit.md)
 > 카테고리 체계: [`MONITORING_DESIGN.md` §보안 카테고리](../MONITORING_DESIGN.md)
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
 ## 30초 요약 — 세 갈래
 
 | 경로 | 알고리즘 | 키 | 한도 | 코드 |
@@ -30,7 +50,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
   # ① 설정 존재 여부
   grep -rn "forward-headers-strategy" queue-api/src/main/resources/application-prod.yml   # 없으면 확정
   # ② Redis에 버킷이 몇 개인지 (개수가 아니라 '몇 개뿐인지'가 핵심)
-  redis-cli -p 6380 --scan --pattern 'rl:signup:ip*' -i 0.01 | head -20
+  redis-cli -c -p 7001 --scan --pattern 'rl:signup:ip*' -i 0.01 | head -20
   ```
   **`rl:signup:ip*` 키가 사실상 1~2개뿐인데 429가 쏟아지면 확정.** 정상이라면 요청 IP 수만큼 키가 있어야 한다.
 - **정상 범위**: `rl:{action}:ip*` 고유 키 수 ≈ 해당 윈도우의 고유 클라이언트 IP 수. 1개 = 비정상.
@@ -41,7 +61,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 - **조치**:
   1. 즉시: 해당 버킷 키를 지워 창을 리셋한다(윈도우 만료까지 최대 60초 기다리는 것과 같지만 즉효).
      ```bash
-     redis-cli -p 6379 --scan --pattern 'rl:signup:ip10.0.1.7:*' -i 0.01 | xargs -r redis-cli -p 6379 del
+     redis-cli -c -p 7001 --scan --pattern 'rl:signup:ip10.0.1.7:*' -i 0.01 | xargs -r redis-cli -c -p 7001 del
      ```
      되돌리기: 불필요(키가 다시 생성된다). **다만 이건 60초짜리 임시 조치다. 근본 해결은 설정 추가+재배포.**
   2. 근본: `application-prod.yml`에 `server.forward-headers-strategy: native` 추가 후 재배포. (**앱 코드 수정 아님** — 필터 주석 `:196-197`이 명시하는 의도된 방식이다.)
@@ -65,8 +85,8 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 - **1분 안에 확인**:
   ```bash
   TOK=tok_019...
-  redis-cli -p 6380 hgetall "rl:poll:token:$TOK"   # tokens(남은 토큰), lastRefillMillis
-  redis-cli -p 6380 ttl  "rl:poll:token:$TOK"      # 폴링 키의 TTL 상한은 65. 65 근처면 최근 갱신됨
+  redis-cli -c -p 7001 hgetall "rl:poll:token:$TOK"   # tokens(남은 토큰), lastRefillMillis
+  redis-cli -c -p 7001 ttl  "rl:poll:token:$TOK"      # 폴링 키의 TTL 상한은 65. 65 근처면 최근 갱신됨
   ```
   **`tokens` 값이 1.0 미만이면 그 토큰은 지금 거부 상태.** 0에 붙어 있으면 지속 초과다.
 - **정상 범위**: `tokens` ≥ 1.0, 정상 폴링 중이면 대개 cap 5에 붙어 있다. 429 비율은 **기준선 수집 필요** — **SDK가 붙은 실사용 3일치 429 비율을 재고, 그 값이 1%를 넘으면 한도 설계 자체를 재검토**해야 한다.
@@ -80,13 +100,13 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
   - **한도 자체는 런타임 조정 불가.** capacity 5 / refill 1.0은 `RateLimitFilter`(`POLL_CAPACITY`, `POLL_REFILL_PER_SEC`)에 하드코딩돼 있다.
   - **대신 반대편을 늘릴 수 있다** — `queue:{q}:pacing`으로 폴링 간격을 늘리면 소비 속도가 줄어 429가 사라진다. 재배포가 필요 없는 유일한 레버다:
     ```bash
-    redis-cli -p 6379 set 'queue:{q_xxx}:pacing' '50:4,1000:10,5000:20,10000:30,*:40'
-    # 되돌리기: redis-cli -p 6379 del 'queue:{q_xxx}:pacing'
+    redis-cli -c -p 7001 set 'queue:{q_xxx}:pacing' '50:4,1000:10,5000:20,10000:30,*:40'
+    # 되돌리기: redis-cli -c -p 7001 del 'queue:{q_xxx}:pacing'
     ```
     ⚠️ 형식이 깨지면 **조용히** 기본 사다리로 돌아간다(핫패스라 로그가 없다). `/status` 응답으로 반영을 확인할 것.
   - 개별 사용자 구제가 필요하면 그 버킷만 지운다(즉시 5개 토큰 회복):
     ```bash
-    redis-cli -p 6379 del "rl:poll:token:tok_019..."
+    redis-cli -c -p 7001 del "rl:poll:token:tok_019..."
     ```
     되돌리기: 불필요(다음 요청에서 재생성).
   - 광범위하면 사건으로 기록하고 상수 재조정(재배포)으로 넘긴다.
@@ -100,7 +120,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 - **1분 안에 확인**:
   ```bash
   grep -c "Tenant not found for rate limit" <api-log>     # 0이 아니면 확정
-  redis-cli -p 6380 --scan --pattern 'rl:tenant:*' -i 0.01 | wc -l
+  redis-cli -c -p 7001 --scan --pattern 'rl:tenant:*' -i 0.01 | wc -l
   ```
   **`Tenant not found` 로그가 있는데 429가 0이면 확정.**
   `rl:tenant:*` 키 수는 이 판정에 쓰지 마라 — TTL이 120s라 **키 수가 활성 테넌트 수보다 적은 것이 정상**이다.
@@ -135,7 +155,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
   # ① 폴링 404율 (랜덤 tokenId는 거의 전부 404)
   curl -s 'http://localhost:9090/api/v1/query?query=sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens/{tokenId}",status="404"}[1m]))/sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens/{tokenId}"}[1m]))' | jq -r '.data.result[0].value[1]'
   # ② rl:poll:token:* 키 개수 증가율 (정상이면 활성 대기자 수에 수렴)
-  redis-cli -p 6380 info keyspace
+  redis-cli -c -p 7001 info keyspace
   ```
   **404 비율이 0.5(50%)를 넘고 `rl:poll:token:*` 키 수가 활성 대기자 수를 크게 초과하면 공격 의심.**
 - **정상 범위**: 폴링 404 비율 < 0.05. `rl:poll:token:*` 키 수 ≈ (**최근 65초** 폴링한 고유 토큰 수). **정확한 임계값은 기준선 수집 필요 — 실사용 3일치 404 비율을 먼저 재라.**
@@ -161,10 +181,10 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 - **먼저 의심할 것**: TTL은 정상적으로 걸려 있다(token-bucket **폴링 65s / Plan 120s**, fixed-window 윈도우+1s). 개수가 많다면 **실제로 그만큼의 고유 키가 만들어지고 있다**는 뜻 — 대부분 `rl:poll:token:{tokenId}`다(토큰마다 1개).
 - **1분 안에 확인**:
   ```bash
-  redis-cli -p 6380 info keyspace     # db0 keys=N, expires=M
+  redis-cli -c -p 7001 info keyspace     # db0 keys=N, expires=M
   # TTL이 없는 rl 키가 있는지 표본 확인 (전수 스캔 금지)
-  redis-cli -p 6380 --scan --pattern 'rl:*' -i 0.01 | head -50 | \
-    while read k; do echo "$(redis-cli -p 6380 ttl "$k") $k"; done | sort -n | head
+  redis-cli -c -p 7001 --scan --pattern 'rl:*' -i 0.01 | head -50 | \
+    while read k; do echo "$(redis-cli -c -p 7001 ttl "$k") $k"; done | sort -n | head
   ```
   **TTL이 `-1`(무기한)인 `rl:` 키가 하나라도 나오면 이상.** 정상은 전부 양수다.
 - **정상 범위**: `rl:poll:token:*` 수 ≤ **최근 65초** 폴링한 고유 토큰 수. `expires` / `keys` 비율이 `rl:` 영역에서 1.0.
@@ -177,7 +197,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 - **조치**: TTL이 정상이면 조치 불필요. 메모리 압박이면 만료가 빠른 것부터 자연 감소를 기다리고, 급하면 패턴 삭제:
   ```bash
   # ⚠️ --scan 을 쓸 것. KEYS 금지. COUNT는 100 이하
-  redis-cli -p 6379 --scan --pattern 'rl:poll:token:*' -i 0.01 | xargs -r -n 500 redis-cli -p 6379 del
+  redis-cli -c -p 7001 --scan --pattern 'rl:poll:token:*' -i 0.01 | xargs -r -n 500 redis-cli -c -p 7001 del
   ```
   되돌리기: 불필요(전원 한도가 초기화되어 잠시 관대해질 뿐).
 - **하면 안 되는 것**:

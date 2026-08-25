@@ -171,7 +171,7 @@ flowchart TD
 
     ARESP --> POLL["유저 다음 Polling 시\nadmitToken 수신"]
     --> USER["유저 → Tenant\nadmitToken 전달"]
-    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인만 — Redis·DB 쓰기 0회"]
+    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인 + COMPLETED 발행 (PR #48)\n※ 이 응답 시점이 완료다\nRedis·DB 직접 쓰기 0회 — 이벤트만 낸다"]
 
     VERIFY --> VK{"queue:{queueId}:admit-by-admit:{admitToken}\n유효?\n값에 tokenId와 identifier가 함께 들어 있다 (첫 구분자로만 분리)\n→ identifier가 손에 있으므로 DB를 안 읽는다 (§80)"}
     VK -->|"만료 or 무효"| VDB["DB Fallback\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND admitted_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(issued_at 아님 — 줄 선 시각은 2시간 전일 수 있다. §80)"]
@@ -184,7 +184,7 @@ flowchart TD
 
     COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - 300초\n   (COMPLETE_VALID_WINDOW_SECONDS, §80 구현)\n\n0을 허용하는 이유: TTL 만료로 복귀했지만\nTenant는 이미 입장시킨 경우가 실재한다"]
     DB -->|"0행"| E404C(["404 INVALID_ADMIT_TOKEN (TK002)\n409를 따로 두지 않는다 — 원인이 무엇이든\nTenant가 할 일은 같다"])
-    DB -->|"1행"| ZREM["Redis 정리 (나중)\nZREM queue:{queueId}:waiting\nZREM queue:{queueId}:admitted\nDEL admit-by-token + admit-by-admit\nDEL token-info\nHDEL queue:{queueId}:tokens {identifier} ← 반드시 마지막\n(중복 게이트 해제. 먼저 지우면 폴링이 영영 404)"]
+    DB -->|"1행"| ZREM["Redis 정리 (나중)\nZREM queue:{queueId}:waiting\nZREM queue:{queueId}:admitted\nDEL admit-by-token + admit-by-admit\nHDEL queue:{queueId}:tokens {identifier} ← 반드시 마지막\n(중복 게이트 해제. 먼저 지우면 폴링이 영영 404)"]
     --> KAFKA2["Kafka COMPLETED 발행 (key=tokenId)\n※ 발행 실패는 삼킨다(로그만) — DB는 이미 status=2로 확정"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])
 
@@ -236,11 +236,11 @@ flowchart TD
 ```mermaid
 flowchart TD
     JOB(["TokenReclaimJob\n10초 주기\n※ TokenExpiryJob이라는 클래스는 없다 —\n   세 판정이 이 잡 하나에 들어갔다"])
-    --> ALIST["활성 큐 목록 조회\nACTIVE · PAUSED · DRAINING\n큐별 병렬 처리 (동시 10개 / 8초 타임아웃)\nbatch-lock:{t}:{q} NX EX 15 → 분산 처리"]
+    --> ALIST["큐 목록 조회 — queueRepository.findAll()\n※ 상태 필터 없음 · 순차 for 루프\n※ 락 없음 — EVAL 자체가 claim (§80)\n※ 큐당 CLAIM_LIMIT=500"]
 
     ALIST --> W1 & W2 & W3
 
-    W1["waitingTtl 체크 (WAITING)\nZRANGEBYSCORE\n0 ~ now_ms - waitingTtl_ms"]
+    W1["waitingTtl 체크 (WAITING)\nZRANGE 앞부분 고정량 스캔\n→ HGET tokens의 issuedAt < cutoff\n※ score는 seq다 — 시간 cutoff로 ZRANGEBYSCORE 불가"]
     W2["inactiveTtl 체크 (WAITING)\nZRANGEBYSCORE queue:{queueId}:last-active\n0 ~ now_ms - inactiveTtl_ms\n(member=seq, score=마지막 ka 시각)"]
     W3["admitToken TTL 체크 (ADMIT_ISSUED) — claim-Lua (§80)\nZRANGEBYSCORE queue:{queueId}:admitted 0 now\n(score=만료 epoch ms, member='seq|identifier')\n※ EXISTS 스캔 폐기 — 만료된 키는 이미 사라져\n   무엇이 만료됐는지 알 수단이 없었다"]
 

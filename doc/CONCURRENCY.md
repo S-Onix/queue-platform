@@ -673,7 +673,7 @@ class QueueCreationConcurrencyTest {
   라우팅은 소유자를 모를 때 `queueId`를 해싱해 클러스터를 정하는데, **키 이름에 shard가 들어가면
   질문을 만들려면 답을 이미 알아야 한다.** 순환이라 성립하지 않는다. (`DECISIONS §67`의 서술은 이 점에서 낡았다)
 - `@DistributedLock` key도 Hash Tag 활용 — 미착수
-- 이중 라우팅 정보 도메인에 반영 — 미착수(현재는 `RedisClusterAssigner`가 `queueId` 해시로 결정)
+- 이중 라우팅 정보 도메인에 반영 — 미착수. ⚠️ **현재 배정은 `queueId` 해시가 아니다** — `RedisClusterAssigner`가 **생성 시점의 cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에 기록한다
 
 ---
 

@@ -120,7 +120,7 @@ flowchart TD
     API -->|"이벤트 발행\n(produce)"| Kafka
     Kafka -->|"지속 구독\n(consume)"| Consumer
     Consumer -->|"DB INSERT (tokens)\n배치 · 멱등"| DB_M
-    Batch -->|"@Scheduled\n(ZRANGEBYSCORE, ZREM\nbatch-lock)"| Redis
+    Batch -->|"@Scheduled\n회수 3경로 · 대사 · 과금\n(락 없음 — EVAL이 claim)"| Redis
     Batch -->|"DB UPDATE (expire)\n@Transactional"| DB_M
     API -->|"SELECT\n@Transactional(readOnly)"| DB_R
     API -->|"UPDATE\n(complete)\n@Transactional"| DB_M
@@ -179,7 +179,7 @@ stateDiagram-v2
     [*] --> WAITING : POST /tokens\nEnqueue
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
     ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka 발행
-    ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
+    ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\n종료 — 복귀 없음 (§36)\n재접속하면 맨 뒤
     WAITING --> EXPIRED : Batch TTL 만료\n(waitingTtl · inactiveTtl)
     COMPLETED --> [*]
     EXPIRED --> [*]
@@ -188,7 +188,7 @@ stateDiagram-v2
 > 🔴 **취소 전용 엔드포인트는 없다 (DECISIONS §82).** 유저가 취소 버튼을 누르든 탭을 닫든
 > 신호는 **"폴링이 멈춘다"** 하나이고, `inactiveTtl` 판정 배치가 EXPIRED(4)로 보낸다.
 > `inactiveTtl`은 **"몇 초까지 자리를 지켜줄 것인가"** 라는 유예 창이라, 그 안에 돌아오면
-> 같은 identifier로 재-enqueue해 **원래 순번이 복원**된다(창을 되살리는 신호는 `ka=1` 폴링 재개다).
+> 같은 identifier로 재-enqueue해 **원래 순번이 복원**된다(창을 되살리는 신호는 **개인 폴링 재개**다 — `ka` 여부와 무관, §82 F안).
 
 ---
 
@@ -206,7 +206,7 @@ flowchart TD
     E -- "ADMIT_ISSUED\nadmitToken 포함" --> F
 
     F["⑥ 유저 → Tenant\nadmitToken 전달"]
-    --> G["⑦ verify\n유효성 확인만"]
+    --> G["⑦ verify\n유효성 확인 + COMPLETED 발행\n(이 시점이 완료다)"]
     --> H["⑧ Tenant → 유저 입장 허용"]
     --> I["⑨ complete\nCOMPLETED + ZREM + Kafka"]
 
@@ -230,15 +230,15 @@ flowchart TD
 | `queue:{queueId}:seq` | String | 없음 | `INCR`로 score 발급 |
 | `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `tokenId\|issuedAt` (중복 방지 + 소유권 대조) |
 | `queue:{queueId}:last-active` | ZSet | 없음 | keepalive. member=`seq`, score=ms |
-| `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 |
-| `token-info:{tokenId}` | String | 폴링 간격+2s | Polling 캐시 (§79 이후 존치 여부 후속 검토) |
+| ~~`queue-meta:{t}:{q}`~~ | — | — | 🔴 **구현된 적 없다**(전 코드 0건) |
+| ~~`token-info:{tokenId}`~~ | — | — | 🔴 **구현된 적 없다**(전 코드 0건) |
 | `queue:{queueId}:admit-by-token:{tokenId}` | 60s | Polling 응답용 |
 | `queue:{queueId}:admit-by-admit:{admitToken}` | 60s | verify/complete용 |
 | `queue:{queueId}:admit-watermark` | 없음 | 마지막 admit seq (`/status` 전광판) |
 | `queue:{queueId}:pacing` | 없음 | 폴링 간격 구간표 오버라이드 (없으면 코드 상수) |
 | `queue:{queueId}:admit-idem:{requestId}` | 300s | admit 멱등성 (requestId는 Tenant 지정값 → 큐 스코프) |
 | `queue:{queueId}:admitted` | 없음 | admit된 토큰의 만료 시각 ZSet. TTL 복귀 claim 대상 ([§80](doc/DECISIONS.md)) |
-| `batch-lock:{t}:{q}` | 15s | Batch 서버 분산 |
+| ~~`batch-lock:{t}:{q}`~~ | — | 🔴 **구현된 적 없다**(전 코드 0건). 배치는 락을 안 쓴다(§80) |
 | `apikey:{keyHash}` | 60s | API Key 캐시 |
 
 ---
@@ -269,7 +269,8 @@ admit_token: DB 저장 → Redis 미스 시 Fallback
 
 ```
 Cluster A (7001-7008) · Cluster B (8001-8008)     각 4 Master + 4 Replica
-큐 하나 → 둘 중 하나에 배정 (RedisClusterAssigner, queueId 해시)
+큐 하나 → 둘 중 하나에 배정 (RedisClusterAssigner — **queueId 해시가 아니다**)
+  └ 기준은 생성 시점 cluster1의 used_memory/maxmemory >= 0.5. 결과는 queues.redis_cluster_no에 기록
 한 큐의 키 4종(waiting/seq/tokens/last-active)은 반드시 같은 클러스터
   └ 해시태그는 한 클러스터 안의 슬롯만 정렬한다. 경계는 못 넘는다
 큐 상태가 아닌 키(rl:*, apikey:*)는 전부 cluster1 (@Primary)
@@ -386,7 +387,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | JPA + Virtual Thread | @Transactional 자연스러움 | blocking I/O | VT가 OS Thread 고갈 없이 처리 |
 | admitToken 만료 → **종료**(§36) | 좀비가 admit 슬롯을 재순환 점유하지 않는다 | 60초를 놓치면 맨 뒤 | Platform 귀책분(폴링 지연)이 이미 예산 안이라 봐줄 근거가 없다 |
 | Kafka Enqueue 버퍼 | DB 적재를 비동기로 흡수 | Eventually Consistent | At-Least-Once 보장 |
-| Kafka admit 처리 | admit 요청 영속성 | Consumer 처리 지연 | DB PENDING → 멱등성 보장 |
+| ~~Kafka admit 처리~~ | — | — | 🔴 **§80이 폐기.** admit은 **동기 Lua**다. 멱등은 Redis `admit-idem` 키(PX 300s) |
 | status TINYINT | 저장공간·비교 성능 | 가독성 (상수로 보완) | 대량 tokens 테이블 최적화 |
 | redis_sync_needed | Redis 다운 중 INSERT 복구 | 컬럼 추가 | 데이터 정합성 보장 |
 | admit_token 컬럼 | Redis 미스 시 DB Fallback | 컬럼 추가 | verify 안정성 향상 |
@@ -396,7 +397,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | ZCARD Pipeline | queue-count 관리 불필요 | N번 ZCARD | 카운터 불일치 위험 제거 |
 | `pacing` 구간표 | 서버 부하 절약 + 장애 시 서버가 전원 간격 조정 | SDK 구현 필요 | 순위 높을수록 Polling 드물게 (§79) |
 | Redis R/W 분리 미적용 | 설계 단순 | - | Lua 원자성. In-Memory 충분 |
-| MySQL R/W 분리 | SELECT 2,000 rps 분산 | Replica lag | token-info 캐시로 lag 최소화 |
+| MySQL R/W 분리 | SELECT 2,000 rps 분산 | Replica lag | ~~token-info 캐시~~ — 그 키는 구현된 적 없다. 폴링은 Redis만 본다 |
 | tokens 파티셔닝 | 월별 DROP 빠른 정리 | PK에 파티션 키 + **범위 조건 프루닝 안 됨**(§83) | 집계는 `PARTITION` 절로 지목 |
 | RedisKeyFactory | 컴파일 타임 검사 | - | Enum: 가변인수 타입 안전성 없음 |
 
@@ -423,10 +424,10 @@ Tenant (REST API)       : POST /verify → POST /complete
 
 | 문서 | 설명 |
 |------|------|
-| [FRS v1.13](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
+| [FRS v1.16](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
 | [STATE](doc/STATE.md) | Token · Queue · ApiKey 상태 머신 |
 | [FLOW](doc/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
-| [DECISIONS](doc/DECISIONS.md) | 83개 설계 결정 + 근거 + 면접 포인트 |
+| [DECISIONS](doc/DECISIONS.md) | 84개 설계 결정 + 근거 + 면접 포인트 |
 | [ROADMAP](doc/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
 | [CONCURRENCY](doc/CONCURRENCY.md) | 동시성 제어 우선순위 · `@DistributedLock` |
 

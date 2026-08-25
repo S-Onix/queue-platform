@@ -125,7 +125,7 @@ Redis (QueueKeys — §8 참조):
    ← { ready: true, admitToken: "at_xxx" }
    유저 → Tenant: admitToken 전달
 
-⑦ Tenant → Platform: verify (유효성 확인만. 상태 변경 없음)
+⑦ Tenant → Platform: verify (**이 응답 시점이 완료다** — COMPLETED 발행. Redis·DB 직접 쓰기는 0회)
    POST /queues/:queueId/admit-tokens/:admitToken/verify
    ← { valid: true, identifier }
 
@@ -151,7 +151,7 @@ Redis (QueueKeys — §8 참조):
 | Token Lifecycle | Enqueue / Polling / admit / verify / complete / 이탈 | ✅ |
 | TTL / Batch | 만료 처리 / 파티션 운영 / 통계 집계 | ✅ |
 | Kafka | Enqueue 버퍼 / 상태 변경 이벤트 | ✅ |
-| Billing | 과금 집계 (Kafka Consumer) | ✅ |
+| Billing | 과금 집계 — ~~Kafka Consumer~~ **일 1회 배치**(`BillingSnapshotJob`, §84). `BillingConsumer`는 없다 | ✅ |
 | SDK | **JS SDK만** (Tenant 서버는 REST API 직접 호출) | ✅ |
 
 ---
@@ -201,6 +201,9 @@ Redis (QueueKeys — §8 참조):
 
 ---
 
+> ✏️ **누락 정정(2026-08-26): `POST /api/v1/tenants/logout`** (`TenantController.java:33`).
+> 본문 `RefreshRequest`로 refresh 토큰을 받아 폐기한다. 위 표에 없었다.
+
 ## 5. Queue 설정
 
 | 파라미터 | 타입 | 필수 | 기본값 | 설명 |
@@ -229,7 +232,7 @@ stateDiagram-v2
     [*] --> WAITING : POST /tokens (HSETNX tokens)
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
     ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-lifecycle 발행
-    ADMIT_ISSUED --> WAITING : admitToken TTL 60초 초과\nseq 유지 → 우선순위 보존
+    ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\n종료 — 복귀 없음 (§36)\n재접속하면 맨 뒤
     WAITING --> EXPIRED : Batch (waitingTtl · inactiveTtl)\nKafka token-lifecycle 발행
     COMPLETED --> [*]
     EXPIRED --> [*]
@@ -801,20 +804,21 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | `queue:{queueId}:last-active` | Sorted Set | 없음 | keepalive. member=`seq`, score=epoch ms. **모든 개인 폴링이 갱신** (§74 · §82 F안 — `ka` 분기 삭제). 회수 시 `ZREM` (§82) |
 | `queue:{queueId}:admitted` | Sorted Set | 없음 | **admit된 토큰의 만료 시각**. score=만료 epoch ms, member=`"seq\|identifier"`. TTL 만료 복귀 배치가 `ZRANGEBYSCORE 0 now`로 claim (§80) |
 
-> ⚠️ `:tokens`의 회수는 **complete 경로(`cleanupCompleted`의 `HDEL`)뿐**이고, `:last-active`는 여전히 회수 경로가 **전 코드 0건**이다. 이탈자(complete하지 않은 사람) 회수 배치는 Sprint 9.
+> ✏️ **정정(2026-08-26).** `:tokens`는 complete 외에 **회수 3경로가 전부 `HDEL`**하고, `:last-active`도
+> `inactive_expire.lua:43`·`waiting_expire.lua:66`이 **`ZREM`한다.** 아래 구 서술은 폐기됐다. ~~ 이탈자(complete하지 않은 사람) 회수 배치는 Sprint 9.
 
 **그 외**
 
 | Key 패턴 | 자료구조 | TTL | 역할 |
 |----------|----------|-----|------|
-| `queue-meta:{t}:{q}` | Hash | 없음 | 큐 설정 |
+| ~~`queue-meta:{t}:{q}`~~ | — | — | 🔴 **구현된 적 없다**(전 코드 0건). 큐 설정은 DB `queues`에서 읽는다 |
 | `token-info:{tokenId}` | String | — | ⚠️ **구현된 적 없다**(전 코드 0건). 존재 이유였던 "폴링의 DB status 조회 대체"를 §79가 없앴다(폴링은 DB를 안 읽는다). **폐기 여부 미판정** |
 | `queue:{queueId}:admit-by-token:{tokenId}` | String | 60s | Polling 응답용 admitToken |
 | `queue:{queueId}:admit-by-admit:{admitToken}` | String | 60s | verify용 역참조. 값은 `"tokenId\|identifier"` — verify가 DB 없이 신원을 답한다 |
 | `queue:{queueId}:admit-watermark` | String | 없음 | 마지막 admit seq. `/status` 전광판 원본 (§79) |
 | `queue:{queueId}:pacing` | String | 없음 | 폴링 간격 구간표 **오버라이드**. 없으면 코드 상수 (§79) |
 | `queue:{queueId}:admit-idem:{requestId}` | String | 300s | admit 멱등성. `requestId`는 **Tenant가 정하는 값**이라 큐 스코프 필수 |
-| `batch-lock:{t}:{q}` | String | 15s | Batch 서버 분산 |
+| ~~`batch-lock:{t}:{q}`~~ | — | — | 🔴 **구현된 적 없다**(전 코드 0건). 배치는 락을 안 쓴다 — `EVAL`이 곧 claim (§80) |
 | `apikey:{keyHash}` | String | 60s | API Key 인증 캐시 |
 
 > 제거된 Key:
@@ -1090,7 +1094,8 @@ BCrypt → 별도 스케줄러 격리 불필요
 > Platform은 **순서만 관리**한다.
 > 입장 여부는 **Tenant 서버가 결정**한다.
 > 유저는 **Platform에 직접 Polling**한다 (`pacing` 구간표 기반 적응형, §79).
-> verify = 유효성 확인만. complete = COMPLETED + ZREM + Kafka 발행.
+> verify = **완료 확정**(응답 시점에 COMPLETED 발행, 직접 쓰기 0회). complete = COMPLETED + ZREM + Kafka 발행.
+> **둘 중 하나만 불러도 완료된다.** 둘 다 불러도 멱등이다.
 > DB 먼저, ZREM 나중 — **잔류가 유실보다 안전**하다.
 > seq를 DB에 저장 — **Redis 전손 시 DB 재구성**(§71)이 주 용도다. ~~ADMIT_ISSUED 복귀 시 순위 복원~~은 §36이 폐기.
 > Kafka At-Least-Once — **DB INSERT는 반드시 보장**된다.

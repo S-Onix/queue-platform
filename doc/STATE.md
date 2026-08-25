@@ -70,7 +70,7 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | 항목 | 내용 |
 |------|------|
 | ADMIT_ISSUED | 입장토큰 발급됨. 유저가 Polling으로 admitToken 수신 대기 |
-| verify | ADMIT_ISSUED 상태 유지. 유효성 확인만. 상태 변경 없음 |
+| verify | **verify가 완료를 확정한다**(응답 시점에 `COMPLETED` 발행, PR #48). Redis·DB **직접** 쓰기는 0회 — 이벤트만 낸다. ~~상태 변경 없음~~ |
 | complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
 | admitToken 만료 | **복귀하지 않는다 (§36).** `HDEL tokens`로 게이트만 풀고 끝. 재접속 → 재-enqueue → 맨 뒤. ⚠️ **DB `status`는 `1`로 남는다** — `EXPIRED` 가드가 `status = 0` 전용이라 no-op이고, 그것이 `complete`의 300초 창을 살린다 |
 | 이탈 | **전용 API 없음 (§82).** 폴링 중단 → `inactiveTtl` 판정 배치 → EXPIRED(4). `QE_006_INVALID_STATUS`는 쓰이는 곳이 없다 |
@@ -86,8 +86,9 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 
 | 값 | 원인 | 대상 | Batch 감지 |
 |----|------|------|------------|
-| `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms) |
+| `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | 🔴 ~~ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms)~~ — `waiting`의 score는 **seq**라 시간축이 아니다. **앞부분 고정량 `ZRANGE` 스캔 + `HGET tokens`의 `issuedAt` 비교**다(`waiting_expire.lua:38,52,59`) |
 | `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) — **이탈 회수의 유일한 경로다(§82). ✅ 구현 완료** |
+| `RECONCILE` | complete 창 300초 초과한 `status=1` 잔류 | ADMIT_ISSUED | `ReconcileJob` → `UPDATE ... SET status = 4`(`TokenJpaRepository:114`). **DB만 본다** |
 | ~~`ADMIT_TOKEN_TTL`~~ | 🔴 **성립하지 않는다.** admitToken 만료자는 `status = 1`에 머물러 **`EXPIRED(4)`에 도달하지 않는다**(위 가드 참조). `expiredReason`은 status가 4인 사람의 사유이므로 이 값은 쓰이지 않는다. 만료 자체는 §36대로 `HDEL tokens` 후 종료 | — | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
 
 > 🔴 **admitToken TTL 만료는 복귀하지 않는다 (§36, 2026-08-21).** claim 잡이 `HDEL tokens`로
@@ -109,10 +110,12 @@ stateDiagram-v2
     ACTIVE --> PAUSED : POST /pause\n신규 Enqueue 차단
     PAUSED --> ACTIVE : POST /resume
 
-    ACTIVE --> DRAINING : DELETE /queues
-    PAUSED --> DRAINING : DELETE /queues
+    PAUSED --> DELETED : DELETE /queues
 
-    DRAINING --> DELETED : Batch\n잔여 토큰 = 0
+    %% 🔴 DRAINING은 도달도 탈출도 불가능하다 (2026-08-26 실측)
+    %%   drain()은 ACTIVE만 받는데 프로덕션 호출이 0건이고,
+    %%   delete()는 PAUSED만 받는다 (Queue.java:100-112). DRAINING → DELETED 배치도 없다.
+    ACTIVE --> DRAINING : drain() — 호출자 0건
 
     DELETED --> [*]
 ```
@@ -122,7 +125,8 @@ stateDiagram-v2
 | ACTIVE | ✅ | 유지 |
 | PAUSED | ❌ 503 | 유지 |
 | DRAINING | ❌ 503 | 순차 만료 |
-| DELETED | ❌ 404 | 없음 |
+| DELETED | ❌ **503 Q004** | 없음 |
+  ※ ~~404~~가 아니다 — 조회는 되고(`findByQueueId`가 삭제를 안 거른다) `isEnqueueable()`이 `ACTIVE`만 봐서 `QUEUE_NOT_ACTIVE`다
 
 ---
 

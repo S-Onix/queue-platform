@@ -3,14 +3,34 @@
 > RunBook: [`doc/monitoring/runbook/polling.md`](../runbook/polling.md)
 > 3자 대조는 [`queries/kafka-persistence.md` §3](kafka-persistence.md)에 한 벌만 둔다.
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
 ## 0. 준비
 
 ```bash
 Q=q_xxx; SEQ=12345; TOK=tok_019...
 export DB_PASSWORD=queueapp1234
 alias MYR='mysql -h127.0.0.1 -P3307 -uqueueapp -p"$DB_PASSWORD" queue_platform -t'
-alias RR='redis-cli -p 6380'    # 조회
-alias RW='redis-cli -p 6379'    # 쓰기/설정
+alias RR='redis-cli -c -p 7001'    # 조회
+alias RW='redis-cli -c -p 7001'    # 쓰기/설정
 ```
 
 **위험 명령 금지**: `KEYS` · `FLUSHALL` · `ZRANGE key 0 -1` · `HGETALL`(대형 Hash) · `DEBUG SLEEP` · `--scan` 결과를 파이프 없이 통째로 받는 것(수백만 줄).
@@ -177,7 +197,7 @@ histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{u
 
 ```bash
 timedatectl show -p NTPSynchronized -p TimeUSec
-RTS=$(redis-cli -p 6380 time | awk 'NR==1{s=$1} NR==2{printf "%d", s*1000+int($1/1000)}')
+RTS=$(redis-cli -c -p 7001 time | awk 'NR==1{s=$1} NR==2{printf "%d", s*1000+int($1/1000)}')
 echo "was=$(date +%s%3N)  redis=$RTS"
 # WAS 다수일 때는 각 WAS에서 date +%s%3N 을 동시에 찍어 비교한다
 ```
@@ -224,7 +244,7 @@ wc -l /tmp/rebuild_$Q.tsv
 awk -F'\t' -v q="$Q" '{
   printf "ZADD queue:{%s}:waiting %s %s\n", q, $2, $1
   printf "HSET queue:{%s}:tokens %s %s|%s\n", q, $1, $3, $4
-}' /tmp/rebuild_$Q.tsv | redis-cli -p 6379 --pipe
+}' /tmp/rebuild_$Q.tsv | redis-cli -c -p 7001 --pipe
 # ⚠️ identifier(user_id)에 공백·개행이 있으면 inline 프로토콜이 깨진다.
 #    identifier는 Tenant가 자유 지정하는 값이라 실제로 있을 수 있다 — 먼저 확인할 것:
 #    awk -F'\t' '$1 ~ / |\r/ {print NR": ["$1"]"}' /tmp/rebuild_$Q.tsv    (출력 없어야 안전)
