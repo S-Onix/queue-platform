@@ -128,7 +128,8 @@ CREATE TABLE queues (
 --            (b) 실증 당시 tokens 는 0행이었다. INSTANT 지원 여부는 행 수와 무관하지만,
 --            대용량에서의 MDL 배타 락 대기(장기 트랜잭션 뒤에서 대기)까지 잰 것은 아니다.
 --            테이블당 row version 64 상한을 넘기면 그때는 INSTANT가 아니라 재구축이다.
--- [redis_sync_needed] Redis 다운 중 INSERT 토큰 추적 → RedisSyncJob
+-- [redis_sync_needed] ⬜ **미사용.** RedisSyncJob 이 없고 이 컬럼을 쓰는 코드도 0건이다
+--   (TokenEntity 가 insertable=false, UPDATE 하는 곳 없음). 값은 항상 0이다
 -- [파티션 키] PRIMARY KEY(id, issued_at) — MySQL 제약
 --
 -- [파티션 유예 전략 — 월말 걸친 토큰 보호]
@@ -305,6 +306,21 @@ SELECT agg.tenant_id, '202604', agg.cnt
            AND issued_at <  '2026-05-01'
          GROUP BY tenant_id) AS agg
 ON DUPLICATE KEY UPDATE `count` = agg.cnt;
+
+-- ================================================================
+-- 🔴 파티션 유효 시한 — **2026-12-31까지다.** (2026-08-26 추가)
+--
+--   BillingSnapshotJob 은 매일 당월 파티션을 `FROM tokens PARTITION (pYYYY_MM)` 로 지목한다(§84).
+--   위 정의는 p2026_12 로 끝나므로 **2027-01-01 UTC 00:30 부터 당월 집계가 매일 ERROR 1735
+--   (Unknown partition 'p2027_01') 로 죽는다.** 실측 재현 완료.
+--
+--   🪤 잡이 월별 try/catch 로 예외를 삼키므로 **앱은 안 죽는다.** 남는 신호는 로그 한 줄과
+--      queue_billing_snapshot_total{result="failure"} 뿐이다 — 조용히 멈춘다.
+--
+--   해야 할 것: **2026-12 안에** 아래 Step 4 로 p2027_01 이후를 사전 생성한다.
+--   ⚠️ "사전"이 중요하다. 놓치면 2027-01 토큰이 p_future 에 쌓이고, 그 뒤 REORGANIZE 는
+--      데이터 있는 파티션 재구축이라 쓰기가 잠긴다(§83 실측 행당 40~80µs).
+-- ================================================================
 
 -- Step 3: 파티션 DROP (Step 1,2 완료 후 실행)
 ALTER TABLE tokens DROP PARTITION p2026_04;

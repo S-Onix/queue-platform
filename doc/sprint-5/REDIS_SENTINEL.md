@@ -1,6 +1,11 @@
 # Sprint 5 Phase 1 — Redis Sentinel 학습 노트
 
 > 작성일: 2026-05 (Sprint 5 진행 중)
+>
+> ⚠️ **이 문서는 그 시점의 학습 노트다. 현행 인프라가 아니다.**
+> 앱이 붙는 Redis는 **독립 2 Cluster**(7001-7008 / 8001-8008)이고,
+> `RedisConfig`에서 **Sentinel 분기는 제거됐다**(§75 D28). 아래 §8 "Spring 연동"은 **폐기된 경로**다.
+> Sentinel 자체는 failover·quorum 학습 자산으로 남아 있다 — 구축 절차는 `doc/INFRA_SETUP.md` §6.
 > 목적: WSL2에 Redis Sentinel 직접 구성 + Failover 실증
 
 ---

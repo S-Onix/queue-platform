@@ -8,6 +8,26 @@
 > 쿼리 모음: [`doc/monitoring/queries/polling.md`](../queries/polling.md)
 > 카테고리 체계: [`MONITORING_DESIGN.md` 1-2 / 2-2](../MONITORING_DESIGN.md)
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
 ## 30초 요약
 
 ```
@@ -48,9 +68,9 @@
 - **1분 안에 확인**:
   ```bash
   Q=q_xxx
-  redis-cli -p 6379 get "queue:{$Q}:admit-watermark"
+  redis-cli -c -p 7001 get "queue:{$Q}:admit-watermark"
   sleep 30
-  redis-cli -p 6379 get "queue:{$Q}:admit-watermark"
+  redis-cli -c -p 7001 get "queue:{$Q}:admit-watermark"
   ```
   **두 값이 같으면 그 사이 admit이 0건이었다는 뜻이다. Platform 문제가 아니라 Tenant가 안 뽑아간 것이다.**
 - **정상 범위**: watermark는 **단조 증가**한다. `admit.lua`가 현재값보다 클 때만 쓰므로 절대 감소하지 않는다.
@@ -73,9 +93,9 @@
   그래도 감시는 필요하다: **회수보다 유입이 빠르면** 여전히 쌓인다. seq는 INCR이라 재사용이 없어 멤버가 절대 겹치지 않는다.
 - **1분 안에 확인**:
   ```bash
-  redis-cli -p 6380 info memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy'
-  redis-cli -p 6380 zcard 'queue:{q_xxx}:last-active'
-  redis-cli -p 6380 memory usage 'queue:{q_xxx}:last-active'    # 표본 추정치. 정확값 아님
+  redis-cli -c -p 7001 info memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy'
+  redis-cli -c -p 7001 zcard 'queue:{q_xxx}:last-active'
+  redis-cli -c -p 7001 memory usage 'queue:{q_xxx}:last-active'    # 표본 추정치. 정확값 아님
   ```
   **`used_memory` / `maxmemory` 가 0.8을 넘으면 위험.** 현재 실측 설정: `maxmemory 1073741824`(1GB), `maxmemory-policy noeviction`, `appendonly yes`.
 - **정상 범위**: `used_memory` ≤ 800MB (1GB의 80%). `zcard last-active` ≤ 해당 큐의 `zcard waiting` — **이 관계가 깨지면(last-active > waiting) 이미 좀비 멤버가 쌓인 것이다.**
@@ -87,13 +107,13 @@
   1. 종료된 이벤트의 `last-active`를 지운다 (**진행 중 큐에는 쓰지 마라**):
      ```bash
      # last-active를 읽는 코드가 0건이므로 이 키만 지우는 것은 현재 기능에 영향이 없다
-     redis-cli -p 6379 del 'queue:{q_종료된큐}:last-active'
+     redis-cli -c -p 7001 del 'queue:{q_종료된큐}:last-active'
      ```
      되돌리기: 없다. 다만 아무도 읽지 않는 데이터라 손실이 없다. **inactive_ttl 배치(미구현)가 들어온 뒤에는 이 판단이 뒤집힌다** — 그때는 지우면 안 된다.
   2. 그래도 부족하면 종료된 큐의 `waiting`/`tokens`도 지운다. `seq`는 남긴다(순번 재사용 방지). → [`runbook/enqueue.md`](enqueue.md) 의 FULL 항목 참조.
   3. 임시로 `maxmemory`를 올린다 (물리 메모리 여유가 있을 때만):
      ```bash
-     redis-cli -p 6379 config set maxmemory 2gb     # 되돌리기: config set maxmemory 1gb
+     redis-cli -c -p 7001 config set maxmemory 2gb     # 되돌리기: config set maxmemory 1gb
      # ⚠️ CONFIG REWRITE 하지 않으면 재기동 시 원복된다 (이 경우엔 그게 안전장치다)
      ```
 - **하면 안 되는 것**:
@@ -108,8 +128,8 @@
 - **먼저 의심할 것**: 요청 1건 = **Redis master 왕복 2회 확정**. ① Rate Limit `token-bucket.lua` EVAL, ② `poll_verify.lua` EVAL(`ZRANGEBYSCORE` 포함). 둘 다 **쓰기라서 replica로 못 뺀다**(token-bucket은 HMSET+EXPIRE, poll_verify는 **항상** ZADD — §82 F안으로 ka 분기가 사라졌다).
 - **1분 안에 확인**:
   ```bash
-  redis-cli -p 6379 info commandstats | grep -E 'cmdstat_(evalsha|eval|zrangebyscore|zadd|hget)'
-  redis-cli -p 6379 info stats | grep instantaneous_ops_per_sec
+  redis-cli -c -p 7001 info commandstats | grep -E 'cmdstat_(evalsha|eval|zrangebyscore|zadd|hget)'
+  redis-cli -c -p 7001 info stats | grep instantaneous_ops_per_sec
   ```
   **`evalsha`의 `calls` 증가율이 폴링 RPS의 2배면 정상 구조다.** `usec_per_call`이 급증했다면 ZSet이 커진 것.
 - **정상 범위**: **기준선 수집 필요.** `poll_verify.lua`는 `ZRANGEBYSCORE`가 O(log N + M), M=1이라 30만에서도 이론상 가볍지만 **실측이 없다**. 평상시 폴링 부하 3일치의 `usec_per_call` p95를 재고 그 3배를 경고선으로 시작할 것.
@@ -125,8 +145,8 @@
   - **`pacing` 키로 전원 폴링 간격을 즉시 늘린다.** 재배포 없이 부하를 절반으로 깎는 유일한 런타임 레버다:
     ```bash
     # 전원 간격 2배. 되돌리기: DEL 하면 코드 기본 사다리로 돌아간다
-    redis-cli -p 6379 set 'queue:{q_xxx}:pacing' '50:4,1000:10,5000:20,10000:30,*:40'
-    redis-cli -p 6379 del 'queue:{q_xxx}:pacing'
+    redis-cli -c -p 7001 set 'queue:{q_xxx}:pacing' '50:4,1000:10,5000:20,10000:30,*:40'
+    redis-cli -c -p 7001 del 'queue:{q_xxx}:pacing'
     ```
     형식은 `상한:간격초` CSV이고 **마지막은 반드시 `*:초`**(그 이상 전부)다. 형식이 깨지면 조용히
     기본 사다리로 돌아가므로(로그 없음 — 15만/s 경로라 못 남긴다), 바꾼 뒤 `/status` 응답을 직접 확인할 것.
@@ -145,11 +165,11 @@
 - **1분 안에 확인**:
   ```bash
   Q=q_xxx; SEQ=12345; TOK=tok_019...
-  redis-cli -p 6380 zrangebyscore "queue:{$Q}:waiting" $SEQ $SEQ           # ① 비면 멤버 없음
-  ID=$(redis-cli -p 6380 zrangebyscore "queue:{$Q}:waiting" $SEQ $SEQ)
-  redis-cli -p 6380 hget "queue:{$Q}:tokens" "$ID"                          # ② 비면 Hash 없음 / ③ 값이 "tokenId|issuedAt"
-  redis-cli -p 6379 get "queue:{$Q}:admit-by-token:$TOK"                     # 값이 있으면 404가 아니라 ready:true여야 한다
-  redis-cli -p 6379 zscore "queue:{$Q}:admitted" "$SEQ|$ID"                  # 있는데 위가 비었다 = 복귀 대기 중(위 ⚠️)
+  redis-cli -c -p 7001 zrangebyscore "queue:{$Q}:waiting" $SEQ $SEQ           # ① 비면 멤버 없음
+  ID=$(redis-cli -c -p 7001 zrangebyscore "queue:{$Q}:waiting" $SEQ $SEQ)
+  redis-cli -c -p 7001 hget "queue:{$Q}:tokens" "$ID"                          # ② 비면 Hash 없음 / ③ 값이 "tokenId|issuedAt"
+  redis-cli -c -p 7001 get "queue:{$Q}:admit-by-token:$TOK"                     # 값이 있으면 404가 아니라 ready:true여야 한다
+  redis-cli -c -p 7001 zscore "queue:{$Q}:admitted" "$SEQ|$ID"                  # 있는데 위가 비었다 = 복귀 대기 중(위 ⚠️)
   ```
   **② 결과의 `|` 앞부분이 요청의 tokenId와 다르면 ③ 불일치(= 남의 seq를 조회한 것). 정상 거절이다.**
 - **정상 범위**: 404 비율 < 전체 폴링의 1%. **정확한 임계값은 기준선 수집 필요** — 정상 이탈(브라우저 새로고침 후 옛 seq 재사용)이 얼마나 되는지 데이터가 없다. **3일치 404 비율을 먼저 재라.**
@@ -169,7 +189,7 @@
   ```bash
   timedatectl show -p NTPSynchronized -p TimeUSec       # NTPSynchronized=yes 여야 정상
   # Redis 서버 시각과 WAS 시각 차이
-  echo "redis=$(redis-cli -p 6380 time | head -1)000  was=$(date +%s%3N)"
+  echo "redis=$(redis-cli -c -p 7001 time | head -1)000  was=$(date +%s%3N)"
   ```
   **차이가 1,000ms(1초)를 넘으면 조사. 5,000ms를 넘으면 즉시 조치.**
 - **정상 범위**: WAS 간 시계 오차 < 1초. NTP 동기 상태 `yes`.

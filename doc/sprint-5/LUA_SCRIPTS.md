@@ -1,6 +1,13 @@
 # Sprint 5 Phase 2 — Lua Script 3종 학습 노트
 
 > 작성일: 2026-05 (Sprint 5 Phase 2 진행 예정)
+>
+> ⚠️ **이 문서는 그 시점의 학습 노트다. 현행 목록이 아니다.**
+> 제목의 "Lua Script 3종"은 작성 당시 기준이고, **지금은 8개**다 —
+> `enqueue_bulk` · `poll_verify` · `admit` · `admit_expire` · `inactive_expire` ·
+> `waiting_expire` · `token-bucket` · `fixed-window`.
+> 현행 정본은 `queue-infrastructure/src/main/resources/lua/`와 `doc/FRS_final.md`다.
+> 노트를 갱신하지 않는 이유는 **"그때 무엇을 몰랐는지"가 이 문서의 값어치**이기 때문이다.
 > 목적: Queue Platform의 핵심 Redis Lua Script 분석
 
 > ⚠️ **이 문서는 §66 D2 이전의 "슬라이스" 설계를 다룬 학습 기록이다.**

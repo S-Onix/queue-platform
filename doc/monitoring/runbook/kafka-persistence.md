@@ -4,6 +4,37 @@
 > 쿼리 모음: [`doc/monitoring/queries/kafka-persistence.md`](../queries/kafka-persistence.md)
 > 카테고리 체계: [`MONITORING_DESIGN.md` 2-3 / 4-6](../MONITORING_DESIGN.md)
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
+> 🔴 **`hlen tokens` 와 `zcard waiting` 은 같지 않은 것이 정상이다 (2026-08-26 정정).**
+> `admit.lua`는 `ZPOPMIN waitingKey`로 **waiting에서만 빼고 `tokens` Hash는 일부러 남긴다**
+> (중복 게이트 = `HSETNX`). 그래서 **admit이 한 번이라도 일어난 큐는 항상 `hlen > zcard`다.**
+> 반대로 회수 3경로는 `HDEL tokens`를 하지만 DB 행은 남으므로 **`db > hlen`도 정상**이다.
+>
+> **차이를 유령 토큰으로 세지 마라.** 정본은 `ReconcileJob.gapOf()`이고 모집단이 다르다 —
+> `ZCOUNT(waiting, ≤settledSeq)` − `COUNT(tokens WHERE status=0 AND seq ≤ settledSeq)`.
+> 게이지 `queue_reconcile_ghosts`가 그 값이다. **여기 절차의 `hlen-db`와 게이지는 같은 수가 아니다.**
+
+---
+
 ## 30초 요약
 
 ```
@@ -19,7 +50,9 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
       └ 제약 위반 시 이분 탐색으로 범인 1건만 token-lifecycle.DLT
 ```
 
-**구조적으로 못 막는 갭 하나**: Lua 성공 ↔ Kafka 발행 사이에 프로세스가 죽으면 "Redis엔 있고 DB엔 없는" 유령 토큰이 남는다. Redis-Kafka 간 분산 트랜잭션이 없어서다(DECISIONS §73 D15). **로컬 100만 건 테스트에서 835건 실측.** reconciliation 스위퍼는 **미구현** — 이 런북의 첫 항목이 그 대체 수단이다.
+**구조적으로 못 막는 갭 하나**: Lua 성공 ↔ Kafka 발행 사이에 프로세스가 죽으면 "Redis엔 있고 DB엔 없는" 유령 토큰이 남는다. Redis-Kafka 간 분산 트랜잭션이 없어서다(DECISIONS §73 D15). **로컬 100만 건 테스트에서 835건 실측.**
+
+> ✏️ **reconciliation은 이제 구현돼 있다**(`ReconcileJob`, 5분 주기 · PR #48). **탐지는 배치가 한다** — `queue_reconcile_ghosts` 게이지가 그 수다. **다만 복구는 여전히 사람 몫이다**: 배치는 유령 토큰을 세기만 하고 다시 만들지 않는다(그 값이 0이 아닌 것을 실제로 본 뒤에 붙이기로 했다). 그래서 아래 절차는 **"먼저 게이지를 보고, 0이 아닐 때만"** 쓰는 것으로 바뀐다.
 
 ---
 
@@ -29,7 +62,7 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 - **1분 안에 확인** — 3자 대조 한 줄:
   ```bash
   Q=q_xxx
-  redis-cli -p 6380 zcard "queue:{$Q}:waiting"; redis-cli -p 6380 hlen "queue:{$Q}:tokens"; redis-cli -p 6380 get "queue:{$Q}:seq"
+  redis-cli -c -p 7001 zcard "queue:{$Q}:waiting"; redis-cli -c -p 7001 hlen "queue:{$Q}:tokens"; redis-cli -c -p 7001 get "queue:{$Q}:seq"
   mysql -h127.0.0.1 -P3307 -uqueueapp -p queue_platform -N -e \
     "SELECT COUNT(*) FROM tokens WHERE queue_id='$Q' AND issued_at >= UTC_DATE()"
   ```
@@ -58,7 +91,11 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
   - lag > 0 → 아직 안 밀린 것. 유령 아님. `[lag이 줄지 않는다]` 항목으로.
   - lag = 0, DLT = 0, 그런데 DB가 적다 → **발행 갭 확정.** 어느 tokenId인지는 [`queries/kafka-persistence.md` §3](../queries/kafka-persistence.md) 의 차집합 스크립트로 뽑는다.
   - lag = 0, DLT > 0 → 격리된 항목이다. `[DLT에 쌓인다]` 항목으로.
-- **조치** (reconciliation 미구현이므로 수동):
+- **먼저 볼 것**: `queue_reconcile_ghosts` 게이지(`ReconcileJob`, 5분 주기).
+  이 값이 **0이면 손대지 마라** — 아래 수동 보정은 배치가 세지 못한 갭을 사람이 메우는 절차이지,
+  평상시에 돌리는 것이 아니다. ⚠️ 배치에는 **정착 시간 300초**가 있어 방금 들어온 건은
+  일부러 제외된다(컨슈머 지연을 갭으로 오탐하지 않으려고). 사고 직후라면 5분 기다렸다 다시 본다.
+- **조치** (배치는 탐지만 한다 — 복구는 아직 수동이다):
   1. 차집합 스크립트로 누락 tokenId·identifier·seq·issuedAt을 파일로 뽑는다. Redis Hash 값이 `tokenId|issuedAt` 형식이라 **DB 재구성에 필요한 값이 전부 Redis에 있다**(`enqueue_bulk.lua:75`).
   2. 그 목록으로 `tokens`에 직접 INSERT한다. `ON DUPLICATE KEY`가 아니라 수동이므로 `issued_at`을 **밀리초까지 정확히** 맞춰야 한다 — 1ms만 어긋나도 `UNIQUE(token_id, issued_at)`이 다른 행으로 인식해 중복이 생긴다.
   3. 되돌리기: INSERT한 `token_id` 목록을 남겨두고, 잘못됐으면 `DELETE FROM tokens WHERE token_id IN (...) AND issued_at = '...'`.
@@ -202,4 +239,4 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 | 적재 건수 / 배치 크기 분포 | **미노출.** `log.debug`만 (`INFO` 레벨에선 안 찍힘) |
 | DLT 유입 카운터 | **미노출.** Kafka 오프셋을 직접 세야 함 |
 | consumer lag (PromQL) | **클라이언트 단위는 가능** — `kafka_consumer_fetch_manager_records_lag_max`. 단 **실가동 `prometheus.yml`에 consumer job 등록이 선행**이다. **그룹 단위 LAG 합계는 여전히 불가**(kafka_exporter 미설치) — 아래 주의 참조 |
-| 유령 토큰 수(reconciliation) | **미구현.** 수동 3자 대조가 유일 |
+| 유령 토큰 수(reconciliation) | ✅ **`queue_reconcile_ghosts`** (`ReconcileJob`, 5분). PromQL에서 **`sum`이 아니라 `max`** — batch N대가 같은 값을 각자 보고한다. 짝인 `queue_reconcile_stale`은 반대 방향(DB > Redis = 종료 이벤트 유실) |

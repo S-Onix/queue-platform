@@ -189,7 +189,7 @@ groups:
           severity: warning
         annotations:
           summary: "Redis {{ $labels.instance }} 현 추세면 6시간 내 maxmemory 도달 — noeviction이라 쓰기(enqueue)가 거부된다"
-          action: "`redis-cli -p 6379 CONFIG GET maxmemory` 로 현재 한도 확인 → `INFO memory`의 used_memory → `--bigkeys`로 어느 큐가 키우는지 본다. ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다."
+          action: "`redis-cli -c -p 7001 CONFIG GET maxmemory` (앱이 붙는 Cluster. 6379는 Sentinel이라 다른 값이다) 로 현재 한도 확인 → `INFO memory`의 used_memory → `--bigkeys`로 어느 큐가 키우는지 본다. ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # <보류> — 지금 쓰지 않은 규칙과 그 이유
@@ -219,7 +219,7 @@ groups:
 #   rate(redis_cpu_user_main_thread_seconds_total{job="redis"}[1m]) — 1.0이 물리 상한이다.
 #   → 두 가지가 없어서 보류한다.
 #     (1) 기준선 — 평상시 값이 0.02인지 0.6인지 모른다. 경보선을 정할 근거가 없다.
-#     (2) **조치 레버가 없다.** pacing은 아직 Redis 키가 아니고(§79 설계만),
+#     (2) **조치 레버가 없다.** ~~pacing은 아직 Redis 키가 아니고~~ → ✏️ `QueueKeys.pacing()` 구현됨.(§79 설계만),
 #         Rate Limit cap/refill은 코드 하드코딩이라 런타임 변경이 불가능하다.
 #         깨워도 할 수 있는 게 없는 알람은 쓰지 않는다.
 #     레버가 생긴 뒤(pacing 키 구현) 부하 테스트로 기준선을 잡고 쓴다.

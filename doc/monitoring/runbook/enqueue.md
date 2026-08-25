@@ -4,6 +4,36 @@
 > 쿼리 모음: [`doc/monitoring/queries/enqueue.md`](../queries/enqueue.md)
 > 카테고리 체계: [`MONITORING_DESIGN.md` 4-2](../MONITORING_DESIGN.md)
 
+> ## 🔴 이 문서의 `redis-cli` 대상 (2026-08-26 정정)
+>
+> **큐 상태 키는 Sentinel(6379/6380)에 없다.** 앱이 붙는 곳은 **독립 2 Cluster**다 —
+> `Cluster A 7001-7008` · `Cluster B 8001-8008` (§75). 아래 명령은 전부 그 기준으로 고쳤다.
+>
+> ```bash
+> redis-cli -c -p 7001 ...      # Cluster A   (-c 없으면 MOVED)
+> redis-cli -c -p 8001 ...      # Cluster B
+> ```
+>
+> 🪤 **6380에 치면 에러가 아니라 `0`이 나온다.** 키가 없으니 빈 값이고, 장애 중에는
+> "큐가 비었다"로 읽힌다 — **조용히 틀린 답**이라 제일 위험하다.
+>
+> 🪤 **어느 클러스터인지는 큐마다 다르다.** `RedisClusterAssigner`가 **생성 시점의
+> cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에
+> 기록한다. **queueId 해시가 아니다** — 큐를 보고 추측하지 말고 그 컬럼을 조회하라:
+> `SELECT redis_cluster_no FROM queues WHERE queue_id = '...'`
+
+---
+
+> ### 배치 3잡을 볼 때 쓰는 로그 문자열 (2026-08-26 추가)
+> 이 잡들은 **값이 바뀔 때만 찍는 전이 로그**라, 문자열을 모르면 새벽에 못 찾는다.
+> ```bash
+> grep "회수 admitTokenTTL="  queue-batch.log   # TokenReclaimJob — 회수 3경로 건수가 한 줄에
+> grep "대사 갭"              queue-batch.log   # ReconcileJob — 유령/낡음. "대사 갭 0으로 회복"이 해소 신호
+> grep "과금 집계"            queue-batch.log   # BillingSnapshotJob — month=별 성공/실패
+> ```
+> 게이지: `queue_waiting_orphans` · `queue_reconcile_ghosts` · `queue_reconcile_stale`(전부 **`max`**로 본다) ·
+> `queue_billing_snapshot_total{result}`. 🪤 **batch가 안 떠 있으면 이 시계열은 0이 아니라 사라진다.**
+
 ## 30초 요약 — 이 경로에서 무슨 일이 일어나는가
 
 ```
@@ -54,7 +84,7 @@ HTTP 요청
   # 초당 요청 수(유입)
   curl -s 'http://localhost:9090/api/v1/query?query=sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens",method="POST"}[1m]))' | jq -r '.data.result[0].value[1]'
   # 초당 실제 적재(처리) — Redis seq 증가율
-  redis-cli -p 6380 get 'queue:{q_xxx}:seq'; sleep 10; redis-cli -p 6380 get 'queue:{q_xxx}:seq'
+  redis-cli -c -p 7001 get 'queue:{q_xxx}:seq'; sleep 10; redis-cli -c -p 7001 get 'queue:{q_xxx}:seq'
   ```
   **유입 RPS > 5000이면 확정 적체.** seq 증가분이 10초에 50,000 미만이면 처리가 유입을 못 따라간다.
 - **정상 범위**: 유입 RPS ≤ 5000 (WAS 1대 기준. WAS N대면 각 JVM이 독립 `globalQueue`+독립 스케줄러라 총 처리 상한은 5000×N).
@@ -84,7 +114,9 @@ HTTP 요청
   curl -s 'http://localhost:9090/api/v1/query?query=sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens",method="POST"}[1m])offset 2m)' | jq -r '.data.result[0].value[1]'
   ```
   **유실 상한 ≈ (유입 RPS × 1초) + 5000.** 유입 2,000 RPS였다면 최대 7,000건.
-- **정상 범위**: 정상 종료(SIGTERM + graceful shutdown)라면 0이어야 하지만, **graceful shutdown 설정이 없다** (`server.shutdown: graceful` 미설정). 즉 정상 재배포에서도 유실 가능.
+- **정상 범위**: 정상 종료(SIGTERM)라면 **0이어야 하고, 실제로 0이다.**
+  ✏️ **구 서술 "graceful shutdown 설정이 없다"는 거짓이다**(2026-08-26 정정) — `queue-api/application.yml:131` `shutdown: graceful` + `:35` `timeout-per-shutdown-phase: 20s`가 있고, `BatchProcessor`가 `SmartLifecycle`이라 `stop()`에서 **마지막 drain**을 돈다.
+  **유실은 `kill -9`·OOM Kill·LB 미차단 구간에 한정된다.** 롤링 배포마다 테넌트에게 재시도를 공지할 일이 아니다.
 - **원인별 분기**: 이 유실은 **Redis에도 안 들어간 상태**라 아래 "유령 토큰"(Redis O / DB X)과 다르다. 3자 대조로는 안 잡힌다 — Redis·DB 어디에도 없기 때문에 대조는 "일치"로 나온다.
 - **조치**: 서버 쪽 복구 수단이 없다. Tenant에게 "해당 시간대 enqueue 요청 중 응답을 못 받은 건은 재시도하라"고 통지한다. 재시도는 안전하다 — 같은 `identifier`로 다시 넣으면 `enqueue_bulk.lua`가 `HSETNX`로 EXISTS 처리하며 기존 tokenId·순번을 그대로 돌려준다(`enqueue_bulk.lua` EXISTS 분기).
 - **하면 안 되는 것**: "Redis와 DB가 일치하니 유실 없음"이라고 결론짓는 것. 이 유실 유형은 3자 대조로 검출되지 않는다.
@@ -149,8 +181,8 @@ HTTP 요청
 - **먼저 의심할 것**: 큐 하나에 트래픽이 몰린 핫키. 키가 전부 `{queueId}` 해시태그라 **Cluster여도 슬롯 하나 = 마스터 한 대**에 집중된다(`QueueKeys.java:9-21`). Redis는 단일 스레드라 여기서 코어 1개가 상한이다.
 - **1분 안에 확인**:
   ```bash
-  redis-cli -p 6379 --stat        # instantaneous_ops_per_sec, 5초 관찰 후 Ctrl-C
-  redis-cli -p 6379 info commandstats | grep -E 'evalsha|eval|zadd|zrangebyscore'
+  redis-cli -c -p 7001 --stat        # instantaneous_ops_per_sec, 5초 관찰 후 Ctrl-C
+  redis-cli -c -p 7001 info commandstats | grep -E 'evalsha|eval|zadd|zrangebyscore'
   ```
   **`calls`가 EVALSHA에 몰리고 `usec_per_call`이 1,000(=1ms)을 넘으면 Lua가 무겁다. `ops/sec`이 수만인데 CPU가 100%면 이미 상한.**
 - **정상 범위**: `evalsha`의 `usec_per_call` — **기준선 수집 필요.** enqueue_bulk는 청크당 건수(1~500)에 따라 10배 이상 변동하므로 고정 임계값이 무의미하다. **평상시 트래픽 3일치의 p50/p95를 먼저 재고**, 그 p95의 3배를 임계로 잡을 것.
@@ -159,7 +191,7 @@ HTTP 요청
   - `evalsha` 호출 수 ≈ 초당 배치 사이클 수 × 큐 수 × 청크 수 → enqueue가 맞다. 큐가 커질수록 `ZADD`/`ZRANK`의 O(log N)이 커지지만 30만에서도 log2 ≈ 18로 CPU 주범은 아니다. 호출 **횟수**를 봐라.
   - `slowlog`에 Lua가 잡히면:
     ```bash
-    redis-cli -p 6379 slowlog get 10
+    redis-cli -c -p 7001 slowlog get 10
     ```
 - **조치**: Redis는 스케일업(코어 수를 늘려도 소용없음 — 단일 스레드)으로 못 푼다. 트래픽을 큐 단위로 나누는 것이 유일한 수단이고 이는 설계 변경이다. **즉시 조치는 해당 큐 일시 정지(위 UPDATE)뿐이다.**
 - **하면 안 되는 것**:
@@ -171,17 +203,26 @@ HTTP 요청
 
 ### [증상] enqueue가 429(Q005 QUEUE_FULL)를 반환한다
 
-- **먼저 의심할 것**: 진짜 정원 초과가 아니라 **`waiting` ZSet에서 아무것도 빠지지 않아서**일 가능성이 높다. 전 소스에 `ZREM`이 0건이다(admit 미구현). 한 번 들어간 항목은 영원히 남는다.
+- **먼저 의심할 것**: 진짜 정원 초과인지, 아니면 **`waiting`에서 빠지는 속도가 못 따라가는 것**인지.
+  ✏️ **구 서술 "전 소스에 `ZREM`이 0건이다(admit 미구현)"는 더 이상 사실이 아니다.** admit이 빼고,
+  회수 배치 3경로(`admit_expire`·`inactive_expire`·`waiting_expire`)가 뺀다. 그러니 **지금은 두 갈래**다 —
+  ① Tenant가 `admit`을 안 부르고 있다(Backpressure Pull이라 Platform은 먼저 안 뺀다)
+  ② 회수 배치가 안 돌거나 밀렸다(`TokenReclaimJob` 로그의 회수 3경로 건수를 본다).
 - **1분 안에 확인**:
   ```bash
-  redis-cli -p 6380 zcard 'queue:{q_xxx}:waiting'
+  redis-cli -c -p 7001 zcard 'queue:{q_xxx}:waiting'
   mysql -h127.0.0.1 -P3307 -uqueueapp -p queue_platform -e \
     "SELECT max_capacity FROM queues WHERE queue_id='q_xxx'"
   ```
   **ZCARD ≥ max_capacity면 FULL이 맞다.** 이때 ZCARD가 실제 "지금 기다리는 사람 수"와 같은지는 별개 문제다.
-- **정상 범위**: ZCARD < max_capacity × 0.8을 경고선으로 (`MONITORING_DESIGN.md` 4-2). 다만 **줄어드는 경로가 없으므로 이 값은 단조증가한다** — 시간에 따른 절대 기준을 세울 수 없다.
+- **정상 범위**: ZCARD < max_capacity × 0.8을 경고선으로 (`MONITORING_DESIGN.md` 4-2).
+  ✏️ 구 서술의 "줄어드는 경로가 없어 단조증가한다"는 **폐기됐다** — admit과 회수 배치가 뺀다.
+  이제 이 값은 **오르내린다**. 그래서 절대값보다 **추세**를 본다: 유입 > (admit + 회수)면 계속 오른다.
 - **원인별 분기**:
-  - 이 큐의 이벤트가 이미 끝났는데 ZCARD가 그대로 → 좀비 WAITING. 청소 경로가 미구현이다.
+  - 이 큐의 이벤트가 이미 끝났는데 ZCARD가 그대로 → 좀비 WAITING.
+    ✏️ **청소 경로는 이제 있다** — `waitingTtl`(기본 7200초) 절대 만료가 회수한다.
+    그래도 안 줄면 `TokenReclaimJob`이 도는지, 그 큐의 `waitingTtl` 설정이 과도하게 큰지 본다.
+    `queue_waiting_orphans` 게이지(맨 앞 항목의 `tokens` Hash 미스)도 함께 본다.
   - 429(RL001)와 429(Q005)는 **같은 HTTP 상태 코드**다. 응답 본문의 `error` 필드로 구분: `Q005`=정원, `RL001`=Rate Limit.
 - **조치**: 정원을 늘린다 (다음 배치 사이클부터 반영 — `getMaxCapacity()`가 매 사이클 DB를 읽으므로 캐시 무효화 불필요):
   ```sql
@@ -192,7 +233,7 @@ HTTP 요청
   이벤트가 끝난 좀비 큐라면 큐 키를 통째로 지우는 것이 유일한 청소 수단이다. **되돌릴 수 없다. 진행 중인 이벤트에는 절대 쓰지 마라:**
   ```bash
   # 반드시 이벤트 종료 확인 후. seq는 지우면 순번이 1부터 재시작해 DB UNIQUE와 충돌 가능
-  redis-cli -p 6379 del 'queue:{q_xxx}:waiting' 'queue:{q_xxx}:tokens' 'queue:{q_xxx}:last-active'
+  redis-cli -c -p 7001 del 'queue:{q_xxx}:waiting' 'queue:{q_xxx}:tokens' 'queue:{q_xxx}:last-active'
   # seq는 남긴다 (순번 재사용 방지)
   ```
 - **하면 안 되는 것**:
@@ -211,4 +252,8 @@ HTTP 요청
 | enqueue 결과 분포(OK/EXISTS/FULL) | **미노출.** `MONITORING_DESIGN.md` 4-2의 `queue_token_enqueue_total`은 **미구현** |
 | `queue_waiting_count` Gauge | **미구현.** ZCARD를 직접 조회하는 수밖에 없음 |
 
-프로젝트 전체에서 `MeterRegistry` 사용처가 0건이다 — `MONITORING_DESIGN.md`의 커스텀 메트릭은 전부 설계 단계이며 코드에 없다.
+✏️ **구 서술 "`MeterRegistry` 사용처 0건"은 거짓이다**(2026-08-26 정정). **4종이 등록돼 있다** — `queue_waiting_orphans`(`TokenReclaimJob:122`) · `queue_reconcile_ghosts`/`queue_reconcile_stale`(`ReconcileJob:99-100`) · `queue_billing_snapshot_total{result=success|failure}`(`BillingSnapshotJob:64,66`).
+
+🪤 **넷 다 `queue-batch`가 낸다.** batch가 안 떠 있으면 시계열이 **0이 아니라 사라진다** — `== 0` 형태의 알람은 그때 발화하지 않는다.
+
+`MONITORING_DESIGN.md`의 나머지 커스텀 메트릭(`queue_token_enqueue_total`·`queue_waiting_count`·`queue_token_admit_total` 등)은 여전히 **설계 단계이며 코드에 없다.**

@@ -3728,8 +3728,9 @@ public RedisScript<Long> fixedWindowScript() {
 ## §67 Sprint 12+ — 이중 라우팅 아키텍처 (Cluster + Hash Tag)
 
 > ✏️ **Layer 2(`{shard_X}` 태그)는 철회됐다 (2026-08-26 표시, 근거는 `QueueKeys.java` javadoc).**
-> Layer 1(Application이 클러스터를 고른다)은 **§75로 구현 완료**다 — `RedisClusterAssigner`가
-> `queueId` 해시로 A/B를 정한다.
+> Layer 1(Application이 클러스터를 고른다)은 **§75로 구현 완료**다 — 다만 **`queueId` 해시가 아니다.**
+> `RedisClusterAssigner`가 **생성 시점의 cluster1 메모리 사용률**(`used_memory/maxmemory ≥ 0.5`)로 정하고 `queues.redis_cluster_no`에 기록한다(§75 D27-3). 🪤 **"해시라 결정론적"으로 읽으면 안 된다** —
+> 같은 이름의 큐라도 만든 시점에 따라 다른 클러스터로 간다.
 >
 > **왜 Layer 2가 성립하지 않나:** 라우팅은 *소유자를 모를 때* `queueId`를 해싱해 클러스터를
 > 정한다. 그런데 키 이름에 `shard`를 넣으면 **키를 만들려면 shard를 이미 알아야 하고, shard를

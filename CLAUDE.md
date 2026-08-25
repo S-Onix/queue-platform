@@ -189,7 +189,18 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 - Setter 지양, 불변 객체 지향
 - 정적 팩토리 (`create()`, `reconstruct()`)로 생성 제어
 
-### 테스트 필수
+### 테스트 필수 — 인프라를 쓰면 `@Tag`를 붙인다
+
+**CI 레인이 둘이고 가르는 기준은 모듈이 아니라 `@Tag`다.**
+```
+./gradlew test              전부 384건 (로컬 기본)
+./gradlew test -PunitOnly   246건 (CI 단위 레인) — mysql/redis 태그 제외
+```
+- 실 MySQL을 쓰면 `@Tag("mysql")`, 실 Redis Cluster를 쓰면 `@Tag("redis")`
+- `@WebMvcTest`처럼 목으로 막힌 것은 **붙이지 않는다**
+- 🪤 **안 붙이면 단위 레인에서 인프라 없이 돌다 깨지고, 잘못 붙이면 CI에서 조용히 사라진다.**
+  모듈 단위로 가르면 안 되는 이유가 이것이다 — 실제로 384건 중 104건만 돌던 상태였다
+
 - Domain 단위 테스트 (Spring 없음, JUnit 5만)
 - Service 단위 테스트 (Mockito)
 - Controller 통합 테스트 (MockMvc)

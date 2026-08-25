@@ -622,6 +622,11 @@ rate(http_server_requests_seconds_count[5m])
 
 ### 2-2. Redis 클러스터 측정 (Master + Slave + Sentinel)
 
+> ✏️ **이 절은 Sentinel 기준으로 쓰였고, 앱이 붙는 곳은 이제 Cluster A/B다**(7001-7008 / 8001-8008, §75).
+> `RedisConfig`에서 Sentinel 분기를 제거했으므로 **아래 `INFO sentinel` 수집은 앱 가용성과 무관**하다.
+> Cluster는 `INFO`·`CLUSTER INFO`(`cluster_state`)·`CLUSTER NODES`로 본다. Sentinel 측정은
+> 학습·로컬 자산에만 해당한다(§75 D28).
+
 - 측정 이유
   - Redis 부하 상태 파악
     - 메모리 사용량
