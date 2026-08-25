@@ -402,7 +402,8 @@ GET /api/v1/queues/:queueId/tokens/:tokenId?seq={seq}&ka={0|1}
 인증: tokenId 소유 (permitAll, DECISIONS §74)
 Rate Limit: tokenId 기준 Token Bucket — cap 5 / refill 1.0 per sec
 
-처리: poll_verify.lua 1회 (ZRANGEBYSCORE + HGET 대조 + ka=1이면 ZADD last-active)
+처리: poll_verify.lua 1회 (ZRANGEBYSCORE + HGET 대조 + **항상** ZADD last-active)
+      ⚠️ `ka`는 **무시된다**(§82 F안) — 폴링이 오면 **언제나** `last-active`를 갱신한다. 파라미터는 하위호환으로만 받는다.
       검증 실패 시에만 GET queue:{queueId}:admit-by-token:{tokenId}  ← 추가 왕복은 이 경우뿐이다
         값이 있으면  → ready:true + admitToken  (admit되면 waiting에서 빠지므로 필수. 없으면 정상 입장자가 404)
         값이 없으면  → 404 TK001
@@ -656,7 +657,8 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 > 끊김은 Tenant가 알 방법이 없어 Cancel로는 못 잡는다. 이탈 감지 배치는 어차피 필요하다.
 
 ```
-트리거: 브라우저가 ka=1 폴링을 멈춘다 (취소 버튼 · 탭 닫음 · 네트워크 끊김 — 신호는 하나다)
+트리거: 브라우저가 **개인 폴링을 멈춘다** (취소 버튼 · 탭 닫음 · 네트워크 끊김 — 신호는 하나다)
+        ※ `ka` 여부와 무관하다 — 폴링이 곧 생존 신호다 (§82 F안)
 
 판정:   seqs = ZRANGEBYSCORE queue:{queueId}:last-active -inf (now_ms - inactiveTtl_ms) LIMIT 0 N
         🔴 last-active의 member는 **seq**다 (§8 키표 · poll_verify.lua). identifier가 아니다.
@@ -796,7 +798,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | `queue:{queueId}:waiting` | Sorted Set | 없음 | 대기열. **member=`identifier`**, score=`seq` |
 | `queue:{queueId}:seq` | String | 없음 | 큐별 순번 카운터. `INCR`이 score를 발급 (§70 D9) |
 | `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `"tokenId\|issuedAt"`. **중복 Enqueue 게이트(`HSETNX`)** + 폴링 소유권 대조(§74). 큐에서 빼는 경로는 반드시 `HDEL` |
-| `queue:{queueId}:last-active` | Sorted Set | 없음 | keepalive. member=`seq`, score=epoch ms. `ka=1` 폴링이 갱신 (§74) |
+| `queue:{queueId}:last-active` | Sorted Set | 없음 | keepalive. member=`seq`, score=epoch ms. **모든 개인 폴링이 갱신** (§74 · §82 F안 — `ka` 분기 삭제). 회수 시 `ZREM` (§82) |
 | `queue:{queueId}:admitted` | Sorted Set | 없음 | **admit된 토큰의 만료 시각**. score=만료 epoch ms, member=`"seq\|identifier"`. TTL 만료 복귀 배치가 `ZRANGEBYSCORE 0 now`로 claim (§80) |
 
 > ⚠️ `:tokens`의 회수는 **complete 경로(`cleanupCompleted`의 `HDEL`)뿐**이고, `:last-active`는 여전히 회수 경로가 **전 코드 0건**이다. 이탈자(complete하지 않은 사람) 회수 배치는 Sprint 9.
@@ -848,10 +850,11 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 
 | Job | 주기 | 처리 |
 |-----|------|------|
-| `TokenExpiryJob` | 10초 | WAITING TTL 만료 → EXPIRED + Kafka 발행 |
-| `TokenReclaimJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기) + `RETURNED` 발행. 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
-| `RedisSyncJob` | 5분 | redis_sync_needed=1 토큰 → Redis 재삽입 |
-| `BillingSnapshotJob` | M+2월 초 | tokens 원본 집계 → queue_daily_stats + billing_snapshots → 파티션 DROP |
+| ~~`TokenExpiryJob`~~ | — | ⛔ **그런 클래스는 없다.** `waitingTtl`·`inactiveTtl` 판정은 아래 `TokenReclaimJob` 안에 들어갔다 — 셋 다 같은 10초 주기에 같은 큐 목록을 도는 작업이라 프로세스를 나눌 이유가 없었다 |
+| `TokenReclaimJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기. ~~`RETURNED` 발행~~ — **그 이벤트 타입은 존재하지 않는다**: `TokenEventType`은 `ENQUEUED·ADMITTED·COMPLETED·EXPIRED` 4개다). ⚠️ 이 경로에서 **DB `status`는 1에 머문다** — `EXPIRED` 소비 가드가 `IF(status=0,4,status)`라 1에서 no-op이고, 그건 `complete`의 300초 창을 살리려는 의도다. 잔류분은 `ReconcileJob`이 정리한다. **회수 경로는 총 3개**(admitToken TTL · `inactiveTtl` · `waitingTtl`). 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
+| `RedisSyncJob` ⬜ | 5분 | **미구현.** `redis_sync_needed` 컬럼은 쓰고 있으나 읽어서 되살리는 잡이 없다 |
+| `BillingSnapshotJob` ✅ | **매일 UTC 00:30** | `tokens` 원본을 `PARTITION (pYYYY_MM)`로 집계 → `billing_snapshots` UPSERT. **전월 + 당월**만 본다(더 과거는 DROP된 달을 깎는다). `READ COMMITTED` 필수 — 안 걸면 `INSERT ... SELECT`가 `tokens` 적재를 막는다(실측 6초 `ERROR 1205`). ShedLock 없음(UPSERT 멱등). 상세 §84 |
+| ~~`queue_daily_stats` 집계 + 파티션 DROP/REORGANIZE~~ | ⬜ M+2월 초 | **미착수.** §84가 `BillingSnapshotJob`에서 분리했다 — 과금이 아니라 파티션 운영이고 DDL이라 성격이 다르다 |
 
 > 🔴 **`TokenReclaimJob`의 한 주기 상한은 큐당 `CLAIM_LIMIT = 500`이고, 적체는 실재한다.**
 > 통합테스트에서 **14,747건이 약 30주기(≈300초)에 걸쳐** 복귀했다. **에러도 경고도 없이 지연만
@@ -982,7 +985,7 @@ queue.startPolling({
   복귀 → 즉시 재개
 
 keepalive:
-  개인 엔드포인트를 ka=1로 30~60초에 1회만 호출 → last-active 갱신
+  개인 엔드포인트를 30~60초에 1회만 호출 → last-active 갱신 (`ka` 불필요 — §82 F안)
   (평상시 /status만 때리면 서버는 대기자가 살아 있는지 알 수 없다)
 
 404 처리:

@@ -2,7 +2,9 @@
 
 > 대상: **엔드포인트 2개** (DECISIONS §79로 분할됨)
 > ① `GET /api/v1/queues/{queueId}/status` — 큐 전광판. **permitAll + Rate Limit 없음**
-> ② `GET /api/v1/queues/{queueId}/tokens/{tokenId}?seq={mySeq}&ka={true|false}` — 개인 상태. **permitAll**
+> ② `GET /api/v1/queues/{queueId}/tokens/{tokenId}?seq={mySeq}` — 개인 상태. **permitAll**
+> ⚠️ `ka` 파라미터는 **무시된다**(§82 F안). 받기는 하지만 분기가 없다 — **폴링이 오면 언제나** `last-active`를 갱신한다.
+>    분기가 있던 시절엔 `ka`를 안 붙이는 클라이언트의 **살아 있는 대기자가 회수됐다.** 파라미터는 하위호환으로만 남았다
 > 쿼리 모음: [`doc/monitoring/queries/polling.md`](../queries/polling.md)
 > 카테고리 체계: [`MONITORING_DESIGN.md` 1-2 / 2-2](../MONITORING_DESIGN.md)
 
@@ -23,7 +25,7 @@
   └ QueueEngineService.poll()
       └ verifyWaiting() → poll_verify.lua : ZRANGEBYSCORE(waiting, seq, seq)  ★2회차 왕복 (master 쓰기)
                                             HGET(tokens, identifier) → tokenId 대조
-                                            ka=1이면 ZADD(last-active, now, seq)
+                                            ZADD(last-active, now, seq) ← 항상. ka와 무관(§82 F안)
       └ 검증 실패 시에만 GET admit-by-token:{tokenId}   ★3회차 (admit된 사람 / 없는 토큰만)
   응답: { ready: false }  또는  { ready: true, admitToken }
 ```
@@ -66,7 +68,9 @@
 
 ### [증상] Redis 메모리가 계속 증가한다 / `used_memory`가 1GB에 접근한다
 
-- **먼저 의심할 것**: `queue:{q}:last-active` ZSet. `ka=1` 폴링마다 `ZADD`만 하고 **삭제도 만료도 없다**. 30만 명 큐가 한 바퀴 돌면 멤버 30만. 이벤트 100회면 같은 키에 3천만 멤버가 영구히 남는다. seq는 INCR이라 재사용도 안 되니 멤버는 절대 겹치지 않는다.
+- **먼저 의심할 것**: `queue:{q}:last-active` ZSet. 폴링마다 `ZADD`한다(`ka`와 무관 — §82 F안).
+  ⚠️ **"삭제도 만료도 없다"는 더 이상 사실이 아니다** — `inactive_expire.lua`·`waiting_expire.lua`가 회수하면서 `ZREM`한다(§82 · PR #45/#48).
+  그래도 감시는 필요하다: **회수보다 유입이 빠르면** 여전히 쌓인다. seq는 INCR이라 재사용이 없어 멤버가 절대 겹치지 않는다.
 - **1분 안에 확인**:
   ```bash
   redis-cli -p 6380 info memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy'
@@ -101,7 +105,7 @@
 
 ### [증상] Redis master CPU가 폴링 트래픽에 비례해 100%로 간다
 
-- **먼저 의심할 것**: 요청 1건 = **Redis master 왕복 2회 확정**. ① Rate Limit `token-bucket.lua` EVAL, ② `poll_verify.lua` EVAL(`ZRANGEBYSCORE` 포함). 둘 다 **쓰기라서 replica로 못 뺀다**(token-bucket은 HMSET+EXPIRE, poll_verify는 ka=1일 때 ZADD).
+- **먼저 의심할 것**: 요청 1건 = **Redis master 왕복 2회 확정**. ① Rate Limit `token-bucket.lua` EVAL, ② `poll_verify.lua` EVAL(`ZRANGEBYSCORE` 포함). 둘 다 **쓰기라서 replica로 못 뺀다**(token-bucket은 HMSET+EXPIRE, poll_verify는 **항상** ZADD — §82 F안으로 ka 분기가 사라졌다).
 - **1분 안에 확인**:
   ```bash
   redis-cli -p 6379 info commandstats | grep -E 'cmdstat_(evalsha|eval|zrangebyscore|zadd|hget)'
@@ -154,7 +158,7 @@
   - 산발적 404 → 정상. 잘못된 seq/tokenId 조합.
   - 404가 급증 + `zcard waiting` = 0 + `get seq` 가 살아 있음 → **RDB 롤백/failover로 ZSet만 옛 상태로 돌아간 것**이 아니라 키가 지워진 것. `redisSeq < dbMaxSeq` 비교로 확정([`queries/kafka-persistence.md`](../queries/kafka-persistence.md) §4).
 - **조치**: 큐 전체 404면 Redis 유실. DB `tokens`에서 해당 큐의 WAITING 행으로 ZSet·Hash를 재구성해야 하는데 **복구 도구가 미구현**이다. 수동 재구성 절차는 [`queries/polling.md` §5](../queries/polling.md) 참조.
-- **하면 안 되는 것**: 404를 줄이려고 `poll_verify.lua`의 검증을 우회하는 것. tokenId 대조가 빠지면 seq(INCR이라 추측 자명)만으로 남의 대기 항목에 `ka=1`을 걸 수 있다.
+- **하면 안 되는 것**: 404를 줄이려고 `poll_verify.lua`의 검증을 우회하는 것. tokenId 대조가 빠지면 seq(INCR이라 추측 자명)만으로 남의 대기 항목에 keepalive를 걸 수 있다.
 
 ---
 
@@ -192,5 +196,5 @@
 | `pacing` 오버라이드 적용 여부 | **미노출.** 형식 오류가 조용히 기본값으로 떨어지므로(로그 없음) `/status` 응답을 직접 봐야 한다 |
 | 404(TK001)의 두 상황 구분 | **불가.** 진짜 소멸과 WAITING 복귀 대기가 같은 코드다 (§79 404 계약 — ErrorCode 미분리) |
 | `last-active` 크기 | **미노출.** ZCARD 직접 조회만 |
-| keepalive(ka=1) 비율 | **미노출** |
+| keepalive 비율 | **의미 없음** — `ka` 분기가 사라져 모든 폴링이 keepalive다(§82 F안) |
 | Redis 메모리 (PromQL) | **불가.** redis_exporter 미설치, prometheus.yml에 redis job 없음 |

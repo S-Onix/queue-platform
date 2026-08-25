@@ -939,9 +939,9 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
     - 대기 인원 수 추적 필요
 - 대안
   - Custom 메트릭 작성
-    - queue_token_enqueue_total{tenant_id, queue_id, result}
+    - queue_token_enqueue_total{tenant_id, queue_id, result}   ⬜ **미구현** (계측 코드 0건)
       - result: success / failure
-    - queue_waiting_count (Gauge, Queue별 현재 대기 인원)
+    - queue_waiting_count (Gauge, Queue별 현재 대기 인원)         ⬜ **미구현** — ZCARD 직접 조회로 대체 중
       - 라벨: queue_id
 - 이슈
   - queue_id 라벨 Cardinality?

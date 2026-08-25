@@ -8,9 +8,10 @@ import java.util.TimeZone;
 /**
  * 스케줄 작업 전담 서버.
  *
- * <p><b>현재 비어 있다.</b> enqueue 적재를 담당하던 outbox 드레인 스케줄러가 Kafka 전환으로
- * 사라졌고(적재는 {@code queue-consumer}가 맡는다), TTL 만료 감지·파티션 정리 등 실제
- * 스케줄 작업은 Sprint 7·9에서 들어온다.
+ * <p>잡 3개가 돈다 — {@code TokenReclaimJob}(회수 3경로, 10초) ·
+ * {@code ReconcileJob}(Redis↔DB 대사, 5분) · {@code BillingSnapshotJob}(과금 스냅샷, 매일).
+ * enqueue 적재를 담당하던 outbox 드레인 스케줄러는 Kafka 전환으로 사라졌다
+ * (적재는 {@code queue-consumer}가 맡는다).
  *
  * <p>모듈을 지우지 않고 남겨 둔 이유는 <b>확장 방향이 다르기</b> 때문이다. 소비는 유입량에
  * 비례해 인스턴스를 늘려야 하지만, 스케줄 작업은 늘릴수록 중복 실행을 막을 장치가 필요해진다.

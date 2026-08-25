@@ -605,7 +605,11 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 
 ---
 
-### ⬜ Sprint 9 — Batch 모듈 (TokenExpiryJob + RedisSyncJob + BillingSnapshotJob)
+### 🔄 Sprint 9 — Batch 모듈 (~~TokenExpiryJob~~ `TokenReclaimJob` + `ReconcileJob` + `BillingSnapshotJob` ✅ / `RedisSyncJob` ⬜)
+
+> ✏️ **`TokenExpiryJob`은 만들지 않았다.** `waitingTtl`·`inactiveTtl`·admitToken TTL 세 판정이
+> 모두 10초 주기에 같은 큐 목록을 도는 작업이라 `TokenReclaimJob` 하나로 합쳤다. 아래 서술의
+> `TokenExpiryJob`은 그 잡의 세 경로로 읽어라.
 
 **예상 기간:** 1.5주
 **카테고리:** 운영
@@ -648,7 +652,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 | 4 | `ApiKeyCache.invalidate` 프로덕션 호출 연결 (revoke 경로) | 구현·포트 선언은 있는데 **호출부가 0건**이라 폐기된 키가 최대 60초 살아 있다. 배치가 아니라 revoke 서비스 쪽 한 줄이지만, 다른 정리 작업과 함께 처리 |
 
 **완료 기준 (DoD):**
-- [ ] Batch Server 기동 후 TokenExpiryJob 10초 주기 실행 로그 확인
+- [x] Batch Server 기동 후 `TokenReclaimJob` 10초 주기 실행 로그 확인 — 실측 `회수 admitTokenTTL=1건 inactiveTTL=0건 waitingTTL=4000건`
 - [ ] `queue-batch`의 `/actuator/prometheus`가 200을 반환 (위 1번 — reconciliation 지표의 전제)
 - [x] 회수 후 `waiting`·`tokens`·`last-active` **세 키에서 모두 빠진다** — `InactiveReclaimTest`가 실제 Redis로 단언(§82)
 - [ ] `zcard last-active` ≤ `zcard waiting` **부등식 자체**는 아직 안 잰다 — 위 테스트는 개별 키의 잔존 멤버만 단언한다
@@ -717,7 +721,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - 🔴 **착수 전 결정**: 지터 규약이 §79 안에서 갈려 있다(대칭 ±20% vs 비대칭) — `FRS` §6.3
 - `PollingManager` (`/status`의 `pacing` 구간표로 간격 계산 + ±20% 지터, setTimeout 관리 — §79)
   - `rank = mySeq − lastAdmittedSeq`를 **SDK가** 계산한다. 서버는 rank를 계산하지 않는다
-  - `rank <= 0`일 때만 개인 엔드포인트 호출 + 30~60초에 1회 `ka=1`
+  - `rank <= 0`일 때만 개인 엔드포인트 호출 + 30~60초에 1회 keepalive (`ka` 불필요 — §82 F안)
 - `RetryHandler` (429 응답 시 Retry-After 헤더 활용)
 - `StateManager` (IDLE → WAITING → READY → COMPLETED → EXPIRED)
 - `VisibilityHandler` (visibilitychange → Polling 중단/재개)
