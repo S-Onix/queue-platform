@@ -115,6 +115,21 @@ jobs:
       - name: 통합 테스트 (전체)
         run: ./gradlew --no-daemon test
 
+      # 🔴 초록은 "돌았다"의 증거가 아니다.
+      # 태그 설정이 깨지거나 누가 -PunitOnly를 흘려 넣으면 이 레인은 인프라를 다 띄워 놓고
+      # 인프라 테스트를 0건 실행한 채 통과한다 — 정확히 이 레인이 막으려던 실패가 조용히 돌아온다.
+      # 그래서 대표 두 건(mysql 태그 하나, redis 태그 하나)이 실제로 실행됐는지 결과 XML로 못박는다.
+      - name: 태그된 테스트가 실제로 돌았는지 확인
+        run: |
+          set -e
+          for t in TokenAdmitQueryIntegrationTest RedisQueueEngineRoutingTest; do
+            f=$(find . -path '*/build/test-results/test/TEST-*'"$t"'.xml' | head -1)
+            [ -n "$f" ] || { echo "$t 결과가 없다 — 인프라 테스트가 실행되지 않았다" >&2; exit 1; }
+            n=$(grep -o 'tests="[0-9]*"' "$f" | head -1 | tr -dc 0-9)
+            [ "${n:-0}" -gt 0 ] || { echo "$t 가 0건 실행됐다" >&2; exit 1; }
+            echo "$t: $n건"
+          done
+
       - name: 실패 시 테스트 리포트 업로드
         if: failure()
         uses: actions/upload-artifact@v4
