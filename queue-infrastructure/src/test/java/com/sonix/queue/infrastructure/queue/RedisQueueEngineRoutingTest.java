@@ -7,6 +7,7 @@ import com.sonix.queue.domain.queue.ReclaimedToken;
 import com.sonix.queue.infrastructure.repository.QueueJpaRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -37,6 +38,7 @@ import static org.mockito.Mockito.when;
  * {@code doc/INFRA_SETUP.md} §6.5). 큐 키는 {@code q_dev_*}를 쓰고 매 테스트 뒤 지운다.
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
+@Tag("redis")
 class RedisQueueEngineRoutingTest {
 
     @Autowired

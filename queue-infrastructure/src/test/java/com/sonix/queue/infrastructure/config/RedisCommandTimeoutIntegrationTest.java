@@ -1,6 +1,7 @@
 package com.sonix.queue.infrastructure.config;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -27,6 +28,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  * 키를 만들지도 않으므로 정리할 데이터도 남지 않는다.
  */
 @SpringBootTest(classes = com.sonix.queue.infrastructure.queue.QueueEngineRedisTestConfig.class)
+@Tag("redis")
 class RedisCommandTimeoutIntegrationTest {
 
     /** 아무도 쓰지 않는 키. BLPOP은 키를 생성하지 않으므로 정리 대상이 남지 않는다. */

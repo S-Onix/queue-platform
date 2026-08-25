@@ -30,6 +30,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
 @TestMethodOrder(MethodOrderer.DisplayName.class)
+@Tag("redis")
 public class EnqueueConcurrencyTest {
 
     @Autowired private RedisQueueEngine queueEngine;

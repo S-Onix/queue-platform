@@ -28,6 +28,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * <p>로컬 Redis에 연결하며, 테스트 키는 각 테스트 전후로 정리한다.
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
+@Tag("redis")
 public class PollRedisAdapterIntegrationTest {
 
     @Autowired private RedisQueueEngine queueEngine;

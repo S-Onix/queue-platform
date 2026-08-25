@@ -44,6 +44,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 로 뿌린다. 기대: 각 큐 ZCARD == 2,000, rank 0~1999 유일, 전체 OK 10,000, 예외 0.
  */
 @SpringBootTest(classes = EnqueueE2ETestConfig.class)
+@Tag("redis")
 class MultiInstanceEnqueueTest {
 
     private static final int WAS_COUNT = 3;

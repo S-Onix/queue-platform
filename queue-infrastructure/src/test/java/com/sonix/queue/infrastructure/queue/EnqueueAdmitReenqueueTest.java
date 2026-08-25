@@ -6,6 +6,7 @@ import com.sonix.queue.domain.queue.ReclaimedToken;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -37,6 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * </ul>
  */
 @SpringBootTest(classes = QueueEngineRedisTestConfig.class)
+@Tag("redis")
 class EnqueueAdmitReenqueueTest {
 
     private static final String QUEUE_ID = "q_dev_reenqueue";

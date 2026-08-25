@@ -3,6 +3,7 @@ package com.sonix.queue.infrastructure.ratelimit;
 import com.sonix.queue.domain.ratelimit.FixedWindowRateLimiter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -29,6 +30,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  * (키 하나만 쓰면 "우연히 base와 같은 슬롯"인 1/16384를 배제했다고 말하기 어렵다)
  */
 @SpringBootTest(classes = RateLimitRedisTestConfig.class)
+@Tag("redis")
 class RedisFixedWindowRateLimiterTest {
 
     @Autowired

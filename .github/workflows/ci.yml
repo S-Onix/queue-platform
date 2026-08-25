@@ -1,14 +1,16 @@
 # 빌드·테스트·이미지 검증.
 #
-# ⚠️ 지금 CI가 도는 테스트는 49개 중 10개다 (common 2 · domain 5 · batch 1 · consumer 2).
-#    나머지 39개(queue-infrastructure 25 · queue-api 14)는 실 인프라를 요구한다 —
-#    MySQL master+replica(스키마 선주입, ddl-auto=none) · Redis Cluster 2개 · Kafka.
-#    통합 레인은 후속 작업이고, 착수 전에 테스트에 @Tag를 달아 인프라 필요 여부를 코드로
-#    표시해야 한다. 지금처럼 모듈 단위로 가르면 새 순수 테스트가 CI 밖에 남는다.
+# 레인이 둘이다. 가르는 기준은 **모듈이 아니라 @Tag** 다.
 #
-#    그래서 이 워크플로가 실제로 지키는 것은 두 가지다.
-#      1) 전 모듈 컴파일 (main + test) — 포트 시그니처 변경 같은 광역 파손을 잡는다
-#      2) 이미지 3종이 실제로 구워지는가 — Dockerfile은 로컬에서 안 굽고 넘어가기 쉽다
+#   단위 레인    ./gradlew test -PunitOnly    인프라 불필요분 전부 (246건)
+#   통합 레인    ./gradlew test               MySQL + Redis Cluster 2개를 띄우고 전부 (384건)
+#
+# ⚠️ 모듈로 가르면 안 된다. queue-infrastructure·queue-api에는 순수 테스트와 인프라 테스트가
+#    섞여 있어서, 모듈 단위로 자르면 새로 추가되는 순수 테스트가 통째로 CI 밖에 남는다.
+#    실제로 그 상태였다 — 384건 중 104건만 돌고 있었다.
+#
+# Kafka는 띄우지 않는다. @EmbeddedKafka를 쓰는 테스트가 0건이고, 발행 경로는 목으로 검증한다.
+# 없는 인프라를 "언젠가 쓸 것"이라고 미리 세우지 않는다.
 name: CI
 
 on:
@@ -45,17 +47,94 @@ jobs:
       - name: 컴파일 (main + test, 전 모듈)
         run: ./gradlew --no-daemon compileJava compileTestJava
 
-      # 실 인프라가 필요 없는 모듈만 돌린다. 목록을 늘리려면 위 주석의 @Tag 작업이 먼저다.
-      - name: 단위 테스트 (인프라 불필요 모듈)
-        run: >
-          ./gradlew --no-daemon
-          :queue-common:test :queue-domain:test :queue-batch:test :queue-consumer:test
+      # @Tag("mysql")/@Tag("redis")가 붙지 않은 전부. 모듈 목록을 손으로 관리하지 않는다 —
+      # 새 순수 테스트는 태그를 안 붙이면 자동으로 여기 들어온다.
+      - name: 단위 테스트 (인프라 불필요분 전부)
+        run: ./gradlew --no-daemon test -PunitOnly
 
       - name: 실패 시 테스트 리포트 업로드
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
+          path: '**/build/reports/tests/**'
+          retention-days: 7
+
+  integration:
+    name: 통합 테스트 (MySQL · Redis Cluster 2)
+    needs: build
+    runs-on: ubuntu-latest
+
+    services:
+      # 테스트가 127.0.0.1:3306을 하드코딩한다(TokenJpaTestConfig 등). replica jdbc-url도 3306을
+      # 가리키므로 인스턴스는 하나면 된다 — 복제까지 세우는 것은 이 레인이 검증하려는 범위가 아니다.
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: queue_platform
+          MYSQL_USER: queueapp
+          MYSQL_PASSWORD: queueapp1234
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Redis 설치
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-server redis-tools
+
+      # 두 클러스터를 로컬과 같은 포트(7001-7008 / 8001-8008)로 띄운다. RedisConfig의 @Value
+      # 기본값이 그 목록이라 테스트에 프로퍼티를 주입할 배관이 필요 없다.
+      #
+      # 🔴 하나로 합치면 안 된다. 두 클러스터가 독립이어야 큐 단위 라우팅(§75)이 검증된다 —
+      #    같은 클러스터를 둘로 가리키면 "다른 슬롯이라도 같은 노드면 조용히 성공"하는 구멍이 열린다.
+      - name: Redis Cluster 2개 기동
+        run: |
+          ./scripts/ci/redis-cluster-up.sh 7001
+          ./scripts/ci/redis-cluster-up.sh 8001
+
+      # ddl-auto=none이라 스키마를 먼저 넣어야 한다. schema.sql을 통째로 파이프하면
+      # 파일 중간의 파티션 운영 절(ALTER TABLE ... DROP PARTITION)까지 실행된다 — 스크립트가 걷어낸다.
+      - name: 스키마 주입
+        env:
+          MYSQL_USER: root
+          MYSQL_PASSWORD: root
+        run: ./scripts/ci/load-schema.sh
+
+      - name: 통합 테스트 (전체)
+        run: ./gradlew --no-daemon test
+
+      # 🔴 초록은 "돌았다"의 증거가 아니다.
+      # 태그 설정이 깨지거나 누가 -PunitOnly를 흘려 넣으면 이 레인은 인프라를 다 띄워 놓고
+      # 인프라 테스트를 0건 실행한 채 통과한다 — 정확히 이 레인이 막으려던 실패가 조용히 돌아온다.
+      # 그래서 대표 두 건(mysql 태그 하나, redis 태그 하나)이 실제로 실행됐는지 결과 XML로 못박는다.
+      - name: 태그된 테스트가 실제로 돌았는지 확인
+        run: |
+          set -e
+          for t in TokenAdmitQueryIntegrationTest RedisQueueEngineRoutingTest; do
+            f=$(find . -path '*/build/test-results/test/TEST-*'"$t"'.xml' | head -1)
+            [ -n "$f" ] || { echo "$t 결과가 없다 — 인프라 테스트가 실행되지 않았다" >&2; exit 1; }
+            n=$(grep -o 'tests="[0-9]*"' "$f" | head -1 | tr -dc 0-9)
+            [ "${n:-0}" -gt 0 ] || { echo "$t 가 0건 실행됐다" >&2; exit 1; }
+            echo "$t: $n건"
+          done
+
+      - name: 실패 시 테스트 리포트 업로드
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
           path: '**/build/reports/tests/**'
           retention-days: 7
 
