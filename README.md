@@ -5,7 +5,7 @@
 
 [![Java](https://img.shields.io/badge/Java-21-007396?logo=java)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring_Boot-3.3.4-6DB33F?logo=springboot)](https://spring.io/projects/spring-boot)
-[![Redis](https://img.shields.io/badge/Redis-Sentinel-DC382D?logo=redis)](https://redis.io/)
+[![Redis](https://img.shields.io/badge/Redis-Cluster_x2-DC382D?logo=redis)](https://redis.io/)
 [![Kafka](https://img.shields.io/badge/Kafka-Spring_Kafka-231F20?logo=apachekafka)](https://kafka.apache.org/)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql)](https://www.mysql.com/)
 
@@ -106,7 +106,7 @@ flowchart TD
     Batch["⏱ Batch Server\n@Scheduled Jobs"]
     Consumer["📥 queue-consumer\nKafka 소비 전담"]
     Kafka["📨 Kafka\ntoken-lifecycle (key=tokenId)"]
-    Redis["🔴 Redis Sentinel\nMaster + Slave 2 + Sentinel 3"]
+    Redis["🔴 Redis 독립 2 Cluster\nA(7001-7008) · B(8001-8008)\n큐 단위 라우팅 (§75)"]
     DB_M["🗄 MySQL Master"]
     DB_R["🗄 MySQL Read Replica"]
 
@@ -261,19 +261,22 @@ admit_token: DB 저장 → Redis 미스 시 Fallback
 
 ---
 
-## 🔴 Redis Sentinel
+## 🔴 Redis — 독립 2 Cluster + 큐 단위 라우팅
 
-> 아래는 **현재 구현** 상태다. 목표 구성은 **독립 2 Cluster + 큐 단위 이중 라우팅**으로 확정
-> (cluster1 master 50% 초과 시 신규 큐를 cluster2로). 전환 시점은 미정. → [DECISIONS §75](doc/DECISIONS.md)
-> Sentinel은 폐기가 아니라 학습·로컬 자산으로 남긴다.
+> **전환 완료**(§75). `RedisConfig`는 **Cluster 전용**이고 Sentinel 분기는 코드에서 제거했다 —
+> 프로파일로 나누면 해시태그 누락처럼 "Cluster에서만 터지는" 결함이 Sentinel 경로로 숨는다.
+> Sentinel은 폐기가 아니라 **학습·로컬 자산**으로 남긴다(§75 D28). 앱은 붙지 않는다.
 
 ```
-Master 1 + Slave 2 + Sentinel 3
-쿼럼 = 2 | min-replicas-to-write 1 (Split Brain 방지)
-모든 연산 → Master (Lua 원자성)
-Slave: Failover + 백업
-Failover: 5~10초 | Circuit Breaker → 503
+Cluster A (7001-7008) · Cluster B (8001-8008)     각 4 Master + 4 Replica
+큐 하나 → 둘 중 하나에 배정 (RedisClusterAssigner, queueId 해시)
+한 큐의 키 4종(waiting/seq/tokens/last-active)은 반드시 같은 클러스터
+  └ 해시태그는 한 클러스터 안의 슬롯만 정렬한다. 경계는 못 넘는다
+큐 상태가 아닌 키(rl:*, apikey:*)는 전부 cluster1 (@Primary)
 ```
+
+> 🪤 **키를 새로 만들면 반드시 `QueueKeys`를 거칠 것.** 해시태그 없는 키를 다중 키 Lua의
+> `KEYS`에 끼우면 Cluster에서만 `CROSSSLOT`으로 깨진다 — **로컬 Sentinel로는 안 잡힌다.**
 
 ---
 
@@ -281,11 +284,12 @@ Failover: 5~10초 | Circuit Breaker → 503
 
 | 토픽 | 파티션 키 | 생산 | 소비 |
 |------|------|------|------|
-| `token-lifecycle` (18 파티션) | **`tokenId`** | Enqueue API (+ Sprint 7 상태 전이) | `queue-consumer`의 `TokenLifecycleConsumer` → tokens INSERT |
+| `token-lifecycle` (18 파티션) | **`tokenId`** | Enqueue · admit · verify/complete · 회수 배치 | `queue-consumer`의 `TokenLifecycleConsumer` → tokens 적재 |
 
 > **단일 토픽 + `tokenId` 키**인 이유: 순서 보장은 같은 토픽의 같은 파티션 안에서만 성립하고,
 > `queueId`로 잡으면 한 큐 30만 명이 통째로 한 파티션에 몰린다 ([DECISIONS §73](doc/DECISIONS.md) D16·D18).
-> admit 요청 전달 수단은 **미판정**(Sprint 7).
+> ✏️ 구 서술 "admit 요청 전달 수단은 **미판정**(Sprint 7)"은 **§80이 닫았다** — admit은 **동기 Lua**라
+> 전달할 명령이 없다. 명령 토픽(`enqueue-admit`)은 **만들지 않는다.**
 
 ---
 
@@ -319,7 +323,14 @@ Queue Engine API (API Key 인증, Sprint 6~7):
   POST   /api/v1/queues/:queueId/tokens/:tokenId/complete → Complete
 ```
 
-### JS SDK (브라우저용)
+### JS SDK (브라우저용) — ⬜ **설계만. 코드 0줄이다**
+
+> 🔴 **아래는 목표 인터페이스이지 동작하는 API가 아니다.** SDK는 아직 한 줄도 없다.
+> 지금 브라우저를 붙이려면 **REST를 직접 호출**해야 한다 → [`doc/TENANT_INTEGRATION.md`](doc/TENANT_INTEGRATION.md)
+>
+> 착수 전에 **지터 규약을 먼저 확정**해야 한다 — §79 본문(±20% 대칭)과 같은 절 Consequences
+> (하한 위로만, 비대칭)가 서로 다르다. 서버가 간격을 계산하지 않으므로 **SDK가 그 값을 지키는
+> 유일한 장치**다. 리더 탭(`BroadcastChannel`)도 확정만 되고 코드가 없다.
 
 ```javascript
 const queue = QueueSDK.init({
@@ -348,7 +359,7 @@ queue.startPolling({
 ```
 유저 → Tenant 서버      : 서비스 접속
 Tenant (REST API)       : POST /tokens → 대기토큰 발급
-Tenant → 유저           : token, queueId 전달
+Tenant → 유저           : tokenId, queueId, **seq** 전달   ← seq를 빼면 폴링이 아예 안 된다
 유저 (JS SDK)           : startPolling() → Platform 직접 Polling
 JS SDK → onReady        : admitToken 수신
 유저 → Tenant 서버      : admitToken 전달
@@ -401,7 +412,7 @@ Tenant (REST API)       : POST /verify → POST /complete
 | DB 연결 | JDBC + Virtual Thread | blocking → spring.threads.virtual.enabled=true |
 | Messaging | Spring Kafka | Enqueue 버퍼 + 상태 이벤트 |
 | Batch | Spring MVC + Tomcat | @Scheduled + Spring Kafka Consumer |
-| Cache | Redis Sentinel (현재) → 독립 2 Cluster (확정, 시점 미정) | FIFO Sorted Set + Lua 원자 · 큐 단위 이중 라우팅 ([DECISIONS §75](doc/DECISIONS.md)) |
+| Cache · Queue 상태 | **독립 2 Cluster + 큐 단위 라우팅** (§75, 구현 완료. ~~Sentinel~~은 학습 자산) | FIFO Sorted Set + Lua 원자 · 큐 단위 이중 라우팅 ([DECISIONS §75](doc/DECISIONS.md)) |
 | DB | MySQL 8.0 | Range 파티셔닝 + Replica |
 | Architecture | Hexagonal + DDD | 도메인 단위 테스트 |
 | Build | Gradle 멀티모듈 6개 | 의존성 명확 분리 |

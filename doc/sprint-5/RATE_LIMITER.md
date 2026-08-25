@@ -1,6 +1,10 @@
 # Sprint 5 Phase C — Rate Limiter 설계 + 구현 통합 문서
 
 > 작성일: 2026-06-10 (Sprint 5-C 완료 시점)
+>
+> ⚠️ **이 문서는 그 시점의 설계·구현 노트다.** 이후 폴링 전용 버킷이 추가됐다
+> (`rl:poll:token:{tokenId}`, cap 5 · refill 1.0/s — §74·PR #23).
+> **운영 수치의 정본은 `doc/monitoring/runbook/rate-limit.md`다**(코드 줄 번호까지 대조돼 있다).
 > 목적: Queue Platform의 Rate Limiter 알고리즘 선택, 분리, 구현, 면접 답변 자산 통합 정리
 
 ---

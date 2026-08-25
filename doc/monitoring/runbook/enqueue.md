@@ -171,7 +171,11 @@ HTTP 요청
 
 ### [증상] enqueue가 429(Q005 QUEUE_FULL)를 반환한다
 
-- **먼저 의심할 것**: 진짜 정원 초과가 아니라 **`waiting` ZSet에서 아무것도 빠지지 않아서**일 가능성이 높다. 전 소스에 `ZREM`이 0건이다(admit 미구현). 한 번 들어간 항목은 영원히 남는다.
+- **먼저 의심할 것**: 진짜 정원 초과인지, 아니면 **`waiting`에서 빠지는 속도가 못 따라가는 것**인지.
+  ✏️ **구 서술 "전 소스에 `ZREM`이 0건이다(admit 미구현)"는 더 이상 사실이 아니다.** admit이 빼고,
+  회수 배치 3경로(`admit_expire`·`inactive_expire`·`waiting_expire`)가 뺀다. 그러니 **지금은 두 갈래**다 —
+  ① Tenant가 `admit`을 안 부르고 있다(Backpressure Pull이라 Platform은 먼저 안 뺀다)
+  ② 회수 배치가 안 돌거나 밀렸다(`TokenReclaimJob` 로그의 회수 3경로 건수를 본다).
 - **1분 안에 확인**:
   ```bash
   redis-cli -p 6380 zcard 'queue:{q_xxx}:waiting'
@@ -179,9 +183,14 @@ HTTP 요청
     "SELECT max_capacity FROM queues WHERE queue_id='q_xxx'"
   ```
   **ZCARD ≥ max_capacity면 FULL이 맞다.** 이때 ZCARD가 실제 "지금 기다리는 사람 수"와 같은지는 별개 문제다.
-- **정상 범위**: ZCARD < max_capacity × 0.8을 경고선으로 (`MONITORING_DESIGN.md` 4-2). 다만 **줄어드는 경로가 없으므로 이 값은 단조증가한다** — 시간에 따른 절대 기준을 세울 수 없다.
+- **정상 범위**: ZCARD < max_capacity × 0.8을 경고선으로 (`MONITORING_DESIGN.md` 4-2).
+  ✏️ 구 서술의 "줄어드는 경로가 없어 단조증가한다"는 **폐기됐다** — admit과 회수 배치가 뺀다.
+  이제 이 값은 **오르내린다**. 그래서 절대값보다 **추세**를 본다: 유입 > (admit + 회수)면 계속 오른다.
 - **원인별 분기**:
-  - 이 큐의 이벤트가 이미 끝났는데 ZCARD가 그대로 → 좀비 WAITING. 청소 경로가 미구현이다.
+  - 이 큐의 이벤트가 이미 끝났는데 ZCARD가 그대로 → 좀비 WAITING.
+    ✏️ **청소 경로는 이제 있다** — `waitingTtl`(기본 7200초) 절대 만료가 회수한다.
+    그래도 안 줄면 `TokenReclaimJob`이 도는지, 그 큐의 `waitingTtl` 설정이 과도하게 큰지 본다.
+    `queue_waiting_orphans` 게이지(맨 앞 항목의 `tokens` Hash 미스)도 함께 본다.
   - 429(RL001)와 429(Q005)는 **같은 HTTP 상태 코드**다. 응답 본문의 `error` 필드로 구분: `Q005`=정원, `RL001`=Rate Limit.
 - **조치**: 정원을 늘린다 (다음 배치 사이클부터 반영 — `getMaxCapacity()`가 매 사이클 DB를 읽으므로 캐시 무효화 불필요):
   ```sql

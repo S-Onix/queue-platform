@@ -1,7 +1,9 @@
 # 조회 쿼리 — Kafka 비동기 영속화 / 정합성 대조
 
 > RunBook: [`doc/monitoring/runbook/kafka-persistence.md`](../runbook/kafka-persistence.md)
-> **§3의 3자 대조가 이 문서의 핵심이다.** 발행 갭(Redis O / DB X)을 발견하는 유일한 수단이고, reconciliation은 미구현이다.
+> **§3의 3자 대조가 이 문서의 핵심이다.** 발행 갭(Redis O / DB X)을 손으로 확인하는 수단이다.
+> ✏️ **탐지 자체는 이제 `ReconcileJob`(5분)이 한다** — `queue_reconcile_ghosts` 게이지를 먼저 보라.
+> 이 문서의 절차는 **그 값이 0이 아닐 때** 어느 tokenId인지 특정하고 메우는 데 쓴다. **복구(재적재)는 아직 배치가 하지 않는다.**
 
 ## 0. 준비
 
@@ -159,7 +161,13 @@ while IFS=$'\t' read -r id tok ts; do
 done < /tmp/ghost_$Q.tsv > /tmp/ghost_full_$Q.tsv
 ```
 
-### 3-3. 수동 보정 INSERT (reconciliation 미구현이므로 사람 손으로)
+### 3-3. 수동 보정 INSERT — ⚠️ **`queue_reconcile_ghosts` > 0 을 확인한 뒤에만**
+
+> 🔴 **평상시에 돌리지 마라.** `ReconcileJob`이 유령 토큰을 **탐지**하지만 **재적재는 하지 않는다**
+> (그 값이 0이 아닌 것을 실제로 본 뒤에 붙이기로 했다). 그 공백을 사람이 메우는 절차다.
+>
+> **과금이 `tokens` 행 수다**(§84). 여기서 만든 행은 그대로 청구서가 되고, 배치가 나중에
+> 같은 일을 하게 되면 이 절차와 겹친다. 실행 전 게이지를 보고, 실행한 `token_id` 목록을 남겨라.
 
 ```bash
 # epoch millis → UTC DATETIME(3) 문자열. ⚠️ 1ms만 어긋나도 UNIQUE(token_id, issued_at)가 다른 행으로 본다
