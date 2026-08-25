@@ -1,5 +1,6 @@
 package com.sonix.queue.infrastructure.token;
 
+import com.sonix.queue.infrastructure.adapter.BillingJdbcAdapter;
 import com.sonix.queue.infrastructure.adapter.TokenJpaAdapter;
 import com.sonix.queue.infrastructure.config.DataSourceConfig;
 import com.sonix.queue.infrastructure.config.JpaConfig;
@@ -39,6 +40,6 @@ import org.springframework.context.annotation.Import;
         TransactionAutoConfiguration.class,
         JdbcTemplateAutoConfiguration.class
 })
-@Import({DataSourceConfig.class, JpaConfig.class, TokenJpaAdapter.class})
+@Import({DataSourceConfig.class, JpaConfig.class, TokenJpaAdapter.class, BillingJdbcAdapter.class})
 public class TokenJpaTestConfig {
 }
