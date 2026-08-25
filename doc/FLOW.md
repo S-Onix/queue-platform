@@ -76,7 +76,8 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
   - 해시태그 있으면: 셋 다 같은 slot → 같은 Master → 정상
   - `poll_verify.lua`도 3키다 (waiting + tokens + last-active, §74)
 - Sentinel에선 무해하므로 **선제 적용 완료** (로컬 Cluster A에서 실제 스크립트 실행 검증)
-- 이중 라우팅 (Sprint 12+): 태그가 shard로 이동 → `queue:{shard_X}:{queueId}:waiting`
+- ~~이중 라우팅 (Sprint 12+): 태그가 shard로 이동 → `queue:{shard_X}:{queueId}:waiting`~~
+  → 🔴 **철회** — 태그 기준은 `queueId`로 확정됐다(§70 D10). 키 이름에 shard를 넣으면 라우팅이 순환한다(`QueueKeys.java` javadoc · `DECISIONS §67` 머리말)
 
 ### Kafka 적재 (구현 완료 — DECISIONS §73)
 
