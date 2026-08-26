@@ -67,7 +67,6 @@ public class QueueService {
         return QueueResponse.from(queue);
     }
 
-    @Transactional
     /**
      * 도메인의 상태 가드({@code IllegalStateException})를 409 {@code QE006}으로 바꾼다.
      *
@@ -88,6 +87,7 @@ public class QueueService {
         }
     }
 
+    @Transactional
     public QueueResponse deleteQueue(Long tenantId, String queueId) {
         Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
 
