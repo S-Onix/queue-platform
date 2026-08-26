@@ -226,7 +226,9 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
 --     ③ 과금 근거가 아니다 (과금은 enqueue 수 기준).
 --   대체:
 --     멱등 → Redis queue:{q}:admit-idem:{requestId} (결과 payload 저장 → REPLAY)
---     장기 이력 → queue_daily_stats.total_admit_count
+--     장기 이력 → ⚠️ 남지 않는다. queue_daily_stats.total_admit_issued는 "발급된 입장권 수"이지
+--                    "admit 호출 수"가 아니다(호출 1회에 N명). tokens에서 뽑을 수 있는 건 전자뿐이라
+--                    요청 수는 Micrometer 카운터 소관이다 — 일별 테이블이 받을 수 없다 (§86)
 --   ⚠️ 대가: Redis 멱등키가 유실되면 중복 admit을 감지할 수단이 없다.
 --      UNIQUE (request_id)가 마지막 방어선이었다. §80이 명시적으로 수용한 비용이다.
 -- ================================================================
@@ -252,24 +254,46 @@ CREATE TABLE billing_snapshots (
 
 
 -- queue_daily_stats: 파티션 DROP 후 과금/통계 근거 영구 보존
--- INSERT-only 불변 테이블 (감사 기준)
+--   tokens는 M+2월에 파티션째 사라진다. 그때 "어느 큐가 어느 날 얼마나 받았나"를
+--   재구성할 수 있는 표는 여기뿐이다 — billing_snapshots는 tenant×month 합계뿐이라
+--   테넌트가 큐를 둘 이상 쓰는 순간 분해가 영구히 불가능해진다.
+--
+--   ⚠️ INSERT-only가 아니다. UPSERT로 덮어쓴다. 전월분은 그 달 내내 다시 집계되는데,
+--      그렇게 안 하면 늦게 admit된 토큰(= 가장 오래 기다린 토큰, 이 표의 존재 이유)이
+--      통째로 빠진다. 예전 `ON DUPLICATE KEY UPDATE id = id`가 정확히 그 결함이었다.
+--   ⚠️ stat_date는 UTC 날짜다. 파티션 축(issued_at)·billing 축과 같아야
+--      SUM(total_enqueued) == billing_snapshots.count 롤업 검증이 성립한다.
 CREATE TABLE queue_daily_stats (
     id                BIGINT      NOT NULL AUTO_INCREMENT,
     tenant_id         BIGINT      NOT NULL,
     queue_id          VARCHAR(50) NOT NULL,
-    stat_date         DATE        NOT NULL,
+    stat_date         DATE        NOT NULL,   -- DATE(issued_at), UTC. "줄 선 날" 기준
     total_enqueued    INT         NOT NULL DEFAULT 0,
     total_completed   INT         NOT NULL DEFAULT 0,
     -- 🔴 total_cancelled 삭제 (DECISIONS §82) — 항상 0이 될 컬럼이다
     total_expired     INT         NOT NULL DEFAULT 0,
-    total_admit_count INT         NOT NULL DEFAULT 0,
-    avg_wait_sec      INT         NULL,
+    -- 발급된 입장권 수다. "입장한 사람 수"가 아니고, admit API 호출 수도 아니다
+    -- (호출 1회에 N명이 나간다). status로는 못 센다 — ReconcileJob이 잔류 ADMIT_ISSUED를
+    -- status=4로 정리하므로 SUM(status=1)은 0이 나온다(실측 15,151건이 status=4에 숨어 있었다).
+    total_admit_issued INT        NOT NULL DEFAULT 0,
+    -- AVG가 아니라 SUM인 이유: 평균은 합산되지 않는다. 일별 AVG 30개로 월 AVG를 못 만든다
+    -- (각 날의 표본 수를 모르면 가중을 못 준다). 분모는 total_admit_issued가 이미 갖고 있다.
+    -- BIGINT인 이유: 30만 × waitingTtl 7200 = 2.16e9 > INT_MAX 2,147,483,647
+    -- NULL = admit 0건(표본 없음). 0("즉시 입장")과 다르므로 DEFAULT 0을 주지 마라
+    sum_wait_sec      BIGINT      NULL,
+    -- MAX는 합산된다(MAX(MAX) = 기간 MAX). 백분위는 안 되므로 p50/p99 컬럼은 두지 않는다
+    -- ⚠️ 음수가 들어올 수 있다. issued_at·admitted_at 둘 다 앱 시계라 API 서버 N대의
+    --    스큐만큼 어긋난다(실측 -398초 1건). GREATEST(...,0)로 가리지 않는다 — 스큐 신호다
     max_wait_sec      INT         NULL,
     created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                                  ON UPDATE CURRENT_TIMESTAMP(3),
 
     PRIMARY KEY (id),
-    UNIQUE KEY uq_queue_daily_stat (queue_id, stat_date),
-    INDEX idx_queue_daily_tenant   (tenant_id, stat_date)
+    UNIQUE KEY uq_queue_daily_stat (queue_id, stat_date)
+    -- idx_queue_daily_tenant는 두지 않는다. 읽는 쿼리(BillingJdbcAdapter.COUNT_MISMATCH)가
+    -- stat_date 범위로만 걸어서 (tenant_id, stat_date) 선두 컬럼을 못 타기 때문이다 —
+    -- 있어도 안 쓰인다. 파티션도 아닌 소형 표라 리더가 늘면 그때 온라인으로 붙이면 된다
 );
 
 
@@ -277,31 +301,53 @@ CREATE TABLE queue_daily_stats (
 -- 파티션 운영 쿼리 (1달 유예 — M월 파티션은 M+2월 초 DROP)
 --
 -- 예시: 4월 파티션(p2026_04) → 6월 초 처리
+--
+-- 🔴 이 절은 이제 **참고용이다.** 정본은 BillingSnapshotJob.purgeSettledPartition 이고
+--    매월 1일 00:05 UTC에 자동으로 돈다 (§86). 손으로 돌 일이 있으면 아래 순서를 지켜라 —
+--    **순서 자체가 게이트다.**
+--
+--      ① 파티션이 있는가          (없으면 이미 지운 것이다. 정상)
+--      ② Step 1 + Step 2 집계     (던지면 여기서 멈춘다)
+--      ③ 대사 = 0 인가            (SUM(daily) == billing.count)
+--      ④ 원본이 있는데 집계가 0행은 아닌가
+--         └ ③만 믿으면 안 된다. **두 집계가 나란히 실패해 둘 다 0행이면 대사도 0**이다
+--      ⑤ 그때만 DROP
+--
+-- 🪤 DROP 대상 달은 **일일/월별 집계 대상에 없다.** 6/5에 지우는 건 4월인데 그날 잡이 보는 건
+--    5월·6월이다. 그래서 ②를 지우기 직전에 한 번 더 하는 것이고, 안 하면 그 사이 도착한
+--    4월 토큰이 아무에게도 안 세어진 채 사라진다 = 미청구.
 -- ================================================================
 
 -- Step 1: queue_daily_stats 집계 (파티션 DROP 전 필수)
+--   🔴 정본 구현은 BillingJdbcAdapter.UPSERT_DAILY_STATS 이고, 여기는 그것과 같은 모양을 유지한다.
+--   🔴 PARTITION (pYYYY_MM)은 프루닝(§83)이자 가드다 — 이미 DROP된 달을 실수로 재집계하면
+--      ERROR 1735로 죽는다. 범위 조건만 있으면 남은 행만 세어 통계를 조용히 0으로 깎는다.
+--   🔴 ODKU는 덮어쓴다. id = id로 두면 늦게 붙는 admit이 영원히 반영되지 않는다.
+--   🪤 INSERT ... SELECT에는 행 별칭(AS new)을 못 붙인다 — 파생 테이블 별칭(AS a)이 유일한 방법.
 INSERT INTO queue_daily_stats
     (tenant_id, queue_id, stat_date,
-     total_enqueued, total_completed,
-     total_expired, total_admit_count, avg_wait_sec, max_wait_sec)
-SELECT
-    tenant_id,
-    queue_id,
-    DATE(issued_at)                                             AS stat_date,
-    COUNT(*)                                                    AS total_enqueued,
-    SUM(status = 2)                                             AS total_completed,
-    SUM(status = 4)                                             AS total_expired,
-    0                                                           AS total_admit_count,
-    -- ⚠️ issued_at·completed_at 둘 다 UTC일 때만 맞다. completed_at은 Sprint 7 미구현이다.
-    --    규약이 어떻게 UTC를 보장하는지(JVM TZ + JDBC 2개)는 위 [시각 규약] 참조 —
-    --    그 셋 중 하나라도 어긋난 채 값이 들어가면 이 두 줄이 통째로 32,400초 어긋난다.
-    AVG(TIMESTAMPDIFF(SECOND, issued_at, completed_at))         AS avg_wait_sec,
-    MAX(TIMESTAMPDIFF(SECOND, issued_at, completed_at))         AS max_wait_sec
-FROM tokens
-WHERE issued_at >= '2026-04-01'
-  AND issued_at <  '2026-05-01'
-GROUP BY tenant_id, queue_id, DATE(issued_at)
-ON DUPLICATE KEY UPDATE id = id; -- 멱등: 배치 재실행 안전
+     total_enqueued, total_completed, total_expired,
+     total_admit_issued, sum_wait_sec, max_wait_sec)
+SELECT a.tenant_id, a.queue_id, a.stat_date, a.enq, a.cmp, a.exp, a.adm, a.sw, a.mw
+  FROM (SELECT tenant_id, queue_id,
+               DATE(issued_at)                                    AS stat_date,
+               COUNT(*)                                           AS enq,
+               SUM(status = 2)                                    AS cmp,
+               SUM(status = 4)                                    AS exp,
+               SUM(admitted_at IS NOT NULL)                       AS adm,
+               -- ⚠️ 기준은 admitted_at이다. completed_at이 아니다 —
+               --    그 구간엔 테넌트 내부 처리 시간과 컨슈머 적용 지연이 섞인다.
+               --    issued_at → admitted_at이 Platform이 단독으로 책임지는 유일한 구간이다.
+               SUM(TIMESTAMPDIFF(SECOND, issued_at, admitted_at)) AS sw,
+               MAX(TIMESTAMPDIFF(SECOND, issued_at, admitted_at)) AS mw
+          FROM tokens PARTITION (p2026_04)
+         WHERE issued_at >= '2026-04-01'
+           AND issued_at <  '2026-05-01'
+         GROUP BY tenant_id, queue_id, DATE(issued_at)) AS a
+ON DUPLICATE KEY UPDATE
+    total_enqueued     = a.enq, total_completed = a.cmp,
+    total_expired      = a.exp, total_admit_issued = a.adm,
+    sum_wait_sec       = a.sw,  max_wait_sec    = a.mw;
 
 -- Step 2: billing_snapshots 집계 (tokens 원본에서 직접)
 --   🔴 상태 술어를 넣지 마라 (DECISIONS §82). 과금은 status를 보지 않는다 —
