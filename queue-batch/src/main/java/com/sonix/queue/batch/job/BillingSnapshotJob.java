@@ -16,20 +16,32 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * 월별 과금 스냅샷 (Sprint 9 · {@code doc/ROADMAP.md} §Sprint 9).
  *
- * <h2>왜 매월 1일 00:05(UTC)인가</h2>
- * 마감은 <b>월말</b>이다. 그런데 <b>월말 23:59에 돌리면 그 달의 마지막 60초를 못 센다</b> —
- * 23:59:00~23:59:59.999에 enqueue된 토큰이 집계 밖에 남고, 다음 마감은 한 달 뒤라
- * <b>청구서가 나간 뒤에야</b> 잡힌다. 경계를 완전히 넘긴 직후에 마감해야 누락 창이 0이 된다.
+ * <h2>매일 UTC 00:30 — 마감은 월 단위인데 실행은 왜 매일인가</h2>
+ * <b>마감 시각과 실행 주기는 다른 문제다.</b> 마감(= 한 달을 확정하는 순간)은 월 경계를 넘긴
+ * <b>1일 첫 실행</b>에서 일어난다. 실행을 매일 하는 것은 그 마감을 <b>보호</b>하기 위해서다.
  *
- * <p>00:00 정각이 아니라 00:05인 이유는 자정에 몰리는 다른 작업과 겹치지 않기 위해서다.
- * <b>{@code zone = "UTC"}는 못박는다</b> — 월 경계·파티션 표현식·{@code issued_at}이 전부 UTC라
- * 여기만 KST로 돌면 월이 바뀌는 순간 "전월"의 뜻이 9시간 어긋난다.
+ * <p>🪤 <b>월말 23:59에 마감하면 그 달의 마지막 60초를 못 센다</b> — 23:59:00~23:59:59.999에
+ * enqueue된 토큰이 집계 밖에 남고, 다음 마감은 한 달 뒤라 <b>청구서가 나간 뒤에야</b> 잡힌다.
+ * 경계를 완전히 넘긴 뒤에 마감해야 누락 창이 0이 된다. 00:30이 그 자리다.
  *
- * <p>🔴 <b>월 1회라 재시도 여유가 없다.</b> 매일 돌던 때는 실패해도 다음 날이 가져갔지만
- * 이제는 다음 기회가 한 달 뒤다. 그래서 {@code failure} counter가 <b>경보 대상</b>이다 —
- * 실패를 놓치면 그 달 청구가 통째로 비거나 낡은 값으로 나간다.
- * (완전히 놓쳐도 마지막 방어가 하나 남는다: 그 달 파티션을 DROP하기 직전에
- * {@link #purgeSettledPartition}이 한 번 더 집계한다.)
+ * <p>🔴 <b>반대로 "월 1회만" 돌리면 자기 방어 장치가 셋 무너진다</b>(실제로 그렇게 바꿨다가 되돌렸다) —
+ * <ul>
+ *   <li>{@link #purgeSettledPartition}의 대상이 매 실행 이동하므로,
+ *       <b>DROP이 한 번 실패하면 그 파티션을 다시 보는 실행이 없다.</b>
+ *       그런데 {@code DROP_LOCK_WAIT_SECONDS}는 <b>포기를 정상 경로로 설계한 값</b>이라 실패가 드물지 않다</li>
+ *   <li>아래 "전월을 함께 다시 집계한다"가 <b>월초 1회</b>가 되어, 늦게 붙는 admit이 두 달간 빠진다</li>
+ *   <li>{@code mismatch} 게이지가 <b>한 달 내내 낡은 값</b>을 보고한다(기동 직후에는 0 = 정상으로 보인다)</li>
+ * </ul>
+ *
+ * <p>🪤 <b>00:05이 아니라 00:30인 이유</b>도 여기 있다. {@code ReconcileJob.SETTLE_SECONDS}가
+ * <b>300초</b>다 — "컨슈머가 5분까지 밀리는 것은 정상"이라고 이 레포가 못박은 값이다.
+ * 00:05에 마감하면 그 여유가 <b>정확히 0</b>이라, 말일 23:59:59에 enqueue된 토큰의 행이
+ * 00:05:01에 적재되면 <b>두 표에서 똑같이 빠진다</b>. 그러면 {@code countBillingMismatch}는
+ * 양쪽이 같이 놓쳤으므로 <b>0(정상)</b>을 돌려준다 — 자기 탐지기가 못 보는 사고 유형이 된다.
+ * 00:30은 그 6배 여유다.
+ *
+ * <p>매일 돌아서 얻는 것 셋 — 테넌트가 <b>당월 사용량을 오늘 본다</b> /
+ * 한 번 실패해도 <b>다음 날이 가져간다</b> / 16만 행에 115ms라 반박할 만한 비용이 아니다.
  *
  * <h2>전월을 함께 다시 집계한다</h2>
  * 5/1 00:30에 4월분이 확정돼 있다는 보장이 없다. 4/30 23:59:59에 enqueue된 토큰은 Kafka를
@@ -62,6 +74,9 @@ public class BillingSnapshotJob {
      * <p>같은 모듈의 다른 잡들은 gauge를 내지만 이건 counter다 — 관측 대상이 "지금 몇 개"가 아니라
      * "돌았는가"라서다. 실패는 최대 한 달 뒤 청구서에서 드러나므로 로그만으로는 늦다.
      */
+    /** 대사 결과 미상(미실행 또는 실패). 0(불일치 없음)과 구분하기 위한 값이다. */
+    private static final long NOT_MEASURED = -1L;
+
     private final Counter success;
     private final Counter failure;
 
@@ -74,10 +89,12 @@ public class BillingSnapshotJob {
      *
      * <p>⚠️ N대가 각자 같은 값을 보고하므로 PromQL에선 {@code sum}이 아니라 {@code max}로 본다.
      *
-     * <p>⚠️ <b>{@code -1}은 "대사 자체가 실패"다.</b> 0(정상)과 구분해야 한다 —
-     * 실패를 0으로 두면 조회가 깨진 순간 지표가 가장 건강해 보인다.
+     * <p>⚠️ <b>{@code -1}은 "값을 모른다"다</b> — 대사가 실패했거나 아직 한 번도 안 돌았다.
+     * 0(정상)과 구분해야 한다. 초기값도 {@code -1}인 이유가 같다: {@code 0}으로 두면
+     * <b>batch 기동 직후부터 첫 실행까지 지표가 가장 건강해 보인다.</b> 실패를 0으로 두면
+     * 조회가 깨진 순간 같은 일이 벌어진다 — 둘은 같은 함정의 두 얼굴이다.
      */
-    private final AtomicLong mismatch = new AtomicLong();
+    private final AtomicLong mismatch = new AtomicLong(NOT_MEASURED);
 
     public BillingSnapshotJob(BillingRepository billingRepository, MeterRegistry meterRegistry) {
         this.billingRepository = billingRepository;
@@ -89,9 +106,12 @@ public class BillingSnapshotJob {
     }
 
     /**
-     * 매월 1일 00:05 UTC. 근거는 클래스 javadoc 참조.
+     * 매일 UTC 00:30. 근거(왜 매일인지·왜 00:05이 아닌지)는 클래스 javadoc 참조.
+     *
+     * <p><b>{@code zone = "UTC"}는 못박는다</b> — 월 경계·파티션 표현식·{@code issued_at}이 전부
+     * UTC라 여기만 KST로 돌면 월이 바뀌는 날 "전월"의 뜻이 9시간 어긋난다.
      */
-    @Scheduled(cron = "${queue.batch.billing.cron:0 5 0 1 * *}", zone = "UTC")
+    @Scheduled(cron = "${queue.batch.billing.cron:0 30 0 * * *}", zone = "UTC")
     public void snapshot() {
         YearMonth current = YearMonth.from(LocalDate.now(ZoneOffset.UTC));
 
@@ -178,7 +198,9 @@ public class BillingSnapshotJob {
                     + "이후 이 달의 근거는 queue_daily_stats·billing_snapshots뿐이다", target, rows);
         } catch (RuntimeException e) {
             // 경쟁에서 진 인스턴스의 ERROR 1507도 여기로 온다 — 결과가 같으므로 피해가 없다.
-            // 그 외 실패는 다음 날 주기가 그대로 다시 시도한다. 유예가 한 달이라 창이 넉넉하다
+            // 🔑 그 외 실패는 **다음 날 주기가 그대로 다시 시도한다**. 이 문장이 참이려면
+            //    잡이 매일 돌아야 한다 — lock_wait_timeout이 짧아 포기가 정상 경로이기 때문이다.
+            //    월 1회로 바꾸면 대상이 이동해 그 파티션을 다시 보는 실행이 없어진다(클래스 javadoc)
             log.error("파티션 정리 실패 month={} — DROP은 일어나지 않았다", target, e);
         }
     }
@@ -209,7 +231,7 @@ public class BillingSnapshotJob {
             }
         } catch (RuntimeException e) {
             // 🔴 0으로 두면 "대사가 죽었다"가 "전부 정상"으로 보인다. 이 게이지가 유일한 경보면이다
-            mismatch.set(-1);
+            mismatch.set(NOT_MEASURED);
             log.error("과금 대사 실패 month={} — 게이지를 -1로 둔다(정상 0과 구분)", settled, e);
         }
     }

@@ -138,7 +138,7 @@ class BillingSnapshotJobTest {
     }
 
     @Test
-    @DisplayName("DROP 직전에 그 달을 한 번 더 집계한다 — 일일 집계가 안 보는 달이라 여기가 유일한 기회다")
+    @DisplayName("DROP 직전에 그 달을 한 번 더 집계한다 — 정기 집계가 안 보는 달이라 여기가 유일한 기회다")
     void aggregatesTargetMonthRightBeforeDrop() {
         YearMonth current = YearMonth.from(LocalDate.now(ZoneOffset.UTC));
         YearMonth target = current.minusMonths(2);
@@ -271,6 +271,12 @@ class BillingSnapshotJobTest {
         verify(billingRepository).upsertDailyStats(current);
         verify(billingRepository).countBillingMismatch(current.minusMonths(1));
         assertThat(counter("failure")).isEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("한 번도 안 돌았으면 게이지가 -1이다 — 0으로 두면 기동 직후가 가장 건강해 보인다")
+    void gaugeStartsUnmeasured() {
+        assertThat(registry.get("queue.billing.mismatch").gauge().value()).isEqualTo(-1.0);
     }
 
     private double gauge() {
