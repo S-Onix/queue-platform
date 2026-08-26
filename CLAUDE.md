@@ -399,7 +399,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 > 계기: 이 레포에 실제로 넷이 쌓여 있었다.
 > - `queue_daily_stats.total_admit_count` — 집계 SQL이 `0`을 상수로 박아 넣고 있었다 (§86에서 해소)
-> - `tokens.expired_reason` — 쓰는 코드 0건이고 `@Column(insertable = false)`라 **쓸 수조차 없다** (미해결)
+> - `tokens.expired_reason` — 쓰는 코드 0건이었다 (§86에서 해소. `insertable = false`는 유지가 맞았다 —
+>   막히는 건 JPA 경로뿐이고 사유를 쓰는 전이는 raw JDBC를 탄다)
 > - `queue_admission_wait_seconds` — `MONITORING_DESIGN.md`가 경보 정본이라 지목하는데 구현 0건 (미해결)
 > - `queue_daily_stats` 자체 — 쓰는 배치만 있고 읽는 코드가 0건이었다 (§86 롤업 대사로 해소)
 

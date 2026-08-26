@@ -357,6 +357,30 @@ class BillingSnapshotIntegrationTest {
     }
 
     @Test
+    @DisplayName("만료 사유별로 나눠 센다 — 셋의 의미가 정반대라 총계로는 조치가 안 나온다")
+    void splitsExpiredByReason() {
+        seedExpired("tok_d15", ldt(7, 15, 0), 3);   // INACTIVE   = 정상 이탈
+        seedExpired("tok_d16", ldt(7, 15, 0), 4);   // WAITING_TTL = 용량 부족
+        seedExpired("tok_d17", ldt(7, 15, 0), 4);
+        seedExpired("tok_d18", ldt(7, 15, 0), 2);   // ADMIT_STALE = Tenant 귀책
+        seed("tok_d19", ldt(7, 15, 0), 4);          // 사유 없는 옛 행 → 어느 칸에도 안 들어간다
+
+        adapter.upsertDailyStats(TARGET);
+
+        assertThat(stat("total_expired", QUEUE_ID, "2026-07-15")).isEqualTo(5);
+        assertThat(stat("expired_inactive", QUEUE_ID, "2026-07-15")).isEqualTo(1);
+        assertThat(stat("expired_waiting_ttl", QUEUE_ID, "2026-07-15")).isEqualTo(2);
+        assertThat(stat("expired_admit_stale", QUEUE_ID, "2026-07-15")).isEqualTo(1);
+        // 🔑 합(4) ≠ total_expired(5). 사유가 없던 시기의 행이 NULL이라 그렇고, 그 차이가
+        //    "언제부터 사유를 남기기 시작했나"다. 억지로 맞추면 그 정보가 사라진다
+    }
+
+    private void seedExpired(String tokenId, LocalDateTime issuedAt, int reason) {
+        seed(tokenId, issuedAt, 4);
+        jdbc.update("UPDATE tokens SET expired_reason = ? WHERE token_id = ?", reason, tokenId);
+    }
+
+    @Test
     @DisplayName("음수 대기를 그대로 보존한다 — GREATEST(...,0)으로 가리면 시계 스큐 신호가 사라진다")
     void preservesNegativeWaitFromClockSkew() {
         // 🔑 issued_at·admitted_at 둘 다 앱 시계라 API 서버 N대의 스큐만큼 음수가 나온다

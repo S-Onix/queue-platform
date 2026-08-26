@@ -52,6 +52,17 @@ public class TokenEntity implements Persistable<TokenEntityId> {
 
     // WAITING 삽입 시엔 DB 기본값 사용 → INSERT에서 제외 (insertable=false)
     @JdbcTypeCode(SqlTypes.TINYINT)
+    /**
+     * 만료 사유({@link com.sonix.queue.domain.queue.ExpiredReason}). {@code EXPIRED}에서만 채워진다.
+     *
+     * <p>🪤 <b>{@code insertable = false}는 유지한다.</b> "컬럼이 있는데 쓸 수조차 없다"는 지적이
+     * 있었지만 절반만 맞다 — 막히는 건 <b>JPA 경로뿐</b>이고, 사유를 쓰는 {@code EXPIRED} 전이는
+     * {@code TokenJpaAdapter.TRANSITION_INSERT}(raw JDBC)를 탄다. JPA 경로는 {@code ENQUEUED}
+     * 적재라 애초에 사유가 없다.
+     *
+     * <p>🔴 <b>풀면 {@code @SQLInsert}가 깨진다</b>(실측: {@code Parameter index out of range (8 > 7)}).
+     * 그 어노테이션은 컬럼 수가 고정된 SQL 문자열이라 매핑이 바뀌면 바인딩이 어긋난다.
+     */
     @Column(insertable = false) Integer expiredReason;
     @Column(insertable = false, length = 50) String  admitToken;
     /**

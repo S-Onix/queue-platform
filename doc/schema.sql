@@ -157,6 +157,15 @@ CREATE TABLE tokens (
     -- 🔴 admitToken TTL 만료자는 4가 아니라 **1에 머문다**(§36) — EXPIRED 가드가 status=0
     --    전용이라 no-op이고, 그것이 complete의 status IN (0,1) + 300초 창을 살린다.
     status            TINYINT      NOT NULL DEFAULT 0,
+    -- 만료 사유 (ExpiredReason, §86). 셋의 의미가 정반대라 조치가 갈린다 —
+    --   1 ADMIT_TTL    admitToken TTL(60초) 만료.  ⚠️ **DB에는 남지 않는다** — 그 경로는 status=1이라
+    --                  EXPIRED 가드에서 no-op이고, 같은 사람이 300초 뒤 2로 기록된다. 이벤트에만 있다
+    --   2 ADMIT_STALE  complete 창(300초) 초과. ReconcileJob이 **직접 UPDATE**로 쓴다 → Tenant 귀책
+    --   3 INACTIVE     inactiveTtl 초과(폴링 끊김) → 정상 이탈. 조치 없음
+    --   4 WAITING_TTL  waitingTtl 초과 → **용량 부족**. "슬롯을 늘리라"고 통보할 유일한 값
+    -- 🪤 NULL = 사유를 남기기 전(§86 이전)에 만료된 행이다. 0으로 채우지 마라 — 0은 뜻이 없다
+    -- 🪤 집계는 SUM(expired_reason <=> N)이다. `=`로 쓰면 전 행이 NULL인 그룹에서 SUM이
+    --    NULL을 돌려주고 NOT NULL 컬럼 적재가 통째로 실패한다(실측)
     expired_reason    TINYINT      NULL,
     admit_token       VARCHAR(50)  NULL,
     redis_sync_needed TINYINT      NOT NULL DEFAULT 0,
@@ -272,6 +281,13 @@ CREATE TABLE queue_daily_stats (
     total_completed   INT         NOT NULL DEFAULT 0,
     -- 🔴 total_cancelled 삭제 (DECISIONS §82) — 항상 0이 될 컬럼이다
     total_expired     INT         NOT NULL DEFAULT 0,
+    -- 만료 사유별 분해 (§86). 셋의 의미가 정반대라 합치면 조치로 이어지지 않는다 —
+    --   admit_stale = Tenant 귀책(입장권 쥐고 안 들어옴) / inactive = 정상 이탈
+    --   waiting_ttl = 용량 부족. "슬롯을 늘리라"고 통보해야 하는 유일한 값이다
+    -- ⚠️ 합이 total_expired와 다를 수 있다. expired_reason이 없던 시기의 행은 NULL이다
+    expired_admit_stale INT       NOT NULL DEFAULT 0,
+    expired_inactive    INT       NOT NULL DEFAULT 0,
+    expired_waiting_ttl INT       NOT NULL DEFAULT 0,
     -- 발급된 입장권 수다. "입장한 사람 수"가 아니고, admit API 호출 수도 아니다
     -- (호출 1회에 N명이 나간다). status로는 못 센다 — ReconcileJob이 잔류 ADMIT_ISSUED를
     -- status=4로 정리하므로 SUM(status=1)은 0이 나온다(실측 15,151건이 status=4에 숨어 있었다).
@@ -327,13 +343,18 @@ CREATE TABLE queue_daily_stats (
 INSERT INTO queue_daily_stats
     (tenant_id, queue_id, stat_date,
      total_enqueued, total_completed, total_expired,
+     expired_admit_stale, expired_inactive, expired_waiting_ttl,
      total_admit_issued, sum_wait_sec, max_wait_sec)
-SELECT a.tenant_id, a.queue_id, a.stat_date, a.enq, a.cmp, a.exp, a.adm, a.sw, a.mw
+SELECT a.tenant_id, a.queue_id, a.stat_date, a.enq, a.cmp, a.exp,
+       a.e_stale, a.e_inact, a.e_wait, a.adm, a.sw, a.mw
   FROM (SELECT tenant_id, queue_id,
                DATE(issued_at)                                    AS stat_date,
                COUNT(*)                                           AS enq,
                SUM(status = 2)                                    AS cmp,
                SUM(status = 4)                                    AS exp,
+               SUM(expired_reason <=> 2)                            AS e_stale,
+               SUM(expired_reason <=> 3)                            AS e_inact,
+               SUM(expired_reason <=> 4)                            AS e_wait,
                SUM(admitted_at IS NOT NULL)                       AS adm,
                -- ⚠️ 기준은 admitted_at이다. completed_at이 아니다 —
                --    그 구간엔 테넌트 내부 처리 시간과 컨슈머 적용 지연이 섞인다.
@@ -347,6 +368,8 @@ SELECT a.tenant_id, a.queue_id, a.stat_date, a.enq, a.cmp, a.exp, a.adm, a.sw, a
 ON DUPLICATE KEY UPDATE
     total_enqueued     = a.enq, total_completed = a.cmp,
     total_expired      = a.exp, total_admit_issued = a.adm,
+    expired_admit_stale = a.e_stale, expired_inactive = a.e_inact,
+    expired_waiting_ttl = a.e_wait,
     sum_wait_sec       = a.sw,  max_wait_sec    = a.mw;
 
 -- Step 2: billing_snapshots 집계 (tokens 원본에서 직접)

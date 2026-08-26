@@ -45,7 +45,16 @@ public record EnqueueEvent(
                 long seq,
                 Instant issuedAt,
                 String admitToken,
-                Instant admittedAt
+                Instant admittedAt,
+                /**
+                 * 만료 사유 코드({@link ExpiredReason#getCode()}). {@code EXPIRED} 이벤트에서만 채워지고
+                 * 나머지 이벤트에선 {@code null}이다 — {@code admitToken}·{@code admittedAt}과 같은 패턴이다.
+                 *
+                 * <p>🔑 <b>사유는 발행 지점에서 이미 갈려 있다.</b> {@code TokenReclaimJob}의 회수 3경로가
+                 * 각각 다른 메서드이고, 어느 규칙이 발화했는지 알면서 부른다. 이 칸이 없던 동안은
+                 * 그 정보를 <b>한 줄 뒤에 버리고 있었다</b>.
+                 */
+                Integer expiredReason
         ) {
 
     /**
@@ -73,7 +82,7 @@ public record EnqueueEvent(
                 TokenEventType.ENQUEUED.name(),
                 result.getTokenId(), queueId, tenantId,
                 result.getIdentifier(), result.getSeq(), result.getIssuedAt(),
-                null, null
+                null, null, null
         );
     }
 }

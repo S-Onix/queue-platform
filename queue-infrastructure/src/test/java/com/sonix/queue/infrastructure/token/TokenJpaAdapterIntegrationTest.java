@@ -1,5 +1,6 @@
 package com.sonix.queue.infrastructure.token;
 
+import com.sonix.queue.domain.queue.ExpiredReason;
 import com.sonix.queue.domain.queue.Token;
 import com.sonix.queue.domain.queue.TokenEventType;
 import com.sonix.queue.domain.queue.TokenStatus;
@@ -320,6 +321,48 @@ class TokenJpaAdapterIntegrationTest {
 
     private Token admitted(String tokenId, long seq) {
         return transition(tokenId, seq, TokenStatus.ADMIT_ISSUED, admitTokenFor(tokenId), ADMITTED_AT);
+    }
+
+    @Test
+    @DisplayName("만료 사유가 DB까지 도달한다 — 경로마다 다른 값이고, 안 실으면 영구 소실이다")
+    void transition_persistsExpiredReason() {
+        String inactive = "tok_r_i_" + UUID.randomUUID();
+        String waitingTtl = "tok_r_w_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(inactive, 11), waiting(waitingTtl, 12)));
+
+        adapter.applyTransition(TokenEventType.EXPIRED, List.of(
+                expired(inactive, 11, ExpiredReason.INACTIVE),
+                expired(waitingTtl, 12, ExpiredReason.WAITING_TTL)));
+
+        // 🔑 셋의 의미가 정반대라(정상 이탈 / 용량 부족) 총계로 합치면 조치로 이어지지 않는다
+        assertThat(reasonOf(inactive)).isEqualTo(ExpiredReason.INACTIVE.getCode());
+        assertThat(reasonOf(waitingTtl)).isEqualTo(ExpiredReason.WAITING_TTL.getCode());
+    }
+
+    @Test
+    @DisplayName("사유에도 status 가드가 걸린다 — 없으면 나중에 complete될 토큰에 만료 사유가 박힌다")
+    void transition_expiredReasonRespectsStatusGuard() {
+        // 🔴 expired_reason을 무조건 쓰면 이 행은 status=2(완료)인데 expired_reason이 채워진다.
+        //    그러면 통계가 "완료됐는데 만료된 토큰"이라는 거짓을 말한다.
+        String token = "tok_r_g_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(token, 13)));
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(token, 13)));
+
+        adapter.applyTransition(TokenEventType.EXPIRED,
+                List.of(expired(token, 13, ExpiredReason.ADMIT_TTL)));
+
+        assertThat(statusOf(token)).as("§36 — 1에 머문다").isEqualTo(1);
+        assertThat(reasonOf(token)).as("사유도 안 박힌다. ADMIT_TTL은 ReconcileJob이 ADMIT_STALE로 쓴다").isNull();
+    }
+
+    private Token expired(String tokenId, long seq, ExpiredReason reason) {
+        return Token.transition(TokenStatus.EXPIRED, tokenId, QUEUE_ID, tenantId, "user_" + tokenId,
+                seq, ISSUED_AT, null, null, reason.getCode());
+    }
+
+    private Integer reasonOf(String tokenId) {
+        return jdbc.queryForObject("SELECT expired_reason FROM tokens WHERE token_id = ?",
+                Integer.class, tokenId);
     }
 
     private Token transition(String tokenId, long seq, TokenStatus status,

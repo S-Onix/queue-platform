@@ -3,6 +3,7 @@ package com.sonix.queue.batch.job;
 import com.sonix.queue.domain.queue.EnqueueEvent;
 import com.sonix.queue.domain.queue.EnqueueEventPublisher;
 import com.sonix.queue.domain.queue.ReclaimedToken;
+import com.sonix.queue.domain.queue.ExpiredReason;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
@@ -241,7 +242,7 @@ public class TokenReclaimJob {
         }
 
         for (ReclaimedToken token : claimed) {
-            publishExpired(queue, token);
+            publishExpired(queue, ExpiredReason.WAITING_TTL, token);
         }
         return claimed.size();
     }
@@ -270,7 +271,7 @@ public class TokenReclaimJob {
         }
 
         for (ReclaimedToken token : claimed) {
-            publishExpired(queue, token);
+            publishExpired(queue, ExpiredReason.INACTIVE, token);
         }
         return claimed.size();
     }
@@ -291,7 +292,7 @@ public class TokenReclaimJob {
         }
 
         for (ReclaimedToken expired : claimed) {
-            publishExpired(queue, expired);
+            publishExpired(queue, ExpiredReason.ADMIT_TTL, expired);
         }
         return claimed.size();
     }
@@ -330,13 +331,13 @@ public class TokenReclaimJob {
      * <b>reconciliation이 대조할 원본조차 없다</b>. 삼키는 선택은 유지하되(되돌릴 수단이 없다)
      * 이 갭은 Sprint 9 reconciliation의 몫이며 <b>지금은 에러 로그가 유일한 단서</b>다.
      */
-    private void publishExpired(Queue queue, ReclaimedToken expired) {
+    private void publishExpired(Queue queue, ExpiredReason reason, ReclaimedToken expired) {
         if (!expired.publishable()) {
             // tokens Hash 미스 = tokenId/issuedAt을 모른다. 컨슈머의 멱등 키가
             // (token_id, issued_at)이라 추측해 채우면 같은 토큰의 두 번째 행이 생긴다.
             // 게이트 해제(HDEL)는 Lua에서 이미 끝났으므로 사용자의 재-enqueue는 막히지 않는다.
-            log.error("EXPIRED 발행 생략(tokenId·issuedAt 미확인) queueId={} identifier={} seq={}",
-                    queue.getQueueId(), expired.identifier(), expired.seq());
+            log.error("EXPIRED 발행 생략(tokenId·issuedAt 미확인) queueId={} identifier={} seq={} reason={}",
+                    queue.getQueueId(), expired.identifier(), expired.seq(), reason);
             return;
         }
 
@@ -349,7 +350,7 @@ public class TokenReclaimJob {
                     expired.identifier(),
                     expired.seq(),
                     expired.issuedAt(),
-                    null, null));
+                    null, null, reason.getCode()));
         } catch (RuntimeException e) {
             log.error("EXPIRED 발행 실패 tokenId={} queueId={} — Redis 회수는 이미 확정됐다",
                     expired.tokenId(), queue.getQueueId(), e);

@@ -156,7 +156,7 @@ public class QueueEngineService {
             }
             boolean published = publishQuietly(new EnqueueEvent(TokenEventType.ADMITTED.name(),
                     record.tokenId(), queueId, tenantId, record.identifier(), record.seq(),
-                    record.issuedAt(), record.admitToken(), admittedAt));
+                    record.issuedAt(), record.admitToken(), admittedAt, null));
             if (!published) {
                 log.error("ADMITTED 발행 중단 queueId={} 건너뜀={}건 첫tokenId={}",
                         queueId, records.size() - i, record.tokenId());
@@ -226,7 +226,7 @@ public class QueueEngineService {
         publishQuietly(new EnqueueEvent(
                 TokenEventType.COMPLETED.name(), token.getTokenId(), queueId, tenantId,
                 token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC),
-                admitToken, null));
+                admitToken, null, null));
 
         return token.getUserId();
     }
@@ -245,7 +245,7 @@ public class QueueEngineService {
         }
         publishQuietly(new EnqueueEvent(
                 TokenEventType.COMPLETED.name(), ref.tokenId(), queueId, tenantId,
-                ref.identifier(), ref.seq(), ref.issuedAt(), admitToken, null));
+                ref.identifier(), ref.seq(), ref.issuedAt(), admitToken, null, null));
     }
 
     /**
@@ -291,7 +291,7 @@ public class QueueEngineService {
         // ADMITTED가 이미 채운 값이다(§80 가드 표).
         publishQuietly(new EnqueueEvent(TokenEventType.COMPLETED.name(), tokenId, queueId, tenantId,
                 token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC),
-                admitToken, null));
+                admitToken, null, null));
 
         return completedAt;
     }

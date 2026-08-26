@@ -119,7 +119,7 @@ class TokenLifecycleConsumerTest {
         doNothing().when(persistService).persist(any(), anyList());
 
         List<EnqueueEvent> legacy = List.of(new EnqueueEvent(
-                null, "tok_0", "q_test", 1L, "u0", 1L, Instant.ofEpochMilli(1L), null, null));
+                null, "tok_0", "q_test", 1L, "u0", 1L, Instant.ofEpochMilli(1L), null, null, null));
 
         assertThatCode(() -> consumer.consume(legacy)).doesNotThrowAnyException();
 
@@ -177,7 +177,7 @@ class TokenLifecycleConsumerTest {
 
         Instant admittedAt = Instant.ofEpochMilli(1_700_000_009_000L);
         consumer.consume(List.of(new EnqueueEvent("ADMITTED", "tok_0", "q_test", 1L, "u0", 1L,
-                Instant.ofEpochMilli(1_700_000_000_000L), "adm_0", admittedAt)));
+                Instant.ofEpochMilli(1_700_000_000_000L), "adm_0", admittedAt, null)));
 
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<Token>> captor = ArgumentCaptor.forClass(List.class);
@@ -240,7 +240,7 @@ class TokenLifecycleConsumerTest {
 
     private static EnqueueEvent withType(String eventType, EnqueueEvent e) {
         return new EnqueueEvent(eventType, e.tokenId(), e.queueId(), e.tenantId(), e.userId(),
-                e.seq(), e.issuedAt(), e.admitToken(), e.admittedAt());
+                e.seq(), e.issuedAt(), e.admitToken(), e.admittedAt(), null);
     }
 
     private static List<EnqueueEvent> events(int count) {
@@ -248,7 +248,7 @@ class TokenLifecycleConsumerTest {
         for (int i = 0; i < count; i++) {
             events.add(new EnqueueEvent(
                     "ENQUEUED", "tok_" + i, "q_test", 1L, "u" + i, i + 1,
-                    Instant.ofEpochMilli(1_700_000_000_000L + i), null, null));
+                    Instant.ofEpochMilli(1_700_000_000_000L + i), null, null, null));
         }
         assertThat(events).hasSize(count);
         return events;

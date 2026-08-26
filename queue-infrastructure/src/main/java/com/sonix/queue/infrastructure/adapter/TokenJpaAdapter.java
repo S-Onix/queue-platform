@@ -46,8 +46,8 @@ public class TokenJpaAdapter implements TokenRepository {
      * {@code TokenUpsertRewriteTest}가 이 사실을 왕복 횟수로 못박는다.
      */
     private static final String TRANSITION_INSERT = """
-            INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at, admit_token, admitted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) AS new
+            INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at, admit_token, admitted_at, expired_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AS new
             ON DUPLICATE KEY UPDATE
             """;
 
@@ -93,8 +93,17 @@ public class TokenJpaAdapter implements TokenRepository {
         // 🔴 출발이 0뿐인 것은 의도다 (§36). admitToken TTL 만료자는 status = 1이라 여기서
         //    no-op이 되고, 그래야 complete의 status IN (0, 1) + 300초 유효 창이 살아남는다.
         //    IN (0, 1)로 넓히면 늦은 입장이 INVALID_ADMIT_TOKEN이 된다.
-        sql.put(TokenEventType.EXPIRED, TRANSITION_INSERT +
-                "status = IF(tokens.status = 0, 4, tokens.status)");
+        // 🔴 expired_reason에도 **같은 가드가 필요하다.** 무조건 쓰면 status = 1로 살아 있다가
+        //    나중에 complete되는 토큰에 "만료됨" 사유가 박힌다 — 그 행은 status = 2인데
+        //    expired_reason이 채워져 있어 통계가 거짓말을 한다.
+        // 🪤 값을 '?'가 아니라 new.expired_reason으로 받는 이유: ODKU의 SET 절에 '?'를 쓰면
+        //    rewriteBatchedStatements가 조용히 꺼진다(admit_token이 같은 우회를 하는 그 이유).
+        //    INSERT의 VALUES 자리에 있는 '?'는 그 문제가 없다.
+        // 🪤 admitToken TTL 만료(ADMIT_TTL)는 status가 1이라 여기서 통째로 no-op이므로
+        //    DB에 남지 않는다. 그 경로의 사유는 ReconcileJob의 직접 UPDATE가 ADMIT_STALE로 쓴다.
+        sql.put(TokenEventType.EXPIRED, TRANSITION_INSERT + """
+                expired_reason = IF(tokens.status = 0, new.expired_reason, tokens.expired_reason),
+                status         = IF(tokens.status = 0, 4, tokens.status)""");
         return Map.copyOf(sql);
     }
 
@@ -154,6 +163,10 @@ public class TokenJpaAdapter implements TokenRepository {
                 else ps.setString(8, token.getAdmitToken());
                 if (token.getAdmittedAt() == null) ps.setNull(9, Types.TIMESTAMP);
                 else ps.setObject(9, token.getAdmittedAt());
+                // EXPIRED에서만 값이 있다. 나머지 이벤트에선 NULL이고, ODKU 가드가
+                // tokens.expired_reason을 보존하므로 기존 값을 지우지 않는다
+                if (token.getExpiredReason() == null) ps.setNull(10, Types.TINYINT);
+                else ps.setInt(10, token.getExpiredReason());
             }
 
             @Override

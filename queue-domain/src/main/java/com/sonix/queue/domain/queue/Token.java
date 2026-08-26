@@ -89,6 +89,21 @@ public class Token {
     public static Token transition(TokenStatus status, String tokenId, String queueId, Long tenantId,
                                    String userId, long seq, LocalDateTime issuedAt,
                                    String admitToken, LocalDateTime admittedAt) {
+        return transition(status, tokenId, queueId, tenantId, userId, seq, issuedAt,
+                admitToken, admittedAt, null);
+    }
+
+    /**
+     * 만료 사유({@link ExpiredReason#getCode()})까지 실어 나르는 전이.
+     *
+     * <p>{@code EXPIRED}에서만 값이 있다. 사유는 <b>회수 배치의 호출 지점에서 이미 갈려 있고</b>
+     * (경로별로 다른 메서드다), 이 칸이 없던 동안은 그걸 한 줄 뒤에 버리고 있었다 —
+     * 그래서 만료 16만 건이 "왜 만료됐는지" 구분 불가였다(§86).
+     */
+    public static Token transition(TokenStatus status, String tokenId, String queueId, Long tenantId,
+                                   String userId, long seq, LocalDateTime issuedAt,
+                                   String admitToken, LocalDateTime admittedAt,
+                                   Integer expiredReason) {
         Token token = new Token();
         token.tokenId = tokenId;
         token.queueId = queueId;
@@ -96,7 +111,7 @@ public class Token {
         token.userId = userId;
         token.seq = seq;
         token.status = status;
-        token.expiredReason = null;
+        token.expiredReason = expiredReason;
         token.admitToken = admitToken;
         token.redisSyncNeeded = false;
         token.issuedAt = issuedAt;
