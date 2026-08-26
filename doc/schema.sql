@@ -195,6 +195,19 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
     PARTITION p2026_10 VALUES LESS THAN (202611),
     PARTITION p2026_11 VALUES LESS THAN (202612),
     PARTITION p2026_12 VALUES LESS THAN (202701),
+    -- 2027년분 사전 생성 (2026-08-26 적용, master+replica 실행 완료 — 2.7초, p_future 0행)
+    PARTITION p2027_01 VALUES LESS THAN (202702),
+    PARTITION p2027_02 VALUES LESS THAN (202703),
+    PARTITION p2027_03 VALUES LESS THAN (202704),
+    PARTITION p2027_04 VALUES LESS THAN (202705),
+    PARTITION p2027_05 VALUES LESS THAN (202706),
+    PARTITION p2027_06 VALUES LESS THAN (202707),
+    PARTITION p2027_07 VALUES LESS THAN (202708),
+    PARTITION p2027_08 VALUES LESS THAN (202709),
+    PARTITION p2027_09 VALUES LESS THAN (202710),
+    PARTITION p2027_10 VALUES LESS THAN (202711),
+    PARTITION p2027_11 VALUES LESS THAN (202712),
+    PARTITION p2027_12 VALUES LESS THAN (202801),
     PARTITION p_future  VALUES LESS THAN MAXVALUE
 );
 
@@ -308,11 +321,13 @@ SELECT agg.tenant_id, '202604', agg.cnt
 ON DUPLICATE KEY UPDATE `count` = agg.cnt;
 
 -- ================================================================
--- 🔴 파티션 유효 시한 — **2026-12-31까지다.** (2026-08-26 추가)
+-- 🔴 파티션 유효 시한 — **2027-12-31까지다.** (2026-08-26 갱신)
 --
 --   BillingSnapshotJob 은 매일 당월 파티션을 `FROM tokens PARTITION (pYYYY_MM)` 로 지목한다(§84).
---   위 정의는 p2026_12 로 끝나므로 **2027-01-01 UTC 00:30 부터 당월 집계가 매일 ERROR 1735
---   (Unknown partition 'p2027_01') 로 죽는다.** 실측 재현 완료.
+--   정의에 없는 달을 지목하면 ERROR 1735 (Unknown partition) 로 죽는다 — 실측 재현 완료.
+--
+--   ✅ 2026-08-26: 2027년 12개월분을 사전 생성했다 (master 3306 + replica 3307, 25 파티션).
+--      직전 시한이던 2027-01-01 은 해소됐다. **다음 마감은 2027-12 안이다.**
 --
 --   🪤 잡이 월별 try/catch 로 예외를 삼키므로 **앱은 안 죽는다.** 남는 신호는 로그 한 줄과
 --      queue_billing_snapshot_total{result="failure"} 뿐이다 — 조용히 멈춘다.
