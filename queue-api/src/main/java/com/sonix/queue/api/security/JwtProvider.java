@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.Date;
+import java.util.UUID;
 
 
 /**
@@ -73,6 +74,20 @@ public class JwtProvider {
                 .subject(id.toString())
                 .claim(CLAIM_TENANT_ID, tenantId)
                 .claim(CLAIM_TYPE, TYPE_REFRESH)
+                // 🔴 jti — **발급 사건을 유일하게 만드는 nonce다.** 없으면 같은 초의 두 발급이
+                //    바이트 단위로 같아진다(sub·tenantId·type·iat·exp가 전부 같고 iat는 초 단위다).
+                //    그러면 sha256도 같아 refresh_tokens.token_hash UNIQUE에 걸려 500이 난다.
+                //    실측 경로 둘: ① 로그인 더블클릭 ② refresh()가 폐기(:127) 직후 재발급(:131)해
+                //    **자기가 방금 지운 행과 충돌**한다.
+                //
+                //    ⚠️ **이 값을 읽는 코드를 만들지 마라.** 조회 키로 쓰거나 검증에서 필수로 걸면
+                //       그 순간 되돌리기 어려운 축이 된다 — 롤링 배포 중 구버전이 낸 jti 없는 토큰이
+                //       7일(Refresh 유효기간) 내내 401이 된다. 지금은 **쓰기 전용**이라 모르는
+                //       클레임으로 무시되고 구/신 4방향이 전부 호환된다.
+                //
+                //    Access Token에는 넣지 않는다 — DB에 저장하지 않아 UNIQUE 충돌이 없다.
+                //    §42가 예고한 블랙리스트를 실제로 만들 때 그때 판단한다.
+                .id(UUID.randomUUID().toString())
                 .issuedAt(Date.from(now))
                 .expiration(Date.from(now.plus(jwtProperties.refreshTokenExpiry())))
                 .signWith(keyStore.getActiveKey())

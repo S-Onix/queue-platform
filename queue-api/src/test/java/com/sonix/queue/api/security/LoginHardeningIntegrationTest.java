@@ -147,7 +147,15 @@ class LoginHardeningIntegrationTest {
      *
      * <p>SQL 직접 시드 대신 REST를 쓰는 이유는 전례다 — 시드가 필터 결함(D-1)을 숨긴 적이 있다.
      *
-     * <p>🔴 <b>계정을 나누고 로그인 횟수를 최소로 두는 이유:</b> 같은 테넌트가 <b>같은 초</b>에 두 번
+     * <p>✏️ <b>계정을 나누고 로그인 횟수를 최소로 둔 이유 — 이제는 해소된 결함 때문이다.</b>
+     * 이 테스트를 쓰던 시점엔 {@code jti}가 없어, 같은 테넌트가 <b>같은 초</b>에 두 번 로그인하면
+     * Refresh 토큰이 바이트 단위로 같아져 {@code refresh_tokens.token_hash} UNIQUE 위반으로
+     * <b>500</b>이 났다(이 테스트를 쓰다 실제로 재현했고, 그래서 그 경로를 피해 짰다).
+     *
+     * <p>지금은 {@code JwtProvider.generateRefreshToken}에 {@code jti}가 들어가 해소됐다
+     * (회귀 방지는 {@code JwtProviderTest}의 발급 유일성 단위 테스트가 맡는다).
+     * <b>구조를 그대로 두는 이유</b>는 이 클래스의 관심사가 로그인 방어이지 토큰 발급이 아니어서다 —
+     * 계정을 나눠 두면 폭주 테스트가 다른 케이스의 상태를 오염시키지 않는다.
      * 로그인하면 Refresh JWT가 바이트 단위로 동일해진다({@code JwtProvider}가 {@code jti}·nonce 없이
      * sub·tenantId·type·iat(초)·exp만 담는다). 그러면 {@code refresh_tokens.token_hash} UNIQUE에
      * 걸려 500이 난다. 실제로 이 테스트를 쓰다가 재현했다(보고 대상 — 운영 코드는 고치지 않았다).
