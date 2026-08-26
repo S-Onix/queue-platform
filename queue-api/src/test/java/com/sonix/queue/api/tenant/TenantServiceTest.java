@@ -123,7 +123,7 @@ class TenantServiceTest {
             BusinessException ex = assertThrows(BusinessException.class,
                     () -> tenantService.login(request));
 
-            assertEquals(ErrorCode.TENANT_NOT_FOUND, ex.getErrorCode());
+            assertEquals(ErrorCode.INVALID_CREDENTIALS, ex.getErrorCode());
             verify(refreshTokenRepository, never()).save(any());
         }
 
@@ -137,7 +137,7 @@ class TenantServiceTest {
             BusinessException ex = assertThrows(BusinessException.class,
                     () -> tenantService.login(request));
 
-            assertEquals(ErrorCode.INVALID_PASSWORD, ex.getErrorCode());
+            assertEquals(ErrorCode.INVALID_CREDENTIALS, ex.getErrorCode());
             verify(refreshTokenRepository, never()).save(any());
         }
     }

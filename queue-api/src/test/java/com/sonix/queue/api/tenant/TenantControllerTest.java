@@ -59,7 +59,7 @@ class TenantControllerTest {
         mockMvc.perform(
                         post("/api/v1/tenants/signup")
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content("{\"email\":\"test@email.com\",\"password\":\"1234\",\"name\":\"테스트\"}")
+                                .content("{\"email\":\"test@email.com\",\"password\":\"Str0ngPassw0rd!\",\"name\":\"테스트\"}")
                 )
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.email").value("test@email.com"))
@@ -78,7 +78,7 @@ class TenantControllerTest {
         mockMvc.perform(
                         post("/api/v1/tenants/signup")
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content("{\"email\":\"test@email.com\",\"password\":\"1234\",\"name\":\"테스트\"}")
+                                .content("{\"email\":\"test@email.com\",\"password\":\"Str0ngPassw0rd!\",\"name\":\"테스트\"}")
                 )
                 .andExpect(status().isConflict());  // 409
     }
@@ -101,12 +101,18 @@ class TenantControllerTest {
                 .andExpect(jsonPath("$.data.refreshToken").value("mock-refresh"));
     }
 
+    /**
+     * 🔴 <b>없는 이메일도 401이다.</b> 예전엔 404(T002)라 <b>응답 코드 한 번으로 계정 존재 여부가
+     * 새어나갔다</b> — 공격자가 그걸로 실존 계정 목록을 만든 뒤 10/분 예산을 그쪽에만 쓴다.
+     *
+     * <p>이 테스트의 옛 이름이 "없는 이메일 → 404"였다. <b>테스트가 누출을 명세로 못박고 있었다.</b>
+     */
     @Test
-    @DisplayName("POST /login 없는 이메일 → 404")
-    void login_not_found() throws Exception {
+    @DisplayName("POST /login 없는 이메일 → 401 (틀린 비밀번호와 같은 응답 — 계정 열거 차단)")
+    void login_unknown_email_is_indistinguishable() throws Exception {
         // given
         when(tenantService.login(any(LoginRequest.class)))
-                .thenThrow(new BusinessException(ErrorCode.TENANT_NOT_FOUND));
+                .thenThrow(new BusinessException(ErrorCode.INVALID_CREDENTIALS));
 
         // when & then
         mockMvc.perform(
@@ -114,15 +120,15 @@ class TenantControllerTest {
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .content("{\"email\":\"no@email.com\",\"password\":\"1234\"}")
                 )
-                .andExpect(status().isNotFound());  // 404
+                .andExpect(status().isUnauthorized());  // 401 — 아래 케이스와 같아야 한다
     }
 
     @Test
-    @DisplayName("POST /login 잘못된 비밀번호 → 401")
+    @DisplayName("POST /login 잘못된 비밀번호 → 401 (위 케이스와 구분 불가)")
     void login_invalid_password() throws Exception {
         // given
         when(tenantService.login(any(LoginRequest.class)))
-                .thenThrow(new BusinessException(ErrorCode.INVALID_PASSWORD));
+                .thenThrow(new BusinessException(ErrorCode.INVALID_CREDENTIALS));
 
         // when & then
         mockMvc.perform(

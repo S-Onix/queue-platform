@@ -5,7 +5,11 @@ public enum ErrorCode {
     INTERNAL_SERVER_ERROR("I004", "서버 오류가 발생했습니다.", 500),
     DUPLICATE_EMAIL("T001", "이미 존재하는 이메일입니다.", 409),
     TENANT_NOT_FOUND("T002", "Tenant를 찾을 수 없습니다.", 404),
-    INVALID_PASSWORD("T003", "비밀번호가 일치하지 않습니다.", 401),
+    /**
+     * 로그인 실패. <b>이메일이 없든 비밀번호가 틀리든 이 하나로 답한다</b>(계정 열거 차단).
+     * 그래서 메시지도 어느 쪽인지 말하지 않는다.
+     */
+    INVALID_CREDENTIALS("T003", "이메일 또는 비밀번호가 올바르지 않습니다.", 401),
     API_KEY_NOT_FOUND("A001", "API Key를 찾을 수 없습니다.", 404),
     API_KEY_NOT_OWNED("A002", "본인의 API Key가 아닙니다.", 403),
     INVALID_TOKEN("T004", "유효하지 않은 토큰입니다.", 401),
