@@ -10,8 +10,10 @@ import java.time.Instant;
  * 순수 record라 도메인에 둬도 헥사고날 위반이 아니다
  *
  * <p><b>{@code eventType}이 판별 필드다</b>(§80). 토픽을 나누면 같은 토큰의 상태 전이 순서가
- * 깨지므로(§73 D18) 한 토픽·한 스키마에 싣고 본문 필드로 구분한다. 현재 발행되는 값은
- * {@code ENQUEUED} 하나뿐이고, admit·complete 등은 Sprint 7 이후 같은 스키마로 실린다.
+ * 깨지므로(§73 D18) 한 토픽·한 스키마에 싣고 본문 필드로 구분한다.
+ * <b>현재 넷 다 발행된다</b> — {@code ENQUEUED}(enqueue) · {@code ADMITTED}(admit) ·
+ * {@code COMPLETED}(verify 또는 complete) · {@code EXPIRED}(회수 배치 3경로).
+ * (구 서술 "현재 발행되는 값은 ENQUEUED 하나뿐"은 Sprint 7·8로 거짓이 됐다.)
  *
  * <p><b>{@code admitToken}·{@code admittedAt}은 타입에 따라 null이다.</b> 이벤트마다 존재하는
  * 값이 다른데 스키마는 하나여서 생기는 일이며, 소비 측 UPSERT가 타입별로 필요한 칸만 쓰므로
@@ -43,7 +45,16 @@ public record EnqueueEvent(
                 long seq,
                 Instant issuedAt,
                 String admitToken,
-                Instant admittedAt
+                Instant admittedAt,
+                /**
+                 * 만료 사유 코드({@link ExpiredReason#getCode()}). {@code EXPIRED} 이벤트에서만 채워지고
+                 * 나머지 이벤트에선 {@code null}이다 — {@code admitToken}·{@code admittedAt}과 같은 패턴이다.
+                 *
+                 * <p>🔑 <b>사유는 발행 지점에서 이미 갈려 있다.</b> {@code TokenReclaimJob}의 회수 3경로가
+                 * 각각 다른 메서드이고, 어느 규칙이 발화했는지 알면서 부른다. 이 칸이 없던 동안은
+                 * 그 정보를 <b>한 줄 뒤에 버리고 있었다</b>.
+                 */
+                Integer expiredReason
         ) {
 
     /**
@@ -71,7 +82,7 @@ public record EnqueueEvent(
                 TokenEventType.ENQUEUED.name(),
                 result.getTokenId(), queueId, tenantId,
                 result.getIdentifier(), result.getSeq(), result.getIssuedAt(),
-                null, null
+                null, null, null
         );
     }
 }

@@ -54,11 +54,21 @@ public class TenantService {
 
     @Transactional
     public LoginResponse login(LoginRequest request) {
+        // 🔴 두 실패를 같은 코드로 답한다 (계정 열거 차단).
+        //
+        // 예전엔 없는 이메일이 TENANT_NOT_FOUND(404), 틀린 비밀번호가 INVALID_PASSWORD(401)라
+        // **응답 코드 한 번으로 계정 존재 여부가 새어나갔다.** 공격자는 그걸로 실존 계정 목록을
+        // 만든 뒤 10/분 예산을 그쪽에만 쓴다.
+        //
+        // ⚠️ 타이밍 차이는 남는다 — 없는 이메일은 bcrypt를 안 타서 더 빨리 돌아온다.
+        //    더미 해시 비교로 시간을 맞추는 방법이 있지만 **하지 않는다**: 쓰레기 이메일마다
+        //    bcrypt(cost 10, 약 60ms)를 태우는 CPU 증폭기가 되고, 그 코어는 폴링과 공유한다.
+        //    누출을 하나 막으려다 자원 고갈 경로를 여는 맞교환이라 이득이 없다(2026-08-26 판정).
         Tenant tenant = tenantRepository.findByEmail(request.getEmail())
-                .orElseThrow(() -> new BusinessException(ErrorCode.TENANT_NOT_FOUND));
+                .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_CREDENTIALS));
 
         if(!passwordHasher.matches(request.getPassword(), tenant.getPasswordHash())){
-            throw new BusinessException(ErrorCode.INVALID_PASSWORD);
+            throw new BusinessException(ErrorCode.INVALID_CREDENTIALS);
         }
 
         String accessToken = jwtProvider.generateAccessToken(tenant.getId(), tenant.getTenantId());

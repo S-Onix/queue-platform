@@ -6,13 +6,15 @@ import java.util.Optional;
 public interface QueueEngine {
 
     /**
-     * 대기열 진입 관련 인터페이스
-     * >> 추후 RedisQueueEngine을 통해 실제 구현 코드 작성
+     * 대기열 진입. 구현은 {@code RedisQueueEngine}이다.
      *
-     * 하이브리드로 진행 예정
-     * 1초에 1000건 이하의 요청인 경우 >> lua script
-     * 1초에 1000건 이상의 요청이 올 경우 >> bulk lua script 진행
+     * <p>🔴 <b>하이브리드는 폐기됐다(§70).</b> 구 주석은 "1초 1000건 미만이면 단건 lua, 이상이면
+     * bulk lua"였는데, <b>{@code enqueue_bulk.lua} 단독</b>으로 확정됐다. 임계값 분기 자체가 없다.
+     * 단건 경로가 사라져 저부하 요청도 배치 주기만큼 기다린다 — 그 재조정은 별건이다(§70 D8).
      *
+     * <p>구 주석에 남아 있던 이슈("1000건 기준을 polling까지 잡아야 하나")도 §79가 닫았다 —
+     * 평상시 폴링은 {@code /status}가 받고 이 경로와 무관하다. 아래는 그 원문이다.
+     * <pre>
      * 이슈사항 : 1초에 1000건에 대한 기준을 polling까지 잡아야하는가? >> Polling은 push 방식으로 변경 진행하여 실제 admit이 발생할 때에만 ranking 계산한다.
      * */
     EnqueueResult enqueue(String queueId, String identifier);

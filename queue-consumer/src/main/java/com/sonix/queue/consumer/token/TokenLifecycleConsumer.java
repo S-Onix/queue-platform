@@ -209,6 +209,6 @@ public class TokenLifecycleConsumer {
 
         return Token.transition(TokenEventType.from(e.eventType()).targetStatus(),
                 e.tokenId(), e.queueId(), e.tenantId(), e.userId(), e.seq(),
-                issuedAt, e.admitToken(), admittedAt);
+                issuedAt, e.admitToken(), admittedAt, e.expiredReason());
     }
 }

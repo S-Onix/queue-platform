@@ -61,7 +61,7 @@ Tenant    → 슬롯 관리 + 입장 제어
 | Enqueue | Tenant 서버가 유저 대신 Platform에 대기열 등록 요청 |
 | Polling | 유저가 Platform에 직접 순위 확인 요청 (적응형 간격) |
 | admit | Tenant 서버가 슬롯 여유 생길 때 Platform에 N명 입장토큰 요청 |
-| verify | Tenant가 admitToken 유효성 확인 (상태 변경 없음) |
+| verify | Tenant가 admitToken 유효성 확인 + **완료 확정**(`COMPLETED` 발행, PR #48). Redis·DB 직접 쓰기만 0회 |
 | complete | Tenant가 입장 완료 후 Platform에 통보 → COMPLETED + ZREM |
 | maxCapacity | 대기열 최대 인원 |
 | waitingTtl | 대기 중 절대 만료 시간 (기본 7200s) |
@@ -573,7 +573,8 @@ POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
 Response: { "valid": true, "identifier": "0190e2c1-..." }
 ```
 
-> **"상태 변경 없음"이 이제 문자 그대로다** (DECISIONS §80).
+> ✏️ 구 서술 **"\"상태 변경 없음\"이 이제 문자 그대로다"는 §80 시점의 사실**이고 지금은 아니다 —
+> PR #48로 verify가 `COMPLETED`를 발행한다. **Redis·DB 직접 쓰기가 0회**인 것은 여전히 참이다.
 > 구 설계는 여기서 `SET verified-token:{tokenId} EX 60`을 했는데 **그 키는 폐기됐다.**
 > 존재 이유가 "admit이 verified 토큰을 제외한다"였는데, §80이 admit에서 Redis 밖 조회를
 > 전부 걷어내면서 **읽는 곳이 사라졌다.**

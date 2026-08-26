@@ -35,9 +35,11 @@ public enum TokenEventType {
     /** Tenant가 입장 완료를 통보. */
     COMPLETED(TokenStatus.COMPLETED),
 
-    /** 사용자가 대기를 취소. */
+    // 🔴 CANCELLED 자리가 여기였다. §82가 Cancel API를 폐기해 상수를 지웠고 status 3은 결번이다.
+    //    (구 코드엔 "사용자가 대기를 취소"라는 javadoc만 상수 없이 남아 있어, 바로 아래
+    //     EXPIRED가 취소인 것처럼 읽혔다.)
 
-    /** 대기 TTL 초과로 폐기. */
+    /** 대기 TTL 초과·이탈로 폐기. 회수 배치 3경로가 발행한다. */
     EXPIRED(TokenStatus.EXPIRED);
 
     private final TokenStatus targetStatus;

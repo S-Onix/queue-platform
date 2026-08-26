@@ -100,7 +100,25 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        // 2) 인증 여부 확인
+        // 2) 공개 endpoint(signup/login/refresh)는 인증 여부와 무관하게 IP Fixed Window를 먼저 태운다.
+        //
+        // 🔴 예전엔 아래 3)의 else 가지에서만 걸었다. 그러면 **클라이언트가 한도를 고를 수 있다** —
+        //    /login은 permitAll이라 남의(또는 자기) Access 토큰을 Authorization 헤더에 붙여도 그대로
+        //    통과하고, JwtAuthenticationFilter가 컨텍스트를 채운 뒤라 3)이 "인증된 요청"으로 분기한다.
+        //    결과: brute force가 LOGIN(10/분/IP)이 아니라 **공격자 자신의 테넌트 버킷(FREE 100/분)**을
+        //    소비한다. 계정을 K개 만들면 버킷도 K개라 IP 기준 한도가 사실상 사라진다.
+        //
+        //    로그인 시도의 신원은 **body의 email**이지 헤더의 토큰이 아니다. 그러니 이 세 경로에서는
+        //    헤더를 보고 한도를 고르면 안 된다. 위 폴링 선처리와 같은 모양이다.
+        if (resolvePublicEndpoint(request.getRequestURI()) != null) {
+            if (!checkPublicRateLimit(request, response)) {
+                return;   // 429로 종료
+            }
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        // 3) 인증 여부 확인
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
 
         if (auth != null && auth.getPrincipal() instanceof TenantAuth tenantAuth) {

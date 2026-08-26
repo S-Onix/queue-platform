@@ -419,7 +419,14 @@ public class BatchProcessor implements SmartLifecycle {
 
     /**
      * Queue의 최대 용량 조회.
-     * Sprint 5-E: 상수 반환 (임시). Sprint 6+: DB 조회 + Caffeine 캐싱.
+     *
+     * <p>⚠️ 구 주석은 "Sprint 5-E: 상수 반환(임시)"이었으나 <b>이미 DB를 읽는다</b>
+     * ({@code queueRepository.findByQueueId}). 남은 미착수는 <b>캐싱뿐</b>이다 —
+     * 지금은 그룹마다 조회가 든다(같은 파일의 드레인 주석 참조).
+     *
+     * <p>캐시를 붙일 때 답해야 할 것: {@code Queue}는 {@code status}가 가변이라
+     * TTL만큼 PAUSED 반영이 늦으면 <b>정지시킨 큐에 사람이 계속 들어온다.</b>
+     * {@code ownerByQueueId}(불변이라 무해)와 사정이 다르다.
      */
     private long getMaxCapacity(String queueId) {
         return queueRepository.findByQueueId(queueId)

@@ -189,20 +189,22 @@ Optional<Tenant> findByIdForUpdate(@Param("id") Long id);
 | createQueue (quota 검증) | 비관적 락 | DB만 건드림, 짧은 트랜잭션 |
 | Queue 생성 + Redis/Kafka 초기화 | 분산 락 | 외부 시스템 포함 |
 | ApiKey rotate | 분산 락 | 캐시 무효화 등 외부 영향 |
-| 일별 통계 집계 (`queue_daily_stats`, **미착수**) | ShedLock | leader election 성격. INSERT-only 누적이라 중복 실행이 곧 중복 행이다 |
+| **일별 통계 집계** (`queue_daily_stats`) | **락 없음** | `BillingSnapshotJob`에 얹혀 같은 근거로 산다 (§84·§86). ~~INSERT-only 누적이라 ShedLock 필요~~ → **틀렸다**: `uq_queue_daily_stat (queue_id, stat_date)`가 있어 중복 INSERT는 애초에 ERROR 1062로 막히고, ODKU 덮어쓰기가 멱등을 만든다 |
 | enqueue (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
 | admit (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
 | admitToken TTL 만료 배치 (스케줄러, ~~복귀~~ → 종료 §36) | **락 없음 (claim-Lua)** | `ZRANGEBYSCORE 0 now` + `ZREM`이 한 Lua = **`EVAL` 자체가 claim**. N대가 동시에 돌아도 한 대만 가져가고 나머지는 빈 배열 → 사다리 2단이 5단을 이긴다. `@Scheduled` + leader election 규칙의 **명시적 예외** (DECISIONS §80 ⑧) |
 | **`inactiveTtl`·`waitingTtl` 회수 배치** (스케줄러) | **락 없음 (claim-Lua)** | 위와 같은 구조다 — `inactive_expire.lua`·`waiting_expire.lua` 안에서 조회와 `ZREM`이 한 `EVAL`이라 **가져간 놈만 처리**한다 (§82) |
 | **`ReconcileJob`** (대사, 5분) | **락 없음** | 두 숫자를 **읽기만** 한다(부수효과 없음 — N대가 같은 값을 각자 보고할 뿐이라 PromQL에서 `sum`이 아니라 `max`로 본다). 유일한 쓰기인 잔류 정리는 술어 `status = 1`이 멱등성을 만들어 각 행이 한 번만 전이한다 |
 | **`BillingSnapshotJob`** (과금, 매일) | **락 없음** | UPSERT가 멱등이라 N대가 같은 값을 쓸 뿐이고, 동시에 돌아도 둘 다 같은 SELECT의 결과라 어느 쪽이 이겨도 정답이다 (§84). ⚠️ **정확성만 같고 비용은 다르다** — 파티션 스캔이 인스턴스 수만큼 곱해진다 |
-| 파티션 DROP | 분산 락 | 관리 작업, 단일 실행 보장 |
+| **파티션 DROP** (`BillingSnapshotJob`, 매일) | **락 없음** | ~~분산 락~~ → **§86에서 뒤집힘**: DDL이라 MySQL의 **메타데이터 락이 이미 직렬화**한다. 한 대만 성공하고 나머지는 `ERROR 1507`을 받는데 결과가 같아(파티션은 사라졌다) 피해가 없다. 삼키고 로그만 남긴다 — **2단으로 되는 일에 5단을 쓰지 않는다** |
 
 > 🔑 **스케줄러 4행이 전부 "락 없음"인 것은 규칙 위반이 아니라 사다리를 지킨 결과다.**
 > 동시성 제어 우선순위에서 분산 락은 **5단**이고, 위 넷은 전부 **2단(Redis 원자 연산)이나
 > 1단(DB 제약·멱등 술어)에서 이미 해결됐다.** 2단으로 되는 일에 5단을 쓰면 그게 과설계다.
-> 반대로 **`queue_daily_stats`처럼 INSERT-only 누적은 멱등하지 않아** 여전히 ShedLock이 필요하다 —
-> "스케줄러니까 락 없이 된다"로 일반화하면 안 된다.
+> 판단 기준은 스케줄러냐가 아니라 **같은 작업을 두 번 해도 결과가 같은가**다.
+> 파티션 DROP은 **멱등하지 않은데도 락이 없는** 유일한 항목인데, 그건 규칙의 예외가 아니라
+> **DB가 이미 1단에서 막아 주기 때문**이다(메타데이터 락). 사다리를 건너뛴 게 아니라
+> 더 아래 단에서 해결됐다.
 
 ---
 

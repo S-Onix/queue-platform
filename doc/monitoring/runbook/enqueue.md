@@ -252,7 +252,9 @@ HTTP 요청
 | enqueue 결과 분포(OK/EXISTS/FULL) | **미노출.** `MONITORING_DESIGN.md` 4-2의 `queue_token_enqueue_total`은 **미구현** |
 | `queue_waiting_count` Gauge | **미구현.** ZCARD를 직접 조회하는 수밖에 없음 |
 
-✏️ **구 서술 "`MeterRegistry` 사용처 0건"은 거짓이다**(2026-08-26 정정). **4종이 등록돼 있다** — `queue_waiting_orphans`(`TokenReclaimJob:122`) · `queue_reconcile_ghosts`/`queue_reconcile_stale`(`ReconcileJob:99-100`) · `queue_billing_snapshot_total{result=success|failure}`(`BillingSnapshotJob:64,66`).
+✏️ **구 서술 "`MeterRegistry` 사용처 0건"은 거짓이다**(2026-08-26 정정). **5종이 등록돼 있다** — `queue_waiting_orphans`(`TokenReclaimJob:122`) · `queue_reconcile_ghosts`/`queue_reconcile_stale`(`ReconcileJob:99-100`) · `queue_billing_snapshot_total{result=success|failure}` · `queue_billing_mismatch`(`BillingSnapshotJob`).
+
+🔑 `queue_billing_mismatch`는 **0이어야 하고, `-1`은 "대사 자체가 실패"다**(§86). 0으로 두면 조회가 깨진 순간 지표가 가장 건강해 보이므로 값으로 구분한다. N대가 각자 보고하므로 `max`로 본다.
 
 🪤 **넷 다 `queue-batch`가 낸다.** batch가 안 떠 있으면 시계열이 **0이 아니라 사라진다** — `== 0` 형태의 알람은 그때 발화하지 않는다.
 

@@ -1,6 +1,7 @@
 package com.sonix.queue.consumer.token;
 
 import com.sonix.queue.domain.queue.EnqueueEvent;
+import com.sonix.queue.domain.queue.ExpiredReason;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.kafka.support.serializer.JsonDeserializer;
@@ -53,12 +54,43 @@ class EnqueueEventSerdeTest {
     }
 
     @Test
+    @DisplayName("expiredReason이 없던 옛 메시지가 그대로 복원된다 — 롤링 배포 중 큐에 남은 형태다")
+    void deserializesMessageWithoutExpiredReason() {
+        // 🔑 §86이 EnqueueEvent에 칸을 하나 더했다. 신규 컨슈머가 뜨는 순간 토픽에는
+        //    그 칸이 없는 메시지가 남아 있다. 여기서 깨지면 적재가 통째로 멈춘다.
+        byte[] legacy = ("""
+                {"eventType":"EXPIRED","tokenId":"tok_old","queueId":"q_ticket","tenantId":42,
+                 "userId":"user-1","seq":7,"issuedAt":"2026-08-10T12:34:56.789Z",
+                 "admitToken":null,"admittedAt":null}
+                """).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        try (JsonDeserializer<EnqueueEvent> deserializer = deserializer()) {
+            EnqueueEvent restored = deserializer.deserialize(TOPIC, legacy);
+
+            assertThat(restored.expiredReason()).isNull();   // 사유 미상 — 옛 메시지의 정직한 표현
+            assertThat(restored.tokenId()).isEqualTo("tok_old");
+            assertThat(restored.seq()).isEqualTo(7L);
+        }
+    }
+
+    @Test
+    @DisplayName("만료 사유가 왕복 후에도 보존된다 — 이 칸이 비면 만료 원인이 영구 소실된다")
+    void preservesExpiredReason() {
+        EnqueueEvent original = new EnqueueEvent(
+                "EXPIRED", "tok_x", "q_ticket", 42L, "user-1", 9L,
+                Instant.parse("2026-08-10T12:34:56.789Z"), null, null,
+                ExpiredReason.WAITING_TTL.getCode());
+
+        assertThat(roundTrip(original).expiredReason()).isEqualTo(ExpiredReason.WAITING_TTL.getCode());
+    }
+
+    @Test
     @DisplayName("밀리초 정밀도의 issuedAt이 왕복 후에도 정확히 보존된다")
     void preservesMillisecondPrecision() {
         // tokens.issued_at 이 DATETIME(3) 이므로 밀리초까지가 저장 대상이다.
         Instant issuedAt = Instant.parse("2026-08-10T12:34:56.789Z");
         EnqueueEvent original = new EnqueueEvent(
-                "ENQUEUED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L, issuedAt, null, null);
+                "ENQUEUED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L, issuedAt, null, null, null);
 
         EnqueueEvent restored = roundTrip(original);
 
@@ -96,7 +128,7 @@ class EnqueueEventSerdeTest {
     void keepsUnknownEventTypeAsIs() {
         EnqueueEvent original = new EnqueueEvent(
                 "WHAT_IS_THIS", "tok_x", "q_ticket", 1L, "user-1", 1L,
-                Instant.parse("2026-08-10T00:00:00.001Z"), null, null);
+                Instant.parse("2026-08-10T00:00:00.001Z"), null, null, null);
 
         assertThat(roundTrip(original).eventType()).isEqualTo("WHAT_IS_THIS");
     }
@@ -107,7 +139,7 @@ class EnqueueEventSerdeTest {
         // 과학표기·double 변환이 끼어들면 큰 정수가 뭉개진다. Long 경계로 확인한다.
         EnqueueEvent original = new EnqueueEvent(
                 "ENQUEUED", "tok_big", "q_ticket", Long.MAX_VALUE, "user-1",
-                Long.MAX_VALUE, Instant.parse("2026-08-10T00:00:00.001Z"), null, null);
+                Long.MAX_VALUE, Instant.parse("2026-08-10T00:00:00.001Z"), null, null, null);
 
         EnqueueEvent restored = roundTrip(original);
 
@@ -126,7 +158,7 @@ class EnqueueEventSerdeTest {
         Instant admittedAt = Instant.parse("2026-08-10T12:35:00.123Z");
         EnqueueEvent original = new EnqueueEvent(
                 "ADMITTED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L,
-                Instant.parse("2026-08-10T12:34:56.789Z"), "adm_9f3c", admittedAt);
+                Instant.parse("2026-08-10T12:34:56.789Z"), "adm_9f3c", admittedAt, null);
 
         EnqueueEvent restored = roundTrip(original);
 
@@ -144,7 +176,7 @@ class EnqueueEventSerdeTest {
     void keepsAdmitFieldsNullForEnqueued() {
         EnqueueEvent restored = roundTrip(new EnqueueEvent(
                 "ENQUEUED", "tok_a1b2", "q_ticket", 42L, "user-1", 1234L,
-                Instant.parse("2026-08-10T12:34:56.789Z"), null, null));
+                Instant.parse("2026-08-10T12:34:56.789Z"), null, null, null));
 
         assertThat(restored.admitToken()).isNull();
         assertThat(restored.admittedAt()).isNull();

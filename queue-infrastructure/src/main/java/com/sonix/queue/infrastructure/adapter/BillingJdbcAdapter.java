@@ -59,6 +59,81 @@ public class BillingJdbcAdapter implements BillingRepository {
             ON DUPLICATE KEY UPDATE `count` = agg.cnt
             """;
 
+    /**
+     * {@code doc/schema.sql} Step 1의 집계. {@code UPSERT_MONTHLY}와 같은 파티션을 훑으므로
+     * 바로 뒤에 붙여 돌리면 버퍼풀이 따뜻하다(실측 180ms / 16만 행).
+     *
+     * <p>🔴 <b>{@code ON DUPLICATE KEY UPDATE id = id}로 두면 안 된다.</b> {@code schema.sql}의
+     * 원안이 그랬고, 그러면 <b>늦게 도착한 admit이 영원히 반영되지 않는다</b>(도커 실증:
+     * 재집계해도 {@code total_admit_issued}가 0에 고정). 오래 기다린 사람일수록 늦게 admit되므로,
+     * 하필 이 표가 남기려던 것만 골라서 버린다. 전 컬럼을 덮어쓴다.
+     *
+     * <p>🔴 <b>{@code SUM(admitted_at IS NOT NULL)}이지 {@code SUM(status = 1)}이 아니다.</b>
+     * {@code ReconcileJob}이 잔류 {@code ADMIT_ISSUED}를 {@code status = 4}로 정리하므로
+     * 후자는 0이 나온다 — 실측에서 15,151건이 {@code status = 4} 아래 숨어 있었다.
+     * 그래서 {@code status}(집합을 분할)와 {@code admitted_at}(그 분할을 가로지름)이 둘 다 필요하다.
+     * 덕분에 {@code total_admit_issued - total_completed} = "입장권 받고 안 들어온 수"가 공짜로 나온다.
+     *
+     * <p>🔴 <b>{@code AVG}가 아니라 {@code SUM}이다.</b> 평균은 합산되지 않는다 — 일별 AVG로는
+     * 월 평균을 만들 수 없다(각 날의 표본 수를 모르면 가중을 못 준다). 분모는 어차피 저장하는
+     * {@code total_admit_issued}가 갖고 있다. 같은 이유로 {@code p50}/{@code p99}는 컬럼으로
+     * 두지 않는다 — 백분위는 원리적으로 합산도 재계산도 안 된다.
+     *
+     * <p>🔴 <b>만료 사유는 {@code expired_reason}으로만 갈린다.</b> {@code ADMIT_TTL}(코드 1)은
+     * 컬럼에 없다 — 그 경로는 컨슈머 가드에서 no-op이라 DB에 도달하지 않고, 같은 사람이
+     * 300초 뒤 {@code ReconcileJob}에 의해 {@code ADMIT_STALE}(2)로 기록된다.
+     * 즉 <b>1은 이벤트에만 있고 DB에는 2로 남는다.</b>
+     *
+     * <p>🪤 <b>{@code =}가 아니라 {@code <=>}다.</b> {@code expired_reason}은 NULL 허용이라
+     * 그 그룹의 전 행이 NULL이면 {@code SUM(expired_reason = 2)}가 <b>0이 아니라 NULL</b>을
+     * 돌려주고, 컬럼이 {@code NOT NULL}이라 적재가 통째로 실패한다(실측:
+     * {@code DataIntegrityViolationException} 8건). NULL-safe 비교는 항상 0/1이다.
+     * {@code SUM(status = 2)}에 같은 문제가 없는 건 {@code status}가 {@code NOT NULL}이라서다.
+     *
+     * <p>🪤 셋의 합은 {@code total_expired}와 다를 수 있다 — 사유가 없던 시기의 행이 NULL이다.
+     * 억지로 맞추지 마라. 차이가 곧 "언제부터 사유를 남기기 시작했나"다.
+     *
+     * <p>🪤 {@code stat_date = DATE(issued_at)}은 <b>"줄 선 날"</b> 기준이라, 4/30 발행 · 5/1 입장인
+     * 토큰의 대기 시간은 4/30에 붙는다. {@code admitted_at} 기준으로 바꾸면 안 되는 이유는
+     * 취향이 아니다 — <b>한 토큰 = 한 파티션 = 한 stat 행</b>이 깨져 재집계가 멱등하지 않게 되고,
+     * {@code PARTITION} 절도 못 쓰게 된다. 밀림은 {@code waitingTtl} 7200초가 상한이다.
+     */
+    private static final String UPSERT_DAILY_STATS = """
+            INSERT INTO queue_daily_stats
+                (tenant_id, queue_id, stat_date,
+                 total_enqueued, total_completed, total_expired,
+                 expired_admit_stale, expired_inactive, expired_waiting_ttl,
+                 total_admit_issued, sum_wait_sec, max_wait_sec)
+            SELECT a.tenant_id, a.queue_id, a.stat_date, a.enq, a.cmp, a.exp,
+                   a.e_stale, a.e_inact, a.e_wait, a.adm, a.sw, a.mw
+              FROM (SELECT tenant_id, queue_id,
+                           DATE(issued_at)                                    AS stat_date,
+                           COUNT(*)                                           AS enq,
+                           SUM(status = 2)                                    AS cmp,
+                           SUM(status = 4)                                    AS exp,
+                           SUM(expired_reason <=> 2)                            AS e_stale,
+                           SUM(expired_reason <=> 3)                            AS e_inact,
+                           SUM(expired_reason <=> 4)                            AS e_wait,
+                           SUM(admitted_at IS NOT NULL)                       AS adm,
+                           SUM(TIMESTAMPDIFF(SECOND, issued_at, admitted_at)) AS sw,
+                           MAX(TIMESTAMPDIFF(SECOND, issued_at, admitted_at)) AS mw
+                      FROM tokens PARTITION (%s)
+                     WHERE issued_at >= ? AND issued_at < ?
+                     GROUP BY tenant_id, queue_id, DATE(issued_at)) AS a
+            ON DUPLICATE KEY UPDATE
+                total_enqueued     = a.enq, total_completed    = a.cmp,
+                total_expired      = a.exp, total_admit_issued = a.adm,
+                expired_admit_stale = a.e_stale, expired_inactive = a.e_inact,
+                expired_waiting_ttl = a.e_wait,
+                sum_wait_sec       = a.sw,  max_wait_sec       = a.mw
+            """;
+
+    /**
+     * {@code DROP PARTITION}이 MDL을 기다릴 최대 시간. 못 잡으면 {@code ERROR 1205}로 포기한다.
+     * 짧을수록 좋다 — 이 값이 곧 <b>다른 요청이 막힐 수 있는 시간의 상한</b>이다.
+     */
+    private static final int DROP_LOCK_WAIT_SECONDS = 3;
+
     private final JdbcTemplate jdbcTemplate;
 
     public BillingJdbcAdapter(JdbcTemplate jdbcTemplate) {
@@ -87,5 +162,129 @@ public class BillingJdbcAdapter implements BillingRepository {
                 month.format(YYYYMM),
                 month.atDay(1).atStartOfDay(),
                 month.plusMonths(1).atDay(1).atStartOfDay());
+    }
+
+    /**
+     * 🪤 <b>{@code JOIN}이 아니라 {@code UNION ALL} + {@code GROUP BY}인 이유</b>: JOIN이면 한쪽에만
+     * 있는 테넌트가 결과에서 통째로 빠져 "불일치 0"이 된다. 한쪽 표가 아예 비어 있는 것이
+     * 가장 큰 사고인데 그게 가장 조용해진다. 양쪽을 0으로 채워 합치면 그 경우가 차이로 드러난다.
+     *
+     * <p>🪤 {@code stat_date}로 자르는 범위는 {@code UTC} 월 경계다 — {@code billing_snapshots}의
+     * {@code year_month}와 같은 축이어야 등식이 성립한다.
+     */
+    private static final String COUNT_MISMATCH = """
+            SELECT COUNT(*) FROM (
+              SELECT u.tenant_id FROM (
+                SELECT tenant_id, total_enqueued AS d, 0 AS b
+                  FROM queue_daily_stats WHERE stat_date >= ? AND stat_date < ?
+                UNION ALL
+                SELECT tenant_id, 0, `count`
+                  FROM billing_snapshots WHERE `year_month` = ?
+              ) AS u
+              GROUP BY u.tenant_id HAVING SUM(u.d) <> SUM(u.b)
+            ) AS x
+            """;
+
+    /**
+     * {@code upsertMonthlySnapshot}과 <b>같은 이유로</b> {@code READ COMMITTED}다 —
+     * 같은 파티션을 같은 방식으로 훑으므로 REPEATABLE READ면 컨슈머의 {@code tokens} 적재를
+     * 똑같이 막는다. 오히려 이쪽이 뒤에 도므로 창이 더 길다.
+     */
+    @Override
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public void upsertDailyStats(YearMonth month) {
+        jdbcTemplate.update(
+                UPSERT_DAILY_STATS.formatted(month.format(PARTITION_NAME)),
+                month.atDay(1).atStartOfDay(),
+                month.plusMonths(1).atDay(1).atStartOfDay());
+    }
+
+    /**
+     * 🔴 <b>{@code @Transactional(readOnly = true)}를 붙이면 안 된다.</b>
+     * {@code ReplicationRoutingDataSource}가 그걸 보고 <b>replica로 보낸다</b>(prod는 별도 호스트).
+     * 이 조회는 <b>방금 master에 커밋한 두 표</b>를 대조하는 것이라, 복제가 한쪽만 따라잡은 창에
+     * 걸리면 그 달 토큰이 있는 거의 모든 테넌트가 불일치로 잡힌다.
+     *
+     * <p>트랜잭션 자체를 안 건다 — 단문 {@code SELECT}라 필요가 없고, 트랜잭션이 없으면
+     * 라우팅 키가 {@code "master"}가 되어 원하는 쪽으로 간다. 하루 한 번이라 비용도 문제가 아니다.
+     *
+     * <p>🪤 <b>통합 테스트로는 이 결함을 못 잡는다</b> — 테스트 설정이 replica url을 master(3306)로
+     * 준다. 라우팅이 갈라지지 않으므로 어떤 단정도 빨개지지 않는다.
+     */
+    @Override
+    public long countBillingMismatch(YearMonth month) {
+        Long n = jdbcTemplate.queryForObject(COUNT_MISMATCH, Long.class,
+                month.atDay(1), month.plusMonths(1).atDay(1), month.format(YYYYMM));
+        return n == null ? 0L : n;
+    }
+
+    /**
+     * 🪤 <b>{@code information_schema}로 존재를 먼저 본다.</b> 없는 파티션을 {@code PARTITION} 절로
+     * 지목하면 {@code ERROR 1735}라, 존재 확인과 건수 조회를 한 문장으로 합칠 수 없다.
+     */
+    @Override
+    public long countPartitionRows(YearMonth month) {
+        String partition = month.format(PARTITION_NAME);
+        Integer exists = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM information_schema.PARTITIONS
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tokens' AND PARTITION_NAME = ?
+                """, Integer.class, partition);
+        if (exists == null || exists == 0) {
+            return -1L;
+        }
+        Long n = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM tokens PARTITION (%s)".formatted(partition), Long.class);
+        return n == null ? 0L : n;
+    }
+
+    @Override
+    public long countDailyStatRows(YearMonth month) {
+        Long n = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM queue_daily_stats WHERE stat_date >= ? AND stat_date < ?",
+                Long.class, month.atDay(1), month.plusMonths(1).atDay(1));
+        return n == null ? 0L : n;
+    }
+
+    /**
+     * 🔴 <b>되돌릴 수 없다.</b> 호출 조건은 포트 javadoc 참조.
+     *
+     * <p>{@code @Transactional}을 걸지 않는다 — DDL은 MySQL에서 <b>암묵적 커밋</b>이라 트랜잭션이
+     * 아무것도 보호하지 못한다. 걸어 두면 "롤백되겠지"라는 잘못된 안심만 준다.
+     *
+     * <h2>🔴 {@code lock_wait_timeout}이 이 메서드의 핵심이다</h2>
+     * {@code DROP PARTITION}은 <b>테이블 전체에 배타적 메타데이터 락(MDL)</b>을 잡는다.
+     * 대상 파티션이 비어 있어도 소용없다 — MDL은 파티션 단위가 아니다.
+     *
+     * <p>긴 트랜잭션이 {@code tokens}를 물고 있으면 이 DDL이 대기하는데, <b>그 뒤에 도착한
+     * 평범한 INSERT가 전부 그 뒤에 줄을 선다</b>(실측: 5초짜리 트랜잭션 뒤에서 DROP이 4.17초 대기,
+     * <b>그 사이 도착한 INSERT가 3.05초 블록</b>). 그러면 {@code queue-consumer}의 적재가 밀리고
+     * Kafka lag → {@code ReconcileJob}의 정착 판정 오염으로 번진다.
+     *
+     * <p><b>MySQL 기본값은 31,536,000초 = 365일</b>이다(실측). 즉 <b>대기에 상한이 없다</b>.
+     * 짧게 걸어 두면 못 잡았을 때 {@code ERROR 1205}로 <b>즉시 포기</b>하고, 뒤에 막혔던 요청도
+     * 그 시점에 풀린다(실측: INSERT 블록 3.05초 → 1.04초).
+     *
+     * <p>포기해도 되는 이유: <b>DROP이 늦어서 잃는 것은 스토리지뿐</b>이다. 유예가 한 달이라
+     * 다음 달 주기가 다시 시도하면 되고, 그때까지 파티션이 남아 있는 것은 아무것도 깨지 않는다.
+     * <b>지연은 공짜고 블로킹은 사고다.</b>
+     *
+     * <p>🪤 세션 변수라 커넥션 풀에 남는다. {@code SET SESSION}을 DDL과 <b>한 문장으로 보내면</b>
+     * 반납된 커넥션에 값이 남아 다른 쿼리가 2초 만에 포기하게 된다. 그래서 {@code execute} 안에서
+     * 원복까지 한다.
+     */
+    @Override
+    public void dropPartition(YearMonth month) {
+        jdbcTemplate.execute((java.sql.Connection conn) -> {
+            try (java.sql.Statement st = conn.createStatement()) {
+                st.execute("SET SESSION lock_wait_timeout = " + DROP_LOCK_WAIT_SECONDS);
+                try {
+                    st.execute("ALTER TABLE tokens DROP PARTITION %s"
+                            .formatted(month.format(PARTITION_NAME)));
+                } finally {
+                    st.execute("SET SESSION lock_wait_timeout = @@GLOBAL.lock_wait_timeout");
+                }
+            }
+            return null;
+        });
     }
 }

@@ -25,9 +25,13 @@ public class QueueEngineService {
     private static final int ADMIT_TTL_SECONDS = 60;
 
     /**
-     * complete를 받아 주는 유효 창(초). <b>admitToken TTL 60초보다 반드시 길다</b> —
-     * TTL이 만료돼 WAITING으로 복귀했는데 Tenant는 이미 유저를 입장시킨 경우를 덮어야 하기
-     * 때문이다(FRS §6.6이 {@code status IN (0,1)}로 관대한 것과 같은 이유).
+     * ⚠️ <b>이 블록은 상수 설명이다. 상수 자체는 {@code Token.COMPLETE_VALID_WINDOW_SECONDS}로
+     * 옮겼고 여기엔 뒤따르는 필드가 없다</b> — 근거를 잃지 않으려고 남겨 둔 기록이다.
+     *
+     * <p>complete를 받아 주는 유효 창(초). <b>admitToken TTL 60초보다 반드시 길다</b> —
+     * Tenant가 이미 유저를 입장시켰는데 통보가 늦은 경우를 덮어야 하기 때문이다
+     * (FRS §6.6이 {@code status IN (0,1)}로 관대한 것과 같은 이유).
+     * (구 서술의 "TTL이 만료돼 WAITING으로 복귀했는데"는 §36이 복귀를 폐기해 거짓이 됐다.)
      *
      * <p><b>왜 300인가</b>: 이 값은 "Tenant가 얼마나 늦어도 봐줄 것인가"라는 SLA 판단이라
      * 시스템 상수에서 유도되지 않는다. 그래서 <b>이미 있는 숫자</b>에 맞췄다 —
@@ -35,7 +39,7 @@ public class QueueEngineService {
      * 잡은 값이고, 그 창이 닫힌 뒤 도착한 complete는 대응할 admit 재시도가 이미 없다.
      * 큐 기본 {@code inactiveTtl}(300초)과도 같아 외울 숫자가 하나로 준다.
      *
-     * <p>60초에 대해 5배 여유 = TTL 만료 후 복귀·재입장 처리에 4분을 준다는 뜻이다.
+     * <p>60초에 대해 5배 여유 = 늦은 complete 통보에 4분을 준다는 뜻이다.
      * 늘리는 건 하위호환, 줄이는 건 파괴적 변경이므로 여기서도 "필요를 채우는 최소"를 잡았다.
      */
 
@@ -152,7 +156,7 @@ public class QueueEngineService {
             }
             boolean published = publishQuietly(new EnqueueEvent(TokenEventType.ADMITTED.name(),
                     record.tokenId(), queueId, tenantId, record.identifier(), record.seq(),
-                    record.issuedAt(), record.admitToken(), admittedAt));
+                    record.issuedAt(), record.admitToken(), admittedAt, null));
             if (!published) {
                 log.error("ADMITTED 발행 중단 queueId={} 건너뜀={}건 첫tokenId={}",
                         queueId, records.size() - i, record.tokenId());
@@ -190,11 +194,18 @@ public class QueueEngineService {
             //    없다 (CLAUDE.md 원칙 1 — Platform은 순서만, Tenant가 입장 제어).
             //    이 전이가 없으면 complete를 안 부르는 Tenant의 행이 status=1로 영원히 남는다.
             //
-            //    🔴 **DB를 직접 쓰지 않고 이벤트만 발행한다.** 이 메서드는
-            //    @Transactional(readOnly = true)라 Replica로 라우팅되고, Replica는
-            //    super-read-only=ON이라 UPDATE가 실패한다. 쓰기 트랜잭션으로 바꾸면 Redis 히트로
-            //    끝나는 정상 경로까지 Master 트랜잭션을 열게 되어, verify가 DB를 안 읽게 만든
-            //    설계(§6.4)가 되돌아간다.
+            //    🔴 **DB를 직접 쓰지 않고 이벤트만 발행한다.**
+            //
+            //    ⚠️ 구 주석은 근거를 "이 메서드는 @Transactional(readOnly = true)라 Replica로
+            //       라우팅되고 UPDATE가 실패한다"로 적었는데 **그 전제가 거짓이다** — 이 메서드에는
+            //       트랜잭션 어노테이션이 아예 없다(위 주석 참조. Kafka send-timeout 12초를
+            //       커넥션 쥔 채 기다리지 않으려고 일부러 뺐다).
+            //
+            //    진짜 근거는 둘이다: ① 쓰기 트랜잭션을 열면 Redis 히트로 끝나는 정상 경로까지
+            //    Master 커넥션을 잡아 "verify는 DB를 안 읽는다"는 설계(§6.4)가 되돌아간다.
+            //    ② 여기서 UPDATE하면 Kafka 소비 경로와 두 갈래로 갈려 순서 보장이 사라진다.
+            //    🔴 **주석대로 readOnly를 되붙이지 마라** — 그게 F-3(verify가 Kafka 12초 동안
+            //       커넥션 점유) 사고의 재발 경로다.
             //
             //    이벤트 경로가 오히려 안전하다 — 파티션 키가 tokenId라
             //    ENQUEUED → ADMITTED → COMPLETED 순서가 보장되므로, 컨슈머 백로그 구간이어도
@@ -215,7 +226,7 @@ public class QueueEngineService {
         publishQuietly(new EnqueueEvent(
                 TokenEventType.COMPLETED.name(), token.getTokenId(), queueId, tenantId,
                 token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC),
-                admitToken, null));
+                admitToken, null, null));
 
         return token.getUserId();
     }
@@ -234,7 +245,7 @@ public class QueueEngineService {
         }
         publishQuietly(new EnqueueEvent(
                 TokenEventType.COMPLETED.name(), ref.tokenId(), queueId, tenantId,
-                ref.identifier(), ref.seq(), ref.issuedAt(), admitToken, null));
+                ref.identifier(), ref.seq(), ref.issuedAt(), admitToken, null, null));
     }
 
     /**
@@ -280,7 +291,7 @@ public class QueueEngineService {
         // ADMITTED가 이미 채운 값이다(§80 가드 표).
         publishQuietly(new EnqueueEvent(TokenEventType.COMPLETED.name(), tokenId, queueId, tenantId,
                 token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC),
-                admitToken, null));
+                admitToken, null, null));
 
         return completedAt;
     }
@@ -332,8 +343,13 @@ public class QueueEngineService {
      *       생기지만(§80 ⑥), 평범한 {@code GET}은 Lettuce가 슬롯으로 정확히 라우팅한다.</li>
      * </ul>
      *
-     * <p>⚠️ <b>TTL 만료로 복귀한 사람은 이 분기에 오지 않는다.</b> 복귀 배치가 원래 seq 그대로
-     * {@code waiting}에 되돌려 놓으므로 {@code verifyWaiting}이 통과한다 — 정상 대기 응답이다.
+     * <p>🔴 <b>admitToken TTL이 만료된 사람은 정확히 이 분기로 와서 404를 받는다. 그게 의도다.</b>
+     * (구 주석은 "복귀 배치가 waiting에 되돌려 놓으므로 이 분기에 오지 않는다"였다 — <b>§36이
+     * 복귀를 폐기</b>해 거짓이 됐다. {@code admit_expire.lua}에 {@code ZADD waiting}이 없다.)
+     *
+     * <p>회수 배치가 {@code admitted}에서 빼고 {@code tokens} Hash를 {@code HDEL}하므로
+     * {@code verifyWaiting}도 {@code findAdmitTokenByTokenId}도 실패한다 → 404가 <b>종료 신호</b>다.
+     * 재접속하면 재-enqueue라 맨 뒤다. <b>이 404를 버그로 보고 고치면 §36 계약이 깨진다.</b>
      */
     public PollResult poll(String queueId, String tokenId, long seq, boolean keepalive){
         // 존재(seq)만이 아니라 소유권(tokenId)까지 검증한다. seq는 큐별 INCR이라 추측이 자명해서,

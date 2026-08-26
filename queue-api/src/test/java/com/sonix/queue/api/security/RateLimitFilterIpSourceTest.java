@@ -9,6 +9,7 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.mock.web.MockFilterChain;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,6 +47,36 @@ class RateLimitFilterIpSourceTest {
     @AfterEach
     void clearAuth() {
         SecurityContextHolder.clearContext();
+    }
+
+    /**
+     * 🔴 <b>공개 endpoint는 인증돼 있어도 IP Fixed Window를 탄다.</b>
+     *
+     * <p>{@code /login}은 {@code permitAll}이고 {@code JwtAuthenticationFilter}는 경로를 안 가리므로,
+     * <b>유효한 Access 토큰을 헤더에 붙이면 SecurityContext가 채워진 채로 이 필터에 도달한다.</b>
+     * 예전엔 그때 "인증된 요청" 분기로 빠져 {@code rl:tenant:&#123;id&#125;}(FREE 100/분)를 썼다 —
+     * 즉 <b>클라이언트가 자기 한도를 고를 수 있었다.</b> LOGIN 10/분 대비 10배이고,
+     * 계정을 K개 만들면 버킷도 K개라 IP 기준 한도가 사실상 사라진다.
+     *
+     * <p>이 케이스가 없으면 그 선처리 블록을 지워도 전체 테스트가 초록이다 —
+     * 컨트롤러 테스트는 전부 {@code @MockBean RateLimitFilter}라 필터 본문이 안 돈다.
+     */
+    @Test
+    @DisplayName("인증된 상태로 /login을 쳐도 테넌트 버킷이 아니라 LOGIN IP 윈도우를 탄다")
+    void authenticatedRequestOnPublicEndpointStillUsesIpWindow() throws Exception {
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken(
+                        new TenantAuth(1L, "t_dev"), null, java.util.List.of()));
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/v1/tenants/login");
+        request.setRemoteAddr("203.0.113.9");
+
+        filter.doFilter(request, new MockHttpServletResponse(), new MockFilterChain());
+
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        verify(fixedWindow).tryAcquire(key.capture(), eq(10), eq(60_000L));
+        assertThat(key.getValue()).contains("203.0.113.9");
+        verifyNoInteractions(tokenBucket);   // ← 테넌트 버킷으로 새면 안 된다
     }
 
     private void callSignupFrom(String remoteAddr, String... headers) throws Exception {

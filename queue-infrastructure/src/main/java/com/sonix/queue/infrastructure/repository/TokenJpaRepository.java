@@ -111,7 +111,7 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
     @Modifying(clearAutomatically = true)
     @Query(value = """
             UPDATE tokens
-               SET status = 4
+               SET status = 4, expired_reason = 2
              WHERE queue_id = :queueId
                AND status = 1
                AND admitted_at < :admittedBefore

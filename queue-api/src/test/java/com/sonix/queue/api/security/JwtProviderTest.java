@@ -290,4 +290,25 @@ class JwtProviderTest {
             assertTrue(store.findKey("valid-kid").isPresent());
         }
     }
+
+    /**
+     * 🔴 <b>같은 초에 두 번 발급해도 토큰이 달라야 한다.</b>
+     *
+     * <p>{@code jti}가 없던 시절엔 {@code sub}·{@code tenantId}·{@code type}·{@code iat}·{@code exp}가
+     * 전부 같고 {@code iat}가 <b>초 단위</b>라 두 발급이 <b>바이트 단위로 동일</b>했다.
+     * 그러면 {@code sha256}도 같아 {@code refresh_tokens.token_hash} UNIQUE에 걸려 <b>500</b>이 났다 —
+     * 로그인 더블클릭, 그리고 {@code refresh()}가 폐기 직후 재발급해 <b>자기가 방금 지운 행과 충돌</b>하는 경로.
+     *
+     * <p><b>왜 통합 테스트가 아니라 여기인가</b>: 결함은 이 함수의 <b>값 생성</b>에 있다.
+     * MySQL을 띄워 "같은 초 로그인 2회"를 재현하면 같은 명제를 훨씬 비싸게 검증하고,
+     * 초 경계에 걸리면 플레이키가 된다. 두 번 불러 다르면 그것으로 끝난다.
+     */
+    @Test
+    @DisplayName("generateRefreshToken은 같은 입력·같은 초에도 매번 다른 토큰을 만든다 (jti)")
+    void refreshTokenIsUniquePerIssue() {
+        String first = jwtProvider.generateRefreshToken(1L, "t_dev");
+        String second = jwtProvider.generateRefreshToken(1L, "t_dev");
+
+        assertNotEquals(first, second);
+    }
 }

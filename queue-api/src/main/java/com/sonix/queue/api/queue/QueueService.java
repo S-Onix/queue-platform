@@ -41,7 +41,7 @@ public class QueueService {
     public QueueResponse updateQueue(Long tenantId, String queueId, QueueUpdateRequest request) {
         Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
 
-        queue.update(request.getName());
+        guardTransition(() -> queue.update(request.getName()));
         queueRepository.save(queue);
 
         return QueueResponse.from(queue);
@@ -51,7 +51,7 @@ public class QueueService {
     public QueueResponse pauseQueue(Long tenantId, String queueId) {
         Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
 
-        queue.pause();
+        guardTransition(() -> queue.pause());
         queueRepository.save(queue);
 
         return QueueResponse.from(queue);
@@ -61,17 +61,37 @@ public class QueueService {
     public QueueResponse resumeQueue(Long tenantId, String queueId) {
         Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
 
-        queue.resume();
+        guardTransition(() -> queue.resume());
         queueRepository.save(queue);
 
         return QueueResponse.from(queue);
+    }
+
+    /**
+     * 도메인의 상태 가드({@code IllegalStateException})를 409 {@code QE006}으로 바꾼다.
+     *
+     * <p><b>왜 전역 핸들러가 아니라 여기인가</b>: {@code IllegalStateException}은 코드 전체에
+     * 17곳 있고 대부분은 <b>진짜 500</b>이다({@code TimeZoneGuard}·{@code JwtKeyStore}·
+     * {@code RedisQueueEngine}). 전역에서 통째로 409에 매핑하면 프로그래머 오류가
+     * "클라이언트 잘못"으로 위장된다. <b>의도를 아는 곳에서만</b> 좁게 바꾼다.
+     *
+     * <p><b>왜 도메인이 직접 {@code BusinessException}을 던지지 않나</b>: {@code queue-domain}은
+     * {@code ErrorCode}를 한 번도 참조하지 않는다. HTTP 상태를 아는 상수를 도메인에 들이면
+     * 그 순수성이 깨진다.
+     */
+    private void guardTransition(Runnable transition) {
+        try {
+            transition.run();
+        } catch (IllegalStateException e) {
+            throw new BusinessException(ErrorCode.QUEUE_INVALID_STATUS);
+        }
     }
 
     @Transactional
     public QueueResponse deleteQueue(Long tenantId, String queueId) {
         Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
 
-        queue.delete();
+        guardTransition(() -> queue.delete());
         queueRepository.save(queue);
 
         return QueueResponse.from(queue);
