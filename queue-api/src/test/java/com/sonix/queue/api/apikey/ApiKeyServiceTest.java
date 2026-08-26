@@ -24,6 +24,9 @@ class ApiKeyServiceTest {
     @Mock
     private ApiKeyRepository apiKeyRepository;
 
+    @Mock
+    private com.sonix.queue.domain.apikey.ApiKeyCache apiKeyCache;
+
     @InjectMocks
     private ApiKeyService apiKeyService;
 
@@ -59,6 +62,11 @@ class ApiKeyServiceTest {
         assertEquals(ApiKeyStatus.REVOKED, apiKey.getStatus());
         assertNotNull(apiKey.getRevokedAt());
         verify(apiKeyRepository).save(any(ApiKey.class));
+
+        // 🔴 캐시 무효화가 빠지면 폐기한 키가 최대 60초(POSITIVE_TTL) 더 통과한다.
+        //    캐시에 든 객체는 revoke 이전 스냅샷이라 필터의 isActive() 검사로는 못 막는다.
+        //    이 단언이 없으면 그 한 줄을 지워도 테스트가 전부 초록이다.
+        verify(apiKeyCache).invalidate(apiKey.getKeyHash());
     }
 
     @Test

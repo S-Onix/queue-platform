@@ -162,7 +162,7 @@ class QueueServiceTest {
         when(queueRepository.findByQueueId("q_test1234")).thenReturn(Optional.of(queue));
 
         // when & then
-        assertThrows(IllegalStateException.class, () ->
+        assertThrows(BusinessException.class, () ->
                 queueService.pauseQueue(1L, "q_test1234"));
     }
 
@@ -195,7 +195,7 @@ class QueueServiceTest {
         when(queueRepository.findByQueueId("q_test1234")).thenReturn(Optional.of(queue));
 
         // when & then
-        assertThrows(IllegalStateException.class, () ->
+        assertThrows(BusinessException.class, () ->
                 queueService.resumeQueue(1L, "q_test1234"));
     }
 
@@ -228,7 +228,7 @@ class QueueServiceTest {
         when(queueRepository.findByQueueId("q_test1234")).thenReturn(Optional.of(queue));
 
         // when & then
-        assertThrows(IllegalStateException.class, () ->
+        assertThrows(BusinessException.class, () ->
                 queueService.deleteQueue(1L, "q_test1234"));
     }
 
