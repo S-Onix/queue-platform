@@ -10,8 +10,10 @@ import java.time.Instant;
  * 순수 record라 도메인에 둬도 헥사고날 위반이 아니다
  *
  * <p><b>{@code eventType}이 판별 필드다</b>(§80). 토픽을 나누면 같은 토큰의 상태 전이 순서가
- * 깨지므로(§73 D18) 한 토픽·한 스키마에 싣고 본문 필드로 구분한다. 현재 발행되는 값은
- * {@code ENQUEUED} 하나뿐이고, admit·complete 등은 Sprint 7 이후 같은 스키마로 실린다.
+ * 깨지므로(§73 D18) 한 토픽·한 스키마에 싣고 본문 필드로 구분한다.
+ * <b>현재 넷 다 발행된다</b> — {@code ENQUEUED}(enqueue) · {@code ADMITTED}(admit) ·
+ * {@code COMPLETED}(verify 또는 complete) · {@code EXPIRED}(회수 배치 3경로).
+ * (구 서술 "현재 발행되는 값은 ENQUEUED 하나뿐"은 Sprint 7·8로 거짓이 됐다.)
  *
  * <p><b>{@code admitToken}·{@code admittedAt}은 타입에 따라 null이다.</b> 이벤트마다 존재하는
  * 값이 다른데 스키마는 하나여서 생기는 일이며, 소비 측 UPSERT가 타입별로 필요한 칸만 쓰므로

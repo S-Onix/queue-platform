@@ -162,7 +162,10 @@ CREATE TABLE tokens (
     redis_sync_needed TINYINT      NOT NULL DEFAULT 0,
     -- ⚠️ 아래 4개는 전부 UTC 벽시계다. 위 [시각 규약] 참조. DEFAULT를 붙이지 마라.
     -- 🔴 cancelled_at 삭제 (DECISIONS §82) — Cancel API를 만들지 않아 status=3에 도달하는
-    --    경로가 없다. 이탈은 inactiveTtl 판정 배치가 잡고 expired_at에 기록된다.
+    --    경로가 없다. 이탈은 inactiveTtl 판정 배치가 잡는다.
+    --    🔴 다만 expired_at 에는 **기록되지 않는다** — 쓰는 코드가 0건이라 영원히 NULL 이다.
+    --       EXPIRED 소비 가드가 status = IF(status=0, 4, status) 하나뿐이고, ReconcileJob 의
+    --       직접 UPDATE 도 SET status = 4 뿐이다. COMPLETED 만 completed_at 을 찍는다.
     issued_at         DATETIME(3)  NOT NULL,
     admitted_at       DATETIME(3)  NULL,     -- admit 시각 (DECISIONS §80)
     completed_at      DATETIME(3)  NULL,

@@ -202,7 +202,10 @@ public class TokenReclaimJob {
             return;
         }
         if (total > 0) {
-            log.warn("좀비 대기자 {}건 — watermark보다 앞 순번인데 waiting에 남아 있다 {}", total, queues);
+            // 🔴 문구에 watermark를 쓰지 마라. 판정은 RedisQueueEngine.countOrphanedWaiting이고
+            //    기준은 "waiting에 있는데 tokens Hash에 없다"다. **위치(watermark 비교) 판정은
+            //    오탐 15,144건으로 기각된 안**이라, 그렇게 적으면 조사자가 엉뚱한 데를 판다.
+            log.warn("좀비 대기자 {}건 — waiting 맨 앞인데 tokens Hash에 없다 {}", total, queues);
         } else {
             log.info("좀비 대기자 0건으로 회복");
         }
