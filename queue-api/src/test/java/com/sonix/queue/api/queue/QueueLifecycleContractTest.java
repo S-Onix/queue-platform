@@ -64,7 +64,14 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * 우리 쪽이 무작위로 429가 된다. 그래서 {@link #FROM_TEST_IP}로 전용 출발지를 박는다
  * (필터는 XFF가 아니라 {@code getRemoteAddr()}만 본다 — {@code RateLimitFilter} 참조).
  */
-@SpringBootTest
+@SpringBootTest(properties = {
+        // 🪤 오버라이드가 없으면 local 프로파일의 replica(3307)를 본다. CI는 MySQL이 한 대뿐이라
+        //    ConnectException으로 11건이 깨진다 — 로컬엔 3307이 있어서 통과하고 CI에서만 드러났다.
+        //    다른 @Tag("mysql") 테스트들이 이미 같은 오버라이드를 갖고 있다.
+        // 🔴 대가: 이 설정에서는 master/replica 라우팅이 갈리지 않는다. readOnly가 replica로 새는
+        //    결함(§86의 countBillingMismatch 같은 것)은 **어떤 테스트로도 못 잡는다.** 눈으로 봐야 한다
+        "spring.datasource.replica.jdbc-url=jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
+})
 @AutoConfigureMockMvc
 @TypeExcludeFilters(QueueLifecycleContractTest.ExcludeStrayTestConfig.class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
