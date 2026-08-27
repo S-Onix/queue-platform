@@ -1034,30 +1034,56 @@ keepalive:
 
 ### 성능 목표
 
-| API | p99 목표 | 목표 TPS |
+| API | p99 목표 | 목표 RPS |
 |-----|----------|----------|
-| Enqueue | < 50ms (200 즉시 응답) | 200 rps (10,000 rps 급증 → Kafka) |
+| Enqueue | < 50ms | 200 rps |
 | Polling | < 50ms | 2,000 rps |
 | admit | < 100ms | 10 rps |
+
+> 🔴 **~~"10,000 rps 급증 → Kafka"~~ 삭제 (2026-08-27).** 거짓이었다. Kafka 발행은
+> **응답보다 먼저이고 동기다** — `KafkaEnqueueEventPublisher.publish()`가 `.get(12초)`로
+> ack을 기다린 뒤에야 200이 나가고, 실패하면 QE001(503)이다. 즉 **발행 지연이 응답 지연에
+> 그대로 포함되고, Kafka는 버스트 완충 장치가 아니다.** 비동기인 것은 DB 적재뿐이다.
+>
+> ⚠️ **위 숫자 셋은 근거가 약하다 — 목표로 인용하기 전에 읽어라.**
+> - `Enqueue 200 rps`의 근거는 §6.4의 "30만/2시간 = 평균 42/s"인데, 티켓팅은 오픈 직후에
+>   몰리지 균등 도착이 아니다. 평균 42/s는 **대기열이 필요 없는 시나리오**다.
+> - `admit 10 rps × count 상한 100 = 초당 1,000명 배출`이라 유입 200 rps보다 5배 크다.
+>   두 목표를 그대로 두면 **큐가 아예 쌓이지 않는다.** 셋 중 최소 하나는 틀렸다.
+> - `Polling 2,000 rps`는 pacing 구간표(§6.3) × 30만으로 산술하면 약 15,000 rps가 나온다.
+>   `/status`에 **캐시 코드는 0건**이므로 그 전량이 Redis로 간다.
+> - 2026-08-27 로컬 실측 enqueue **1,818 events/s** — 목표의 9배다. 단 부하 도구가 서버와
+>   같은 머신이라 **상한이 아니라 하한**으로만 읽어야 한다.
+>
+> 숫자는 k6 분리 환경 측정 후 갱신한다. 그전까지 이 표를 SLO로 쓰지 마라.
 
 ### 안정성
 
 | 장애 | 영향 | 대응 |
 |------|------|------|
-| Redis Master 다운 | Enqueue/Polling 중단 | Sentinel Failover 5~10초 |
+| Redis Master 다운 | 해당 슬롯의 Enqueue/Polling 중단 | **Cluster 자동 failover**(replica 승격). ~~Sentinel~~은 §75에서 **코드에서 제거**됐다 — `RedisConfig`는 Cluster 전용이고 Sentinel은 학습·로컬 자산이다 |
 | Redis 다운 중 Enqueue | enqueue 자체가 실패 | QE001(503). Redis 가 순번 게이트라 부분 반영이 없다 |
 | Kafka 다운 | DB INSERT 지연 | 복구 후 Consumer 재처리 |
-| MySQL Master 다운 | complete 중단 | Replica 승격 |
+| MySQL Master 다운 | complete 중단 | Replica 승격 — ⚠️ **자동화 도구 없음.** 오케스트레이터가 없어 현재는 수동 절차다 |
 
 ### MySQL Read/Write 분리
 
 ```
 Write → Master: UPDATE (complete, expire)
-Read  → Replica: SELECT (Polling, API Key)
 INSERT → Kafka Consumer → Master (비동기)
 @Transactional(readOnly = true) → Replica
 @Transactional → Master
+어노테이션 없음      → Master   ← 기본값이다. isCurrentTransactionReadOnly()가 false다
 ```
+
+> 🔴 **~~`Read → Replica: SELECT (Polling, API Key)`~~ 삭제 (2026-08-27).** 둘 다 거짓이었다.
+> - **Polling은 DB를 읽지 않는다.** `poll()`은 트랜잭션 어노테이션이 없고 `poll_verify.lua`로
+>   Redis만 친다. replica로 갈 SELECT 자체가 없다.
+> - **API Key 조회는 Filter에서 일어난다**(`ApiKeyAuthenticationFilter`). 트랜잭션 밖이라
+>   `ReplicationRoutingDataSource`가 **master로 보낸다.** (캐시 히트면 DB를 안 친다)
+>
+> 🪤 라우팅을 판단하는 것은 "읽기인가"가 아니라 **`@Transactional(readOnly=true)`가 붙었는가**다.
+>   어노테이션이 없으면 읽기여도 master다. §4-3.
 
 ### Redis Read/Write 분리 미적용
 
