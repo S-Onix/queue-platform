@@ -244,10 +244,43 @@ public class BatchProcessor implements SmartLifecycle {
     /**
      * Global Queue 배치 처리 실행.
      *
-     * <p>주기(fixedRate)는 목표 처리량과 Bulk Lua 실행 시간에 따라 조정.
-     * 예: 초당 5000건 목표 시 CHUNK_SIZE·MAX_DRAIN과 함께 실측 후 결정.
+     * <p><b>이 주기가 enqueue 응답 지연을 그대로 만든다.</b> 요청은 Global Queue에 들어가
+     * 다음 틱을 기다리므로, 평균 대기가 주기의 절반이고 최악이 주기 전체다.
+     *
+     * <p><b>1000ms → 30ms (2026-08-27).</b> CLAUDE.md가 "원안 10ms 대비 100배 이탈"로 지목한
+     * 그 상수다. k6 스윕(유입 100 RPS 고정, 큐 10개, 주기만 변수)으로 손익 곡선을 얻어 정했다:
+     * <pre>
+     *   주기      p50        p95        p99       evalsha   FRS p99&lt;50ms
+     *   1000ms  514.07ms   965.09ms   1000ms      14,710    ✗ 20배 초과
+     *    200ms  119.08ms   208.67ms   211.23ms    16,151    ✗
+     *     50ms   40.80ms    60.66ms    61.51ms    18,404    ✗
+     *     30ms   28.77ms    38.78ms    39.78ms    18,799    ✓ 여유 10.2ms   ← 채택
+     *     20ms   23.59ms    25.86ms    26.85ms    19,521    ✓
+     *     10ms   12.77ms    23.29ms    24.78ms    19,465    ✓
+     * </pre>
+     *
+     * <p><b>숫자가 아니라 이 관계식을 옮겨라</b> — 위 표는 로컬(부하 도구가 서버와 같은 머신)이다.
+     * <pre>
+     *   p99 ≈ 0.99 × 주기 + c        c = Lua + Kafka ack. 로컬 실측 7~19ms
+     *   evalsha_rate ≤ 유입 RPS      주기를 아무리 줄여도 enqueue 1건당 Lua 1회를 못 넘는다
+     * </pre>
+     * 앞 식은 <b>큐 수·유입률과 무관</b>하다(틱 대기는 순전히 주기의 함수다). 뒤 식이 핵심인데,
+     * <b>비용에 상한이 있다</b>는 뜻이다 — 실측에서 20ms(19,521)와 10ms(19,465)가 역전할 만큼
+     * 포화했다. 그래서 "주기를 줄이면 비용이 선형으로 는다"는 <b>거짓</b>이다.
+     *
+     * <p>🪤 <b>왜 50ms가 아닌가.</b> 30ms와 evalsha 차이가 2.1%뿐인데 p99 61.5ms로 목표를 못 넘는다.
+     * 🪤 <b>왜 10ms가 아닌가.</b> 30ms 대비 얻는 것에 비해 틱이 3배다. 비용이 포화해 이득이 없다.
+     * ⚠️ <b>30ms의 여유는 얇다(10.2ms).</b> c가 로컬에서도 7~19ms로 흔들렸고 프로덕션은 네트워크가
+     *    붙어 커진다. <b>c가 15ms를 넘으면 20ms로 내려라</b> — 비용은 사실상 같다.
+     *
+     * <p>🪤 <b>측정할 때 워밍업을 빼지 마라.</b> 첫 스윕이 재기동 직후 바로 재서 p99가 콜드 스타트에
+     * 오염됐다 — 같은 조건에서 워밍업 후 <b>577ms → 61ms(9배)</b>로 갈렸고, 그 오염된 값으로
+     * "구조적으로 달성 불가"라는 <b>틀린 판정</b>을 냈다. 절차는 {@code ~/queue-platform-it/sweep.sh}.
+     *
+     * <p>⬜ 미해결: {@code max}가 모든 주기에서 2.2~2.6s로 붙어 있다. 주기와 무관하고
+     * Kafka(max 28ms)·GC(max 6ms)로 설명되지 않는다. p99에는 안 걸리지만 정체를 모른다.
      */
-    @Scheduled(fixedRate = 1000)
+    @Scheduled(fixedRateString = "${queue.enqueue.drain-interval-ms:30}")
     public void processBatches() {
         // 1. Global Queue에서 최대 MAX_DRAIN 건 drain
         List<PendingEnqueue> drained = drainGlobalQueue();

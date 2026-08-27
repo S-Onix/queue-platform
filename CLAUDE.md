@@ -155,8 +155,11 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 - D6: Lua ZCARD Capacity
 - ~~D7: enqueue.lua + enqueue_bulk.lua~~ → **`enqueue_bulk.lua` 단독** (§70)
 - ~~D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)~~ → **하이브리드 폐기** (§70)
-  - 현재 상수: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
-  - ⚠️ 원안(10ms/1s) 대비 100배/30배 이탈 → **재조정 후속 과제** (단건 경로가 사라져 저부하 요청도 평균 500ms 부담)
+  - 현재 상수: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, **`drain-interval=30ms`**, 타임아웃 30s
+  - ✅ **주기 재조정 완료 (2026-08-27, k6 스윕).** 1000ms → 30ms.
+    enqueue p99 **1000ms → 39.78ms**로 FRS §13 목표(<50ms) 충족. evalsha는 +27.8%뿐이다 —
+    **비용에 상한이 있다**(enqueue 1건당 Lua 1회를 못 넘는다). 근거·관계식은 `BatchProcessor` 주석
+  - ⚠️ `MAX_DRAIN`·`CHUNK_SIZE`는 **아직 원안 이탈 상태**다(재조정 안 함)
 - **D9: score = `INCR queue:{queueId}:seq`** (신설) — ZCARD+1/타임스탬프는 충돌·동점 → INCR만 단조증가·유일
 - **D10: Hash Tag 필수** (신설) — `enqueue_bulk.lua` 3키(waiting/seq/tokens) · `poll_verify.lua` 3키(waiting/tokens/last-active). 해시태그 없으면 Cluster에서 CROSSSLOT. `queue/QueueKeys.java`에서 관리
 
