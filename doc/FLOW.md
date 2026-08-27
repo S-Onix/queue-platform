@@ -64,7 +64,7 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 - ~~D7: enqueue.lua + enqueue_bulk.lua 2개~~ → **`enqueue_bulk.lua` 단독** (§70)
 - ~~D8: 임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s~~ → **하이브리드 폐기.** 배치 상수만 유지 (§70)
   - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, **`drain-interval=20ms`**, 타임아웃 30s
-  - ⚠️ 원안(10ms/1s) 대비 100배/30배 이탈 → 재조정 후속 과제
+  - ✅ 주기는 **재조정 완료**(20ms, 원안 10ms의 2배). `CHUNK_SIZE`·타임아웃은 원안 이탈 유지
 - **D9: score = `INCR queue:{queueId}:seq`** (신설, §70) — 단조증가·유일 보장
 - **D10: Hash Tag 필수** (신설, §70) — `queue/QueueKeys.java`
 

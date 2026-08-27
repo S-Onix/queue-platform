@@ -40,7 +40,7 @@
 HTTP 요청
   └ QueueEngineService.enqueue()          : queue 조회(DB) + 소유권/상태 검증
       └ RedisQueueEngine.enqueue()        : globalQueue.offer() 후 Future.get(30s) 블로킹  ← JVM 힙
-          └ BatchProcessor @Scheduled(1000ms) : drain(최대 5000) → queueId groupBy → 500씩
+          └ BatchProcessor @Scheduled drain-interval=20ms : drain(최대 5000) → queueId groupBy → 500씩
               └ enqueue_bulk.lua          : ZCARD 1회 + 건당 INCR/HSETNX/ZADD/ZRANK
       └ KafkaEnqueueEventPublisher.publish() : send().get(12s)   ← OK 결과만
   └ 200 OK

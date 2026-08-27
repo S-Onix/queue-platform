@@ -132,7 +132,7 @@ sum by (status) (rate(http_server_requests_seconds_count{uri="/api/v1/queues/{qu
 | 지표 | 정상 | 이상 |
 |---|---|---|
 | p50 | **≈ 주기/2 + 10~19ms** (drain 20ms → 20~30ms) | ≫ 주기/2 → 틱 밀림 · **≈1초면 옛 주기(1000ms)로 떠 있는 것** |
-| p99 | ≤ 47ms (2,000 RPS 로컬 실측) | > 5s → 적체 |
+| p99 | **큐 40 기준** 200rps 32ms · 1,000rps 75ms · 2,000rps 104ms | 같은 유입·같은 큐 수에서 2배 이상 → 적체 |
 | 5xx 비율 | 0 | > 0 → RunBook의 503 항목 |
 
 > **이 수치는 WSL2 단일 머신 실측이다. 프로덕션 용량 산정 근거로 쓰지 마라.**
