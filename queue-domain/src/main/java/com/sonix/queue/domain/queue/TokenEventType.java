@@ -18,7 +18,9 @@ import java.util.stream.Collectors;
  * "모르는 타입"으로 잡아낸다.
  *
  * <p>이름 문자열이 곧 계약이다 — <b>상수 이름을 바꾸면 흘러가는 메시지가 깨진다.</b>
- * 순서·개수는 바꿔도 되지만 이름은 못 바꾼다(ordinal이 아니라 name으로 직렬화된다).
+ * 개수는 늘려도 되지만 <b>선언 순서는 상태 전이 순서(ENQUEUED→ADMITTED→COMPLETED→EXPIRED)로
+ * 고정</b>이다 — {@code TokenLifecycleConsumer.persistGrouped}가 {@code EnumMap} 순회 순서에 기댄다.
+ * <b>이름도 못 바꾼다</b>(ordinal이 아니라 name으로 직렬화된다).
  *
  * <p><b>넷 다 발행된다.</b> {@code ENQUEUED}(enqueue) · {@code ADMITTED}(admit) ·
  * {@code COMPLETED}(verify 또는 complete) · {@code EXPIRED}(회수 배치 3경로).

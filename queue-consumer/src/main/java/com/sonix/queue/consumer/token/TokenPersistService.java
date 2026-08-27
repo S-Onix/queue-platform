@@ -36,8 +36,12 @@ public class TokenPersistService {
      * <p><b>{@code ENQUEUED}만 다른 길로 간다.</b> 신규 적재는 충돌 시 no-op이면 되지만, 나머지
      * 전이는 <b>허용 출발 상태를 강제하는 가드</b>가 이벤트마다 달라 SQL이 갈린다 (§80 가드 표).
      *
-     * @param tokens <b>같은 타입이 연속하는 구간</b>이어야 한다. 타입별로 모아 넘기면 같은 토큰의
-     *               전이 순서가 뒤집힌다 — 파티션이 지켜준 순서를 여기서 깨는 셈이다
+     * @param tokens 같은 타입만 담긴 목록. 호출자가 두 방식 중 하나로 만든다 —
+     *               ① 배치에 중복 {@code tokenId}가 없으면 <b>타입별로 모아</b> 한 번에,
+     *               ② 있으면 <b>같은 타입이 연속하는 구간</b>씩. ②가 필요한 이유는 같은 토큰의
+     *               {@code ADMITTED → COMPLETED} 순서가 뒤집히면 COMPLETED가 먼저 no-op이 되어
+     *               그 토큰이 영원히 완료되지 않기 때문이다. 중복이 없으면 뒤집힐 대상 자체가 없다.
+     *               판정은 {@code TokenLifecycleConsumer.canGroupByType}에 있다.
      */
     @Transactional
     public void persist(TokenEventType type, List<Token> tokens) {
