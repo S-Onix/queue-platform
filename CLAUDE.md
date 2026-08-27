@@ -157,9 +157,10 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 - ~~D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)~~ → **하이브리드 폐기** (§70)
   - 현재 상수: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, **`drain-interval=20ms`**, 타임아웃 30s
   - ✅ **주기 재조정 완료 (2026-08-27, k6).** 1000ms → 20ms.
-    **2,000 RPS에서 p99 46.91ms**로 FRS §13 목표(<50ms) 충족(여유 3.09ms). 유실 0.
-    🪤 **30ms로 정했다가 뒤집었다** — 100 RPS 스윕만 보면 39.78ms로 통과인데
-    **2,000 RPS에서 55.20ms로 초과**한다. 주기 스윕만으로 정하지 마라. 근거는 `BatchProcessor` 주석
+    **FRS 목표 부하 200 rps에서 p99 32.32ms**로 목표(<50ms) 충족(여유 17.7ms, 큐 40개).
+    2.5배(500 rps)까지 여유. **5배(1,000 rps)부터 초과**한다.
+    🔴 **p99는 큐 수의 함수다** — 2,000 RPS에서 큐 10개 46.57ms vs 40개 149.46ms.
+    "몇 RPS에서 몇 ms"는 **큐 수 없이는 의미가 없다.** 근거는 `BatchProcessor` 주석
   - ⚠️ `MAX_DRAIN`·`CHUNK_SIZE`는 **아직 원안 이탈 상태**다(재조정 안 함)
 - **D9: score = `INCR queue:{queueId}:seq`** (신설) — ZCARD+1/타임스탬프는 충돌·동점 → INCR만 단조증가·유일
 - **D10: Hash Tag 필수** (신설) — `enqueue_bulk.lua` 3키(waiting/seq/tokens) · `poll_verify.lua` 3키(waiting/tokens/last-active). 해시태그 없으면 Cluster에서 CROSSSLOT. `queue/QueueKeys.java`에서 관리
