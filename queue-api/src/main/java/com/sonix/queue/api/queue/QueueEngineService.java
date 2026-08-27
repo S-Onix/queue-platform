@@ -175,8 +175,16 @@ public class QueueEngineService {
     //    트랜잭션 안이면 LazyConnectionDataSourceProxy가 커넥션을 **트랜잭션이 끝날 때까지 쥔다**.
     //    브로커가 느려지면 Replica 풀이 verify에 12초씩 묶이고, verify는 게이트 개방 순간
     //    입장자 수만큼 몰리는 엔드포인트라 그게 곧 자해가 된다.
-    //    Redis 히트 경로는 DB를 아예 안 읽고, 폴백 경로의 단건 조회는 Spring Data 리포지토리가
-    //    자체 readOnly 트랜잭션을 갖고 있어 Replica 라우팅도 그대로다.
+    //    Redis 히트 경로는 DB를 아예 안 읽는다.
+    //
+    //    🪤 **폴백 경로의 단건 조회는 master로 간다.** 구 주석은 "Spring Data 리포지토리가 자체
+    //       readOnly 트랜잭션을 갖고 있어 Replica 라우팅도 그대로"라고 적었는데 **거짓이다**.
+    //       2026-08-27 라우팅 로그 실측: 트랜잭션 없이 부른 파생 쿼리(findByTokenId 등)는
+    //       readOnly 트랜잭션이 **열리지 않아** isCurrentTransactionReadOnly()가 false다 → master.
+    //       같은 findByQueueId도 @Transactional(readOnly=true) 안에서 부르면 replica로 간다
+    //       (QueueService.getQueue로 대조 확인). **갈리는 것은 메서드가 아니라 트랜잭션이다.**
+    //       → 트랜잭션을 안 거는 이 판단 자체는 유지한다. 다만 대가가 "Replica 풀 점유"가
+    //         아니라 **master 풀 점유**라는 것이 정확한 서술이다.
     public String verify(long tenantId, String queueId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 

@@ -9,8 +9,12 @@ import java.time.Instant;
  * <b>답과 완료 처리를 모두</b> 끝내고 DB를 한 번도 읽지 않는다.
  *
  * <p>{@code seq}·{@code issuedAt}이 함께 실리는 이유는 verify가 {@code COMPLETED} 이벤트를
- * 만들어야 하기 때문이다. 없으면 verify가 DB를 읽어야 하는데, verify는
- * {@code @Transactional(readOnly = true)}라 그 읽기가 <b>Replica</b>로 간다.
+ * 만들어야 하기 때문이다. 없으면 verify가 DB를 읽어야 하고, 그 읽기는 <b>master</b>로 간다.
+ *
+ * <p>🪤 구 주석은 "verify는 {@code @Transactional(readOnly = true)}라 Replica로 간다"였는데
+ * <b>두 겹으로 거짓이다</b>: verify에는 트랜잭션 어노테이션이 <b>아예 없고</b>(Kafka 12초를
+ * 커넥션 쥔 채 기다리지 않으려고 일부러 뺐다), 트랜잭션이 없으면 파생 쿼리는 master로 간다
+ * (2026-08-27 라우팅 로그 실측).
  *
  * @param tokenId    항상 있다
  * @param seq        롤링 배포 중 남은 구 포맷이면 {@code -1}

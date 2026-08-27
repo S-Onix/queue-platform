@@ -431,7 +431,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 ### 4-3. master/replica 라우팅을 항상 확인한다 (2026-08-26 확정)
 
-`@Transactional(readOnly = true)`는 **`ReplicationRoutingDataSource`가 replica로 보낸다.**
+`ReplicationRoutingDataSource`는 `isCurrentTransactionReadOnly()`로 가른다 — **readOnly 트랜잭션이
+열려 있을 때만** replica다. 무엇이 그 트랜잭션을 여는지가 핵심이고, 아래 표가 실측 결과다.
 실측 복제 지연은 idle에서 15~25ms지만, **크기가 문제가 아니다** — 읽는 시점이 쓰는 시점과
 붙어 있으면 어떤 지연이든 걸린다.
 
@@ -440,6 +441,53 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   라우팅이 갈라지지 않으므로 어떤 단정도 빨개지지 않는다. **눈으로 봐야 한다**
 
 > 실측 사례: `countBillingMismatch`가 방금 master에 쓴 두 표를 replica에서 대조하고 있었다(§86).
+
+#### 🔴 읽기의 99%가 master로 간다 (2026-08-27 실측)
+
+```
+master(3306)  Com_select  2,893,040      replica(3307)  Com_select  26,728   ← 0.9%
+```
+
+**갈리는 것은 메서드가 아니라 트랜잭션이다.** 라우팅 로그로 격리 실측했다:
+
+| 호출 | 종류 | 라우팅 |
+|---|---|---|
+| `QueueService.getQueue()` | **명시적 `@Transactional(readOnly = true)`** | **replica** |
+| `queueRepository.findAll()` (batch 2곳) | **`SimpleJpaRepository` CRUD 메서드** | **replica** |
+| `BatchProcessor.getMaxCapacity()` → `findByQueueId()` | **파생 쿼리**, 트랜잭션 없음 | **master** |
+| 인증 필터 → `findByKeyHash()` | **파생 쿼리**, 트랜잭션 없음 | **master** |
+
+🔑 **갈리는 것은 메서드 이름이 아니라 트랜잭션이다.** `getQueue()`가 내부에서 부르는 것도
+**같은 `findByQueueId()`**인데, readOnly 트랜잭션 안이면 replica로 간다.
+
+🪤 **`SimpleJpaRepository`의 클래스 레벨 `@Transactional(readOnly = true)`가 파생 쿼리에는
+안 걸린다.** `findByQueueId`·`findByKeyHash`를 트랜잭션 없이 부르면 readOnly 트랜잭션이
+**열리지 않아 master**로 간다. 주석 3곳이 "파생 쿼리도 replica로 간다"고 적고 있었고
+**전부 거짓이었다**(2026-08-27 정정).
+
+반대로 `findAll()`은 트랜잭션 없이 불러도 **replica로 갔다**(실측). 그 클래스가 직접 구현한
+CRUD 메서드라 어노테이션이 걸린 것으로 **보이나, 확인한 CRUD 메서드는 `findAll` 하나다** —
+`findById` 등 나머지는 **미검증**이다. 일반화하지 마라.
+
+**그래서 replica로 확실히 보내려면 호출자가 직접 `@Transactional(readOnly = true)`를 걸어야 한다.**
+명시적으로 붙은 곳은 **`QueueService:33` 하나뿐**이고, 위 0.9%는 그것과 배치의 `findAll()`이
+합쳐진 값이다.
+
+🔴 **그 0.9% 안에 배치의 큐 목록이 있다.** `ReconcileJob:120`·`TokenReclaimJob:146`의
+`findAll()`이 replica에서 온다(20초에 replica 9회 = 2초 주기 10회와 일치, 실측).
+**새로 만든 큐가 복제 도착 전이면 그 주기의 회수·대사에서 빠진다.**
+
+⚠️ **반대로 replica로 옮기면 안 되는 것도 있다.** `getMaxCapacity`는 못 찾으면
+`IllegalStateException("Queue not found during batch processing")`을 던진다 — 큐 생성 직후
+enqueue가 복제 지연에 걸리면 **그 틱의 그룹 전체가 실패**한다. stale read가 "옛 값"이 아니라
+**하드 실패**가 되는 경로다. 옮기기 전에 "쓰기 직후 읽기인가"를 먼저 봐라.
+
+⚠️ 이 절이 세운 전제 위에서 2026-08-26 dba 감사 6건이 나왔다. **그 판정들을 다시 봐야 한다** —
+"replica로 가니 안전하다"거나 "replica가 부하를 맞는다"는 서술은 대부분 성립하지 않는다.
+
+🪤 **메커니즘 추론으로 판단하지 마라.** 이 건에서 에이전트 둘(code-reviewer·architect)이 독립적으로
+"Spring Data가 readOnly라 replica"라고 추론했고 **둘 다 틀렸다**. 확인 수단은 라우팅 로그다:
+`--logging.level.com.sonix.queue.infrastructure.config=DEBUG`
 
 ### 5. 파일을 수정하는 에이전트와 읽기 전용 검토자를 병렬로 돌리지 않는다 (2026-08-18 확정)
 

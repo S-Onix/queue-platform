@@ -62,10 +62,14 @@ public class QueueJpaAdapter implements QueueRepository {
     /**
      * {@inheritDoc}
      *
-     * <p>{@code SimpleJpaRepository}가 클래스 레벨 {@code @Transactional(readOnly = true)}라
-     * 호출자가 트랜잭션 없이 불러도 <b>읽기 전용 트랜잭션이 열려 replica로 라우팅된다</b>
-     * ({@code ReplicationRoutingDataSource}). 여기에 {@code @Transactional}을 다시 붙이지 않는 것은
-     * 트랜잭션 경계를 Service 계층에만 두는 규칙 때문이다.
+     * <p>🪤 <b>구 주석이 거짓이었다.</b> "{@code SimpleJpaRepository}가 클래스 레벨
+     * {@code @Transactional(readOnly = true)}라 호출자가 트랜잭션 없이 불러도 replica로 라우팅된다"고
+     * 적혀 있었으나, 2026-08-27 라우팅 로그 실측 결과 <b>트랜잭션 없이 부르면 master로 간다</b>.
+     * 파생 쿼리는 readOnly 트랜잭션을 열지 않아 {@code isCurrentTransactionReadOnly()}가 false다.
+     *
+     * <p><b>replica로 보내려면 호출자가 {@code @Transactional(readOnly = true)}를 걸어야 한다.</b>
+     * 여기에 {@code @Transactional}을 붙이지 않는 것은 트랜잭션 경계를 Service 계층에만 두는
+     * 규칙 때문이며, 그 대가가 <b>이 조회가 master로 간다</b>는 것이다.
      */
     @Override
     public List<Queue> findAll() {
