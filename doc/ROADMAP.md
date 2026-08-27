@@ -343,7 +343,7 @@ flowchart TD
 - D6: Lua ZCARD Capacity
 - ~~D7: enqueue.lua + enqueue_bulk.lua~~ → **`enqueue_bulk.lua` 단독** (§70)
 - ~~D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)~~ → **하이브리드 폐기** (§70)
-  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
+  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, **`drain-interval=20ms`**(2026-08-27 재조정), 타임아웃 30s
   - ⚠️ 원안 대비 100배/30배 이탈 → **재조정 후속 과제**
 - **D9: score = `INCR queue:{queueId}:seq`** (신설, §70)
 - **D10: Hash Tag 필수** (신설, §70)

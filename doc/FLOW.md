@@ -14,7 +14,7 @@
 **핵심**:
 - **모든 요청**이 Global Queue에 적재 → `BatchProcessor`가 주기적으로 drain → Bulk Lua 1회
 - 경로가 하나뿐이라 순번 유일성 증명이 한 번으로 끝남 (하이브리드는 두 경로의 순번 일관성을 따로 증명해야 함)
-- 대가: 저부하 요청도 배치 주기를 부담 (`fixedRate=1000ms` → 평균 500ms) — 재조정 후속 과제
+- 대가: 저부하 요청도 배치 주기를 부담 (`drain-interval=20ms` → 평균 10ms). ✅ 재조정 완료(2026-08-27)
 
 ```mermaid
 flowchart TD
@@ -28,7 +28,7 @@ flowchart TD
 
     OFFER -.->|"블로킹 대기"| COMPLETE
 
-    SCHED["⑥ BatchProcessor (Consumer)\n@Scheduled(fixedRate=1000ms)"]
+    SCHED["⑥ BatchProcessor (Consumer)\n@Scheduled drain-interval=20ms"]
     --> DRAIN["drain (최대 MAX_DRAIN=5000)\nqueueId별 groupBy"]
     --> CHUNK["CHUNK_SIZE=500씩 분할"]
     --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\nKEYS[3]=queue:{queueId}:tokens\n(Hash Tag — 세 키가 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity? → FULL\n  INCR seq → score 발급\n  HSETNX tokens[identifier]='tokenId|issuedAt' → 신규? OK : EXISTS\n  (게이트는 이 Hash다 — waiting은 admit되면 빠진다)\n  신규면 ZADD waiting member=identifier score=seq\n  ZRANK → 순번(EXISTS인데 admit됐으면 -1)\n결과 array (입력과 동일 순서)"]
@@ -44,7 +44,10 @@ flowchart TD
     SERV -->|"PAUSED/DRAINING"| E503(["503 Q004 QUEUE_NOT_ACTIVE"])
 ```
 
-**처리량 상한**: 인스턴스당 `MAX_DRAIN / fixedRate` = **5,000 req/s**. 유입이 이를 넘으면
+**처리량 상한**: 인스턴스당 `MAX_DRAIN / 주기` = **250,000 req/s** (5,000건 / 20ms).
+⚠️ 2026-08-27 주기 변경으로 33배가 아니라 **50배** 커졌다 — 이 상한은 사실상 도달 불가라
+스로틀로서는 죽은 상수다. 실제로 먼저 깨지는 것은 `getMaxCapacity`의 DB 조회다(미측정).
+유입이 이를 넘으면
 globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,000×N.
 
 ### Enqueue 결정 근거
@@ -60,7 +63,7 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 - D6: Lua ZCARD Capacity 검증
 - ~~D7: enqueue.lua + enqueue_bulk.lua 2개~~ → **`enqueue_bulk.lua` 단독** (§70)
 - ~~D8: 임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s~~ → **하이브리드 폐기.** 배치 상수만 유지 (§70)
-  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
+  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, **`drain-interval=20ms`**, 타임아웃 30s
   - ⚠️ 원안(10ms/1s) 대비 100배/30배 이탈 → 재조정 후속 과제
 - **D9: score = `INCR queue:{queueId}:seq`** (신설, §70) — 단조증가·유일 보장
 - **D10: Hash Tag 필수** (신설, §70) — `queue/QueueKeys.java`

@@ -45,6 +45,18 @@ groups:
       #   폴백하는데, 그 키의 PX가 60초다. 소화 시간이 60초를 넘으면 폴백조차 미스가 되어
       #   정상 입장자가 404를 받기 시작한다. 즉 이 선이 **사용자 영향이 시작되는 지점**이다.
       #
+      # 🔴 **`and`의 좌우 순서가 의미를 바꾼다.** PromQL의 `A and B`는 **A의 값**을 반환한다.
+      #    처음엔 `sum(lag) > 0 and (lag/rate) > 60`으로 썼는데, 그러면 $value가 소화 시간이
+      #    아니라 **랙 건수**가 되어 랙 5,000건에 "소화 시간 1h 23m"이라고 찍혔다(실측 확인).
+      #    사람이 대응 규모를 정하는 바로 그 숫자였다. 소화 시간을 앞에 둬야 humanizeDuration이
+      #    의미를 갖는다. 교집합이라 가드 효과는 순서와 무관하다.
+      #
+      # 🔴 **`rate > 0` 가드를 추가했다.** 컨슈머가 멈추면 rate=0 → 나눗셈이 +Inf가 되어
+      #    이 규칙과 300초 규칙이 KafkaConsumerStalled와 **셋 다 동시에** 발화했다.
+      #    for가 각각 2m/1m/3m이라 **critical(1m)이 먼저 뜨고 그 조치는 "인스턴스를 늘려라"** 인데,
+      #    독약 메시지나 리밸런스 루프에서 인스턴스를 늘리면 리밸런스를 한 번 더 유발할 뿐이다.
+      #    정답인 Stalled의 조치는 2분 뒤에 온다. 이제 "느림"과 "멈춤"이 실제로 갈린다.
+      #
       # 나눗셈 주의:
       #   - 랙 0이면 분자가 0이라 발화하지 않는다(가드도 함께 건다).
       #   - 컨슈머가 멈춰 rate가 0이면 결과가 +Inf → 발화한다. **의도한 동작이다**
@@ -54,13 +66,15 @@ groups:
       #           유지돼야 발화한다.
       - alert: KafkaConsumerDrainTimeExceedsAdmitTtl
         expr: |
-          sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"}) > 0
-          and
           (
             sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"})
             /
             sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m]))
           ) > 60
+          and
+          sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"}) > 0
+          and
+          sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m])) > 0
         for: 2m
         labels:
           severity: warning
@@ -78,13 +92,15 @@ groups:
       # for: 1m — 이미 warning이 2분간 선행했을 상황이다. 여기서 더 기다릴 이유가 없다.
       - alert: KafkaConsumerDrainTimeExceedsCompleteWindow
         expr: |
-          sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"}) > 0
-          and
           (
             sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"})
             /
             sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m]))
           ) > 300
+          and
+          sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"}) > 0
+          and
+          sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m])) > 0
         for: 1m
         labels:
           severity: critical
