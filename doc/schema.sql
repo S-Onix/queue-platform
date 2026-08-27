@@ -128,8 +128,12 @@ CREATE TABLE queues (
 --            (b) 실증 당시 tokens 는 0행이었다. INSTANT 지원 여부는 행 수와 무관하지만,
 --            대용량에서의 MDL 배타 락 대기(장기 트랜잭션 뒤에서 대기)까지 잰 것은 아니다.
 --            테이블당 row version 64 상한을 넘기면 그때는 INSTANT가 아니라 재구축이다.
--- [redis_sync_needed] ⬜ **미사용.** RedisSyncJob 이 없고 이 컬럼을 쓰는 코드도 0건이다
---   (TokenEntity 가 insertable=false, UPDATE 하는 곳 없음). 값은 항상 0이다
+-- [redis_sync_needed] 🗑 **삭제됨 (2026-08-27).** 쓰는 코드 0건·읽는 코드 0건·전 행 값 0이었다.
+--   설계 목적이던 "Redis 다운 중 INSERT 추적"은 **현재 아키텍처에서 발생할 수 없다** —
+--   enqueue 가 Redis Lua(순번 확정) → Kafka → 컨슈머 INSERT 순서라 Redis 가 죽으면
+--   503 이고 어디에도 INSERT 가 되지 않는다. 실재하는 위험(enqueue 성공 *후* Redis 유실)은
+--   INSERT 시점 플래그로 표현할 수 없다 — 그때는 Redis 가 멀쩡했다. 감지는 redisSeq < dbMaxSeq
+--   **비교**다. 되살리지 마라. 인덱스 idx_tokens_sync_needed 도 함께 지웠다(카디널리티 1)
 -- [파티션 키] PRIMARY KEY(id, issued_at) — MySQL 제약
 --
 -- [파티션 유예 전략 — 월말 걸친 토큰 보호]
@@ -168,7 +172,6 @@ CREATE TABLE tokens (
     --    NULL을 돌려주고 NOT NULL 컬럼 적재가 통째로 실패한다(실측)
     expired_reason    TINYINT      NULL,
     admit_token       VARCHAR(50)  NULL,
-    redis_sync_needed TINYINT      NOT NULL DEFAULT 0,
     -- ⚠️ 아래 4개는 전부 UTC 벽시계다. 위 [시각 규약] 참조. DEFAULT를 붙이지 마라.
     -- 🔴 cancelled_at 삭제 (DECISIONS §82) — Cancel API를 만들지 않아 status=3에 도달하는
     --    경로가 없다. 이탈은 inactiveTtl 판정 배치가 잡는다.
@@ -185,8 +188,7 @@ CREATE TABLE tokens (
     INDEX idx_tokens_token_status         (token_id, status),          -- ⚠️ 삭제 후보: uq_tokens_token_id가 (token_id, ...) 접두로 커버
     INDEX idx_tokens_queue_status_issued  (queue_id, status, issued_at),
     INDEX idx_tokens_queue_user_status    (queue_id, user_id, status), -- ⚠️ 삭제 후보: 중복 판정은 Lua HSETNX(tokens Hash)가 한다. 6개 중 가장 넓다
-    INDEX idx_tokens_status_admit         (status, issued_at),         -- ⚠️ 삭제 후보(Sprint 9 확정 후). 이름의 admit은 admit_token과 무관 — 오해를 부른다
-    INDEX idx_tokens_sync_needed          (redis_sync_needed, status)
+    INDEX idx_tokens_status_admit         (status, issued_at)          -- ⚠️ 삭제 후보(Sprint 9 확정 후). 이름의 admit은 admit_token과 무관 — 오해를 부른다
 
     -- 🔴 fk_tokens_queue 삭제 (2026-08-17)
     --   InnoDB는 파티션 테이블에 FK를 지원하지 않는다. 이 제약이 남아 있으면

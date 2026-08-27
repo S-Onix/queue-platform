@@ -112,7 +112,7 @@
 | §20 | 메모리 압박 해결 | ✅ |
 | §23 | Redis Key 설계 이유 (키표) | ✏️ |
 | §30 | Master/Replica (Sentinel) 설계 | 📉 |
-| §39 | RedisSyncJob 상세 흐름 | ✏️ |
+| §39 | ~~RedisSyncJob 상세 흐름~~ 🗑 철회(2026-08-27) | ✏️ |
 | §64 | Lua Script Bean 등록 패턴 | ✅ |
 | §66 | Redis Cluster 도입 결정 | ✏️ |
 | §67 | 이중 라우팅 (Cluster + Hash Tag) | ✏️ |
@@ -2231,6 +2231,9 @@ Java 매핑:
 
 ### redis_sync_needed 컬럼
 
+> 🗑 **철회 (2026-08-27).** `redis_sync_needed` 컬럼·인덱스·`RedisSyncJob` 계획 전부 폐기했다. 이유는 `doc/schema.sql` [redis_sync_needed] 주석 참조 — 설계 전제("Redis 다운 중 INSERT")가 현재 enqueue 순서(Redis Lua → Kafka → 컨슈머 INSERT)에서 **발생할 수 없다.** 아래는 이력이다.
+
+
 ```
 용도: Redis 다운 중 DB INSERT됐지만 Sorted Set 미반영 토큰 추적
 값: 0 = Redis 반영완료, 1 = 미반영
@@ -2308,6 +2311,9 @@ Redis queue:{queueId}:admit-by-admit 미스 시:
 ---
 
 ## §39 RedisSyncJob 상세 흐름
+
+> 🗑 **철회 (2026-08-27).** `redis_sync_needed` 컬럼·인덱스·`RedisSyncJob` 계획 전부 폐기했다. 이유는 `doc/schema.sql` [redis_sync_needed] 주석 참조 — 설계 전제("Redis 다운 중 INSERT")가 현재 enqueue 순서(Redis Lua → Kafka → 컨슈머 INSERT)에서 **발생할 수 없다.** 아래는 이력이다.
+
 
 > ✏️ **아래 슬라이스 계산·키·멤버는 폐기됐다** (§66 D2 · §70 D9 · §74). 본문의 흐름(①~⑤)과
 > "ZADD NX로 멱등" 원칙은 유효하되, **재삽입 대상 키·멤버는 아래 정정된 표기를 따라라.**

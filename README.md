@@ -91,7 +91,6 @@ JPA blocking → OS Thread 점유 없이 대기
 Redis Lua 처리 → Kafka 발행(동기) → 200 응답 (seq·rank 확정)
 Kafka token-lifecycle (key=tokenId) → DB INSERT (At-Least-Once)
 → Enqueue p99 50ms 이하 달성
-→ redis_sync_needed: Redis 다운 중 INSERT 토큰 추적
 ```
 
 ---
@@ -255,7 +254,6 @@ tokens 테이블:
   → 파티션 DROP 후에도 과금 근거 영구 보존
 
 status: TINYINT (0~4) — VARCHAR 대비 저장공간·비교 성능 최적화
-redis_sync_needed: Redis 다운 중 미반영 토큰 추적
 admit_token: DB 저장 → Redis 미스 시 Fallback
 ```
 
@@ -389,7 +387,6 @@ Tenant (REST API)       : POST /verify → POST /complete
 | Kafka Enqueue 버퍼 | DB 적재를 비동기로 흡수 | Eventually Consistent | At-Least-Once 보장 |
 | ~~Kafka admit 처리~~ | — | — | 🔴 **§80이 폐기.** admit은 **동기 Lua**다. 멱등은 Redis `admit-idem` 키(PX 300s) |
 | status TINYINT | 저장공간·비교 성능 | 가독성 (상수로 보완) | 대량 tokens 테이블 최적화 |
-| redis_sync_needed | Redis 다운 중 INSERT 복구 | 컬럼 추가 | 데이터 정합성 보장 |
 | admit_token 컬럼 | Redis 미스 시 DB Fallback | 컬럼 추가 | verify 안정성 향상 |
 | queue_daily_stats | 파티션 DROP 후 과금 근거 보존 | 배치 필요 | 감사/청구 불변 기록 |
 | billing_snapshots 직접 집계 | tokens 원본 → 중복 방지 불필요 | 집계 쿼리 필요 | billing_events 테이블 제거 |

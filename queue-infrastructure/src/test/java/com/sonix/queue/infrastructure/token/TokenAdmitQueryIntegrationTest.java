@@ -231,7 +231,7 @@ class TokenAdmitQueryIntegrationTest {
         // verify가 발행한 COMPLETED를 컨슈머가 적용하는 것과 같은 경로다.
         adapter.applyTransition(TokenEventType.COMPLETED, List.of(
                 Token.reconstruct(null, "tok_dev_v1", QUEUE_ID, tenantId, "0190e2c1-user", 42L,
-                        TokenStatus.COMPLETED, null, "adm_dev_v1", false, ISSUED_AT, null)));
+                        TokenStatus.COMPLETED, null, "adm_dev_v1", ISSUED_AT, null)));
 
         assertThat(statusOf("tok_dev_v1")).isEqualTo(2);
         // 🔴 여기가 핵심 — NULL이면 complete가 404를 준다.
@@ -251,7 +251,7 @@ class TokenAdmitQueryIntegrationTest {
         seedAdmitted("tok_dev_v2", "adm_dev_v2", 3);
         adapter.applyTransition(TokenEventType.COMPLETED, List.of(
                 Token.reconstruct(null, "tok_dev_v2", QUEUE_ID, tenantId, "0190e2c1-user", 42L,
-                        TokenStatus.COMPLETED, null, "adm_dev_v2", false, ISSUED_AT, null)));
+                        TokenStatus.COMPLETED, null, "adm_dev_v2", ISSUED_AT, null)));
 
         assertThat(adapter.markCompleted(QUEUE_ID, tenantId, "tok_dev_v2", "adm_dev_v2",
                 LocalDateTime.of(2026, 8, 24, 12, 0, 0), 300)).isZero();

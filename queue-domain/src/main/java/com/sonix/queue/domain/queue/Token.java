@@ -57,7 +57,6 @@ public class Token {
     TokenStatus status;
     Integer expiredReason;  // Expired일 경우에
     String admitToken;      // admit 단계에서 생성됨
-    boolean redisSyncNeeded;// Redis와 데이터 싱크가 맞는지 확인 (Redis가 강제로 다운될 경우를 대비)
     LocalDateTime issuedAt;
     LocalDateTime admittedAt;   // admit 시각. verify·complete 유효 창의 기준 (issuedAt이 아니다, §80)
 
@@ -113,7 +112,6 @@ public class Token {
         token.status = status;
         token.expiredReason = expiredReason;
         token.admitToken = admitToken;
-        token.redisSyncNeeded = false;
         token.issuedAt = issuedAt;
         token.admittedAt = admittedAt;
         return token;
@@ -122,8 +120,7 @@ public class Token {
     public static Token reconstruct(Long id, String tokenId, String queueId, Long tenantId,
                                     String userId, long seq, TokenStatus status,
                                     Integer expiredReason, String admitToken,
-                                    boolean redisSyncNeeded, LocalDateTime issuedAt,
-                                    LocalDateTime admittedAt) {
+                                    LocalDateTime issuedAt, LocalDateTime admittedAt) {
         Token token = new Token();
         token.id = id;
         token.tokenId = tokenId;
@@ -134,7 +131,6 @@ public class Token {
         token.status = status;
         token.expiredReason = expiredReason;
         token.admitToken = admitToken;
-        token.redisSyncNeeded = redisSyncNeeded;
         token.issuedAt = issuedAt;
         token.admittedAt = admittedAt;
         return token;

@@ -127,7 +127,7 @@ Client (브라우저)
 - **Sprint 6**: Token 도메인 · Enqueue · Polling (Cancel API는 §82로 폐기)
 - **Sprint 7**: admit · verify · complete + `/status` 분할 · admitWatermark · pacing (§79 · §80)
 - **Sprint 8**: Kafka `token-lifecycle` + `queue-consumer` (100만건 실측)
-- **Sprint 9(진행 중)**: 회수 3경로 · Redis↔DB 대사 · 과금 스냅샷(§84). `RedisSyncJob`은 미착수
+- **Sprint 9(진행 중)**: 회수 3경로 · Redis↔DB 대사 · 과금 스냅샷(§84). `RedisSyncJob`은 폐기(2026-08-27)
 - **인프라 전환**: Sentinel → **독립 2 Cluster + 큐 단위 라우팅** (§75, 코드에서 Sentinel 분기 제거)
 - **배포**: Dockerfile 3종 + compose + GitHub Actions CI(단위 · 통합 · 이미지 3종)
 

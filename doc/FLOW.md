@@ -83,8 +83,7 @@ globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,0
 
 - Enqueue 완료 후 Kafka `token-lifecycle` 발행 (**key = `tokenId`**, 18 파티션)
 - `queue-consumer` 모듈의 `TokenLifecycleConsumer`가 배치로 DB INSERT (멱등)
-- Redis 다운 시 `redis_sync_needed=1` DB INSERT
-- 복구 시 배치가 Sorted Set 재삽입
+- Redis 다운 시 enqueue 는 **QE001(503)** 으로 실패한다 — Redis 가 순번 게이트라 DB 에만 남는 토큰이 생기지 않는다
 
 ---
 
