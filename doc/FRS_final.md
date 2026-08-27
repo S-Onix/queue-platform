@@ -2,6 +2,10 @@
 
 > 버전: v1.16 | 상태: 확정 | 대상: 실제 구현 범위
 >
+> ⚠️ **API 필드 명세의 정본은 [`API.md`](API.md)다** — 코드에서 추출한 것이라 구현과 어긋나지
+> 않는다. 이 문서는 **설계 시점의 요구사항 원본**이며, 여기 적힌 필드가 구현과 갈리면
+> `API.md`가 맞다. (이 문서는 이력이 일이므로 사후에 고치지 않는다.)
+>
 > v1.16 변경사항: **§6.2에 "세션 경계 3종" 신설** — ① `identifier` 매핑의 영속성 요구,
 > ② `tokenId`·`seq`의 브라우저 보관처(SDK 규약, 미정), ③ 비로그인 상태로 `admitToken`을
 > 받았을 때의 입장 처리와 그 보안 대가. 셋 다 Tenant·SDK 책임이고 Platform 코드는 0줄이다
@@ -80,7 +84,7 @@ Tenant    → 슬롯 관리 + 입장 제어
 ```
 DB tokens 테이블:
   tokenId, userId, queueId, seq, status(TINYINT), admit_token
-  redis_sync_needed, issuedAt, completedAt
+  issuedAt, completedAt
   → 메타데이터 원본. Redis 장애 시 복구 기준
   → Kafka Consumer가 INSERT 보장 (At-Least-Once)
   → admit_token: Redis 미스 시 DB Fallback용
@@ -847,7 +851,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | complete 동시성 | DB UPDATE WHERE status=1 (1번만 성공) |
 | ZREM 실패 | DB 먼저 → Batch 10초 내 재실행 |
 | billing 중복 | tokens 원본 집계 → 중복 개념 없음 |
-| Redis 다운 중 INSERT | redis_sync_needed=1 → RedisSyncJob 복구 |
+| Redis 다운 중 INSERT | 🗑 발생 불가 — Redis 가 게이트라 죽으면 503, 어디에도 INSERT 되지 않는다 (2026-08-27) |
 
 ---
 
@@ -857,7 +861,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 |-----|------|------|
 | ~~`TokenExpiryJob`~~ | — | ⛔ **그런 클래스는 없다.** `waitingTtl`·`inactiveTtl` 판정은 아래 `TokenReclaimJob` 안에 들어갔다 — 셋 다 같은 10초 주기에 같은 큐 목록을 도는 작업이라 프로세스를 나눌 이유가 없었다 |
 | `TokenReclaimJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기. ~~`RETURNED` 발행~~ — **그 이벤트 타입은 존재하지 않는다**: `TokenEventType`은 `ENQUEUED·ADMITTED·COMPLETED·EXPIRED` 4개다). ⚠️ 이 경로에서 **DB `status`는 1에 머문다** — `EXPIRED` 소비 가드가 `IF(status=0,4,status)`라 1에서 no-op이고, 그건 `complete`의 300초 창을 살리려는 의도다. 잔류분은 `ReconcileJob`이 정리한다. **회수 경로는 총 3개**(admitToken TTL · `inactiveTtl` · `waitingTtl`). 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
-| `RedisSyncJob` ⬜ | 5분 | **미구현.** `redis_sync_needed` 컬럼은 쓰고 있으나 읽어서 되살리는 잡이 없다 |
+| ~~`RedisSyncJob`~~ 🗑 | — | **폐기 (2026-08-27).** 컬럼·인덱스까지 삭제. 전제가 성립 불가 |
 | `BillingSnapshotJob` ✅ | **매일 UTC 00:30** | `tokens` 원본을 `PARTITION (pYYYY_MM)`로 집계 → `billing_snapshots` UPSERT. **전월 + 당월**만 본다(더 과거는 DROP된 달을 깎는다). `READ COMMITTED` 필수 — 안 걸면 `INSERT ... SELECT`가 `tokens` 적재를 막는다(실측 6초 `ERROR 1205`). ShedLock 없음(UPSERT 멱등). 상세 §84 |
 | ~~`queue_daily_stats` 집계 + 파티션 DROP/REORGANIZE~~ | ⬜ M+2월 초 | **미착수.** §84가 `BillingSnapshotJob`에서 분리했다 — 과금이 아니라 파티션 운영이고 DDL이라 성격이 다르다 |
 
@@ -1041,7 +1045,7 @@ keepalive:
 | 장애 | 영향 | 대응 |
 |------|------|------|
 | Redis Master 다운 | Enqueue/Polling 중단 | Sentinel Failover 5~10초 |
-| Redis 다운 중 Enqueue | Sorted Set 미반영 | redis_sync_needed=1 → RedisSyncJob 복구 |
+| Redis 다운 중 Enqueue | enqueue 자체가 실패 | QE001(503). Redis 가 순번 게이트라 부분 반영이 없다 |
 | Kafka 다운 | DB INSERT 지연 | 복구 후 Consumer 재처리 |
 | MySQL Master 다운 | complete 중단 | Replica 승격 |
 
