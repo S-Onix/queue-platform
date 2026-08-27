@@ -249,7 +249,7 @@ POST /api/v1/queues/:queueId/tokens
 Body: { identifier: string }        ← UUIDv7. 생성·전달 주체는 Tenant (아래 규약)
 
 처리 흐름:
-1. API Key 검증 (Redis 캐시 60s → DB Replica fallback)
+1. API Key 검증 (Redis 캐시 60s → DB **master** fallback — 필터라 트랜잭션 밖이다. §4-3)
 2. Rate limit (per-key)
 3. 큐 상태 확인 (ACTIVE만 허용) + Tenant 소유권 검증
 4. 요청을 Global Queue에 적재 → BatchProcessor가 주기적으로 drain (FLOW.md Enqueue 참조)
@@ -547,7 +547,11 @@ admitToken 생성: tokenId와 동일하게 UUIDv7(랜덤 74비트). 짧은 랜�
 > ✏️ **구 제목 "유효성 확인만 — 상태 변경 없음"은 더 이상 사실이 아니다.** verify는 **응답을 주는
 > 시점에 `COMPLETED`를 발행한다**(PR #48). Platform의 책임이 답을 돌려주는 데까지이기 때문이다.
 > 아래 "2. Redis 쓰기 0회, DB 쓰기 0회"는 **여전히 참**이다 — 직접 쓰지 않고 **이벤트만** 낸다
-> (`@Transactional(readOnly = true)`라 Replica로 가고, Replica는 `super-read-only=ON`이다).
+> (~~`@Transactional(readOnly = true)`라 Replica로 가고~~ — **2026-08-27 정정: 거짓이다.**
+> `verify`에는 트랜잭션 어노테이션이 **아예 없고**(Kafka 12초를 커넥션 쥔 채 기다리지 않으려고
+> 일부러 뺐다), 트랜잭션이 없으면 그 조회는 **master**로 간다. CLAUDE.md §4-3.
+> 🪤 **여기에 `@Transactional(readOnly = true)`를 되붙이지 마라** — `QueueEngineService:213`이
+> 경고한 F-3 재발 경로다).
 
 ```
 POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
@@ -1053,6 +1057,8 @@ keepalive:
 >   **목표 부하 200 rps에서 32.32ms**(여유 17.7ms, 큐 40개, 429·503 0).
 >   2.5배(500 rps)까지 여유가 있고 **5배(1,000 rps)부터 초과**한다.
 >   🔴 **p99는 큐 수의 함수다** — 2,000 rps에서 큐 10개 64.42ms · 20개 77.37ms · 43개 130.50ms(429 0%).
+>   🪤 **1,000 rps는 순서 의존이라 단정 불가**(정순 75.13ms / 역순 37.07ms — JIT 워밍업).
+>   견고한 것은 200·500 rps 충족과 2,000 rps 초과뿐이다.
 >   틱당 그룹마다 `getMaxCapacity`(DB) + Lua가 붙기 때문이다. **큐 수 없이 인용하지 마라.**
 >   지연의 정체는 Redis도 Kafka도 아니고 **틱 대기**였다: `p99 ≈ 0.99 × 주기 + c` (c ≈ 7~19ms).
 >   ⚠️ 로컬 측정이다(부하 도구가 서버와 같은 머신, **큐 40개**). c는 프로덕션에서 다시 재라.

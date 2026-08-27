@@ -160,6 +160,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
     **FRS 목표 부하 200 rps에서 p99 32.32ms**로 목표(<50ms) 충족(여유 17.7ms, 큐 40개).
     2.5배(500 rps)까지 여유. **5배(1,000 rps)부터 초과**한다.
     🔴 **p99는 큐 수의 함수다** — 2,000 RPS에서 큐 10개 64.42ms · 20개 77.37ms · 43개 130.50ms.
+    🪤 **순서를 뒤집어 재라** — 정순만 재면 워밍업을 부하로 착각한다(1,000rps 정순 75ms vs 역순 37ms).
     "몇 RPS에서 몇 ms"는 **큐 수 없이는 의미가 없다.** 근거는 `BatchProcessor` 주석
   - ⚠️ `MAX_DRAIN`·`CHUNK_SIZE`는 **아직 원안 이탈 상태**다(재조정 안 함)
 - **D9: score = `INCR queue:{queueId}:seq`** (신설) — ZCARD+1/타임스탬프는 충돌·동점 → INCR만 단조증가·유일
@@ -464,8 +465,15 @@ master(3306)  Com_select  2,893,040      replica(3307)  Com_select  26,728   ←
 
 🪤 **`SimpleJpaRepository`의 클래스 레벨 `@Transactional(readOnly = true)`가 파생 쿼리에는
 안 걸린다.** `findByQueueId`·`findByKeyHash`를 트랜잭션 없이 부르면 readOnly 트랜잭션이
-**열리지 않아 master**로 간다. 주석 3곳이 "파생 쿼리도 replica로 간다"고 적고 있었고
-**전부 거짓이었다**(2026-08-27 정정).
+**열리지 않아 master**로 간다. 주석 **2곳**(`QueueEngineService:178`·`AdmitRef:13`)이
+"replica로 간다"고 적고 있었고 **거짓이었다**(2026-08-27 정정).
+`QueueJpaAdapter:65`는 **결론이 맞고 근거가 틀렸다** — `findAll()`은 CRUD라 실제로 replica인데
+이유를 "Spring Data 일반"으로 적었다. 셋을 "전부 거짓"으로 묶지 마라.
+
+🪤 **`@Query(nativeQuery)`의 자리는 미정이다.** `findAdmittedByAdmitToken` 등은 파생 쿼리가
+아니라 `@Query`인데, 인터페이스에 선언한 메서드라 같은 편(master)일 것으로 **추론**한다 —
+**미측정이다.** 판정 기준을 굳이 세우자면 "`SimpleJpaRepository`가 구현했나 / 인터페이스에
+선언했나"이지 "CRUD냐 파생 쿼리냐"가 아니다.
 
 반대로 `findAll()`은 트랜잭션 없이 불러도 **replica로 갔다**(실측). 그 클래스가 직접 구현한
 CRUD 메서드라 어노테이션이 걸린 것으로 **보이나, 확인한 CRUD 메서드는 `findAll` 하나다** —

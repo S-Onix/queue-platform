@@ -846,8 +846,10 @@ Batch UPDATE:
 > ✏️ **"Bulk Worker 항상 활성"(분기 없음)은 유효하며 §70이 재확인했다.** 다만 아래 두 가지는 폐기됐다:
 > **① `슬라이스별 ZADD multi-member`** → 대기열은 ZSet 하나다(§66 D2). **② `INCRBY N → seq 블록 채번`**
 > → 항목마다 `INCR queue:{queueId}:seq`로 발급한다(§70 D9).
-> 상수도 실제와 다르다 — 코드는 `MAX_DRAIN=5000` / `CHUNK_SIZE=500` / `fixedRate=1000ms`
-> (`BatchProcessor.java`). 아래 `500건 / 10ms`는 원안이며 **재조정은 후속 과제**다(§70).
+> 상수도 실제와 다르다 — 코드는 `MAX_DRAIN=5000` / `CHUNK_SIZE=500` /
+> **`drain-interval=20ms`**(`BatchProcessor.java`, 2026-08-27 `1000ms`에서 재조정).
+> 아래 `500건 / 10ms`는 원안이며, **주기는 재조정 완료**(원안 10ms의 2배).
+> `CHUNK_SIZE`·타임아웃은 여전히 원안 이탈 상태다.
 
 ### Enqueue Lua — Bulk Worker 항상 활성
 
