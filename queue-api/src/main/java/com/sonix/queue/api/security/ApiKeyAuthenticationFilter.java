@@ -13,6 +13,7 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
 import java.util.List;
@@ -39,6 +40,10 @@ public class ApiKeyAuthenticationFilter extends OncePerRequestFilter {
 
     private final ApiKeyRepository apiKeyRepository;
     private final ApiKeyCache apiKeyCache;
+
+    /** 경로 판정용 정규화. 원문을 쓰면 안 되는 이유는 {@link #shouldNotFilter} javadoc 참조. */
+    private static final UrlPathHelper PATH_HELPER = new UrlPathHelper();
+    static { PATH_HELPER.setDefaultEncoding("UTF-8"); }
 
     public ApiKeyAuthenticationFilter(ApiKeyRepository apiKeyRepository, ApiKeyCache apiKeyCache) {
         this.apiKeyRepository = apiKeyRepository;
@@ -114,10 +119,31 @@ public class ApiKeyAuthenticationFilter extends OncePerRequestFilter {
      * </ul>
      * 그래서 {@code /tokens/{tokenId}/complete}와 {@code /tokens/{tokenId}}를 구분해야 한다 —
      * 정규식이 뭉개지면 <b>폴링이 401</b>이 된다.
+     *
+     * <p>🔴 <b>정규식에 넣는 문자열로 {@code getRequestURI()}(원문)를 쓰면 안 된다.</b> {@code RateLimitFilter}가 같은 이유로
+     * 뚫렸다 — 원문으로 판정하면 디스패처가 보는 문자열과 갈린다.
+     *
+     * <p>여기는 갈려도 <b>fail-closed</b>라 우회가 아니라 오작동이었다(실측 2026-08-28):
+     * {@code POST /api/v1/queues/q_x/tokens} → 404 Q001(정상 도달)인데
+     * {@code POST /api/v1/queues/q_x/token%73} → <b>401</b>. 경로를 인코딩하는 Tenant 클라이언트는
+     * enqueue·admit·verify·complete가 통째로 401이 된다.
+     *
+     * <p>⚠️ 더 중요한 건 <b>방향이 뒤집힐 수 있다는 것</b>이다. 위 4경로 중 하나라도 permitAll이
+     * 되는 순간 fail-closed가 fail-open이 된다. 두 필터가 같은 문자열을 보게 두는 것이 유일한 방어다.
+     *
+     * <p>🔑 {@code setDefaultEncoding("UTF-8")}: {@code UrlPathHelper}는 기본적으로
+     * {@code request.getCharacterEncoding()}으로 디코딩하는데 GET·JSON POST에서는 그게 {@code null}이라
+     * ISO-8859-1로 떨어진다. Tomcat·{@code PathPatternParser}는 UTF-8이다. 지금 쓰는 경로는
+     * 전부 ASCII(UUID hex)라 도달 불가지만, 두 계층의 규칙을 굳이 다르게 둘 이유가 없다.
+     * ⚠️ 다만 이것으로 완전히 같아지지는 않는다 — {@code setDefaultEncoding}은
+     * {@code getCharacterEncoding()}이 <b>null일 때만</b> 덮으므로, 클라이언트가
+     * {@code Content-Type: ...;charset=EUC-KR}을 보내면 경로가 그 charset으로 디코딩된다.
+     * 지금 매칭 대상 세그먼트가 전부 ASCII라 세 charset에서 결과가 같아 도달 불가이나
+     * <b>미측정이다.</b>
      */
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        String uri = request.getRequestURI();
+        String uri = PATH_HELPER.getPathWithinApplication(request);   // 원문 금지 — 위 javadoc
         boolean isTenantEnginePath =
                    uri.matches("/api/v1/queues/[^/]+/tokens")                       // enqueue
                 || uri.matches("/api/v1/queues/[^/]+/admit")                        // admit

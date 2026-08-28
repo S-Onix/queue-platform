@@ -16,6 +16,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -83,17 +84,51 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
 
+    /**
+     * 경로 판정에 쓰는 <b>유일한</b> 문자열원.
+     *
+     * <p>🔴 <b>{@code getRequestURI()}를 직접 쓰면 안 된다.</b> 그건 디코딩 전 원문이라
+     * 디스패처·시큐리티가 보는 문자열과 다르다. 두 계층이 다른 문자열을 보면 한도가 통째로 사라진다
+     * — 2026-08-28 실측으로 두 곳이 뚫렸다:
+     * <ul>
+     *   <li>{@code POST /api/v1/tenants/log%69n} → 15회 전부 401(한도 없음).
+     *       평문은 11회째 429다. 본문이 {@code T003}이라 <b>자격 증명 비교가 실제로 수행됐다</b>
+     *       = brute force에 한도가 없다</li>
+     *   <li>폴링에서 {@code tokenId}의 한 글자만 인코딩하면 <b>버킷이 새로 생긴다</b>.
+     *       평문 소진(429) 상태에서 {@code %74} 변형이 200을 5번 더 받았다. 변형은 글자 수만큼 있다</li>
+     * </ul>
+     *
+     * <p>고치는 방향은 "인코딩을 막는다"가 아니라 <b>디스패처와 같은 문자열을 본다</b>이다.
+     * 막는 쪽은 목록 관리가 되고, 목록은 언젠가 어긋난다. {@link UrlPathHelper}는 Spring MVC가
+     * 쓰는 것과 같은 정규화(1회 디코딩 · 컨텍스트 경로 제거 · 경로 파라미터 {@code ;x=1} 제거)를 한다.
+     *
+     * <p>🔑 <b>"완전히 디코딩"이 목표가 아니다.</b> 이중 인코딩({@code %2569})은 1회 디코딩하면
+     * {@code %69}로 남아 여기서도 안 맞지만, <b>디스패처에서도 안 맞아 404</b>가 된다.
+     * 두 계층이 같은 규칙으로 어긋나므로 우회가 성립하지 않는다. 필요한 성질은 "같은 문자열"이지
+     * "원본 복원"이 아니다.
+     */
+    private static final UrlPathHelper PATH_HELPER = new UrlPathHelper();
+    static {
+        // 기본값은 request.getCharacterEncoding()인데 GET·JSON POST에선 null이라 ISO-8859-1로 떨어진다.
+        // Tomcat·PathPatternParser는 UTF-8이다. 지금 경로는 전부 ASCII라 도달 불가지만
+        // (공개 경로 3개 · tokenId는 UUID hex), 두 계층의 디코딩 규칙을 다르게 둘 이유가 없다.
+        PATH_HELPER.setDefaultEncoding("UTF-8");
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
+        // 경로는 여기서 한 번만 만든다. 아래 판정들이 전부 이 값을 쓴다(위 PATH_HELPER 주석 참조).
+        String path = PATH_HELPER.getPathWithinApplication(request);
+
         // 1) Actuator 등은 Rate Limit 적용 제외
-        if (shouldSkip(request)) {
+        if (shouldSkip(path)) {
             filterChain.doFilter(request, response);
             return;
         }
 
         //Polling의 경우 API-KEY로 인증하지 않기 떄문에 선처리하여 확인한다.
-        if (isPollPath(request)) {
-            if (!checkPollRateLimit(request, response)) {
+        if (isPollPath(request.getMethod(), path)) {
+            if (!checkPollRateLimit(path, response)) {
                 return;   // 429로 종료
             }
             filterChain.doFilter(request, response);
@@ -110,8 +145,8 @@ public class RateLimitFilter extends OncePerRequestFilter {
         //
         //    로그인 시도의 신원은 **body의 email**이지 헤더의 토큰이 아니다. 그러니 이 세 경로에서는
         //    헤더를 보고 한도를 고르면 안 된다. 위 폴링 선처리와 같은 모양이다.
-        if (resolvePublicEndpoint(request.getRequestURI()) != null) {
-            if (!checkPublicRateLimit(request, response)) {
+        if (resolvePublicEndpoint(path) != null) {
+            if (!checkPublicRateLimit(request, path, response)) {
                 return;   // 429로 종료
             }
             filterChain.doFilter(request, response);
@@ -128,7 +163,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
             }
         } else {
             // 인증 전 요청 → Fixed Window + IP 기반
-            if (!checkPublicRateLimit(request, response)) {
+            if (!checkPublicRateLimit(request, path, response)) {
                 return;  // 429 응답으로 종료
             }
         }
@@ -136,17 +171,23 @@ public class RateLimitFilter extends OncePerRequestFilter {
         filterChain.doFilter(request, response);
     }
 
-    /** GET /api/v1/queues/{queueId}/tokens/{tokenId} 형태만 poll로 인식. */
-    private boolean isPollPath(HttpServletRequest req) {
-        return "GET".equals(req.getMethod())
-                && req.getRequestURI().matches("/api/v1/queues/[^/]+/tokens/[^/]+");
+    /** GET /api/v1/queues/{queueId}/tokens/{tokenId} 형태만 poll로 인식. path는 정규화된 값이어야 한다. */
+    private boolean isPollPath(String method, String path) {
+        return "GET".equals(method)
+                && path.matches("/api/v1/queues/[^/]+/tokens/[^/]+");
     }
 
-    /** tokenId 기준 Token Bucket. @return true=통과, false=거부(429 완료). */
-    private boolean checkPollRateLimit(HttpServletRequest req, HttpServletResponse res)
+    /**
+     * tokenId 기준 Token Bucket.
+     *
+     * <p>⚠️ 버킷 키가 되는 tokenId는 <b>정규화된 경로</b>에서 뽑아야 한다. 원문에서 뽑으면
+     * 인코딩 변형마다 다른 키가 나와 버킷이 무한정 새로 생긴다(위 PATH_HELPER 주석의 실측 참조).
+     *
+     * @return true=통과, false=거부(429 완료).
+     */
+    private boolean checkPollRateLimit(String path, HttpServletResponse res)
             throws IOException {
-        String uri = req.getRequestURI();
-        String tokenId = uri.substring(uri.lastIndexOf('/') + 1);   // 마지막 세그먼트
+        String tokenId = path.substring(path.lastIndexOf('/') + 1);   // 마지막 세그먼트
         String key = RateLimitKeys.pollToken(tokenId);
 
         boolean allowed = tokenBucketRateLimiter.tryAcquire(key, POLL_CAPACITY, POLL_REFILL_PER_SEC);
@@ -160,8 +201,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /**
      * Rate Limit 적용 제외 endpoint.
      */
-    private boolean shouldSkip(HttpServletRequest request) {
-        String path = request.getRequestURI();
+    private boolean shouldSkip(String path) {
         return path.startsWith("/actuator/");
     }
 
@@ -207,9 +247,8 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * @return true=통과, false=거부 (429 응답 완료)
      */
     private boolean checkPublicRateLimit(
-            HttpServletRequest request, HttpServletResponse response) throws IOException {
+            HttpServletRequest request, String path, HttpServletResponse response) throws IOException {
 
-        String path = request.getRequestURI();
         PublicEndpointRateLimit publicLimit = resolvePublicEndpoint(path);
 
         if (publicLimit == null) {
