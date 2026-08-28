@@ -16,7 +16,7 @@
 
 ### 응답 봉투
 
-**모든 응답이 `ApiResponse<T>`로 감싸진다.** 실제 body는 항상 이 형태다.
+**컨트롤러를 탄 응답은 `ApiResponse<T>`로 감싸진다.** 실제 body는 이 형태다.
 
 ```json
 {
@@ -33,6 +33,20 @@
 🪤 **`data`를 벗기지 않고 바로 필드를 찾으면 전부 `undefined`다.** 클라이언트는 반드시
 `response.data.tokenId` 형태로 접근하라.
 
+🔴 **봉투가 없는 응답이 있다.** `GlobalExceptionHandler`는 `BusinessException`만 처리한다.
+그 밖의 것 — 본문 검증 실패(`MethodArgumentNotValidException`), JSON 파싱 실패
+(`HttpMessageNotReadableException`), 404, 405 — 는 Spring Boot의 `/error`로 포워드되어
+**봉투 없이** 이 형태로 나간다 (2026-08-28 실측):
+
+```json
+{"timestamp":"2026-08-28T07:05:20.132+00:00","status":400,"error":"Bad Request","path":"/api/v1/tenants/signup"}
+```
+
+즉 클라이언트는 `success` 필드의 유무로 갈라야 한다. 없으면 위 형태다.
+⚠️ **이 응답에는 `message`도 필드별 사유도 없다.** Boot 기본값이 `include-message=NEVER`·
+`include-binding-errors=NEVER`이고 이 레포는 `server.error.*`를 재정의하지 않는다(전수 확인).
+그래서 400을 받아도 **어느 필드가 왜 틀렸는지는 응답으로 알 수 없다.**
+
 ### 인증
 
 인증 수단이 **경로가 아니라 헤더로 정해진다.** `ApiKeyAuthenticationFilter`에는 경로 화이트리스트가
@@ -44,7 +58,7 @@
 | API Key | `X-API-Key: {rawKey}` | 런타임 작업 (enqueue, admit, verify, complete) |
 | 없음 | — | 아래 permitAll 목록 |
 
-**permitAll (인증 불필요)** — `SecurityConfig:37-51`
+**permitAll (인증 불필요)** — `SecurityConfig:36-59`
 
 ```
 POST /api/v1/tenants/signup
@@ -84,7 +98,10 @@ GET  /actuator/{health,info,prometheus}
 | `I004` | 500 | 서버 오류 |
 
 검증 실패(`@NotBlank` 등)는 위 코드가 아니라 **Spring의 `MethodArgumentNotValidException`이 400**으로
-나간다. 메시지에 위반한 필드명과 사유가 담긴다.
+나간다. 🔴 **필드명도 사유도 담기지 않는다** — 위 [응답 봉투]의 `/error` 형태이고 `message`가 빠져 있다.
+🪤 2026-08-28 이전에는 이 400이 **401로 위장돼 나갔다**(`SecurityConfig`의 permitAll 목록에 `/error`가
+없어 ERROR 디스패치가 인증에 걸렸다). 그때 쓰인 클라이언트가 401을 자격 증명 문제로 처리하고 있다면
+**지금은 그 분기가 안 탄다.**
 
 ---
 

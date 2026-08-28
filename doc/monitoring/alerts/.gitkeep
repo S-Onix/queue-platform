@@ -6,8 +6,8 @@
 규칙 파일은 여기에 `*.yml`로 추가한다 (내용은 monitoring 담당).
 추가·수정 후 반영:
 
-  promtool check rules doc/monitoring/alerts/*.yml
-  kill -HUP $(pgrep -x prometheus)
+  /home/sonix/queue-platform-infra/monitoring/prometheus/bin/promtool check rules doc/monitoring/alerts/*.yml
+  curl -XPOST localhost:9090/-/reload
   curl -s localhost:9090/api/v1/rules
 
 이 파일(.gitkeep)은 `*.yml`이 아니므로 Prometheus가 읽지 않는다.
