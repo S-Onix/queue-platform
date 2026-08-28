@@ -58,7 +58,12 @@
 **이 경로에서 가장 위험한 세 가지**
 1. `queue:{q}:last-active` ZSet에 **`ZREM`도 `EXPIRE`도 전 소스에 0건**이다(`poll_verify.lua`가 `ZADD`만 한다). 읽는 코드도 0건 — 즉 지금은 쓰기만 하고 아무도 안 쓰는 데이터가 무한히 쌓인다.
 2. ② permitAll + Rate Limit 키가 요청자 통제값(tokenId) → 요청 1건이 Redis master EVAL 2회를 확정 유발한다.
-3. **① 은 인증도 Rate Limit도 없다.** 방어는 "미지 queueId가 Redis 1왕복 안에서 404로 끝난다"는 것뿐이고, L7 flood은 **CDN·WAF 소관**이다. 앱에서 막을 수단이 없다는 것을 알고 있어라.
+3. **① 은 인증도 Rate Limit도 없다.** L7 flood은 **CDN·WAF 소관**이고 앱에서 막을 수단이 없다.
+   🔴 예전에 적혀 있던 "미지 queueId는 Redis 1왕복에서 끝난다"는 방어 근거는 **거짓이다**
+   (2026-08-28 실측: EXISTS×2 + MGET = **3왕복**, 8개 마스터 전체로 확산). DB가 안전하다는 것만 참이다.
+   그럼에도 앱에 Rate Limit을 달지 않기로 한 근거는 바뀌었다 — **리미터(EVALSHA 31~43µs)가
+   보호 대상(MGET 1.0~1.8µs)보다 20~25배 비싸고**(`INFO commandstats` 누적 평균, 2026-08-28), 개인 폴링 쪽에 더 싼 우회로가 있어 효과가 0이다
+   (3인 합의, `QueueEngineController` 주석에 근거 전문).
 
 ---
 

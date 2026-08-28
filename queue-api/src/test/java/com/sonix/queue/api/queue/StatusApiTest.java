@@ -113,7 +113,7 @@ class StatusApiTest {
     }
 
     @Test
-    @DisplayName("미지 queueId는 404 Q001 — DB를 거치지 않고 Redis 1왕복에서 끝난다")
+    @DisplayName("미지 queueId는 404 Q001 — DB를 거치지 않는다")
     void status_unknownQueueIs404WithoutDb() throws Exception {
         when(queueEngine.readStatus("q_ghost")).thenReturn(Optional.empty());
 
@@ -122,6 +122,9 @@ class StatusApiTest {
                 .andExpect(jsonPath("$.errorResponse.code").value("Q001"));
 
         // 인증이 없는 경로다(§79). 큐 존재 확인이 DB로 내려가면 임의 문자열만으로 MySQL을 때운다.
+        // ⚠️ 이 테스트가 보증하는 것은 "DB를 안 탄다"까지다. Redis 왕복 수는 여기서 알 수 없다
+        //    (queueEngine이 목이다). 실제로는 미지 queueId가 EXISTS×2 + MGET = 3왕복이고
+        //    두 클러스터 8개 마스터로 퍼진다(2026-08-28 실측, QueueEngineController 주석 참조).
         verify(queueRepository, never()).findByQueueId(anyString());
     }
 }

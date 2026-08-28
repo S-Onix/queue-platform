@@ -133,7 +133,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
   - `Tenant not found` 로그 있음 → 데이터 정합성 문제. `api_keys.tenant_id`가 가리키는 `tenants` 행이 없다.
   - 로그 없음 + `rl:tenant:*` 키도 정상 → 한도에 안 닿는 것뿐. 정상.
   - 로그 없음 + `rl:tenant:*` 키 0개 → 필터가 아예 안 타고 있다. `/actuator/` 로 시작하는 경로가 아닌지, Security 필터 체인 순서가 바뀌지 않았는지 확인.
-  - 429는 나는데 메트릭에 안 보인다 → **PromQL의 `uri` 라벨이 `UNKNOWN`일 가능성이 높다.** 필터가 DispatcherServlet 전에 응답을 끝내므로 URI 패턴이 확정되지 않는다. `uri` 없이 `status="429"`만으로 세라. (**실측 확인 필요 — 라벨 값을 한 번 눈으로 볼 것.**)
+  - 429는 나는데 메트릭에 안 보인다 → ✅ **`uri` 라벨은 정상으로 붙는다**(2026-08-28 실측, 위 추정은 틀렸다). `uri="/api/v1/tenants/login"` 처럼 경로별로 집계되므로 **`uri`로 분해해서 세라.** 안 보이면 라벨이 아니라 다른 원인이다.
 - **조치**: 고아 API Key를 찾아 무효화한다.
   ```sql
   -- Replica(3307)에서 먼저 조사
@@ -210,7 +210,8 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 
 | 관측 대상 | 현재 상태 |
 |---|---|
-| 429 발생 수 (경로별/테넌트별) | **미노출.** `http_server_requests_seconds_count{status="429"}`로 총량만. `uri` 라벨이 `UNKNOWN`일 가능성 있음(확인 필요) |
+| 429 발생 수 (경로별) | ✅ **관측 가능.** `http_server_requests_seconds_count{status="429"}` 에 `uri` 라벨이 정상으로 붙는다(2026-08-28 실측) |
+| 429 발생 수 (테넌트별/IP별) | **미노출.** 테넌트·IP 라벨이 없고 초과 로그가 `log.debug`라 **prod(INFO)에선 흔적이 안 남는다** |
 | 429 사유 구분 (RL001 vs Q005) | **불가.** 둘 다 HTTP 429. 응답 본문으로만 구분 |
 | Tenant별 Rate Limit 소진율 | **미노출** |
 | `Tenant not found for rate limit` 발생 | 로그만(WARN). 메트릭 없음 |
