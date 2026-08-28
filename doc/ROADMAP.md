@@ -54,7 +54,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
               ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
               ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
 🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·COMPLETED 발행까지 완료 (~~RETURNED~~는 §36이 폐기)
-🔄 Sprint 9   잡 3개 구현(TokenReclaimJob·ReconcileJob·BillingSnapshotJob) + 회수 3경로 완료. RedisSyncJob만 미착수
+🔄 Sprint 9   잡 3개 구현(TokenReclaimJob·ReconcileJob·BillingSnapshotJob) + 회수 3경로 완료. RedisSyncJob은 폐기(2026-08-27)
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
 🎯 Cluster 로컬 실습 완료 (2026-07-08, 병행 학습) — 프로덕션 도입은 §75, 시점 미정
@@ -343,8 +343,8 @@ flowchart TD
 - D6: Lua ZCARD Capacity
 - ~~D7: enqueue.lua + enqueue_bulk.lua~~ → **`enqueue_bulk.lua` 단독** (§70)
 - ~~D8: 하이브리드 (임계값 1000 req/s, 배치 100, 간격 10ms, 타임아웃 1s)~~ → **하이브리드 폐기** (§70)
-  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, `fixedRate=1000ms`, 타임아웃 30s
-  - ⚠️ 원안 대비 100배/30배 이탈 → **재조정 후속 과제**
+  - 현재: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, **`drain-interval=20ms`**(2026-08-27 재조정), 타임아웃 30s
+  - ✅ 주기는 **재조정 완료**(1000ms → 20ms, 2026-08-27). `CHUNK_SIZE`·타임아웃은 원안 이탈 유지
 - **D9: score = `INCR queue:{queueId}:seq`** (신설, §70)
 - **D10: Hash Tag 필수** (신설, §70)
 
@@ -605,7 +605,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 
 ---
 
-### 🔄 Sprint 9 — Batch 모듈 (~~TokenExpiryJob~~ `TokenReclaimJob` + `ReconcileJob` + `BillingSnapshotJob` ✅ / `RedisSyncJob` ⬜)
+### 🔄 Sprint 9 — Batch 모듈 (~~TokenExpiryJob~~ `TokenReclaimJob` + `ReconcileJob` + `BillingSnapshotJob` ✅ / ~~`RedisSyncJob`~~ 🗑 폐기)
 
 > ✏️ **`TokenExpiryJob`은 만들지 않았다.** `waitingTtl`·`inactiveTtl`·admitToken TTL 세 판정이
 > 모두 10초 주기에 같은 큐 목록을 도는 작업이라 `TokenReclaimJob` 하나로 합쳤다. 아래 서술의
@@ -625,8 +625,11 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
     - ✅ ~~`waitingTtl` 판정 소스는 **미정**~~ → **확정·구현**(`waiting_expire.lua` — 앞부분 스캔 + `tokens`의 `issuedAt` 비교)이다 — `waiting` ZSet의 score는 `seq`라 시간축이 없다.
       DB `tokens.issued_at`이 유력하나 착수 시 결정한다
   - ~~`batch-lock:{t}:{q}` 분산 락~~ → 🔴 **만들지 않았다.** `EVAL`이 곧 claim이라 불필요(§80·CONCURRENCY 매트릭스)
-- `RedisSyncJob` (5분 주기)
-  - `redis_sync_needed=1` 토큰 → Redis 재삽입
+- ~~`RedisSyncJob` (5분 주기)~~ → 🗑 **폐기 (2026-08-27).** 컬럼·인덱스까지 삭제했다.
+  전제인 "Redis 다운 중 DB에만 INSERT"가 성립하지 않는다 — enqueue 는 Redis Lua 가 순번을
+  확정해야 Kafka 로 나가므로, Redis 가 죽으면 QE001(503)이고 **어디에도 INSERT 되지 않는다.**
+  실재하는 위험(enqueue 성공 *후* Redis 유실)은 `redisSeq < dbMaxSeq` **비교**로 감지한다 —
+  INSERT 시점 플래그로는 표현할 수 없다
 - `BillingSnapshotJob` — ✅ **구현 완료**. 단, 원안과 **셋이 다르다**
   - 🔄 **월 1회 → 매일 UTC 00:30, 전월 + 당월 재집계.** M+2월 초는 **파티션 DROP**의 일정이지
     집계의 일정이 아니다. 집계만 떼어 매일 돌리면 ① 테넌트가 당월 사용량을 그날 보고
@@ -640,7 +643,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - 🔄 **ShedLock·`batch-lock`을 쓰지 않는다.** UPSERT가 멱등이라 batch N대가 각자 같은 값을 쓸 뿐이고,
   동시에 돌아도 둘 다 같은 SELECT의 결과라 어느 쪽이 이겨도 정답이다
   (실측: 가상 스레드 8개 동시 UPSERT에서 데드락 0). `ReconcileJob`이 같은 논리의 선례다.
-  나머지 잡(`RedisSyncJob` 등)에는 여전히 필요할 수 있다 — 잡마다 따로 판단한다
+  나머지 잡에는 여전히 필요할 수 있다 — 잡마다 따로 판단한다
 
 **후속 과제 배치** (`doc/reviews/2026-08-17-pr26-agent-review.md` §7 등재분 — 새 항목이 아니라 일정에 얹는 것)
 
@@ -659,7 +662,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
       `issued_at`이 원본과 같아 **두 번째 행이 생기지 않는지** 함께 확인 (§83 함정)
 - [ ] admitToken TTL 만료 케이스 → **종료 + 게이트 해제** 동작 (§36)
-- [ ] Redis 다운 시뮬레이션 → 복구 후 RedisSyncJob이 미반영 토큰 재삽입
+- [ ] Redis 다운 시뮬레이션 → enqueue 가 **QE001(503)** 을 주고 DB·Redis 어디에도 부분 반영이 없는지 확인
 - [ ] **BillingSnapshotJob 수동 트리거 동작 확인** (예: HTTP endpoint 또는 테스트 프로파일)
 - [ ] **파티션 운영 쿼리 dry-run 검증** (schema.sql의 Step 1~4 각 쿼리 실행 + EXPLAIN)
   - `INSERT INTO queue_daily_stats ... ON DUPLICATE KEY UPDATE id = id` 멱등성 확인
@@ -670,7 +673,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
       다른 잡에는 이 DoD가 그대로 살아 있다
 - [ ] Gap Lock 방지 (LIMIT 100 순차 처리)
 
-**참조 문서:** schema.sql의 파티션 운영 섹션, DECISIONS §39 (RedisSyncJob), §43 (Queue 삭제 흐름), §44 (파티션 유예 전략)
+**참조 문서:** schema.sql의 파티션 운영 섹션, DECISIONS §39 (RedisSyncJob — 🗑 철회), §43 (Queue 삭제 흐름), §44 (파티션 유예 전략)
 
 **주의:** ~~BillingSnapshotJob은 월 1회 스케줄이라 실제 시간 기반 검증 불가~~ → **매일 스케줄로 바꿔 이 제약이 사라졌다.** 집계 로직은 실 MySQL 통합 테스트 7건이 덮는다. ~~실제 프로덕션에서는 ShedLock으로 배타 실행 보장~~ → **쓰지 않는다**(위 참조).
 **미검증:** cron `zone = "UTC"`의 실제 발화 시각은 테스트로 못 박지 못했다 — 어노테이션 값을 어노테이션 값과 비교하는 동어반복이라 만들지 않았다.

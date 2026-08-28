@@ -1,0 +1,145 @@
+# Kafka 적재 알람 규칙 — Queue Platform
+#
+# infra.yml과 같은 원칙을 따른다: **근거 없는 임계값을 박지 않는다.**
+# 아래 규칙이 쓰는 숫자 둘은 추정 기준선이 아니라 **코드에 박힌 상수**다.
+#   - 60초  = admitToken TTL (admit.lua ARGV[3], admit-by-* 키의 PX)
+#   - 300초 = Token.COMPLETE_VALID_WINDOW_SECONDS (complete의 DB 유효 창)
+# 그래서 infra.yml의 "한도가 명시된 자원의 추세"(4번 분류)에 해당한다.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 왜 이 알람이 필요한가 — 2026-08-27 실측 사고
+#
+# 컨슈머 랙이 쌓이자 **정상 입장자의 complete가 404**를 받았다. markCompleted의 술어가
+# 요구하는 admit_token·admitted_at은 ADMITTED 이벤트를 컨슈머가 적재해야만 채워지기
+# 때문이다. 즉 동기 응답의 인가 판정이 비동기 투영에 걸려 있었다.
+#
+# 🔴 **그때 이걸 알려준 것이 아무것도 없었다.** 앱은 UP, 브로커도 UP, DB도 UP이었다.
+#    통합 시나리오를 돌려서야 알았다. Kafka 브로커 liveness 체크를 붙였어도 못 잡았을
+#    종류다 — 죽은 것이 없었기 때문이다. 랙은 **양이지 이진 상태가 아니다.**
+#
+# 지금은 타입별 그룹 적재(6cc33e1)로 커밋이 83% 줄어 랙이 사라졌지만, 그건 원인 하나를
+# 없앤 것이지 랙이 다시 못 쌓인다는 뜻이 아니다.
+# ─────────────────────────────────────────────────────────────────────────────
+# 🪤 메트릭 이름 함정 — `_lag_max`를 쓰지 마라
+#
+# 문서 몇 곳이 `kafka_consumer_fetch_manager_records_lag_max`를 가리키는데,
+# 이 시계열은 **한가할 때 NaN**이다(실측: 파티션 18개 전부 NaN). 센서가 최근 fetch가
+# 없으면 값을 안 낸다. NaN으로는 비교가 성립하지 않아 규칙이 **조용히 침묵**한다.
+#
+# 파티션별 실값을 내는 것은 접미사 없는 `..._records_lag`다(실측 0.0).
+# infra.yml <보류> 절이 경고한 그 함정("규칙이 있다는 착각")과 같은 계열이라 여기 적어 둔다.
+# ─────────────────────────────────────────────────────────────────────────────
+# 전제: prometheus.yml에 job_name 'queue-consumer'가 등록돼 있다(실가동 확인).
+#      evaluation_interval=15s, scrape_interval=15s.
+# ─────────────────────────────────────────────────────────────────────────────
+
+groups:
+
+  - name: queue-platform-kafka-persistence
+    rules:
+
+      # 현 소화율로 지금 쌓인 랙을 비우는 데 걸릴 시간이 admitToken TTL(60초)을 넘는다.
+      #
+      # 왜 60초인가: 이 창을 넘기면 complete의 **Redis 폴백이 받아줄 수 없다.**
+      #   admit → (적재 지연) → complete 호출 시 DB에 행이 없으면 admit-by-admit으로
+      #   폴백하는데, 그 키의 PX가 60초다. 소화 시간이 60초를 넘으면 폴백조차 미스가 되어
+      #   정상 입장자가 404를 받기 시작한다. 즉 이 선이 **사용자 영향이 시작되는 지점**이다.
+      #
+      # 🔴 **`and`의 좌우 순서가 의미를 바꾼다.** PromQL의 `A and B`는 **A의 값**을 반환한다.
+      #    처음엔 `sum(lag) > 0 and (lag/rate) > 60`으로 썼는데, 그러면 $value가 소화 시간이
+      #    아니라 **랙 건수**가 되어 랙 5,000건에 "소화 시간 1h 23m"이라고 찍혔다(실측 확인).
+      #    사람이 대응 규모를 정하는 바로 그 숫자였다. 소화 시간을 앞에 둬야 humanizeDuration이
+      #    의미를 갖는다. 교집합이라 가드 효과는 순서와 무관하다.
+      #
+      # 🔴 **`rate > 0` 가드를 추가했다.** 컨슈머가 멈추면 rate=0 → 나눗셈이 +Inf가 되어
+      #    이 규칙과 300초 규칙이 KafkaConsumerStalled와 **셋 다 동시에** 발화했다.
+      #    for가 각각 2m/1m/3m이라 **critical(1m)이 먼저 뜨고 그 조치는 "인스턴스를 늘려라"** 인데,
+      #    독약 메시지나 리밸런스 루프에서 인스턴스를 늘리면 리밸런스를 한 번 더 유발할 뿐이다.
+      #    정답인 Stalled의 조치는 2분 뒤에 온다. 이제 "느림"과 "멈춤"이 실제로 갈린다.
+      #
+      # 나눗셈 주의:
+      #   - 랙 0이면 분자가 0이라 발화하지 않는다(가드도 함께 건다).
+      #   - 컨슈머가 멈춰 rate가 0이면 결과가 +Inf → 발화한다. **의도한 동작이다**
+      #     (영원히 안 비워지는 상태가 곧 최악이다).
+      #
+      # for: 2m — 버스트 직후 일시적으로 랙이 튀는 것은 정상이다. 8회 연속 스크레이프에서
+      #           유지돼야 발화한다.
+      - alert: KafkaConsumerDrainTimeExceedsAdmitTtl
+        expr: |
+          (
+            sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"})
+            /
+            sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m]))
+          ) > 60
+          and
+          sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"}) > 0
+          and
+          sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "token-lifecycle 적재 예상 소화 시간 {{ $value | humanizeDuration }} — admitToken TTL(60초) 초과, complete의 Redis 폴백이 못 받는다"
+          action: "런북 [증상] consumer lag이 줄지 않는다 (doc/monitoring/runbook/kafka-persistence.md). ⚠️ 오프셋을 latest로 리셋하지 마라 — 건너뛴 이벤트는 영원히 DB에 안 들어가고 그게 곧 유령 토큰이다. lag은 지표이지 문제가 아니다."
+
+      # 소화 시간이 complete의 DB 유효 창(300초)을 넘는다.
+      #
+      # 이 선을 넘으면 **되돌릴 수 없다.** 적재가 끝났을 때는 이미 창이 지나 markCompleted가
+      # 0행이고, Redis 키는 60초에 이미 사라진 뒤다. 그 사용자의 완료는 어떤 재시도로도
+      # 기록되지 않는다 — 과금 근거까지 함께 사라진다.
+      # 게다가 ReconcileJob이 300초 뒤 status=1 잔류를 EXPIRED로 확정한다.
+      #
+      # for: 1m — 이미 warning이 2분간 선행했을 상황이다. 여기서 더 기다릴 이유가 없다.
+      - alert: KafkaConsumerDrainTimeExceedsCompleteWindow
+        expr: |
+          (
+            sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"})
+            /
+            sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m]))
+          ) > 300
+          and
+          sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"}) > 0
+          and
+          sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "token-lifecycle 적재 예상 소화 시간 {{ $value | humanizeDuration }} — complete 유효 창(300초) 초과, 완료 기록이 영구 유실된다"
+          action: "컨슈머 인스턴스를 늘려라(파티션 18개까지). ⚠️ concurrency를 올리는 것은 실측상 역효과였다(application.yml 주석). 유실 범위는 queries/kafka-persistence.md §3의 차집합 스크립트로 뽑는다."
+
+      # 랙은 있는데 소화가 완전히 멈췄다.
+      #
+      # 위 두 규칙과 겹쳐 보이지만 다른 것을 잡는다 — 위는 "느리다"이고 이건 "안 돈다"다.
+      # 리밸런스 무한 루프, 독약 메시지, DB 커넥션 고갈이 여기로 온다. 이진 상태에 가까워
+      # 임계값이 없다.
+      #
+      # 🔴 컨슈머가 **죽으면** 이 규칙은 침묵한다 — kafka_consumer_* 시계열이 0이 되는 게
+      #    아니라 사라지기 때문이다. 그때 남는 신호는 infra.yml의 AppInstanceDown뿐이다.
+      #    두 규칙을 함께 봐야 하는 이유다.
+      - alert: KafkaConsumerStalled
+        expr: |
+          sum(kafka_consumer_fetch_manager_records_lag{topic="token-lifecycle"}) > 0
+          and
+          sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic="token-lifecycle"}[5m])) == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "token-lifecycle 컨슈머가 3분간 한 건도 소화하지 못했다 (잔여 {{ $value }}건)"
+          action: "`kafka-consumer-groups.sh --describe --group db-writer`로 파티션 할당 확인 → 리밸런스 루프면 consumer.log의 rebalance 로그, 독약이면 DLT를 본다. max.poll.interval.ms를 무작정 키우지 마라(런북)."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# <보류>
+#
+# ● 그룹 단위 LAG 합계 (kafka_exporter)
+#   → 미설치다. 위 규칙은 **클라이언트가 스스로 보고하는 랙**을 쓴다. 차이가 있다:
+#     클라이언트 랙은 그 컨슈머가 **할당받은 파티션만** 센다. 컨슈머가 전부 죽으면
+#     시계열이 사라져 랙이 "0"이 아니라 **없음**이 된다(위 KafkaConsumerStalled 주석 참조).
+#     그룹 단위 절대 랙이 필요해지면 kafka_exporter를 붙이고 그때 규칙을 옮긴다.
+#
+# ● 적재 지연 시간을 직접 재는 메트릭 (발행 시각 → 적재 시각)
+#   → 위 규칙은 랙과 소화율로 **추정**한다. 직접 재려면 이벤트에 발행 타임스탬프를 싣고
+#     컨슈머가 Timer로 기록해야 하는데, 지금 그걸 만들 이유가 없다 — 추정값으로도
+#     "60초/300초를 넘느냐"는 갈린다. 추정이 실제와 어긋나는 사례가 나오면 그때 만든다.
+# ─────────────────────────────────────────────────────────────────────────────

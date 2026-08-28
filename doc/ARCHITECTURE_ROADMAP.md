@@ -127,7 +127,7 @@ Client (브라우저)
 - **Sprint 6**: Token 도메인 · Enqueue · Polling (Cancel API는 §82로 폐기)
 - **Sprint 7**: admit · verify · complete + `/status` 분할 · admitWatermark · pacing (§79 · §80)
 - **Sprint 8**: Kafka `token-lifecycle` + `queue-consumer` (100만건 실측)
-- **Sprint 9(진행 중)**: 회수 3경로 · Redis↔DB 대사 · 과금 스냅샷(§84). `RedisSyncJob`은 미착수
+- **Sprint 9(진행 중)**: 회수 3경로 · Redis↔DB 대사 · 과금 스냅샷(§84). `RedisSyncJob`은 폐기(2026-08-27)
 - **인프라 전환**: Sentinel → **독립 2 Cluster + 큐 단위 라우팅** (§75, 코드에서 Sentinel 분기 제거)
 - **배포**: Dockerfile 3종 + compose + GitHub Actions CI(단위 · 통합 · 이미지 3종)
 
@@ -212,7 +212,7 @@ queue-api/queue/
   → PendingEnqueue 생성 → globalQueue.offer()
   → future.get(30s) 블로킹 대기
         ↕
-  BatchProcessor @Scheduled(fixedRate=1000ms)
+  BatchProcessor @Scheduled drain-interval=20ms
   → drain(최대 5000) → queueId별 groupBy → 500씩 청크
   → enqueue_bulk.lua 실행 (Hash Tag 2-key)
   → 위치(index)로 매칭하여 future.complete()
@@ -954,9 +954,9 @@ Region A (Asia)      Region B (US)       Region C (EU)
 - 경로가 하나면 이 증명이 통째로 사라진다. 실제로 5-E 검증은 "1,000 동시 → 순번 0~999 유일" 한 번으로 끝났다
 
 **남은 대가 (정직하게)**:
-- 저부하 요청도 배치 주기를 전액 부담 (`fixedRate=1000ms` → 평균 500ms)
+- ~~저부하 요청도 배치 주기를 전액 부담 (`fixedRate=1000ms` → 평균 500ms)~~
 - 하이브리드의 단건 경로는 이 비용을 회피하는 장치였음 → **폐기로 잃은 것이 실재함**
-- → `fixedRate` 재조정(10~50ms)이 후속 과제. 이걸 하면 잃은 것이 사실상 사라짐
+- ✅ **재조정 완료 (2026-08-27): 20ms.** 평균 10ms로 잃은 것이 사실상 사라졌다
 
 **학습 포인트**: "실무가 X를 한다"는 근거는 **X가 정확히 무엇인지** 확인하고 써야 한다.
 Adaptive Batching을 "경로 분기"로 오독한 것이 최초 설계의 뿌리 오류였다.

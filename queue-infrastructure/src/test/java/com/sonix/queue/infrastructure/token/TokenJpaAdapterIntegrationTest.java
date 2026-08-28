@@ -150,7 +150,7 @@ class TokenJpaAdapterIntegrationTest {
 
         Map<String, Object> row = jdbc.queryForMap(
                 "SELECT token_id, queue_id, tenant_id, user_id, seq, status, issued_at, " +
-                        "expired_reason, admit_token, redis_sync_needed " +
+                        "expired_reason, admit_token " +
                         "FROM tokens WHERE token_id = ?", tokenId);
 
         assertThat(row.get("token_id")).isEqualTo(tokenId);
@@ -163,10 +163,9 @@ class TokenJpaAdapterIntegrationTest {
         Object issued = row.get("issued_at");
         LocalDateTime issuedAt = (issued instanceof Timestamp ts) ? ts.toLocalDateTime() : (LocalDateTime) issued;
         assertThat(issuedAt).isEqualTo(ISSUED_AT);
-        // insertable=false 3개 컬럼은 INSERT에서 빠지고 DB 기본값이 적용되어야 한다
+        // insertable=false 컬럼은 INSERT에서 빠지고 DB 기본값이 적용되어야 한다
         assertThat(row.get("expired_reason")).as("EXPIRED 전 → NULL").isNull();
         assertThat(row.get("admit_token")).as("admit 전 → NULL").isNull();
-        assertThat(((Number) row.get("redis_sync_needed")).intValue()).as("기본값 0").isEqualTo(0);
     }
 
     @Test

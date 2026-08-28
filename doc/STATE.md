@@ -79,7 +79,6 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | 복구 | Batch 10초 내 ZREM 재실행 (멱등) |
 | seq 저장 | DB tokens.seq 컬럼 — **Redis 전손 시 DB 재구성**(§71). ~~복귀 시 score 복원~~은 §36이 폐기 |
 | admit_token 컬럼 | DB 저장 → Redis 미스 시 Fallback용 + verify DB Fallback |
-| redis_sync_needed | Redis 다운 중 INSERT된 토큰 추적 → 복구 배치 기준 |
 | Kafka 발행 | **모든 상태 변경**에서 발행 (ENQUEUED/ADMITTED/COMPLETED/EXPIRED). 단일 토픽 `token-lifecycle`, key=`tokenId`. ~~RETURNED~~는 §36이 폐기 |
 
 ### expiredReason

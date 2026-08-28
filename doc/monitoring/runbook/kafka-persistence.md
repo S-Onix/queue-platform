@@ -220,7 +220,9 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
   # 수집기가 이 타깃을 알고 있는가 (job명은 실가동 prometheus.yml 기준)
   curl -s 'http://localhost:9090/api/v1/targets' | grep -o '8082[^,]*' | head
   ```
-- **정상 범위**: 200 + `kafka_consumer_fetch_manager_records_lag_max` 노출. **충족**(실측 200 / 메트릭 213줄).
+- **정상 범위**: 200 + `kafka_consumer_fetch_manager_records_lag` 노출. **충족**(실측 200 / 파티션 18개).
+  🪤 **`_lag_max`가 아니다.** 그 시계열은 한가할 때 **NaN**이라(실측: 18개 전부) 비교가 성립하지 않고
+  규칙이 조용히 침묵한다. 파티션별 실값을 내는 것은 접미사 없는 `..._records_lag`다.
 - **원인별 분기**:
   - **200인데 Prometheus에 없다** → 가장 흔한 경우. 실가동 `prometheus.yml`에 consumer job이 없다. `doc/INFRA_SETUP.md`의 스니펫은 **문서일 뿐 실가동 파일이 아니다** — 실제 파일에 반영하고 reload해야 한다.
   - **404** → 의존성이 빠진 빌드가 배포됐다(재배포 필요). 현재 브랜치 기준으로는 정상 경로가 아니다.
@@ -238,5 +240,5 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 | 발행 지연(publish latency) | **미노출** |
 | 적재 건수 / 배치 크기 분포 | **미노출.** `log.debug`만 (`INFO` 레벨에선 안 찍힘) |
 | DLT 유입 카운터 | **미노출.** Kafka 오프셋을 직접 세야 함 |
-| consumer lag (PromQL) | **클라이언트 단위는 가능** — `kafka_consumer_fetch_manager_records_lag_max`. 단 **실가동 `prometheus.yml`에 consumer job 등록이 선행**이다. **그룹 단위 LAG 합계는 여전히 불가**(kafka_exporter 미설치) — 아래 주의 참조 |
+| consumer lag (PromQL) | **클라이언트 단위는 가능** — `kafka_consumer_fetch_manager_records_lag`(⚠️ `_lag_max`는 한가할 때 NaN이라 쓰지 마라). `prometheus.yml`의 `queue-consumer` job 등록은 **완료**(실가동 확인). 알람 규칙은 [`alerts/kafka.yml`](../alerts/kafka.yml). **그룹 단위 LAG 합계는 여전히 불가**(kafka_exporter 미설치) — 아래 주의 참조 |
 | 유령 토큰 수(reconciliation) | ✅ **`queue_reconcile_ghosts`** (`ReconcileJob`, 5분). PromQL에서 **`sum`이 아니라 `max`** — batch N대가 같은 값을 각자 보고한다. 짝인 `queue_reconcile_stale`은 반대 방향(DB > Redis = 종료 이벤트 유실) |

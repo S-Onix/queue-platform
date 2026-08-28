@@ -2,6 +2,10 @@
 
 > 버전: v1.16 | 상태: 확정 | 대상: 실제 구현 범위
 >
+> ⚠️ **API 필드 명세의 정본은 [`API.md`](API.md)다** — 코드에서 추출한 것이라 구현과 어긋나지
+> 않는다. 이 문서는 **설계 시점의 요구사항 원본**이며, 여기 적힌 필드가 구현과 갈리면
+> `API.md`가 맞다. (이 문서는 이력이 일이므로 사후에 고치지 않는다.)
+>
 > v1.16 변경사항: **§6.2에 "세션 경계 3종" 신설** — ① `identifier` 매핑의 영속성 요구,
 > ② `tokenId`·`seq`의 브라우저 보관처(SDK 규약, 미정), ③ 비로그인 상태로 `admitToken`을
 > 받았을 때의 입장 처리와 그 보안 대가. 셋 다 Tenant·SDK 책임이고 Platform 코드는 0줄이다
@@ -80,7 +84,7 @@ Tenant    → 슬롯 관리 + 입장 제어
 ```
 DB tokens 테이블:
   tokenId, userId, queueId, seq, status(TINYINT), admit_token
-  redis_sync_needed, issuedAt, completedAt
+  issuedAt, completedAt
   → 메타데이터 원본. Redis 장애 시 복구 기준
   → Kafka Consumer가 INSERT 보장 (At-Least-Once)
   → admit_token: Redis 미스 시 DB Fallback용
@@ -245,7 +249,7 @@ POST /api/v1/queues/:queueId/tokens
 Body: { identifier: string }        ← UUIDv7. 생성·전달 주체는 Tenant (아래 규약)
 
 처리 흐름:
-1. API Key 검증 (Redis 캐시 60s → DB Replica fallback)
+1. API Key 검증 (Redis 캐시 60s → DB **master** fallback — 필터라 트랜잭션 밖이다. §4-3)
 2. Rate limit (per-key)
 3. 큐 상태 확인 (ACTIVE만 허용) + Tenant 소유권 검증
 4. 요청을 Global Queue에 적재 → BatchProcessor가 주기적으로 drain (FLOW.md Enqueue 참조)
@@ -543,7 +547,11 @@ admitToken 생성: tokenId와 동일하게 UUIDv7(랜덤 74비트). 짧은 랜�
 > ✏️ **구 제목 "유효성 확인만 — 상태 변경 없음"은 더 이상 사실이 아니다.** verify는 **응답을 주는
 > 시점에 `COMPLETED`를 발행한다**(PR #48). Platform의 책임이 답을 돌려주는 데까지이기 때문이다.
 > 아래 "2. Redis 쓰기 0회, DB 쓰기 0회"는 **여전히 참**이다 — 직접 쓰지 않고 **이벤트만** 낸다
-> (`@Transactional(readOnly = true)`라 Replica로 가고, Replica는 `super-read-only=ON`이다).
+> (~~`@Transactional(readOnly = true)`라 Replica로 가고~~ — **2026-08-27 정정: 거짓이다.**
+> `verify`에는 트랜잭션 어노테이션이 **아예 없고**(Kafka 12초를 커넥션 쥔 채 기다리지 않으려고
+> 일부러 뺐다), 트랜잭션이 없으면 그 조회는 **master**로 간다. CLAUDE.md §4-3.
+> 🪤 **여기에 `@Transactional(readOnly = true)`를 되붙이지 마라** — `QueueEngineService:213`이
+> 경고한 F-3 재발 경로다).
 
 ```
 POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
@@ -847,7 +855,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | complete 동시성 | DB UPDATE WHERE status=1 (1번만 성공) |
 | ZREM 실패 | DB 먼저 → Batch 10초 내 재실행 |
 | billing 중복 | tokens 원본 집계 → 중복 개념 없음 |
-| Redis 다운 중 INSERT | redis_sync_needed=1 → RedisSyncJob 복구 |
+| Redis 다운 중 INSERT | 🗑 발생 불가 — Redis 가 게이트라 죽으면 503, 어디에도 INSERT 되지 않는다 (2026-08-27) |
 
 ---
 
@@ -857,7 +865,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 |-----|------|------|
 | ~~`TokenExpiryJob`~~ | — | ⛔ **그런 클래스는 없다.** `waitingTtl`·`inactiveTtl` 판정은 아래 `TokenReclaimJob` 안에 들어갔다 — 셋 다 같은 10초 주기에 같은 큐 목록을 도는 작업이라 프로세스를 나눌 이유가 없었다 |
 | `TokenReclaimJob` ✅ | 10초 (`fixedDelay`) | `queue:{q}:admitted` ZSet claim-Lua(`ZRANGEBYSCORE 0 now` + `ZREM` 한 Lua) → **`HGET`→`HDEL tokens` + `EXPIRED` 발행**(§36. ~~WAITING 복귀~~ 폐기. ~~`RETURNED` 발행~~ — **그 이벤트 타입은 존재하지 않는다**: `TokenEventType`은 `ENQUEUED·ADMITTED·COMPLETED·EXPIRED` 4개다). ⚠️ 이 경로에서 **DB `status`는 1에 머문다** — `EXPIRED` 소비 가드가 `IF(status=0,4,status)`라 1에서 no-op이고, 그건 `complete`의 300초 창을 살리려는 의도다. 잔류분은 `ReconcileJob`이 정리한다. **회수 경로는 총 3개**(admitToken TTL · `inactiveTtl` · `waitingTtl`). 실행 주체 **queue-batch** (§80). **ShedLock 없음** — `EVAL`이 곧 claim이라 N대가 동시에 돌아도 한 대만 멤버를 가져간다. 단 **큐 목록은 DB `queues`에서 읽는다**(Cluster `SCAN`은 노드별로 따로 돌아 조용히 누락) |
-| `RedisSyncJob` ⬜ | 5분 | **미구현.** `redis_sync_needed` 컬럼은 쓰고 있으나 읽어서 되살리는 잡이 없다 |
+| ~~`RedisSyncJob`~~ 🗑 | — | **폐기 (2026-08-27).** 컬럼·인덱스까지 삭제. 전제가 성립 불가 |
 | `BillingSnapshotJob` ✅ | **매일 UTC 00:30** | `tokens` 원본을 `PARTITION (pYYYY_MM)`로 집계 → `billing_snapshots` UPSERT. **전월 + 당월**만 본다(더 과거는 DROP된 달을 깎는다). `READ COMMITTED` 필수 — 안 걸면 `INSERT ... SELECT`가 `tokens` 적재를 막는다(실측 6초 `ERROR 1205`). ShedLock 없음(UPSERT 멱등). 상세 §84 |
 | ~~`queue_daily_stats` 집계 + 파티션 DROP/REORGANIZE~~ | ⬜ M+2월 초 | **미착수.** §84가 `BillingSnapshotJob`에서 분리했다 — 과금이 아니라 파티션 운영이고 DDL이라 성격이 다르다 |
 
@@ -1030,30 +1038,66 @@ keepalive:
 
 ### 성능 목표
 
-| API | p99 목표 | 목표 TPS |
+| API | p99 목표 | 목표 RPS |
 |-----|----------|----------|
-| Enqueue | < 50ms (200 즉시 응답) | 200 rps (10,000 rps 급증 → Kafka) |
+| Enqueue | < 50ms | 200 rps |
 | Polling | < 50ms | 2,000 rps |
 | admit | < 100ms | 10 rps |
+
+> 🔴 **~~"10,000 rps 급증 → Kafka"~~ 삭제 (2026-08-27).** 거짓이었다. Kafka 발행은
+> **응답보다 먼저이고 동기다** — `KafkaEnqueueEventPublisher.publish()`가 `.get(12초)`로
+> ack을 기다린 뒤에야 200이 나가고, 실패하면 QE001(503)이다. 즉 **발행 지연이 응답 지연에
+> 그대로 포함되고, Kafka는 버스트 완충 장치가 아니다.** 비동기인 것은 DB 적재뿐이다.
+>
+> ⚠️ **위 숫자 셋은 근거가 약하다 — 목표로 인용하기 전에 읽어라.**
+> - `Enqueue 200 rps`의 근거는 §6.4의 "30만/2시간 = 평균 42/s"인데, 티켓팅은 오픈 직후에
+>   몰리지 균등 도착이 아니다. 평균 42/s는 **대기열이 필요 없는 시나리오**다.
+> - ✅ **`Enqueue p99 < 50ms`는 충족한다 (2026-08-27).** 단 그 전까지는 **불가능했다** —
+>   `BatchProcessor` drain 주기가 1000ms라 p99가 **1000ms**였다. 20ms로 내려
+>   **목표 부하 200 rps에서 32.32ms**(여유 17.7ms, 큐 40개, 429·503 0).
+>   2.5배(500 rps)까지 여유가 있고 **5배(1,000 rps)부터 초과**한다.
+>   🔴 **p99는 큐 수의 함수다** — 2,000 rps에서 큐 10개 64.42ms · 20개 77.37ms · 43개 130.50ms(429 0%).
+>   🪤 **1,000 rps는 순서 의존이라 단정 불가**(정순 75.13ms / 역순 37.07ms — JIT 워밍업).
+>   견고한 것은 200·500 rps 충족과 2,000 rps 초과뿐이다.
+>   틱당 그룹마다 `getMaxCapacity`(DB) + Lua가 붙기 때문이다. **큐 수 없이 인용하지 마라.**
+>   지연의 정체는 Redis도 Kafka도 아니고 **틱 대기**였다: `p99 ≈ 0.99 × 주기 + c` (c ≈ 7~19ms).
+>   ⚠️ 로컬 측정이다(부하 도구가 서버와 같은 머신, **큐 40개**). c는 프로덕션에서 다시 재라.
+> - `admit 10 rps × count 상한 100 = 초당 1,000명 배출`이라 유입 200 rps보다 5배 크다.
+>   두 목표를 그대로 두면 **큐가 아예 쌓이지 않는다.** 셋 중 최소 하나는 틀렸다.
+> - `Polling 2,000 rps`는 pacing 구간표(§6.3) × 30만으로 산술하면 약 15,000 rps가 나온다.
+>   `/status`에 **캐시 코드는 0건**이므로 그 전량이 Redis로 간다.
+> - 2026-08-27 로컬 실측 enqueue **1,818 events/s** — 목표의 9배다. 단 부하 도구가 서버와
+>   같은 머신이라 **상한이 아니라 하한**으로만 읽어야 한다.
+>
+> 숫자는 k6 분리 환경 측정 후 갱신한다. 그전까지 이 표를 SLO로 쓰지 마라.
 
 ### 안정성
 
 | 장애 | 영향 | 대응 |
 |------|------|------|
-| Redis Master 다운 | Enqueue/Polling 중단 | Sentinel Failover 5~10초 |
-| Redis 다운 중 Enqueue | Sorted Set 미반영 | redis_sync_needed=1 → RedisSyncJob 복구 |
+| Redis Master 다운 | 해당 슬롯의 Enqueue/Polling 중단 | **Cluster 자동 failover**(replica 승격). ~~Sentinel~~은 §75에서 **코드에서 제거**됐다 — `RedisConfig`는 Cluster 전용이고 Sentinel은 학습·로컬 자산이다 |
+| Redis 다운 중 Enqueue | enqueue 자체가 실패 | QE001(503). Redis 가 순번 게이트라 부분 반영이 없다 |
 | Kafka 다운 | DB INSERT 지연 | 복구 후 Consumer 재처리 |
-| MySQL Master 다운 | complete 중단 | Replica 승격 |
+| MySQL Master 다운 | complete 중단 | Replica 승격 — ⚠️ **자동화 도구 없음.** 오케스트레이터가 없어 현재는 수동 절차다 |
 
 ### MySQL Read/Write 분리
 
 ```
 Write → Master: UPDATE (complete, expire)
-Read  → Replica: SELECT (Polling, API Key)
 INSERT → Kafka Consumer → Master (비동기)
 @Transactional(readOnly = true) → Replica
 @Transactional → Master
+어노테이션 없음      → Master   ← 기본값이다. isCurrentTransactionReadOnly()가 false다
 ```
+
+> 🔴 **~~`Read → Replica: SELECT (Polling, API Key)`~~ 삭제 (2026-08-27).** 둘 다 거짓이었다.
+> - **Polling은 DB를 읽지 않는다.** `poll()`은 트랜잭션 어노테이션이 없고 `poll_verify.lua`로
+>   Redis만 친다. replica로 갈 SELECT 자체가 없다.
+> - **API Key 조회는 Filter에서 일어난다**(`ApiKeyAuthenticationFilter`). 트랜잭션 밖이라
+>   `ReplicationRoutingDataSource`가 **master로 보낸다.** (캐시 히트면 DB를 안 친다)
+>
+> 🪤 라우팅을 판단하는 것은 "읽기인가"가 아니라 **`@Transactional(readOnly=true)`가 붙었는가**다.
+>   어노테이션이 없으면 읽기여도 master다. §4-3.
 
 ### Redis Read/Write 분리 미적용
 

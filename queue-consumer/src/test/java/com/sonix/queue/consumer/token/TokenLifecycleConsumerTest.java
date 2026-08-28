@@ -21,6 +21,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.calls;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
@@ -45,6 +46,11 @@ class TokenLifecycleConsumerTest {
     /**
      * 일시적 원인이었다면 재시도 중 전 건이 적재된다. 이때 예외를 올리면
      * <b>이미 적재를 마친 배치가 통째로 DLT로</b> 간다.
+     *
+     * <p><b>중복 tokenId를 일부러 심는다.</b> 이 단정이 겨냥하는 것은 {@code findOffendingIndex}가
+     * -1을 돌려줬을 때의 분기인데, 배치가 그룹 적재 가능하면 <b>첫 실패를 그룹 경로가 삼키고</b>
+     * 구간 분할이 성공해 버려 그 분기에 닿지 않는다. 호출 횟수(2회)가 우연히 같아서
+     * <b>초록인 채로 검증 대상이 사라진다</b> — 그래서 그룹 경로를 못 타게 막아 둔다.
      */
     @Test
     @DisplayName("범인을 특정하지 못하면(재시도 중 전 건 적재) 예외 없이 ack 한다")
@@ -54,7 +60,7 @@ class TokenLifecycleConsumerTest {
                 .doNothing()
                 .when(persistService).persist(any(), anyList());
 
-        assertThatCode(() -> consumer.consume(events(4)))
+        assertThatCode(() -> consumer.consume(withDuplicateTokenId(events(4))))
                 .doesNotThrowAnyException();
 
         // 최초 1회 + 범인 탐색의 재시도 1회
@@ -105,6 +111,8 @@ class TokenLifecycleConsumerTest {
         consumer.consume(events(4));
 
         verify(persistService).persist(eq(TokenEventType.ENQUEUED), anyList());
+        // 정상 운영의 대부분이 이 모양이다 — 트랜잭션이 하나를 넘으면 안 된다
+        verify(persistService, org.mockito.Mockito.times(1)).persist(any(), anyList());
     }
 
     /**
@@ -127,19 +135,57 @@ class TokenLifecycleConsumerTest {
     }
 
     /**
-     * <b>같은 타입이 연속하는 구간씩</b> 넘겨야 한다. 타입별로 모아 넘기면 같은 토큰의
-     * {@code ADMITTED → COMPLETED} 순서가 뒤집혀, COMPLETED가 먼저 no-op이 되고
-     * 그 토큰은 영원히 완료되지 않는다.
+     * <b>같은 토큰이 한 배치에 두 번 실리면</b> 도착 순서를 그대로 지켜야 한다. 타입별로 모아
+     * 넘기면 그 순서가 뒤집혀, 가드({@code status = 1}에서만)가 거짓인 COMPLETED가 먼저
+     * no-op이 되고 그 토큰은 영원히 완료되지 않는다.
+     *
+     * <p><b>도착 순서를 일부러 전이 순서와 반대로 둔다.</b> 그룹 적재는 {@code EnumMap}의
+     * 선언 순서(ENQUEUED→ADMITTED→COMPLETED→EXPIRED)로 도는데, 도착이 이미 그 순서면
+     * 두 경로의 결과가 같아 <b>구간 분할을 탔는지 아닌지 구분할 수 없다</b>. 반대로 두어야
+     * "정렬되지 않고 도착 순서가 보존됐다"가 관측 가능해진다.
+     *
+     * <p>🔴 이 테스트는 원래 {@code tokenId}가 전부 다른 데이터로 순서를 검증하고 있었다.
+     * 서로 다른 토큰은 순서가 뒤집혀도 아무 일이 일어나지 않으므로, 지키려는 성질을
+     * 겨냥하지 못한 채 <b>구현 방식(구간 분할)만</b> 고정하고 있었다.
      */
     @Test
-    @DisplayName("타입이 섞인 배치는 도착 순서대로 구간을 나눠 적재한다")
-    void 타입이_섞이면_구간별로_순서대로_적재한다() {
+    @DisplayName("같은 토큰이 두 번 실린 배치는 타입별로 모으지 않고 도착 순서를 지킨다")
+    void 같은_토큰이_두_번이면_도착_순서를_지킨다() {
         doNothing().when(persistService).persist(any(), anyList());
 
-        List<EnqueueEvent> events = new ArrayList<>(events(4));
-        events.set(1, withType("ADMITTED", events.get(1)));
-        events.set(2, withType("COMPLETED", events.get(2)));
-        // [ENQUEUED, ADMITTED, COMPLETED, ENQUEUED] → 구간 4개
+        EnqueueEvent base = events(1).get(0);
+        List<EnqueueEvent> events = List.of(
+                withType("COMPLETED", base),
+                withType("ADMITTED", base));   // 같은 tokenId가 두 번
+
+        consumer.consume(events);
+
+        InOrder order = inOrder(persistService);
+        order.verify(persistService).persist(eq(TokenEventType.COMPLETED), anyList());
+        order.verify(persistService).persist(eq(TokenEventType.ADMITTED), anyList());
+        order.verifyNoMoreInteractions();
+    }
+
+    /**
+     * 중복 {@code tokenId}가 없으면 순서가 깨질 대상 자체가 없으므로 타입별로 모은다 —
+     * <b>타입당 1회</b>. 구간 분할은 타입이 바뀔 때마다 트랜잭션(= 커밋 fsync 2회)을 열어,
+     * 혼합 부하에서 커밋이 폭주한 실측이 이 경로의 근거다 — 2026-08-27 반사실 측정으로
+     * 커밋 76,806 → 13,080(절감 83%)을 확인했다. 단 저부하에서는 절감 0%다(본체 주석 참조).
+     *
+     * <p>실행 순서는 {@code EnumMap}의 <b>enum 선언 순서</b>다. 도착을 전이 순서의 역순으로
+     * 넣어 두었으므로, 선언 순서를 뒤섞으면 이 단정이 곧바로 빨개진다.
+     */
+    @Test
+    @DisplayName("중복 tokenId가 없는 혼합 배치는 타입당 1회로 모아 전이 순서대로 적재한다")
+    void 중복이_없으면_타입당_한_번_전이_순서로_적재한다() {
+        doNothing().when(persistService).persist(any(), anyList());
+
+        List<EnqueueEvent> events = new ArrayList<>(events(5));
+        events.set(0, withType("COMPLETED", events.get(0)));
+        events.set(1, withType("EXPIRED", events.get(1)));
+        events.set(2, withType("ADMITTED", events.get(2)));
+        events.set(3, withType("COMPLETED", events.get(3)));
+        // 도착 [COMPLETED, EXPIRED, ADMITTED, COMPLETED, ENQUEUED] → 구간 분할이면 5회
 
         consumer.consume(events);
 
@@ -147,17 +193,59 @@ class TokenLifecycleConsumerTest {
         order.verify(persistService).persist(eq(TokenEventType.ENQUEUED), anyList());
         order.verify(persistService).persist(eq(TokenEventType.ADMITTED), anyList());
         order.verify(persistService).persist(eq(TokenEventType.COMPLETED), anyList());
-        order.verify(persistService).persist(eq(TokenEventType.ENQUEUED), anyList());
+        order.verify(persistService).persist(eq(TokenEventType.EXPIRED), anyList());
+        order.verifyNoMoreInteractions();
+
+        // 같은 타입은 한 번에 — COMPLETED 두 건이 두 트랜잭션으로 쪼개지면 모은 의미가 없다
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Token>> captor = ArgumentCaptor.forClass(List.class);
+        verify(persistService).persist(eq(TokenEventType.COMPLETED), captor.capture());
+        assertThat(captor.getValue()).hasSize(2);
+    }
+
+    /**
+     * 그룹 적재가 제약 위반으로 실패하면 <b>같은 배치를 구간 분할로 다시 태운다</b>.
+     * 그룹 경로에서는 격리 인덱스(원본 배치 기준)를 특정할 수 없으므로, 범인 탐색을 할 수 있는
+     * 경로로 넘겨야 한다. 적재가 멱등이라 재실행이 안전하다는 전제가 여기 걸려 있다.
+     *
+     * <p>재실행이 없으면 <b>제약 위반이 그대로 전파되어 배치 전체가 DLT로</b> 간다.
+     */
+    @Test
+    @DisplayName("그룹 적재가 제약 위반이면 같은 배치를 구간 분할로 다시 태운다")
+    void 그룹_적재가_실패하면_구간_분할로_재실행한다() {
+        // 첫 호출(= 그룹 경로의 첫 그룹)만 실패
+        doThrow(new DataIntegrityViolationException("일시적"))
+                .doNothing()
+                .when(persistService).persist(any(), anyList());
+
+        List<EnqueueEvent> events = new ArrayList<>(events(3));
+        events.set(1, withType("ADMITTED", events.get(1)));
+        // 도착 [ENQUEUED, ADMITTED, ENQUEUED] — 구간 분할이면 3회
+
+        assertThatCode(() -> consumer.consume(events)).doesNotThrowAnyException();
+
+        // 같은 인자의 검증이 연속하므로 calls(1)을 쓴다. 기본 times(1)은 InOrder에서 탐욕적이라
+        // 연속한 동일 호출을 한 번에 삼켜 "3번 불렸다"로 실패한다.
+        InOrder order = inOrder(persistService);
+        order.verify(persistService, calls(1)).persist(eq(TokenEventType.ENQUEUED), anyList()); // 실패한 그룹
+        order.verify(persistService, calls(1)).persist(eq(TokenEventType.ENQUEUED), anyList()); // 구간 1
+        order.verify(persistService, calls(1)).persist(eq(TokenEventType.ADMITTED), anyList()); // 구간 2
+        order.verify(persistService, calls(1)).persist(eq(TokenEventType.ENQUEUED), anyList()); // 구간 3
         order.verifyNoMoreInteractions();
     }
 
-    /** 연속한 같은 타입은 한 구간으로 묶여야 한다 — 건별로 쪼개지면 배치의 이점이 사라진다. */
+    /**
+     * 연속한 같은 타입은 한 구간으로 묶여야 한다 — 건별로 쪼개지면 배치의 이점이 사라진다.
+     *
+     * <p>중복 {@code tokenId}를 심어 <b>구간 분할 경로</b>를 강제한다. 안 그러면 그룹 경로로
+     * 새어 나가 "타입별로 모았으니 2건"이 되어, 구간 병합을 검증하지 않는데도 초록이 된다.
+     */
     @Test
     @DisplayName("연속한 같은 타입은 한 번에 넘어간다")
     void 연속한_같은_타입은_한_구간이다() {
         doNothing().when(persistService).persist(any(), anyList());
 
-        List<EnqueueEvent> events = new ArrayList<>(events(4));
+        List<EnqueueEvent> events = withDuplicateTokenId(new ArrayList<>(events(4)));
         events.set(2, withType("ADMITTED", events.get(2)));
         events.set(3, withType("ADMITTED", events.get(3)));
 
@@ -209,6 +297,10 @@ class TokenLifecycleConsumerTest {
         ArgumentCaptor<List<Token>> captor = ArgumentCaptor.forClass(List.class);
         verify(persistService).persist(eq(TokenEventType.ENQUEUED), captor.capture());
         assertThat(captor.getValue()).hasSize(2);
+
+        // 모르는 타입이 하나라도 있으면 그룹 경로를 타면 안 된다. 탔다면 뒤쪽 ENQUEUED까지
+        // 함께 적재되어(또는 null 키로 터져) 격리 인덱스를 잃는다.
+        verify(persistService, org.mockito.Mockito.times(1)).persist(any(), anyList());
     }
 
     /** 첫 건이 모르는 타입이면 적재할 앞 구간이 없다. */
@@ -236,6 +328,19 @@ class TokenLifecycleConsumerTest {
             }
             return null;
         }).when(persistService).persist(any(), anyList());
+    }
+
+    /**
+     * 마지막 건의 {@code tokenId}를 첫 건과 같게 만들어 <b>그룹 적재 대상에서 제외</b>시킨다.
+     * (컨슈머는 같은 {@code tokenId}가 두 번 이상이면 구간 분할로 내려간다.)
+     */
+    private static List<EnqueueEvent> withDuplicateTokenId(List<EnqueueEvent> events) {
+        List<EnqueueEvent> copy = new ArrayList<>(events);
+        EnqueueEvent last = copy.get(copy.size() - 1);
+        copy.set(copy.size() - 1, new EnqueueEvent(last.eventType(), copy.get(0).tokenId(),
+                last.queueId(), last.tenantId(), last.userId(), last.seq(), last.issuedAt(),
+                last.admitToken(), last.admittedAt(), null));
+        return copy;
     }
 
     private static EnqueueEvent withType(String eventType, EnqueueEvent e) {

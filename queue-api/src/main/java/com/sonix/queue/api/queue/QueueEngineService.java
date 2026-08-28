@@ -175,8 +175,16 @@ public class QueueEngineService {
     //    트랜잭션 안이면 LazyConnectionDataSourceProxy가 커넥션을 **트랜잭션이 끝날 때까지 쥔다**.
     //    브로커가 느려지면 Replica 풀이 verify에 12초씩 묶이고, verify는 게이트 개방 순간
     //    입장자 수만큼 몰리는 엔드포인트라 그게 곧 자해가 된다.
-    //    Redis 히트 경로는 DB를 아예 안 읽고, 폴백 경로의 단건 조회는 Spring Data 리포지토리가
-    //    자체 readOnly 트랜잭션을 갖고 있어 Replica 라우팅도 그대로다.
+    //    Redis 히트 경로는 DB를 아예 안 읽는다.
+    //
+    //    🪤 **폴백 경로의 단건 조회는 master로 간다.** 구 주석은 "Spring Data 리포지토리가 자체
+    //       readOnly 트랜잭션을 갖고 있어 Replica 라우팅도 그대로"라고 적었는데 **거짓이다**.
+    //       2026-08-27 라우팅 로그 실측: 트랜잭션 없이 부른 파생 쿼리(findByTokenId 등)는
+    //       readOnly 트랜잭션이 **열리지 않아** isCurrentTransactionReadOnly()가 false다 → master.
+    //       같은 findByQueueId도 @Transactional(readOnly=true) 안에서 부르면 replica로 간다
+    //       (QueueService.getQueue로 대조 확인). **갈리는 것은 메서드가 아니라 트랜잭션이다.**
+    //       → 트랜잭션을 안 거는 이 판단 자체는 유지한다. 다만 대가가 "Replica 풀 점유"가
+    //         아니라 **master 풀 점유**라는 것이 정확한 서술이다.
     public String verify(long tenantId, String queueId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 
@@ -251,8 +259,15 @@ public class QueueEngineService {
     /**
      * Complete — Tenant가 입장 완료를 통보한다 (FRS §6.6).
      *
-     * <p><b>판정 권위는 DB다.</b> Redis {@code admit-by-admit}은 60초면 사라지므로 그걸 기준으로
-     * 삼으면 정상 입장이 만료 직후 거절된다 (§80이 구 설계를 폐기한 이유).
+     * <p><b>판정 권위는 DB가 먼저, 그 다음이 Redis다.</b> {@code markCompleted}가 1행이면 거기서
+     * 끝난다 — 원장이 동기로 확정되므로 발행이 실패해도 상태가 남는다. <b>0행일 때만</b> Redis
+     * {@code admit-by-admit}으로 폴백하는데, 그 0행에는 두 가지가 섞여 있다: ① 자격 없음,
+     * ② <b>컨슈머가 ADMITTED를 아직 적재하지 않음</b>. ②까지 404로 돌려주면 <b>정상 입장자가
+     * 거절된다</b> — §80이 "발생률은 통합테스트에서 관측한다"고 남긴 그 창이다.
+     *
+     * <p>§80이 폐기한 것은 <b>"Redis 미스면 404"</b>라는 구 설계이지(FRS §6.6) DB 폴백이 아니다.
+     * Redis 히트 창(PX 60초)은 DB 창(300초)의 부분집합이라, 폴백이 통과시키는 요청은 적재만
+     * 끝났다면 UPDATE도 통과시켰을 것들이다.
      *
      * <p><b>@Transactional인 이유</b>: {@code @Modifying} 네이티브 UPDATE가 트랜잭션을 요구한다.
      * 뒤따르는 조회는 방금 갱신한 행을 읽어야 해서(read-your-write) {@code readOnly}가 아니다.
@@ -272,11 +287,55 @@ public class QueueEngineService {
         if (updated == 0) {
             // 🔴 **이미 COMPLETED면 성공이다.** verify가 완료를 확정하게 되면서
             //    verify → complete를 둘 다 부르는 정상 Tenant가 여기 도달한다.
-            //    markCompleted의 술어가 status IN (0,1)이라 0행이 되는데, 이걸 400으로 돌려주면
-            //    아무 잘못 없는 통합이 깨진다. admitToken이 일치하는 완료 행이면 그때의
-            //    completedAt을 그대로 돌려준다 — 재시도에도 같은 답이 나온다.
-            return tokenRepository.findCompletedAt(queueId, tenantId, tokenId, admitToken)
+            //    admitToken이 일치하는 완료 행이면 그때의 completedAt을 그대로 돌려준다
+            //    — 재시도에도 같은 답이 나온다.
+            Optional<LocalDateTime> already =
+                    tokenRepository.findCompletedAt(queueId, tenantId, tokenId, admitToken);
+            if (already.isPresent()) {
+                return already.get();
+            }
+
+            // 🔑 **여기까지 왔다 = DB가 이 토큰을 아직 모른다.**
+            //
+            // markCompleted의 술어가 요구하는 admit_token·admitted_at은 ADMITTED 이벤트를
+            // 컨슈머가 적재해야만 채워진다. 즉 **랙 구간에서는 정상 입장자도 0행**이다.
+            // verify가 같은 창에서 멀쩡한 이유는 Redis를 먼저 보기 때문이다(§6.5).
+            //
+            // 🔑 **정당화는 실측이 아니라 불변식이다.** admit-by-admit의 PX는 60초이고
+            //    complete의 DB 창은 300초다 — **Redis 히트 창 ⊂ DB 창**. 그러므로 이 폴백이
+            //    통과시키는 요청은 예외 없이 **적재만 끝났다면 위 UPDATE도 통과시켰을 것들**이고,
+            //    자격이 넓어지지 않는다. 부하 수치가 없어도 이 문장은 참이다.
+            //    (두 상수가 갈리면 이 불변식이 깨진다 — Token.COMPLETE_VALID_WINDOW_SECONDS와
+            //     admit TTL을 같이 보고 고쳐라.) §80이 기각한 것은 "Redis 미스면 404"라는
+            // 구 설계이지(FRS §6.6) DB 폴백이 아니다.
+            //
+            // ⚠️ **순서를 뒤집지 마라.** DB를 먼저 치는 덕에 랙이 없는 정상 경로는 변경 전과
+            //    완전히 같다 — status=2가 동기로 확정되고, 재시도는 findCompletedAt이 같은 값을
+            //    돌려주며, 발행이 실패해도 원장은 이미 확정돼 있다. Redis를 먼저 보게 만들면
+            //    그 안전망이 사라져, publishQuietly가 발행을 삼켰을 때 행이 status=1로 남고
+            //    ReconcileJob이 **완료된 토큰을 EXPIRED로 확정**한다(Redis 키는 이미 지워진 뒤라
+            //    복구 경로가 없다).
+            AdmitRef ref = queueEngine.findAdmitRefByAdmitToken(queueId, admitToken)
+                    .filter(AdmitRef::complete)
+                    .filter(r -> tokenId.equals(r.tokenId()))
                     .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN));
+
+            // 🔴 **폴백은 조용히 일어나면 안 된다.**
+            // 이 경로가 도는 동안 원장(tokens)에는 이 완료가 없다. 컨슈머가 잠깐 밀린 것이면
+            // 곧 따라잡지만, **적재가 아예 멈춰도 여기는 계속 200을 준다** — Tenant는 정상이라
+            // 믿고 원장은 비어 있는 상태가 된다(과금 근거도 사라진다).
+            // 전례: 컨슈머가 죽은 판에서 이 경로가 계속 200을 내는 동안 tokens 테이블은
+            // 비어 있었고, 그때 이 로그가 없어 **아무도 몰랐다.**
+            // (그 판의 산출물은 소실됐다 — 건수는 재현 미검증이라 적지 않는다.)
+            // WARN인 이유: 정상 운영에서도 랙이 있으면 나오지만, 지속되면 그 자체가 사고다.
+            log.warn("complete가 Redis 폴백으로 처리됐다 — 컨슈머 적재가 밀려 있다. "
+                    + "tokenId={} queueId={} seq={}", tokenId, queueId, ref.seq());
+
+            queueEngine.cleanupCompleted(queueId, ref.identifier(), tokenId, admitToken, ref.seq());
+            // 이벤트에 필요한 값이 AdmitRef 안에 전부 있다. DB를 다시 읽지 않는다.
+            publishQuietly(new EnqueueEvent(TokenEventType.COMPLETED.name(), tokenId, queueId, tenantId,
+                    ref.identifier(), ref.seq(), ref.issuedAt(), admitToken, null, null));
+            return completedAt;
         }
 
         // 정리·발행에 identifier·seq·issuedAt이 필요하다. UPDATE가 1행을 갱신했으므로 반드시 있다.

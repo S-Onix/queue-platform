@@ -74,8 +74,6 @@ public class TokenEntity implements Persistable<TokenEntityId> {
      * 쓰기는 ADMITTED 이벤트를 소비하는 컨슈머 UPSERT 몫이라 {@code insertable = false}다.
      */
     @Column(insertable = false) LocalDateTime admittedAt;
-    @JdbcTypeCode(SqlTypes.TINYINT)
-    @Column(insertable = false) boolean redisSyncNeeded;
 
     @Id
     @Column(length = 50)
@@ -112,7 +110,7 @@ public class TokenEntity implements Persistable<TokenEntityId> {
     public Token toDomain() {
         return Token.reconstruct(this.id, this.tokenId, this.queueId, this.tenantId,
                 this.userId, this.seq, TokenStatus.fromCode(this.status),
-                this.expiredReason, this.admitToken, this.redisSyncNeeded,
+                this.expiredReason, this.admitToken,
                 this.issuedAt, this.admittedAt);
     }
 }

@@ -11,7 +11,12 @@ import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * 토큰 생명주기 이벤트 → tokens 테이블 적재.
@@ -54,11 +59,20 @@ public class TokenLifecycleConsumer {
      * 순서는 의미가 없고(서로 다른 토큰이므로), 같은 파티션 안의 상대 순서는 리스트에
      * 그대로 유지된다.
      *
-     * <p><b>🔴 타입별로 모아 처리하지 말 것.</b> 그러면 파티션이 지켜준 같은 토큰의 순서가
+     * <p><b>🔴 같은 {@code tokenId}가 두 번 이상 있는 배치를 타입별로 모으지 말 것.</b> 그러면 파티션이 지켜준 같은 토큰의 순서가
      * 애플리케이션에서 다시 깨진다. 한 배치에 {@code [ADMITTED tok1, COMPLETED tok1]}이 있을 때
      * COMPLETED를 먼저 적용하면 그 가드({@code status = 1}에서만)가 거짓이라 <b>조용히 no-op</b>이
      * 되고, 이어서 ADMITTED가 1로 만든다 — 그 토큰은 영원히 완료되지 않는다. 구간을 나누면
      * 도착 순서가 그대로 보존된다. 정상 운영에서는 대부분 ENQUEUED 하나라 구간도 하나다.
+     *
+     * <p>🔑 <b>중복 {@code tokenId}가 없으면 그 위험 자체가 없다</b> — 뒤집힐 두 이벤트가 없기
+     * 때문이다. 그 경우에만 {@code canGroupByType}이 참이 되어 타입별로 모은다. 구간 분할은
+     * 지워지지 않았고, 중복이 하나라도 있으면 그대로 내려간다(실측: 배치 9,443개 중 2개, 0.02%).
+     *
+     * <p>⚠️ 위 반례를 정확히 읽어라. {@code [ADMITTED tok1, COMPLETED tok1]}은 <b>그룹 경로에서도
+     * 뒤집히지 않는다</b> — {@code EnumMap} 순회가 ADMITTED를 먼저 내보내기 때문이다. 중복 가드가
+     * 실제로 막는 것은 <b>도착 순서가 상태 전이 순서와 어긋난 배치</b>(재전달이 끼어드는 등)다.
+     * 그런 배치에서 타입별로 모으면 애플리케이션이 파티션의 도착 순서를 다시 어기게 된다.
      *
      * <p>제약 위반 외의 예외는 그대로 전파한다 → 에러 핸들러가 재시도한다.
      *
@@ -68,7 +82,55 @@ public class TokenLifecycleConsumer {
      */
     @KafkaListener(topics = "${queue.consumer.topic:token-lifecycle}")
     public void consume(List<EnqueueEvent> events) {
+        // 위 주석의 반례(`[ADMITTED tok1, COMPLETED tok1]`)는 **같은 tokenId가 한 배치에 두 번**
+        // 나올 때만 성립한다. 없으면 타입별로 모아도 도착 순서가 깨질 대상 자체가 없다.
+        //
+        // 왜 모으는가: 구간 분할은 타입이 바뀔 때마다 트랜잭션을 연다. 타입이 섞인 배치는
+        // 구간이 잘게 부서져 커밋이 폭주하고, 그 랙이 complete를 죽였다.
+        // 타입은 4종뿐이므로 모으면 배치당 최대 4회다.
+        //
+        // 🔑 **이득은 파티션당 유입률의 함수다. 저부하에서는 정확히 0이다.**
+        //    2026-08-27 실측(반사실 splitTx 직접 측정, 전 구간 32만 이벤트):
+        //      파티션당 105~113건/s → 배치 73~158건 → 절감 84~96%
+        //      파티션당   2~3건/s   → 배치  5~ 10건 → 절감 **0%**
+        //      전체 합계: 커밋 76,806 → 13,080 (절감 83.0%)
+        //    파티션당 유입이 낮으면 한 배치에 타입이 한 종류뿐이라 분할 경로도 트랜잭션을
+        //    하나만 연다 — 줄일 것이 없다. 대략 **파티션당 50건/s**가 손익 경계다.
+        //
+        // 🪤 **저부하 벤치로 "효과 없다"고 판단해 지우지 말 것.** 위 0% 구간이 정상이다.
+        //    되돌리려면 파티션당 50건/s 이상을 걸고 splitTx/tx를 다시 재라. 로컬에서 그 부하를
+        //    내려면 부하 도구가 서버를 굶기지 않아야 한다(하니스가 죽은 판의 유입은 파티션당
+        //    10건/s까지 눌려 절감이 0으로 보였다 — 코드가 아니라 측정이 틀린 것이었다).
+        //
+        // ⚠️ 이건 위 금지의 예외가 아니라 **그 금지가 필요 없는 배치만 우회**하는 것이다.
+        //    중복이 하나라도 있으면 아래 구간 분할로 내려간다 (실측 9,443개 중 2개).
+        if (canGroupByType(events)) {
+            try {
+                int types = persistGrouped(events);
+                // 반사실: 같은 배치를 분할 경로로 태웠다면 열렸을 트랜잭션 수.
+                // 이게 types와 같으면 그룹 적재가 줄인 커밋이 0이다 — 값을 하는지의 유일한 직접 근거다.
+                int wouldSplit = countSegments(events);
+                // 🔑 **debug인 이유와, 올려야 할 때.**
+                // 이 줄은 그룹 적재가 값을 하는지 재는 **유일한 직접 근거**다(tx 대 splitTx).
+                // 2026-08-27 측정은 끝났다 — 절감 83.0% / 82.8%로 두 판 재현했다. 상시로 두면
+                // 13분에 1만 줄이라 상용에서는 그 자체가 부하다(로드 테스트 로그 억제 전례).
+                //
+                // 🪤 **다시 재려면 반드시 이 줄을 INFO로 올리고 재라.** 2026-08-27 첫 판은 이게
+                //    debug라 0건이 찍혀 커밋 수를 ReplicationRoutingDataSource 로그로 **유도**했고,
+                //    그 유도값(2.33)이 실측(18.5)과 8배 어긋나 판정이 하루 밀렸다.
+                //    올리는 법: --logging.level.com.sonix.queue.consumer.token=DEBUG
+                log.debug("token-lifecycle 적재 완료: path=grouped events={} tx={} splitTx={}", events.size(), types, wouldSplit);
+                return;
+            } catch (DataIntegrityViolationException e) {
+                // 격리(BatchListenerFailedException)의 인덱스는 **원본 배치 기준**이라
+                // 그룹 경로에서는 특정할 수 없다. 적재가 멱등이므로(ODKU) 구간 분할 경로로
+                // 다시 태워 기존 격리 로직이 범인을 찾게 한다.
+                log.warn("그룹 적재가 제약 위반으로 실패했다({}건) — 구간 분할 경로로 재시도한다", events.size());
+            }
+        }
+
         int start = 0;
+        int segments = 0;
 
         while (start < events.size()) {
             TokenEventType type = TokenEventType.from(events.get(start).eventType());
@@ -91,9 +153,66 @@ public class TokenLifecycleConsumer {
             }
 
             start = end;
+            segments++;
         }
 
-        log.debug("token-lifecycle 적재 완료: {}건", events.size());
+        log.debug("token-lifecycle 적재 완료: path=split events={} tx={} splitTx={}", events.size(), segments, segments);
+    }
+
+    /**
+     * 같은 타입이 연속하는 <b>구간의 개수</b> — 분할 경로가 여는 트랜잭션 수와 같다.
+     *
+     * <p>그룹 경로에서 <b>반사실</b>로만 쓴다. 이 값이 실제 타입 수와 같으면 그룹 적재가
+     * 줄인 커밋이 0이라는 뜻이다.
+     */
+    private static int countSegments(List<EnqueueEvent> events) {
+        int segments = 0;
+        String prev = null;
+        for (EnqueueEvent e : events) {
+            if (!e.eventType().equals(prev)) {
+                segments++;
+                prev = e.eventType();
+            }
+        }
+        return segments;
+    }
+
+    /**
+     * 이 배치를 타입별로 모아도 안전한가.
+     *
+     * <p>둘 다 만족해야 한다 — <b>모르는 타입이 없을 것</b>(있으면 격리 인덱스가 필요하다),
+     * <b>같은 {@code tokenId}가 두 번 이상 없을 것</b>(있으면 도착 순서를 지켜야 한다).
+     */
+    private static boolean canGroupByType(List<EnqueueEvent> events) {
+        Set<String> seen = new HashSet<>(Math.max(16, events.size() * 2));
+        for (EnqueueEvent e : events) {
+            if (TokenEventType.from(e.eventType()) == null) {
+                return false;
+            }
+            if (!seen.add(e.tokenId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 타입별로 모아 타입당 한 번씩 적재한다.
+     *
+     * <p>{@link EnumMap}은 <b>enum 선언 순서</b>로 순회한다. {@code TokenEventType}의 선언 순서가
+     * {@code ENQUEUED → ADMITTED → COMPLETED → EXPIRED}, 즉 상태 전이 순서와 같으므로 그룹 실행
+     * 순서도 자연스럽게 그 방향이다. <b>선언 순서를 바꾸면 이 안전성이 조용히 깨진다.</b>
+     * (중복 tokenId가 없다는 것이 이미 보장돼 있어 순서가 결과를 바꾸지는 않지만,
+     * 판정에 결함이 생겼을 때의 피해를 줄이는 방향으로 고정해 둔다.)
+     */
+    private int persistGrouped(List<EnqueueEvent> events) {
+        Map<TokenEventType, List<Token>> byType = new EnumMap<>(TokenEventType.class);
+        for (EnqueueEvent e : events) {
+            byType.computeIfAbsent(TokenEventType.from(e.eventType()), k -> new ArrayList<>())
+                    .add(toToken(e));
+        }
+        byType.forEach(tokenPersistService::persist);
+        return byType.size();
     }
 
     /**

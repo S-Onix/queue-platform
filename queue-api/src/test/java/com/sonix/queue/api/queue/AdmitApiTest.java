@@ -116,7 +116,7 @@ class AdmitApiTest {
 
     private static Token token(TokenStatus status, String admitToken) {
         return Token.reconstruct(1L, "tok_a", QUEUE_ID, TENANT_ID, "0190e2c1-user", 42L,
-                status, null, admitToken, false,
+                status, null, admitToken,
                 LocalDateTime.ofEpochSecond(1_700_000, 0, ZoneOffset.UTC), null);
     }
 
@@ -303,6 +303,63 @@ class AdmitApiTest {
         mockMvc.perform(post("/api/v1/queues/{q}/tokens/{t}/complete", QUEUE_ID, "tok_a")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"admitToken\":\"adm_wrong\"}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.errorResponse.code").value("TK002"));
+
+        verify(queueEngine, never()).cleanupCompleted(anyString(), anyString(), anyString(), anyString(), anyLong());
+        verifyNoInteractions(eventPublisher);
+    }
+
+    @Test
+    @DisplayName("complete 0행 + Redis 히트 → 200. 컨슈머가 ADMITTED를 아직 적재하지 않은 창")
+    void complete_dbMiss_redisFallback() throws Exception {
+        // 🔑 이 분기가 없던 동안 **정상 입장자가 404**였다 — markCompleted의 술어가 요구하는
+        //    admit_token·admitted_at은 ADMITTED 이벤트를 컨슈머가 적재해야만 채워지기 때문이다.
+        //    Redis 히트는 "60초 안에 admit됐다"를 키의 PX가 이미 증명한 것이고, 그 창(60초)은
+        //    DB 창(300초)의 **부분집합**이라 통과시켜도 자격이 넓어지지 않는다.
+        //
+        // 🪤 **이 스텁이 빠지면 테스트는 그대로 초록인 채 분기를 안 탄다.** Mockito 기본값이
+        //    Optional.empty()라 조용히 404 경로로 흐른다 — 2026-08-27 검토가 잡아낸 실제 구멍이다.
+        when(tokenRepository.markCompleted(anyString(), anyLong(), anyString(), anyString(), any(), anyInt()))
+                .thenReturn(0);
+        when(tokenRepository.findCompletedAt(anyString(), anyLong(), anyString(), anyString()))
+                .thenReturn(Optional.empty());
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
+                .thenReturn(Optional.of(new AdmitRef(
+                        "tok_a", 42L, Instant.ofEpochMilli(1_700_000_000_000L), "0190e2c1-user")));
+
+        mockMvc.perform(post("/api/v1/queues/{q}/tokens/{t}/complete", QUEUE_ID, "tok_a")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"admitToken\":\"adm_1\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("COMPLETED"));
+
+        // 이벤트 재료가 AdmitRef 안에 전부 있다 — 이 경로는 DB를 다시 읽지 않는다.
+        verify(tokenRepository, never()).findByTokenId(anyString(), anyLong(), anyString());
+        verify(queueEngine).cleanupCompleted(QUEUE_ID, "0190e2c1-user", "tok_a", "adm_1", 42L);
+
+        ArgumentCaptor<EnqueueEvent> captor = ArgumentCaptor.forClass(EnqueueEvent.class);
+        verify(eventPublisher).publish(captor.capture());
+        assertThat(captor.getValue().eventType()).isEqualTo("COMPLETED");
+        assertThat(captor.getValue().seq()).isEqualTo(42L);
+    }
+
+    @Test
+    @DisplayName("complete 폴백: admitToken이 가리키는 tokenId가 다르면 404 — 남의 토큰을 못 닫는다")
+    void complete_redisFallback_tokenIdMismatch_404() throws Exception {
+        // 폴백이 인가 판정을 겸한다. admitToken만 맞고 경로의 tokenId가 다르면 거절해야 한다 —
+        // 아니면 admitToken 하나로 같은 큐의 아무 토큰이나 완료시킬 수 있다.
+        when(tokenRepository.markCompleted(anyString(), anyLong(), anyString(), anyString(), any(), anyInt()))
+                .thenReturn(0);
+        when(tokenRepository.findCompletedAt(anyString(), anyLong(), anyString(), anyString()))
+                .thenReturn(Optional.empty());
+        when(queueEngine.findAdmitRefByAdmitToken(QUEUE_ID, "adm_1"))
+                .thenReturn(Optional.of(new AdmitRef(
+                        "tok_OTHER", 99L, Instant.ofEpochMilli(1_700_000_000_000L), "0190e2c1-other")));
+
+        mockMvc.perform(post("/api/v1/queues/{q}/tokens/{t}/complete", QUEUE_ID, "tok_a")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"admitToken\":\"adm_1\"}"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.errorResponse.code").value("TK002"));
 

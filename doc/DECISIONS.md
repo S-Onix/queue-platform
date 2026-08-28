@@ -112,7 +112,7 @@
 | §20 | 메모리 압박 해결 | ✅ |
 | §23 | Redis Key 설계 이유 (키표) | ✏️ |
 | §30 | Master/Replica (Sentinel) 설계 | 📉 |
-| §39 | RedisSyncJob 상세 흐름 | ✏️ |
+| §39 | ~~RedisSyncJob 상세 흐름~~ 🗑 철회(2026-08-27) | ✏️ |
 | §64 | Lua Script Bean 등록 패턴 | ✅ |
 | §66 | Redis Cluster 도입 결정 | ✏️ |
 | §67 | 이중 라우팅 (Cluster + Hash Tag) | ✏️ |
@@ -846,8 +846,10 @@ Batch UPDATE:
 > ✏️ **"Bulk Worker 항상 활성"(분기 없음)은 유효하며 §70이 재확인했다.** 다만 아래 두 가지는 폐기됐다:
 > **① `슬라이스별 ZADD multi-member`** → 대기열은 ZSet 하나다(§66 D2). **② `INCRBY N → seq 블록 채번`**
 > → 항목마다 `INCR queue:{queueId}:seq`로 발급한다(§70 D9).
-> 상수도 실제와 다르다 — 코드는 `MAX_DRAIN=5000` / `CHUNK_SIZE=500` / `fixedRate=1000ms`
-> (`BatchProcessor.java`). 아래 `500건 / 10ms`는 원안이며 **재조정은 후속 과제**다(§70).
+> 상수도 실제와 다르다 — 코드는 `MAX_DRAIN=5000` / `CHUNK_SIZE=500` /
+> **`drain-interval=20ms`**(`BatchProcessor.java`, 2026-08-27 `1000ms`에서 재조정).
+> 아래 `500건 / 10ms`는 원안이며, **주기는 재조정 완료**(원안 10ms의 2배).
+> `CHUNK_SIZE`·타임아웃은 여전히 원안 이탈 상태다.
 
 ### Enqueue Lua — Bulk Worker 항상 활성
 
@@ -2231,6 +2233,9 @@ Java 매핑:
 
 ### redis_sync_needed 컬럼
 
+> 🗑 **철회 (2026-08-27).** `redis_sync_needed` 컬럼·인덱스·`RedisSyncJob` 계획 전부 폐기했다. 이유는 `doc/schema.sql` [redis_sync_needed] 주석 참조 — 설계 전제("Redis 다운 중 INSERT")가 현재 enqueue 순서(Redis Lua → Kafka → 컨슈머 INSERT)에서 **발생할 수 없다.** 아래는 이력이다.
+
+
 ```
 용도: Redis 다운 중 DB INSERT됐지만 Sorted Set 미반영 토큰 추적
 값: 0 = Redis 반영완료, 1 = 미반영
@@ -2308,6 +2313,9 @@ Redis queue:{queueId}:admit-by-admit 미스 시:
 ---
 
 ## §39 RedisSyncJob 상세 흐름
+
+> 🗑 **철회 (2026-08-27).** `redis_sync_needed` 컬럼·인덱스·`RedisSyncJob` 계획 전부 폐기했다. 이유는 `doc/schema.sql` [redis_sync_needed] 주석 참조 — 설계 전제("Redis 다운 중 INSERT")가 현재 enqueue 순서(Redis Lua → Kafka → 컨슈머 INSERT)에서 **발생할 수 없다.** 아래는 이력이다.
+
 
 > ✏️ **아래 슬라이스 계산·키·멤버는 폐기됐다** (§66 D2 · §70 D9 · §74). 본문의 흐름(①~⑤)과
 > "ZADD NX로 멱등" 원칙은 유효하되, **재삽입 대상 키·멤버는 아래 정정된 표기를 따라라.**
