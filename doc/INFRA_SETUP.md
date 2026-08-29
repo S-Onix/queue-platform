@@ -1017,7 +1017,7 @@ mv prometheus-3.0.1.linux-amd64 prometheus
 rm prometheus-3.0.1.linux-amd64.tar.gz
 
 # 확인
-~/prometheus/prometheus --version
+/home/sonix/queue-platform-infra/monitoring/prometheus/bin/prometheus --version
 # prometheus, version 3.0.1 ...
 ```
 
@@ -1034,12 +1034,17 @@ rm prometheus-3.0.1.linux-amd64.tar.gz
 > | 라벨 키 | `application`, `env` (`environment` 아님, `external_labels` 없음) |
 > | 타깃 표기 | `localhost:PORT` (Windows host IP 아님 — 앱도 WSL2 안에서 돈다) |
 >
-> 실가동 파일을 고친 뒤 **reload는 SIGHUP**이다. `prometheus.service`에
-> `--web.enable-lifecycle`이 없어서 `POST /-/reload`는 405가 난다:
+> 실가동 파일을 고친 뒤 **reload는 `POST /-/reload`**다. `prometheus.service`에
+> `--web.enable-lifecycle`을 넣었다 (2026-08-28, 실측 200. 그 전에는 405였다):
 > ```bash
-> kill -HUP $(pgrep -x prometheus)          # 무중단 reload (sudo 불필요, User=sonix)
-> curl -s localhost:9090/api/v1/targets     # 반영 확인
+> curl -XPOST localhost:9090/-/reload        # 무중단 reload (sudo 불필요)
+> curl -s localhost:9090/api/v1/targets      # 반영 확인
 > ```
+> SIGHUP(`kill -HUP $(pgrep -x prometheus)`)도 그대로 된다. HTTP 쪽을 쓰는 이유는
+> **응답 코드가 결과를 알려주기 때문**이다 — 설정이 깨졌으면 400에 사유가 실려 온다.
+> SIGHUP은 성공이든 실패든 조용하고, 로그를 봐야만 알 수 있다.
+> ⚠️ 이 플래그는 인증 없는 `/-/reload`·`/-/quit`를 연다. 지금은 로컬 WSL2라 무해하지만
+> 외부에 노출되는 환경으로 옮길 때는 앞단 차단이 선행이다.
 
 실가동 `prometheus.yml` 구조 (2026-08-17 기준, 타깃 27개):
 
@@ -1174,8 +1179,8 @@ systemctl status redis-exporter mysqld-exporter-master mysqld-exporter-replica
 # 기동/종료 (sudo 필요)
 sudo systemctl start prometheus grafana-server
 
-# 설정만 바꿨을 때 — 재시작하지 말고 SIGHUP (무중단, sudo 불필요)
-kill -HUP $(pgrep -x prometheus)
+# 설정만 바꿨을 때 — 재시작하지 말고 reload (무중단, sudo 불필요)
+curl -XPOST localhost:9090/-/reload      # 설정이 깨졌으면 400 + 사유. SIGHUP도 되지만 조용하다
 
 # 로그
 journalctl -u prometheus -f
@@ -1259,14 +1264,21 @@ C. 대시보드 변수 수정
 
 장기 보존 시 Prometheus 시작 옵션 변경:
 
-```bash
-~/prometheus/prometheus \
-  --config.file=prometheus.yml \
-  --storage.tsdb.retention.time=30d \
-  --storage.tsdb.path=./data
-```
+`prometheus.service`의 `ExecStart`에 `--storage.tsdb.retention.time=30d`를 **추가**하고
+`sudo systemctl daemon-reload && sudo systemctl restart prometheus`.
 
-`prometheus.service`의 `ExecStart`에 플래그를 추가하고 `sudo systemctl daemon-reload && sudo systemctl restart prometheus`.
+⚠️ **기존 줄을 지우고 아래를 붙여넣지 마라** — 유닛의 현재 인자는 4개이고
+`--web.enable-lifecycle`이 빠지면 `POST /-/reload`가 다시 405가 된다(§7-7).
+현재 값은 항상 `systemctl cat prometheus`로 확인하고 **추가만** 해라.
+
+```bash
+# 지금 실제로 도는 인자 (2026-08-28)
+/home/sonix/queue-platform-infra/monitoring/prometheus/bin/prometheus \
+  --config.file=/home/sonix/queue-platform-infra/monitoring/prometheus/prometheus.yml \
+  --storage.tsdb.path=/home/sonix/queue-platform-infra/monitoring/prometheus/data \
+  --web.listen-address=0.0.0.0:9090 \
+  --web.enable-lifecycle
+```
 
 ---
 
@@ -1274,8 +1286,16 @@ C. 대시보드 변수 수정
 
 **왜**: 이 프로젝트의 1차 병목은 **Redis master 단일 스레드**다(폴링 1건 = master EVAL 1회,
 §75 D26으로 한 큐 = 마스터 1대 고정 → 분산 불가). 앱 커스텀 메트릭을 아무리 늘려도
-"Redis가 포화인가"는 안 보인다. 2순위는 **replica 복제 지연** — 읽기 전용 트랜잭션이 replica로
-가고 인증 조회도 그 경로라, 지연이 **앱 401**로 위장해 나타난다.
+"Redis가 포화인가"는 안 보인다. 2순위는 **replica 복제 지연** — 다만 여기가 아픈 이유는
+아래 ⚠️처럼 바뀌었다.
+
+> ⚠️ **"인증 조회가 replica라 지연이 401로 위장한다"는 거짓이다** (2026-08-27 라우팅 로그 실측,
+> CLAUDE.md §4-3). 인증 필터의 `findByKeyHash()`는 파생 쿼리이고 호출부에 `@Transactional`이
+> 없어 readOnly 트랜잭션이 **열리지 않는다** → **master로 간다.** 복제가 아무리 밀려도 인증은
+> 안 흔들린다. 실제로 읽기의 99%가 master다.
+> 그래도 이 지표를 재는 이유는 replica가 **DR 자산**이기 때문이다 — 지연이 곧 유실 가능 구간이고,
+> 배치의 큐 목록(`findAll()`, ReconcileJob·TokenReclaimJob)은 실제로 replica에서 온다.
+> 새 큐가 복제 도착 전이면 **그 주기의 회수·대사에서 빠진다.** 그게 지금 실재하는 위험이다.
 
 | | 값 |
 |---|---|
@@ -1320,7 +1340,7 @@ GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'localhost';
 | 대기열이 조용히 사라졌나? | `redis_evicted_keys_total`, `redis_memory_max_bytes` |
 | failover 발생? | `redis_instance_info{job="redis"}` 의 `role` 라벨 변화, `redis_sentinel_master_config_epoch` 증가 |
 | Sentinel quorum 성립? | `redis_sentinel_master_ckquorum_status` |
-| replica 지연 (→ 401 위장 장애) | `mysql_slave_status_seconds_behind_master` |
+| replica 지연 (→ 배치가 새 큐를 건너뜀 · DR 유실 구간) | `mysql_slave_status_seconds_behind_master` |
 
 **미설치 — 안 깔았을 때 안 보이는 것을 답할 수 있을 때만 추가**:
 `node_exporter`(호스트 CPU/디스크), `kafka_exporter`(컨슈머 lag — 단, Spring Kafka가
@@ -1339,8 +1359,8 @@ GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'localhost';
 
 ```bash
 # 규칙 추가 후
-promtool check rules doc/monitoring/alerts/*.yml
-kill -HUP $(pgrep -x prometheus)
+/home/sonix/queue-platform-infra/monitoring/prometheus/bin/promtool check rules doc/monitoring/alerts/*.yml
+curl -XPOST localhost:9090/-/reload
 curl -s localhost:9090/api/v1/rules      # 로드 확인
 ```
 
@@ -1444,12 +1464,12 @@ redis_stop
 redis_status
 redis_logs master
 
-# Monitoring (Prometheus + Grafana)
-mon_start
-mon_stop
-mon_status
-mon_logs prometheus
-mon_logs grafana
+# Monitoring (Prometheus + Grafana) — bashrc 함수가 아니라 systemd다 (§7-7)
+sudo systemctl start prometheus grafana-server
+sudo systemctl stop  prometheus grafana-server
+systemctl status prometheus grafana-server
+journalctl -u prometheus -f
+journalctl -u grafana-server -f
 
 # MySQL (수동)
 mysql -u root -p -P 3306    # Master
@@ -1570,8 +1590,12 @@ curl http://172.19.64.1:8080/actuator/health
 # 현재 Windows host IP 확인
 ip route show | grep default | awk '{ print $3 }'
 
-# prometheus.yml의 targets와 다르면 mon_start로 자동 갱신
-mon_start
+# ⚠️ 자동 갱신해 주는 것은 없다(mon_start 함수는 존재하지 않는다, §7-7).
+# prometheus.yml의 targets를 직접 고친 뒤 reload 한다.
+#   단, 이 스택의 타깃은 전부 localhost다 — 앱도 WSL2 안에서 돈다(§7-7).
+#   Windows host IP를 타깃에 쓰고 있다면 그 자체가 잘못된 설정이다.
+vi /home/sonix/queue-platform-infra/monitoring/prometheus/prometheus.yml
+curl -XPOST localhost:9090/-/reload
 ```
 
 **원인 3**: Spring Boot가 localhost만 listen
@@ -1650,7 +1674,6 @@ systemctl --version
 **해결**:
 ```bash
 sudo chown -R sonix:sonix ~/queue-platform-infra/
-sudo chown -R sonix:sonix ~/prometheus/
 ```
 
 ### Claude Code 관련
@@ -1690,8 +1713,8 @@ WSL2를 새로 설치하거나 환경 완전 재구축 시:
 9. 기동 + 검증
    redis_start
    redis_status
-   mon_start
-   mon_status
+   sudo systemctl start prometheus grafana-server
+   systemctl status prometheus grafana-server
 10. Windows IntelliJ + Claude Code 설치 (위 §8)
 11. 프로젝트 빌드 테스트
     cd ~/queue-platform && ./gradlew build
@@ -1734,11 +1757,10 @@ cp ~/queue-platform-infra/redis/master/data/dump.rdb ~/backups/redis_$(date +%Y%
 
 ```bash
 # 데이터 위치
-ls -lh ~/prometheus/data/
+ls -lh /home/sonix/queue-platform-infra/monitoring/prometheus/data/
 
-# 보존 기간 변경 — mon_start 함수의 prometheus 실행 옵션에 추가
-./prometheus --config.file=prometheus.yml \
-  --storage.tsdb.retention.time=30d
+# 보존 기간 변경 — systemd 유닛의 ExecStart에 추가 (mon_start 함수는 없다. §7-7 참조)
+sudo systemctl edit --full prometheus     # --storage.tsdb.retention.time=30d 추가
 
 # 운영 환경에선 별도 장기 저장 (Thanos, Cortex) 고려
 ```

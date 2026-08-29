@@ -217,4 +217,4 @@
 | 404(TK001)의 두 상황 구분 | **불가.** 진짜 소멸과 WAITING 복귀 대기가 같은 코드다 (§79 404 계약 — ErrorCode 미분리) |
 | `last-active` 크기 | **미노출.** ZCARD 직접 조회만 |
 | keepalive 비율 | **의미 없음** — `ka` 분기가 사라져 모든 폴링이 keepalive다(§82 F안) |
-| Redis 메모리 (PromQL) | **불가.** redis_exporter 미설치, prometheus.yml에 redis job 없음 |
+| Redis 메모리 (PromQL) | **관측 가능** — `redis_memory_used_bytes` / `redis_memory_max_bytes`. redis_exporter는 멀티타깃 1프로세스로 설치돼 있고 job은 `redis`(3) · `redis-cluster`(16) · `redis-sentinel`(3) 셋이다 (2026-08-28 실측: 타깃 22개 전부 up, 시계열 19개) |

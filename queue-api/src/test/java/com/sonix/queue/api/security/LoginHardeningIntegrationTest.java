@@ -257,7 +257,26 @@ class LoginHardeningIntegrationTest {
     // 2) 비밀번호 최소 12자 (signup에만)
     // ────────────────────────────────────────────────────────────────────────
 
-    /** 이 테스트가 없으면 {@code SignupRequest}의 {@code @Size(min = 12)}를 지워도 아무도 안 막는다. */
+    /**
+     * 이 테스트가 없으면 {@code SignupRequest}의 {@code @Size(min = 12)}를 지워도 아무도 안 막는다.
+     *
+     * <p>🪤 <b>다만 400을 단정하는 이 초록은, 실서버가 401을 내던 동안에도 그대로 통과했다.</b>
+     *
+     * <p>2026-08-28 격리 실측: {@code SecurityConfig}에서 {@code .requestMatchers("/error").permitAll()}
+     * 을 빼고(= 결함 있는 상태) 이 클래스를 돌리면 <b>4건 전부 통과한다</b>. 같은 시점에 실서버는
+     * 같은 요청에 {@code 401 {"error":"UNAUTHORIZED"}} 를 냈다(curl 실측).
+     *
+     * <p><b>왜 못 잡나.</b> MockMvc는 ERROR 디스패치를 실행하지 않는다 — 컨트롤러가 던진 예외를
+     * 그대로 들고 나올 뿐, 서블릿 컨테이너처럼 {@code /error} 로 forward 하지 않는다. 그래서
+     * "시큐리티 필터가 ERROR 디스패치에서 401로 가로챈다"는 결함이 <b>구조적으로 보이지 않는다.</b>
+     *
+     * <p>즉 이 단정은 <b>Bean Validation이 걸렸다</b>는 것까지만 보증한다. 클라이언트가 실제로
+     * 무엇을 받는지는 보증하지 않는다. 그걸 잡으려면 진짜 컨테이너가 필요한데
+     * ({@code webEnvironment=RANDOM_PORT} + {@code TestRestTemplate}) 이 레포에 그런 테스트는
+     * 현재 0건이고, 그것 하나 때문에 만들 근거는 약하다 — 회귀 경로가
+     * {@code SecurityConfig} 한 줄 삭제뿐이고 그건 {@code git diff}에 보인다.
+     * <b>여기 적어두는 이유는, 이 테스트의 초록을 "400이 나간다"의 증거로 인용하지 말라는 것이다.</b>
+     */
     @Test
     @DisplayName("가입은 11자를 400으로 거부하고 12자를 받는다")
     void signupEnforcesMinimumPasswordLength() throws Exception {
