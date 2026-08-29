@@ -139,11 +139,39 @@ public class QueueEngineController {
      *
      * <p><b>Rate Limit을 일부러 안 거는 것이다.</b> {@code RateLimitFilter}가 미등록 public 경로를
      * 무조건 통과시키므로 이 경로는 "인증 0 + 제한 0"이 된다 — 모르고 두는 것과 다르다.
-     * 큐 단위 버킷은 30만 명이 하나를 공유해 남용자 1명이 정상 대기자 전원을 429시키므로
-     * 오히려 해롭고, 미지 {@code queueId}는 {@code MGET}의 {@code seq} 키가 Redis 1왕복 안에서
-     * 404로 끝내 DB로 내려가지 않는다. 남는 위험은 L7 flood이며 CDN·WAF 소관이다.
+     * 큐 단위 버킷은 30만 명이 하나를 공유해 남용자 1명이 정상 대기자 전원을 429시키므로 오히려 해롭다.
      *
-     * <p>응답은 <b>전원 동일</b>하다. 캐시(WAS·CDN)는 그래서 가능해지지만 지금은 붙이지 않는다
+     * <p>🔴 <b>"미지 queueId는 Redis 1왕복"은 거짓이었다</b> (2026-08-28 실측 정정).
+     * §75로 이중 클러스터 라우팅이 들어오면서 {@code RedisQueueEngine.route()}가 소유자를 못 찾으면
+     * 양쪽 클러스터에 {@code EXISTS}를 한 번씩 던지고, 그 결과를 <b>일부러 캐시하지 않는다</b>
+     * (카디널리티 방어). 그래서 미지 {@code queueId}는 <b>매 요청 EXISTS×2 + MGET = 3왕복</b>이고,
+     * 슬롯이 무작위라 <b>두 클러스터 8개 마스터 전체로 퍼진다</b>. 앱 CPU도 200 경로의 1.43배다.
+     * 실측: 미지 50회 → ClusterA exists 50 + mget 50, ClusterB exists 50 (= 요청당 3.0).
+     * 정상 큐 50회 → 해당 마스터 1대에 mget 50뿐.
+     * <b>DB로 안 내려간다는 결론만 유효하다</b> — 비용과 폭발 반경이 틀렸다. §75와 §79는 각각 옳았고
+     * 겹쳐 놓으니 거짓이 됐다(CLAUDE.md §4-2).
+     *
+     * <p><b>그럼에도 여기에 Rate Limit을 달지 않는다</b> (2026-08-28, security·architect·monitoring 3인 합의).
+     * 근거가 "값싼 404"에서 아래 둘로 <b>바뀐다</b>:
+     * <ul>
+     *   <li><b>리미터가 보호 대상보다 20~25배 비싸다.</b> {@code INFO commandstats}의
+     *       <b>누적 평균</b> {@code usec_per_call}(2026-08-28 시점, 통제된 벤치가 아니다 — 재보면
+     *       값이 다르다): 리미터 Lua {@code EVALSHA} 31~43µs vs 이 경로의 {@code MGET} 1.0~1.8µs. 먼저 포화하는 자원이
+     *       그 마스터의 단일 스레드인데(§75 D26), 그걸 지키려고 같은 자원을 25배 더 쓴다</li>
+     *   <li><b>더 싼 우회로가 열려 있어 효과가 0이다.</b> 개인 폴링은 tokenId를 버킷 키로 쓰므로
+     *       무작위 tokenId 1건마다 Redis 키가 새로 생긴다(EVALSHA 2회 + 키 1개). 여기만 막아도
+     *       공격자는 그쪽으로 간다</li>
+     * </ul>
+     * 캐시도 지금은 답이 아니다 — 미지 {@code queueId} flood는 <b>경로가 매번 새 캐시 키</b>라
+     * 엣지에서 전량 미스다. L7 flood는 여전히 CDN·WAF 소관이라는 결론만 그대로다.
+     *
+     * <p>🔁 <b>재검토 트리거</b>: 프로덕션급 노드에서 한 마스터의 {@code MGET} 실처리량이
+     * <b>30,000 ops/s 미만</b>이면 앱 내 스냅샷 캐시(§79 D1이 보류한 것)를 다시 연다.
+     * 확정 명령: {@code redis-benchmark -h <master> -p <port> -t mget -n 500000 -c 50 --threads 4}.
+     * 그 위면 현행 유지이고 실제 해답은 CDN이다.
+     *
+     * <p>응답의 {@code data}는 <b>전원 동일</b>하다(봉투의 {@code timestamp}는 요청마다 다르다).
+     * 캐시(WAS·CDN)는 그래서 가능해지지만 지금은 붙이지 않는다
      * (§79 D1 — 적중률 미측정 상태에서 만들면 정작 효과가 큰 CDN 도입이 미뤄진다).
      */
     @GetMapping("/{queueId}/status")

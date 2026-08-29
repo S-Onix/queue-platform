@@ -72,7 +72,7 @@ groups:
           severity: critical
         annotations:
           summary: "Redis {{ $labels.instance }} ({{ $labels.job }}) 응답 없음 1분"
-          action: "`redis_status` 로 프로세스 확인 → 죽었으면 `redis_start`. master(6379)면 Sentinel이 5~10초 내 승격했어야 한다. 승격이 안 됐으면 quorum을 먼저 본다."
+          action: "⚠️ 이 규칙은 **Cluster**(job=redis-cluster)를 본다. Sentinel 명령을 치지 마라. `systemctl status redis-cluster-a-{1..8}` / `redis-cluster-b-{1..8}` 로 확인 → 죽었으면 해당 유닛만 `systemctl start`. 마스터였으면 Cluster가 스스로 replica를 승격했어야 한다 — `redis-cli -c -p 7001 cluster nodes` 로 승격 여부와 `cluster_state`를 먼저 본다."
 
       # 익스포터 자체가 죽었다 = 위 RedisInstanceDown 규칙이 침묵한다.
       #
@@ -157,8 +157,12 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Sentinel 구성에 master가 {{ $value }}개다 (정상 1개)"
-          action: "`redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster` 로 정본 master 확인 → 나머지를 `SLAVEOF <master> <port>`. 앱 재시작보다 이게 먼저다."
+          # 🔴 2026-08-28 정정: expr은 Cluster를 보는데 summary·action이 Sentinel 원문 그대로였다.
+          #    $value 도 틀렸다 — 이 expr의 값은 cluster_state(0/1)이지 master 개수가 아니다.
+          #    그대로 두면 새벽에 Cluster 노드에 SLAVEOF 를 치게 된다. 커밋 de24048이 다른 알람의
+          #    $value 를 고칠 때 이 건이 빠져 있었다.
+          summary: "Redis Cluster가 온전하지 않다 — cluster_state={{ $value }} (정상 1) 또는 slots_fail>0 ({{ $labels.instance }})"
+          action: "⚠️ **Sentinel 명령을 치지 마라.** `redis-cli -c -p 7001 cluster info` 로 cluster_state·slots_assigned·slots_fail 확인 → `cluster nodes` 로 fail 표시된 노드 특정 → 그 유닛만 `systemctl start redis-cluster-{a|b}-N`. 슬롯 담당이 사라진 것이면 승격 대상 replica가 살아 있는지부터 본다. 앱 재시작보다 이게 먼저다."
 
   # ===========================================================================
   # 3. 한도가 명시된 자원의 추세

@@ -124,7 +124,11 @@ RR --bigkeys -i 0.1     # -i 로 슬립을 넣어 부하를 낮춘다. master �
 
 ---
 
-## 4. Redis 부하 — 개인 폴링 1건 = master 왕복 2회 / `/status` 1건 = 읽기 1회
+## 4. Redis 부하 — 개인 폴링 1건 = master 왕복 2회 / `/status` 1건 = 읽기 1회 **(정상 큐 기준)**
+
+> 🔴 **미지 `queueId`는 3왕복이다** — `EXISTS`×2(양 클러스터) + `MGET`. 소유자를 못 찾은 결과를
+> 캐시하지 않아(카디널리티 방어) 매 요청 반복되고, 슬롯이 무작위라 **8개 마스터 전체로 퍼진다**.
+> 아래 `mget` 증가율만 보면 그 부하가 통째로 안 보인다. `cmdstat_exists`를 같이 봐라.
 
 ```bash
 RW info commandstats | grep -E 'cmdstat_(evalsha|mget|zrangebyscore|zadd|hget|hmset)'
@@ -186,10 +190,12 @@ histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{u
 | 지표 | 정상 | 이상 |
 |---|---|---|
 | 404 비율(개인) | < 0.05 | > 0.50 → 랜덤 tokenId 공격 의심 ([`runbook/rate-limit.md`](../runbook/rate-limit.md)). **단, Tenant가 admitToken을 못 쓰는 사고 중에는 정상 대기자의 복귀 대기 404가 섞인다** (§1 ④) |
-| `/status` 404 비율 | < 0.01 | 급증 = 미지 queueId 스캔. Redis 1왕복에서 끝나 DB는 안전하지만 **앱 측 제한이 없다** → CDN·WAF |
+| `/status` 404 비율 | < 0.01 | 급증 = 미지 queueId 스캔. DB는 안전하지만 🔴 **Redis는 요청당 3왕복(EXISTS×2 + MGET)이고 8개 마스터 전체로 퍼진다**(2026-08-28 실측 — "1왕복"은 거짓이었다). 앱 측 제한이 없다 → CDN·WAF |
 | p99 | **기준선 수집 필요.** 폴링 단독 부하 실측이 없다. 실사용 3일치 p99를 재라 (`doc/ROADMAP.md`의 "p99 < 50ms"는 **목표치이지 실측이 아니다**) | |
 
-**429는 `uri` 라벨이 `UNKNOWN`으로 집계될 가능성이 높다** — RateLimitFilter가 DispatcherServlet 전에 응답을 끝내 URI 패턴이 확정되지 않는다. 429를 셀 때는 `uri` 없이 `status="429"`만 쓰라. (**실측 확인 필요 — 라벨 값을 한 번 눈으로 볼 것.**)
+✅ **429도 `uri` 라벨이 정상으로 붙는다** (2026-08-28 실측 — 위 추정은 틀렸다).
+`http_server_requests_seconds_count{status="429"}` 실측값: `uri="/api/v1/queues/{queueId}/tokens/{tokenId}"` 26건,
+`uri="/api/v1/tenants/login"` 12건. **경로별 분해가 되므로 `uri`를 일부러 빼지 마라.**
 
 ---
 

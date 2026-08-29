@@ -126,6 +126,78 @@ class RateLimitFilterIpSourceTest {
         verifyNoInteractions(fixedWindow);   // 폴링은 인증 전 Fixed Window 분기로 새지 않는다
     }
 
+    /**
+     * 🔴 <b>인코딩한 경로가 한도를 우회하면 안 된다.</b>
+     *
+     * <p>{@code getRequestURI()}는 디코딩 전 원문이라 {@code equals("/api/v1/tenants/login")}이
+     * 빗나가고, 매칭 실패 시 필터가 <b>무제한으로 통과시킨다.</b> 반면 시큐리티·디스패처는
+     * 디코딩된 경로로 판정해 로그인을 그대로 수행한다 — <b>두 계층이 다른 문자열을 본다.</b>
+     *
+     * <p>2026-08-28 실측(수정 전): {@code POST /api/v1/tenants/log%69n} 15회가 전부 401이고
+     * 429가 0건이었다. 평문은 11회째 429다. 본문이 {@code T003}이라
+     * <b>자격 증명 비교가 실제로 수행됐다</b> = brute force에 한도가 없다.
+     *
+     * <p>이 케이스가 없으면 {@code getRequestURI()} 한 줄로 되돌려도 전체 테스트가 초록이다.
+     *
+     * <p>⚠️ <b>목의 한계.</b> {@code MockHttpServletRequest}는 준 문자열을 그대로
+     * {@code getRequestURI()}로 돌려준다. {@code %69}·{@code %74} 케이스는 실제 Tomcat과 결과가
+     * 같은 것을 라이브로 확인했지만, {@code ;x=1}·{@code //}·{@code %2F}는 <b>라이브에서는 필터에
+     * 도달조차 못 한다</b>(Tomcat·StrictHttpFirewall이 앞에서 400). 그런 입력으로 케이스를 추가하면
+     * "필터가 막았다"를 단정하게 되는데 <b>실제 방어자는 firewall이다.</b> 여기에 넣지 마라.
+     */
+    @Test
+    @DisplayName("퍼센트 인코딩한 /log%69n 도 평문과 같은 LOGIN IP 윈도우 키를 쓴다")
+    void percentEncodedPublicPathUsesSameRateLimitKey() throws Exception {
+        MockHttpServletRequest plain =
+                new MockHttpServletRequest("POST", "/api/v1/tenants/login");
+        plain.setRemoteAddr("1.2.3.4");
+        filter.doFilterInternal(plain, new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletRequest encoded =
+                new MockHttpServletRequest("POST", "/api/v1/tenants/log%69n");
+        encoded.setRemoteAddr("1.2.3.4");
+        filter.doFilterInternal(encoded, new MockHttpServletResponse(), new MockFilterChain());
+
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        // 🔑 호출 자체가 2회여야 한다. 우회하면 인코딩 요청은 Limiter를 아예 안 부르고 통과한다.
+        verify(fixedWindow, times(2)).tryAcquire(key.capture(), anyInt(), anyLong());
+        assertThat(key.getAllValues().get(1)).isEqualTo(key.getAllValues().get(0));
+        assertThat(key.getAllValues()).allSatisfy(k -> assertThat(k).contains("login"));
+    }
+
+    /**
+     * 🔴 <b>인코딩 변형마다 폴링 버킷이 새로 생기면 안 된다.</b>
+     *
+     * <p>버킷 키를 원문 마지막 세그먼트에서 뽑으면 {@code tok_...}의 한 글자만 {@code %XX}로
+     * 바꿔도 다른 키가 된다. tokenId가 40자라 변형은 사실상 무제한이고,
+     * <b>폴링 한도(cap 5 / refill 1.0/s)가 통째로 사라진다.</b>
+     *
+     * <p>2026-08-28 실측(수정 전): 평문으로 버킷을 소진해 429가 난 뒤,
+     * {@code t}를 {@code %74}로 바꾼 같은 토큰이 <b>200을 5번 더 받았다.</b>
+     *
+     * <p>폴링 1건 = Redis master EVAL 1회(실측 42μs)이고 한 큐는 마스터 1대에 고정이라
+     * (§75 D26) 분산되지 않는다. 이 한도가 그 단일 스레드를 지키는 유일한 장치다.
+     */
+    @Test
+    @DisplayName("tokenId를 인코딩해도 같은 폴링 버킷 키를 쓴다 (변형마다 새 버킷이 생기지 않는다)")
+    void percentEncodedTokenIdSharesOnePollBucket() throws Exception {
+        MockHttpServletRequest plain =
+                new MockHttpServletRequest("GET", "/api/v1/queues/q_1/tokens/tok_abc");
+        plain.setRemoteAddr("1.2.3.4");
+        filter.doFilterInternal(plain, new MockHttpServletResponse(), new MockFilterChain());
+
+        // tok_abc 의 't' 를 %74 로 — 같은 토큰을 가리키지만 원문 문자열은 다르다
+        MockHttpServletRequest encoded =
+                new MockHttpServletRequest("GET", "/api/v1/queues/q_1/tokens/%74ok_abc");
+        encoded.setRemoteAddr("1.2.3.4");
+        filter.doFilterInternal(encoded, new MockHttpServletResponse(), new MockFilterChain());
+
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        verify(tokenBucket, times(2)).tryAcquire(key.capture(), eq(5), eq(1.0));
+        assertThat(key.getAllValues().get(1)).isEqualTo(key.getAllValues().get(0));
+        assertThat(key.getAllValues()).allSatisfy(k -> assertThat(k).contains("tok_abc"));
+    }
+
     @Test
     @DisplayName("remoteAddr가 다르면 키도 달라진다 (IP 단위 격리가 살아있는지)")
     void differentPeerYieldsDifferentKey() throws Exception {

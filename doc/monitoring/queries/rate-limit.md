@@ -202,7 +202,7 @@ sum(rate(http_server_requests_seconds_count[5m]))
 | 429 절대량이 0 | Rate Limit이 꺼졌을 가능성 → §4 | |
 
 **주의 2가지**
-1. `uri` 라벨이 `UNKNOWN`으로 집계될 가능성이 높다 — 필터가 DispatcherServlet 전에 응답을 끝낸다. (**실측 확인 필요.**)
+1. ✅ `uri` 라벨은 **정상으로 붙는다** (2026-08-28 실측: `uri="/api/v1/tenants/login"` 등 경로별 집계). 필터가 DispatcherServlet 전에 끝내지만 라벨은 확정된다 — 위 추정은 틀렸다.
 2. HTTP 429는 **Rate Limit(RL001)과 정원 초과(Q005)가 공유**한다. 메트릭만으로 구분 불가 — 응답 본문의 `error` 필드로 봐야 한다.
 
 ---
