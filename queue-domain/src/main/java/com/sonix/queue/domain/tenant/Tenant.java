@@ -28,7 +28,10 @@ public class Tenant {
         this.passwordHash = passwordHash;
         this.name = name;
         this.status = TenantStatus.ACTIVE;
-        this.plan = Plan.FREE;
+        // 기본 플랜은 ENTERPRISE다. 플랜 변경 API가 아직 없어(릴리스 게이트 12) FREE로 두면
+        // 신규 테넌트가 rl:tenant:{id} 버킷 100/분에 갇히고, 등급을 올릴 유일한 수단이 SQL이다.
+        // ⚠️ 이 버킷은 enqueue 전용이 아니라 **인증된 요청 전부**가 공유한다.
+        this.plan = Plan.ENTERPRISE;
         this.createdAt = LocalDateTime.now();
         this.tenantId = IdGenerator.generate("t_");
     }
