@@ -19,7 +19,7 @@ CREATE TABLE tenants (
     password_hash VARCHAR(255) NOT NULL,
     name          VARCHAR(100) NOT NULL,
     status        TINYINT      NOT NULL DEFAULT 0,
-    plan          TINYINT      NOT NULL DEFAULT 0,
+    plan          TINYINT      NOT NULL DEFAULT 3,   -- 3=ENTERPRISE (Tenant.create와 같은 값)
     created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 
     PRIMARY KEY (id),
