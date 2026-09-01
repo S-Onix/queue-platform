@@ -51,6 +51,8 @@ class EnqueueAdmitReenqueueTest {
 
     /** admitToken은 UUIDv7이라 값을 모은 뒤에야 지울 수 있다. */
     private final List<String> issuedAdmitTokens = new ArrayList<>();
+    /** admit-by-token도 마찬가지다 — 키 뒷조각이 tokenId라 발급분을 모아야 지운다. */
+    private final List<String> issuedTokenIds = new ArrayList<>();
 
     private Thread consumerThread;
     private final AtomicBoolean running = new AtomicBoolean(true);
@@ -93,8 +95,10 @@ class EnqueueAdmitReenqueueTest {
                 QueueKeys.lastActive(QUEUE_ID),
                 QueueKeys.admitIdem(QUEUE_ID, "req-1")));
         issuedAdmitTokens.forEach(t -> keys.add(QueueKeys.admitByAdmit(QUEUE_ID, t)));
+        issuedTokenIds.forEach(t -> keys.add(QueueKeys.admitByToken(QUEUE_ID, t)));
         redis.delete(keys);
         issuedAdmitTokens.clear();
+        issuedTokenIds.clear();
     }
 
     /**
@@ -177,5 +181,105 @@ class EnqueueAdmitReenqueueTest {
         assertThat(rejoined.isOk()).isTrue();
         assertThat(rejoined.getTokenId()).isNotEqualTo(tokenId);
         assertThat(rejoined.getSeq()).isGreaterThan(seq);
+    }
+
+    /**
+     * 🔴 <b>늦은 complete가 재진입 사용자를 축출한다</b>는 회귀.
+     *
+     * <p>{@code identifier}는 회차 간에 <b>재사용</b>되는 값이다(같은 사람 = 같은 UUIDv7).
+     * 그런데 {@code cleanupCompleted}는 {@code waiting}·{@code tokens}를 <b>identifier만 보고</b>
+     * 지운다. §36이 admitToken TTL 만료 시 {@code HDEL}로 게이트를 풀어주므로, 만료된 사람은
+     * 곧바로 재-enqueue해 <b>새 회차(gen2)</b>를 받는다. 그 상태에서 gen1의 complete가
+     * {@code Token#COMPLETE_VALID_WINDOW_SECONDS}(300초) 안에 뒤늦게 도착하면 — admitToken TTL은
+     * 60초라 <b>240초짜리 취약 창</b>이다 — gen1의 정리가 <b>gen2의 자리와 게이트를 지운다.</b>
+     *
+     * <p>피해자는 이미 한 번 만료로 손해 본 사람이고, 두 번째로 자리를 잃는다. 그것도
+     * 폴링이 조용히 404가 될 뿐 아무 신호가 없다. {@code tokens} 행은 남으므로 과금은 그대로다.
+     *
+     * <p><b>왜 기존 두 테스트가 못 잡았나:</b> 둘 다 {@code cleanupCompleted}를 재-enqueue보다
+     * <b>먼저</b> 부른다({@code admittedUserReenqueueIsNotNew}는 gen2 생성 전에, {@code
+     * reenqueueAfterAdmitExpiryGetsFreshToken}은 gen2를 만들고 그냥 끝난다). "gen2가 살아 있는
+     * 상태에서 gen1의 늦은 complete"라는 인터리빙을 <b>아무도 실행한 적이 없다.</b>
+     *
+     * <p>단언 4·5는 <b>과잉 가드 방지</b>다. "회차가 다르면 아무것도 안 지운다"로 잘못 넓히면
+     * gen1의 {@code admit-by-admit}이 남아 verify가 최대 60초 계속 통과한다.
+     */
+    @Test
+    @DisplayName("늦은 complete는 재-enqueue한 다음 회차를 축출하지 않는다 — 정리는 자기 회차만")
+    void lateCompleteOfExpiredGenerationDoesNotEvictReenqueuedUser() {
+        // gen1 — enqueue → admit
+        EnqueueResult gen1 = engine.enqueue(QUEUE_ID, IDENTIFIER);
+        assertThat(gen1.isOk()).isTrue();
+        String tokenId1 = gen1.getTokenId();
+        long seq1 = gen1.getSeq();
+        issuedTokenIds.add(tokenId1);
+
+        AdmitResult admitted = engine.admit(QUEUE_ID, "req-1", 1, NOW);
+        admitted.records().forEach(r -> issuedAdmitTokens.add(r.admitToken()));
+        assertThat(admitted.records()).hasSize(1);
+        String admitToken1 = admitted.records().get(0).admitToken();
+
+        // admitToken TTL 만료 → §36이 게이트를 푼다 (복귀는 하지 않는다)
+        assertThat(engine.claimExpiredAdmits(QUEUE_ID, NOW + 60_001, 500)).hasSize(1);
+
+        // gen2 — 같은 identifier로 재접속. 새 tokenId·새 seq로 맨 뒤에 선다.
+        EnqueueResult gen2 = engine.enqueue(QUEUE_ID, IDENTIFIER);
+        assertThat(gen2.isOk()).as("게이트가 풀렸으므로 신규여야 한다").isTrue();
+        String tokenId2 = gen2.getTokenId();
+        long seq2 = gen2.getSeq();
+        issuedTokenIds.add(tokenId2);
+        assertThat(tokenId2).isNotEqualTo(tokenId1);
+
+        // 🔴 240초 창 안에 도착한 gen1의 늦은 complete. DB는 이미 status=2로 확정한 상태다.
+        engine.cleanupCompleted(QUEUE_ID, IDENTIFIER, tokenId1, admitToken1, seq1);
+
+        // ① gen2의 자리가 살아 있어야 한다
+        assertThat(redis.opsForZSet().score(QueueKeys.waiting(QUEUE_ID), IDENTIFIER))
+                .as("gen1의 정리가 gen2의 waiting 자리를 지웠다")
+                .isNotNull()
+                .isEqualTo((double) seq2);
+
+        // ② gen2의 중복 게이트가 살아 있어야 한다 (지워지면 재-enqueue가 과금 한 건을 더 만든다)
+        assertThat((String) redis.opsForHash().get(QueueKeys.tokens(QUEUE_ID), IDENTIFIER))
+                .as("gen1의 정리가 gen2의 게이트를 지웠다")
+                .isNotNull()
+                .startsWith(tokenId2 + "|");
+
+        // ③ 🔑 사용자 체감 — gen2의 폴링이 계속 통과해야 한다 (실패하면 조용한 404다)
+        assertThat(engine.verifyWaiting(QUEUE_ID, seq2, tokenId2, false, NOW + 70_000))
+                .as("축출당한 사용자는 이유도 모른 채 폴링 404를 받는다")
+                .isTrue();
+
+        // ④ gen1 정리는 여전히 돼야 한다 — 가드를 과하게 넓히면 여기가 남는다
+        assertThat(redis.opsForZSet().score(QueueKeys.admitted(QUEUE_ID), seq1 + "|" + IDENTIFIER))
+                .as("자기 회차의 admitted 멤버는 무조건 지워야 한다")
+                .isNull();
+
+        // ⑤ 같은 이유. 남으면 완료된 admitToken으로 verify가 최대 60초 계속 통과한다
+        assertThat(redis.hasKey(QueueKeys.admitByToken(QUEUE_ID, tokenId1))).isFalse();
+        assertThat(redis.hasKey(QueueKeys.admitByAdmit(QUEUE_ID, admitToken1))).isFalse();
+    }
+
+    /**
+     * 구분자 없는 <b>구식</b> {@code tokens} 값({@code "tokenId"}만, {@code |issuedAt} 없음)도 대조된다.
+     *
+     * <p>회차 대조가 생기면서 "값을 어떻게 해석하나"가 정리의 전제가 됐다. 이 분기를 {@code sep}이
+     * 없을 때 <b>미스 취급</b>으로 조이면, 롤링 배포 중 남은 구 포맷 값을 가진 완료자의 중복 게이트가
+     * 영영 안 풀려 <b>영구 락아웃</b>이 된다 — 대조를 넣기 전(무조건 HDEL)보다 나빠지는 유일한
+     * 지점이다. {@code poll_verify.lua}가 같은 규약을 쓰고 같은 이유로 단언을 갖고 있다
+     * ({@code PollRedisAdapterIntegrationTest#verifyWaiting_legacyTokenValue}).
+     */
+    @Test
+    @DisplayName("cleanupCompleted: 구분자 없는 구식 Hash 값(tokenId만)도 대조돼 게이트가 풀린다")
+    void cleanupCompleted_legacyTokenValue() {
+        String legacyTokenId = "tok_legacy";
+        issuedTokenIds.add(legacyTokenId);
+        redis.opsForHash().put(QueueKeys.tokens(QUEUE_ID), IDENTIFIER, legacyTokenId);   // issuedAt 없음
+
+        engine.cleanupCompleted(QUEUE_ID, IDENTIFIER, legacyTokenId, "adm_legacy", 1L);
+
+        assertThat(redis.opsForHash().hasKey(QueueKeys.tokens(QUEUE_ID), IDENTIFIER))
+                .as("미스 취급하면 게이트가 안 풀려 영구 락아웃이다")
+                .isFalse();
     }
 }

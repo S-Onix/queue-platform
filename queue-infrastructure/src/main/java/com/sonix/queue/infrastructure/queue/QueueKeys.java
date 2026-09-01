@@ -50,11 +50,21 @@ public final class QueueKeys {
      * 새 tokenId·새 seq를 받는다(폴링 404 · {@code billing_snapshots}의 {@code COUNT(*)} 과금
      * 중복 · {@code status=1} 고아 행).
      *
-     * <p>따라서 <b>사람을 큐에서 빼는 경로는 반드시 이 필드를 {@code HDEL}한다.</b> 현재 그 경로는 셋이다 —
-     * {@code cleanupCompleted}(complete) · {@code admit_expire.lua}(§36) · {@code inactive_expire.lua}(§82).
-     * 그중 {@code cleanupCompleted}에서는, 거기서 HDEL은 <b>맨 마지막 명령</b>이어야 한다(이유는
-     * 해당 구현 주석 참조). 새 경로(예: cancel)를 만들 때도 같은 규칙이다 — 안 지우면 그 사람은
-     * 영영 재입장하지 못하고, 먼저 지우면 아직 큐에 있는 사람이 폴링에서 404가 된다.
+     * <p>따라서 <b>사람을 큐에서 빼는 경로는 반드시 이 필드를 {@code HDEL}한다.</b> 현재 그 경로는 <b>넷</b>이다 —
+     * {@code cleanup_completed.lua}(complete) · {@code admit_expire.lua}(§36) ·
+     * {@code inactive_expire.lua}(§82) · {@code waiting_expire.lua}(§82).
+     * 새 경로(예: cancel)를 만들 때도 같은 규칙이다 — 안 지우면 그 사람은 영영 재입장하지 못하고,
+     * 먼저 지우면 아직 큐에 있는 사람이 폴링에서 404가 된다. 넷 모두 HDEL을 <b>마지막</b>에 둔다.
+     *
+     * <p>🔴 <b>이 필드의 키는 identifier(사람)인데 값은 tokenId(회차)다. 지울 때는 값을 봐야 한다.</b>
+     * identifier는 회차 간에 재사용되므로(같은 사용자 = 같은 UUIDv7), 회차 정보 없이 identifier만
+     * 보고 지우면 <b>다른 회차의 게이트를 지운다</b>. 네 경로가 그 문제를 각각 이렇게 피한다:
+     * {@code cleanup_completed.lua}는 <b>{@code HGET}으로 tokenId를 대조</b>하고, 나머지 셋은
+     * identifier를 <b>지금 Redis에서</b> 얻는다({@code admit_expire}는 {@code admitted} member
+     * {@code "seq|identifier"}에서, {@code inactive_expire}는 {@code last-active}의 seq로 waiting을
+     * 역산해서, {@code waiting_expire}는 waiting 스냅샷에서 직접). <b>바깥에서 들고 온 identifier를
+     * 대조 없이 쓰는 경로를 새로 만들지 마라</b> — 그것이 정확히 "늦은 complete가 재-enqueue한
+     * 사용자를 축출"한 결함이었다.
      */
     public static String tokens(String queueId) {
         return "queue:{" + queueId + "}:tokens";

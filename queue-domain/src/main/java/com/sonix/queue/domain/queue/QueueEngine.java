@@ -230,6 +230,15 @@ public interface QueueEngine {
      * 게이트(HSETNX)라, 남겨두면 완료한 사람이 다시 대기열에 들어오지 못한다. 반대로 지우는
      * 순서를 앞당기면 아직 큐에 있는 사람이 폴링에서 영영 404가 된다(구현 주석 참조).
      *
+     * <p>🔴 <b>{@code identifier}로 지우는 둘({@code waiting}·{@code tokens})은 {@code tokenId}가
+     * 일치할 때만 지운다.</b> identifier는 회차 간에 재사용되는 사람 이름표이고, §36이
+     * admitToken TTL 만료 시 게이트를 풀어주므로 그 사람은 곧 <b>다음 회차</b>로 다시 줄에 선다.
+     * 그런데 complete의 유효 창(300초)이 admitToken TTL(60초)보다 길어 <b>240초 동안</b> 옛 회차의
+     * 늦은 complete가 도착할 수 있다. 대조 없이 지우면 그 다음 회차를 축출한다.
+     * {@code admitted} 멤버와 {@code admit-by-*} 두 키는 반대로 <b>무조건</b> 지운다 — 키에 회차
+     * 고유 값이 박혀 있어 남의 것을 지울 수 없고, 여기에 가드를 걸면 위 60초 문제가 되살아난다.
+     *
+     * @param tokenId 회차 대조 기준. {@code tokens} Hash 값의 앞조각과 비교한다
      * @param seq {@code admitted} ZSet 멤버가 {@code "seq|identifier"}라 필요하다
      */
     void cleanupCompleted(String queueId, String identifier, String tokenId, String admitToken, long seq);

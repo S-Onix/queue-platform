@@ -78,7 +78,7 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 |---|---|---|
 | Queue Engine 엔드포인트 | `grep -rn "Mapping(" queue-api/src/main` | `QueueEngineController`에 **6개** — enqueue · admit · verify · complete · `/status` · 폴링. **`DELETE /tokens/{tokenId}`만 여전히 0건** |
 | `queue-batch` 내용물 | `find queue-batch/src -name "*.java"` | `QueueBatchApplication` + **`TokenReclaimJob`** (+ 그 테스트) |
-| Lua 스크립트 | `ls .../resources/lua/` | **8개** — `admit` · `admit_expire`가 추가됐다 |
+| Lua 스크립트 | `ls .../resources/lua/` | **9개** — `admit` · `admit_expire` · `cleanup_completed`가 추가됐다 |
 | §79 구현됨 | `cat PollResponse.java` | 필드가 `ready` · `admitToken` **둘뿐**. `frontSeq` · `total` · `nextPollAfterSec` 소멸 |
 | `QueueSnapshotCache` 제거 | `find . -name "QueueSnapshotCache*"` | **0건** (§79 D1대로 제거됨) |
 | 회수 경로 | `grep -rln "ZREM\|HDEL" */src/main` | **6파일** — `admit.lua` · `admit_expire.lua` · `enqueue_bulk.lua` · `RedisQueueEngine` · `TokenReclaimJob` · `QueueKeys`. ⚠️ 다만 **complete 경로에만** 있다. 이탈·TTL 만료로 떠난 사람의 `tokens` Hash 필드는 여전히 누적 (§79 후속) |

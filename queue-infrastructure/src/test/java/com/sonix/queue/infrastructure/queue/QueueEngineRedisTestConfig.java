@@ -44,9 +44,11 @@ public class QueueEngineRedisTestConfig {
             @org.springframework.beans.factory.annotation.Qualifier("inactiveExpireScript")
             org.springframework.data.redis.core.script.RedisScript<List> inactiveExpireScript,
             @org.springframework.beans.factory.annotation.Qualifier("waitingExpireScript")
-            org.springframework.data.redis.core.script.RedisScript<List> waitingExpireScript
+            org.springframework.data.redis.core.script.RedisScript<List> waitingExpireScript,
+            @org.springframework.beans.factory.annotation.Qualifier("cleanupCompletedScript")
+            org.springframework.data.redis.core.script.RedisScript<Long> cleanupCompletedScript
     ) {
-        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript, waitingExpireScript);
+        return new RedisQueueEngine(redisTemplate, enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript, inactiveExpireScript, waitingExpireScript, cleanupCompletedScript);
     }
 
     @Bean

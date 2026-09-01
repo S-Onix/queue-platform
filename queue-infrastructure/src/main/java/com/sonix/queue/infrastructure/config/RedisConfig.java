@@ -224,6 +224,15 @@ public class RedisConfig {
         return loadScript("lua/waiting_expire.lua", List.class);
     }
 
+    /**
+     * complete 뒤 Redis 정리. 사람 키(identifier)로 지우는 둘만 회차(tokenId)를 대조한다 —
+     * 대조 없이 지우면 늦은 complete가 재-enqueue한 다음 회차를 축출한다.
+     */
+    @Bean
+    public RedisScript<Long> cleanupCompletedScript() {
+        return loadScript("lua/cleanup_completed.lua", Long.class);
+    }
+
     @Bean
     public RateLimiter rateLimiter(
             @Qualifier("stringRedisTemplate") StringRedisTemplate redisTemplate,
