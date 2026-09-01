@@ -465,33 +465,27 @@ master(3306)  Com_select  2,893,040      replica(3307)  Com_select  26,728   ←
 
 | 호출 | 종류 | 라우팅 |
 |---|---|---|
-| `QueueService.getQueue()` | **명시적 `@Transactional(readOnly = true)`** | **replica** |
-| `queueRepository.findAll()` (batch 2곳) | **`SimpleJpaRepository` CRUD 메서드** | **replica** |
-| `BatchProcessor.getMaxCapacity()` → `findByQueueId()` | **파생 쿼리**, 트랜잭션 없음 | **master** |
-| 인증 필터 → `findByKeyHash()` | **파생 쿼리**, 트랜잭션 없음 | **master** |
+| `queueRepository.findAll()` (batch 2곳) | `SimpleJpaRepository` **CRUD** | **replica** |
+| `tenantRepository.findById()` (Rate Limit 캐시 미스) | `SimpleJpaRepository` **CRUD** | **replica** |
+| `BatchProcessor.getMaxCapacity()` → `findByQueueId()` | 파생 쿼리, 트랜잭션 없음 | **master** |
+| 인증 필터 → `findByKeyHash()` | 파생 쿼리, 트랜잭션 없음 | **master** |
+| verify DB 폴백 → `findAdmittedByAdmitToken()` | **`@Query(nativeQuery)`**, 트랜잭션 없음 | **master** |
 
-🔑 **갈리는 것은 메서드 이름이 아니라 트랜잭션이다.** `getQueue()`가 내부에서 부르는 것도
-**같은 `findByQueueId()`**인데, readOnly 트랜잭션 안이면 replica로 간다.
+🔑 **판정 기준은 하나다 — "readOnly 트랜잭션이 열렸는가."** 파생 쿼리든 `@Query`든 트랜잭션
+없이 부르면 전부 master다. 메서드 이름도, CRUD냐 파생이냐도 기준이 아니다.
 
-🪤 **`SimpleJpaRepository`의 클래스 레벨 `@Transactional(readOnly = true)`가 파생 쿼리에는
-안 걸린다.** `findByQueueId`·`findByKeyHash`를 트랜잭션 없이 부르면 readOnly 트랜잭션이
-**열리지 않아 master**로 간다. 주석 **2곳**(`QueueEngineService:178`·`AdmitRef:13`)이
-"replica로 간다"고 적고 있었고 **거짓이었다**(2026-08-27 정정).
-`QueueJpaAdapter:65`는 **결론이 맞고 근거가 틀렸다** — `findAll()`은 CRUD라 실제로 replica인데
-이유를 "Spring Data 일반"으로 적었다. 셋을 "전부 거짓"으로 묶지 마라.
+**그래서 replica로 확실히 보내려면 호출자가 직접 `@Transactional(readOnly = true)`를 걸어야 한다.
+그리고 지금 main에 그런 곳은 0곳이다** — 유일했던 `QueueService.getQueue`가 read-after-write라
+큐 생성 직후 GET에 **404**를 내서 제거했다(2026-09-01, 실측 2/8·1/12 → 0/30).
 
-🪤 **`@Query(nativeQuery)`의 자리는 미정이다.** `findAdmittedByAdmitToken` 등은 파생 쿼리가
-아니라 `@Query`인데, 인터페이스에 선언한 메서드라 같은 편(master)일 것으로 **추론**한다 —
-**미측정이다.** 판정 기준을 굳이 세우자면 "`SimpleJpaRepository`가 구현했나 / 인터페이스에
-선언했나"이지 "CRUD냐 파생 쿼리냐"가 아니다.
+🪤 **`SimpleJpaRepository`가 구현한 메서드는 클래스 레벨 어노테이션이 걸려 replica로 간다**
+(실측: `findAll`·`findById`). 이건 **규칙이 아니라 함정 노트다** — Spring Data 구현 세부라
+버전이 바뀌면 조용히 달라지고, **그때 깨지는 건 라우팅이라 아무 테스트도 빨개지지 않는다.**
+무엇보다 **의도가 코드에 안 보인다**: `findAll()` 호출자는 자기가 replica를 읽는 줄 모른다.
 
-반대로 `findAll()`은 트랜잭션 없이 불러도 **replica로 갔다**(실측). 그 클래스가 직접 구현한
-CRUD 메서드라 어노테이션이 걸린 것으로 **보이나, 확인한 CRUD 메서드는 `findAll` 하나다** —
-`findById` 등 나머지는 **미검증**이다. 일반화하지 마라.
-
-**그래서 replica로 확실히 보내려면 호출자가 직접 `@Transactional(readOnly = true)`를 걸어야 한다.**
-명시적으로 붙은 곳은 **`QueueService:33` 하나뿐**이고, 위 0.9%는 그것과 배치의 `findAll()`이
-합쳐진 값이다.
+🪤 주석 **2곳**(`QueueEngineService`·`AdmitRef`)이 "replica로 간다"고 적고 있었고 **거짓이었다**
+(2026-08-27 정정). `AdmitApiTest`에도 같은 거짓이 남아 있다가 2026-09-01에야 정정됐다 —
+**정정이 소비처로 전파되지 않는 것이 이 레포의 반복 패턴이다.**
 
 🔴 **그 0.9% 안에 배치의 큐 목록이 있다.** `ReconcileJob:120`·`TokenReclaimJob:146`의
 `findAll()`이 replica에서 온다(20초에 replica 9회 = 2초 주기 10회와 일치, 실측).
@@ -502,8 +496,12 @@ CRUD 메서드라 어노테이션이 걸린 것으로 **보이나, 확인한 CRU
 enqueue가 복제 지연에 걸리면 **그 틱의 그룹 전체가 실패**한다. stale read가 "옛 값"이 아니라
 **하드 실패**가 되는 경로다. 옮기기 전에 "쓰기 직후 읽기인가"를 먼저 봐라.
 
-⚠️ 이 절이 세운 전제 위에서 2026-08-26 dba 감사 6건이 나왔다. **그 판정들을 다시 봐야 한다** —
-"replica로 가니 안전하다"거나 "replica가 부하를 맞는다"는 서술은 대부분 성립하지 않는다.
+✅ **재감사 완료 (2026-09-01)** → `doc/reviews/2026-09-01-replica-assumption-audit.md`.
+2026-08-26 dba 감사 6건은 **원문이 소실돼** 복원하지 못했고(파일로 안 남겼다), 대신 전수 재대조를
+했다. 🔑 **감사 결과는 반드시 파일로 남겨라** — 지시만 남고 대상이 사라진다.
+
+그 결과 **결함 3건 + 낭비 1건**이 나왔다(상세는 그 문서). 아래 표와 기준은 그 재감사 결과로
+**갱신된 것**이다 — 이전 판의 "미측정"·"미검증" 항목은 실측으로 해소됐다.
 
 🪤 **메커니즘 추론으로 판단하지 마라.** 이 건에서 에이전트 둘(code-reviewer·architect)이 독립적으로
 "Spring Data가 readOnly라 replica"라고 추론했고 **둘 다 틀렸다**. 확인 수단은 라우팅 로그다:

@@ -589,7 +589,11 @@ rate(http_server_requests_seconds_count[5m])
     - Slow Query 발생 추세 (성능 저하 원인 식별)
   - Master-Replica 동기화 상태
     - Replication Lag (Replica가 Master 따라가는지)
-    - 읽기 분산 정상 여부
+    - ⚠️ ~~읽기 분산 정상 여부~~ — **잴 대상이 없다** (2026-09-01 실측). 읽기의 99% 이상이
+      master로 간다. 라우팅은 `isCurrentTransactionReadOnly()`로만 갈리는데 명시적
+      `@Transactional(readOnly = true)`가 붙은 곳이 0이 됐다(있던 한 곳은 read-after-write
+      404를 내서 제거). replica로 가는 것은 배치의 `findAll()`과 테넌트 캐시 미스 시
+      `findById`뿐이다. **이 서비스의 DB 읽기는 구조적으로 거의 전부 쓰기 직후라 옮길 읽기가 없다**
 - 문제
   - DB 응답 지연이 발생해도 원인 추정 어려움
     - 쿼리 자체가 느린가
@@ -616,7 +620,10 @@ rate(http_server_requests_seconds_count[5m])
   - 응답 시간 급증 시 원인 추적 (DB? 앱?)
   - 인덱스 추가 필요 시점 (Slow Query rate 추세)
   - DB 인스턴스 스케일업 시점 (Buffer Pool / Connection 포화)
-  - Read 분산 최적화 (Replication Lag 추세로 Replica 추가 결정)
+  - ⚠️ ~~Read 분산 최적화 (Replication Lag 추세로 Replica 추가 결정)~~ — **이 판단으로 가면 안 된다**
+    (2026-09-01 실측). 분산되는 읽기가 없으므로 **replica를 늘려도 아무것도 바뀌지 않는다.**
+    포화는 master가 먼저 친다 — enqueue 1건이 master SELECT 1회(`findQueueAndVerifyOwner`,
+    캐시 없음)를 탄다. Replication Lag은 **DR 건전성 지표로만** 읽어라
 
 ---
 
