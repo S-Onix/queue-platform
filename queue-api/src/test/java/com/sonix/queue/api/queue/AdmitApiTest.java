@@ -387,9 +387,17 @@ class AdmitApiTest {
      * 🔑 <b>verify 응답을 주는 시점이 완료다.</b> Platform의 책임은 답을 돌려주는 데까지이고,
      * 그 뒤 Tenant 안에서 벌어지는 일은 관측할 수도 책임질 수도 없다.
      *
-     * <p>🔴 <b>그런데 DB를 쓰면 안 된다.</b> verify는 {@code @Transactional(readOnly = true)}라
-     * Replica로 라우팅되고 Replica는 {@code super-read-only=ON}이다. 그래서 이벤트만 발행한다 —
-     * {@code verifyNoInteractions(tokenRepository)}가 그 계약을 못박는다.
+     * <p>🔴 <b>그런데 DB를 쓰면 안 된다.</b> {@code verifyNoInteractions(tokenRepository)}가 그 계약을
+     * 못박는다. 이유는 <b>Kafka 발행이 트랜잭션 안에 들어가면 안 되기 때문</b>이다 — 브로커가 느려지면
+     * 커넥션이 최대 12초씩 묶이고, verify는 게이트 개방 순간에 몰린다. <b>근거는 둘이고</b>
+     * 나머지 하나는 순서 보장이다 — 여기서 UPDATE하면 Kafka 소비 경로와 갈려 ADMITTED/COMPLETED
+     * 순서가 역전된다. <b>원문은 {@code QueueEngineService.verify}의 주석이다(둘 다 거기 있다).</b>
+     *
+     * <p>🪤 <b>구 주석은 근거를 "verify는 {@code @Transactional(readOnly = true)}라 Replica로 가고
+     * Replica는 {@code super-read-only=ON}이다"로 적었는데 거짓이다.</b> {@code QueueEngineService}에
+     * {@code readOnly = true}는 <b>한 곳도 없고</b>, verify에는 트랜잭션 어노테이션 자체가 없다.
+     * 2026-08-27에 본문 주석은 정정됐는데 이 테스트 javadoc에는 전파되지 않았다.
+     * <b>이 문장을 믿고 {@code readOnly = true}를 되붙이면</b> 위 12초 점유가 그대로 되살아난다.
      */
     @Test
     @DisplayName("verify 성공 = 완료 — COMPLETED를 발행하되 DB는 건드리지 않는다")
