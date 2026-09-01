@@ -28,7 +28,9 @@ public class TenantJpaAdapter implements TenantRepository {
 
     @Override
     public Optional<Tenant> findById(Long id) {
-        return tenantJpaRepository.findById(id)
+        // 🔴 findByIdEquals다. 상속받은 findById를 쓰면 replica로 가고, replica가 죽으면
+        //    인증된 API 전체가 500이 된다 (TenantJpaRepository 주석 참조).
+        return tenantJpaRepository.findByIdEquals(id)
                 .map(TenantEntity::toDomain);
     }
 
