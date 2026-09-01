@@ -107,6 +107,7 @@ public class RedisQueueEngine implements QueueEngine {
     private final RedisScript<List> admitExpireScript;
     private final RedisScript<List> inactiveExpireScript;
     private final RedisScript<List> waitingExpireScript;
+    private final RedisScript<Long> cleanupCompletedScript;
 
     // global queue
     private final ConcurrentLinkedQueue<PendingEnqueue> globalQueue = new ConcurrentLinkedQueue<>();
@@ -131,7 +132,8 @@ public class RedisQueueEngine implements QueueEngine {
             @Qualifier("admitScript") RedisScript<List> admitScript,
             @Qualifier("admitExpireScript") RedisScript<List> admitExpireScript,
             @Qualifier("inactiveExpireScript") RedisScript<List> inactiveExpireScript,
-            @Qualifier("waitingExpireScript") RedisScript<List> waitingExpireScript
+            @Qualifier("waitingExpireScript") RedisScript<List> waitingExpireScript,
+            @Qualifier("cleanupCompletedScript") RedisScript<Long> cleanupCompletedScript
     ) {
         this.cluster1 = cluster1;
         this.cluster2 = cluster2;
@@ -142,6 +144,7 @@ public class RedisQueueEngine implements QueueEngine {
         this.admitExpireScript = admitExpireScript;
         this.inactiveExpireScript = inactiveExpireScript;
         this.waitingExpireScript = waitingExpireScript;
+        this.cleanupCompletedScript = cleanupCompletedScript;
     }
 
     /**
@@ -157,11 +160,12 @@ public class RedisQueueEngine implements QueueEngine {
             RedisScript<List> admitScript,
             RedisScript<List> admitExpireScript,
             RedisScript<List> inactiveExpireScript,
-            RedisScript<List> waitingExpireScript
+            RedisScript<List> waitingExpireScript,
+            RedisScript<Long> cleanupCompletedScript
     ) {
         this(redisTemplate, redisTemplate, null,
                 enqueueBulkScript, pollVerifyScript, admitScript, admitExpireScript,
-                inactiveExpireScript, waitingExpireScript);
+                inactiveExpireScript, waitingExpireScript, cleanupCompletedScript);
     }
 
     /**
@@ -573,24 +577,36 @@ public class RedisQueueEngine implements QueueEngine {
 
     @Override
     public void cleanupCompleted(String queueId, String identifier, String tokenId, String admitToken, long seq) {
+        // ⚠️ routeForWrite 필수. redisTemplate을 직접 쓰면 cluster2에 배정된 큐의 정리가 cluster1로
+        //    가서 아무것도 못 지운다 — 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다(§75).
         StringRedisTemplate redis = routeForWrite(queueId);
 
-        // TTL 만료로 WAITING에 복귀해 있을 수 있다(§6.6 — status 0을 허용하는 것과 같은 이유).
-        redis.opsForZSet().remove(QueueKeys.waiting(queueId), identifier);
-        redis.opsForZSet().remove(QueueKeys.admitted(queueId), seq + "|" + identifier);
-        // 두 키 모두 {queueId} 해시태그라 같은 슬롯이다 — 다중 키 DEL이 Cluster에서도 성립한다.
-        redis.delete(List.of(QueueKeys.admitByToken(queueId, tokenId),
-                             QueueKeys.admitByAdmit(queueId, admitToken)));
+        // 🔴 **명령을 다시 쪼개지 마라.** 이 정리는 identifier(사람 키)로 지우는 둘과 회차 고유 키로
+        //    지우는 셋이 섞여 있고, 앞의 둘은 "지금 그 사람이 아직 이 회차인가"를 물어야 한다.
+        //    Java에서 HGET → 비교 → HDEL로 쪼개면 그 사이에 admit_expire + 재-enqueue가 끼어들어
+        //    같은 결함이 TOCTOU로 재발한다. 대조와 삭제가 한 EVAL 안에 있어야 성립한다.
+        //    (왜 대조가 필요한지, 왜 순서가 이런지는 cleanup_completed.lua 머리말에 있다)
+        //
+        // 🔑 seq는 Long.toString으로 넘긴다. double을 태우면 "42.0"이 되어 admit.lua가 ZADD한
+        //    member("42|U")와 어긋나 admitted 멤버가 조용히 안 지워진다.
+        Long cleaned = redis.execute(
+                cleanupCompletedScript,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.admitted(queueId), QueueKeys.tokens(queueId),
+                        QueueKeys.admitByToken(queueId, tokenId), QueueKeys.admitByAdmit(queueId, admitToken)),
+                identifier, Long.toString(seq), tokenId);
 
-        // 🔴 **반드시 마지막이다.** tokens Hash가 enqueue의 중복 게이트(HSETNX)라, 지우지 않으면
-        //    완료한 사람이 다시 들어오지 못한다. 그런데 이 메서드는 Lua가 아니라 명령 4개라
-        //    중간에 죽을 수 있고, 순서가 결과를 가른다.
-        //      HDEL이 먼저면: Hash만 사라지고 waiting에 남아 poll_verify가 HGET 미스로 계속 0을
-        //                     반환한다 → 그 사람은 영영 404다 (복구 경로 없음).
-        //      HDEL이 마지막이면: waiting/admitted가 먼저 지워지고 Hash만 남아 재입장만 막힌다
-        //                     (다음 complete·TTL 정리로 해소 가능). 안전한 쪽이다.
-        //    "정리 순서 통일" 같은 이유로 위로 올리지 말 것.
-        redis.opsForHash().delete(QueueKeys.tokens(queueId), identifier);
+        // 🔴 **0은 사고가 아니다 — 가드가 제 일을 한 것이다.** 그래도 로그를 남기는 이유는, 이
+        //    빈도가 §36(admitToken TTL 60초)과 complete 창(300초) 사이의 240초 모순이 실제로
+        //    얼마나 열리는지를 알려주는 **유일한 신호**이기 때문이다. 지금 그 수치는 0건이다.
+        //    complete는 토큰당 1회라 폴링 핫패스(최대 15만/s)와 무관하다.
+        //
+        // ⚠️ **-1(정리할 게 없었음)에는 찍지 않는다.** 늦은 complete는 -1로도 온다 — TTL 만료로
+        //    게이트가 이미 풀렸는데 그 사람이 재-enqueue를 안 한 경우다. 둘을 합쳐 세면 "축출을
+        //    막았다"가 아무 일도 없던 경우에까지 찍혀 위 문장이 거짓이 된다. 0만 센다.
+        if (cleaned != null && cleaned == 0L) {
+            log.warn("늦은 complete가 다른 회차를 만나 정리를 건너뛰었다 — 재-enqueue 축출을 막았다. "
+                    + "tokenId={} queueId={} identifier={} seq={}", tokenId, queueId, identifier, seq);
+        }
     }
 
     /**

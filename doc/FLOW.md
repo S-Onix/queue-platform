@@ -184,9 +184,9 @@ flowchart TD
     VRESP --> ALLOW["Tenant → 유저 입장 허용"]
     --> COMPLETE["POST /queues/:queueId/tokens/:tokenId/complete\n{ admitToken }\nTenant → Platform"]
 
-    COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - 300초\n   (COMPLETE_VALID_WINDOW_SECONDS, §80 구현)\n\n0을 허용하는 이유: TTL 만료로 복귀했지만\nTenant는 이미 입장시킨 경우가 실재한다"]
+    COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - 300초\n   (COMPLETE_VALID_WINDOW_SECONDS, §80 구현)\n\n0을 허용하는 이유: 컨슈머 랙으로 status가\n아직 0인 정상 입장자가 실재한다\n(§36으로 TTL 만료 복귀는 폐기됐다)"]
     DB -->|"0행"| E404C(["404 INVALID_ADMIT_TOKEN (TK002)\n409를 따로 두지 않는다 — 원인이 무엇이든\nTenant가 할 일은 같다"])
-    DB -->|"1행"| ZREM["Redis 정리 (나중)\nZREM queue:{queueId}:waiting\nZREM queue:{queueId}:admitted\nDEL admit-by-token + admit-by-admit\nHDEL queue:{queueId}:tokens {identifier} ← 반드시 마지막\n(중복 게이트 해제. 먼저 지우면 폴링이 영영 404)"]
+    DB -->|"1행"| ZREM["Redis 정리 — cleanup_completed.lua (EVAL 1회, 원자)\nZREM admitted · DEL admit-by-token + admit-by-admit ← 무조건\n(회차마다 유일한 값이 키에 박혀 있다)\nHGET tokens {identifier} → tokenId 대조\n일치할 때만 ZREM waiting → HDEL tokens ← HDEL 마지막\n불일치 = 재-enqueue한 다음 회차다. 지우면 그 사람을 축출한다"]
     --> KAFKA2["Kafka COMPLETED 발행 (key=tokenId)\n※ 발행 실패는 삼킨다(로그만) — DB는 이미 status=2로 확정"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])
 

@@ -652,13 +652,18 @@ Body: { admitToken: "at_xxx" }
       사라지므로 그걸 기준으로 삼으면 정상 입장이 만료 직후 거절된다.
 
 2. Redis 정리 (나중)
-   ZREM queue:{queueId}:waiting  (복귀했다면 남아 있다)
-   ZREM queue:{queueId}:admitted
-   DEL queue:{queueId}:admit-by-token + queue:{queueId}:admit-by-admit
-   HDEL queue:{queueId}:tokens {identifier}   ← **반드시 마지막**
-     안 지우면: 이 Hash가 enqueue의 중복 게이트(HSETNX)라 완료한 사람이 다시 못 들어온다
-     먼저 지우면: 중간에 죽었을 때 waiting에는 남고 Hash만 없어 폴링이 영영 404다
-     (이 4개는 Lua가 아니라 개별 명령이라 원자적이지 않다 — 순서가 결과를 가른다)
+   cleanup_completed.lua — EVAL 1회 (원자)
+   ZREM queue:{queueId}:admitted                                          ← 무조건
+   DEL queue:{queueId}:admit-by-token + queue:{queueId}:admit-by-admit    ← 무조건
+     member/키에 seq·tokenId·admitToken이 박혀 있어 회차마다 유일하다. 남의 것을 지울 수 없다.
+     여기에 가드를 걸면 완료된 admitToken으로 verify가 TTL 60초 동안 계속 통과한다.
+   HGET queue:{queueId}:tokens {identifier} → tokenId 대조
+     일치할 때만 ZREM waiting → HDEL tokens {identifier}   ← HDEL은 여전히 마지막
+     🔴 대조가 없으면: identifier는 회차 간 재사용되는 사람 이름표라, admitToken TTL(60초)
+        만료 후 재-enqueue한 **다음 회차의 자리와 게이트**를 지운다. complete 창이 300초라
+        취약 창이 240초다. 피해자는 폴링 404를 받을 뿐 아무 신호가 없다.
+     🔴 구분자 없는 레거시 값은 **전체를 tokenId로 본다**(poll_verify.lua와 같은 규약).
+        미스 취급하면 롤링 배포 중 게이트가 영영 안 풀려 영구 락아웃이다.
 3. Kafka token-lifecycle 발행 — COMPLETED (key=tokenId)
    → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
    ⚠️ 발행 실패는 삼킨다(로그만). DB는 이미 status=2로 확정됐고, 여기서 5xx를 주면 Tenant
