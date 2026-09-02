@@ -59,6 +59,10 @@ queue-platform/
 - `queue-batch`와 **합치지 않는다**: 소비는 파티션 수만큼 늘리고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요하다 (확장 방향이 반대)
 - `@EnableScheduling`을 붙이지 않는다 — 붙이면 infra의 `@Scheduled` 빈까지 돌아 이중 적재
 - **actuator + micrometer-registry-prometheus 보유**. 레지스트리 빈이 없으면 `/actuator/prometheus` 엔드포인트 자체가 생기지 않아 **컨슈머 lag을 PromQL로 볼 수단이 사라진다**
+  - ⚠️ **의존성은 유지하되 prod에서는 노출을 끈다**(2026-09-02). `batch`·`consumer`는 컨트롤러가 0개라
+    HTTP 표면이 통째로 actuator인데 경계(스크레이퍼 ACL·네트워크 정책)가 아직 없다 — 열어 두면
+    인증 없이 메트릭 176종이 나간다(실측). `queue-api` prod와 같은 판정이며, 경계와 **함께** 다시 켠다.
+    **local·dev는 그대로**라 로컬 관측은 안 바뀐다
 
 ### 의존성 방향 (절대 위반 금지)
 ```
@@ -482,7 +486,7 @@ master(3306)  Com_select  2,893,040      replica(3307)  Com_select  26,728   ←
 🪤 **`SimpleJpaRepository`가 구현한 메서드는 클래스 레벨 어노테이션이 걸려 replica로 간다**
 (실측: `findAll`·`findById`). 이건 **규칙이 아니라 함정 노트다** — Spring Data 구현 세부라
 버전이 바뀌면 조용히 달라지고, **그때 깨지는 건 라우팅이라 아무 테스트도 빨개지지 않는다.**
-무엇보다 **의도가 코드에 안 보인다**: `findAll()` 호출자는 자기가 replica를 읽는 줄 모른다.
+무엇보다 **의도가 코드에 안 보인다**: 상속 CRUD 호출자는 자기가 replica를 읽는 줄 모른다.
 
 🪤 주석 **2곳**(`QueueEngineService`·`AdmitRef`)이 "replica로 간다"고 적고 있었고 **거짓이었다**
 (2026-08-27 정정). `AdmitApiTest`에도 같은 거짓이 남아 있다가 2026-09-01에야 정정됐다 —

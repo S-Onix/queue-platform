@@ -265,6 +265,8 @@ curl -s -o /dev/null -w 'consumer prometheus: %{http_code}\n' http://localhost:8
 ```
 **둘 다 200이 정상이다.** `micrometer-registry-prometheus` 의존성과 `prometheus.yml`의 8082 job이 추가되어 컨슈머 지표를 PromQL로 볼 수 있다. 404가 나오면 의존성이 빠진 것이다.
 
+⚠️ **local·dev 한정이다.** prod 프로필은 `health,info`만 연다(2026-09-02) — 거기서 404는 정상이고 의존성을 의심하는 것은 오진이다. 그때 lag은 `kafka-consumer-groups.sh` CLI로 본다.
+
 > 단 **커스텀 메트릭은 여전히 0건**이다 — 적재 건수·DLT 유입·발행 성공/실패는 아래 "관측이 비어 있는 것"을 참고하라. 여기서 보이는 건 Spring Kafka·Hikari·JVM의 기본 지표뿐이다.
 
 ```bash

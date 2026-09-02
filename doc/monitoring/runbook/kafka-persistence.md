@@ -211,6 +211,8 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 - **먼저 의심할 것**: **엔드포인트가 아니라 수집 쪽이다.** `queue-consumer/build.gradle`에
   `io.micrometer:micrometer-registry-prometheus`가 있고 `application.yml`에
   `exposure.include: health,info,prometheus`도 있으므로 **8082에서 200이 나오는 것이 정상**이다.
+  ⚠️ **단 local·dev 한정이다.** prod 프로필은 `health,info`만 연다(경계가 없는 동안은 열지 않는다,
+  2026-09-02). prod에서 404는 정상이며, 그때 lag은 `kafka-consumer-groups.sh` CLI로 본다.
   안 뜬다면 실가동 `prometheus.yml`에 consumer job이 등록돼 있는지를 먼저 본다
   (→ [증상] scrape 타깃이 DOWN, 및 `doc/INFRA_SETUP.md`).
 - **1분 안에 확인**:

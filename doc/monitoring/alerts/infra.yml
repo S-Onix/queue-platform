@@ -42,8 +42,11 @@ groups:
       #    그래서 severity=info다. "앱이 안 떠 있다"는 사실 표기이지 사고 통보가 아니다.
       #    prod 타깃(관리 포트 분리 후, Sprint 11)이 job으로 추가되면 그 job만 critical로 올린다.
       #
-      # queue-batch(8081)는 여기 없다 — actuator 의존성 자체가 없어 스크레이프 대상이 아니다
-      # (prometheus.yml 주석 참조). 의존성이 생기면 job 추가와 함께 이 정규식에 더한다.
+      # 🔧 옛 주석은 "queue-batch는 actuator 의존성이 없어 스크레이프 대상이 아니다"였는데
+      #    거짓이다 — queue-batch/build.gradle에 actuator·micrometer가 둘 다 있고(`6647ca5`),
+      #    아래 정규식도 이미 queue-batch를 포함한다. 주석이 자기 아래 규칙과 모순이었다.
+      # ⚠️ 다만 prod 프로필은 prometheus를 노출하지 않는다(경계가 없는 동안은 열지 않는다,
+      #    2026-09-02). prod job을 추가할 때는 노출을 다시 켜는 것이 선행이다.
       - alert: AppInstanceDown
         expr: up{job=~"queue-api|queue-batch|queue-consumer"} == 0
         for: 2m
