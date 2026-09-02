@@ -2,15 +2,16 @@
 #
 # 레인이 둘이다. 가르는 기준은 **모듈이 아니라 @Tag** 다.
 #
-#   단위 레인    ./gradlew test -PunitOnly    인프라 불필요분 전부 (274건)
-#   통합 레인    ./gradlew test               MySQL + Redis Cluster 2개를 띄우고 전부 (384건)
+#   단위 레인    ./gradlew test -PunitOnly    인프라 불필요분 전부 (277건)
+#   통합 레인    ./gradlew test               MySQL + Redis Cluster 2개 + Kafka를 띄우고 전부 (448건)
 #
 # ⚠️ 모듈로 가르면 안 된다. queue-infrastructure·queue-api에는 순수 테스트와 인프라 테스트가
 #    섞여 있어서, 모듈 단위로 자르면 새로 추가되는 순수 테스트가 통째로 CI 밖에 남는다.
 #    실제로 그 상태였다 — 384건 중 104건만 돌고 있었다.
 #
-# Kafka는 띄우지 않는다. @EmbeddedKafka를 쓰는 테스트가 0건이고, 발행 경로는 목으로 검증한다.
-# 없는 인프라를 "언젠가 쓸 것"이라고 미리 세우지 않는다.
+# Kafka도 띄운다(2026-09-02). 발행 경로 대부분은 여전히 목으로 검증하지만, 프로듀서와 컨슈머의
+# 직렬화 계약은 두 모듈의 서로 다른 yml에 절반씩 적혀 있어 브로커 없이는 잴 수 없다.
+# @Tag("kafka") 1건(KafkaSerdeContractTest)이 그것을 요구한다 — 그 1건 때문에 세우는 것이다.
 name: CI
 
 on:
@@ -47,7 +48,7 @@ jobs:
       - name: 컴파일 (main + test, 전 모듈)
         run: ./gradlew --no-daemon compileJava compileTestJava
 
-      # @Tag("mysql")/@Tag("redis")가 붙지 않은 전부. 모듈 목록을 손으로 관리하지 않는다 —
+      # @Tag("mysql")/@Tag("redis")/@Tag("kafka")가 붙지 않은 전부. 모듈 목록을 손으로 관리하지 않는다 —
       # 새 순수 테스트는 태그를 안 붙이면 자동으로 여기 들어온다.
       - name: 단위 테스트 (인프라 불필요분 전부)
         run: ./gradlew --no-daemon test -PunitOnly
@@ -61,7 +62,7 @@ jobs:
           retention-days: 7
 
   integration:
-    name: 통합 테스트 (MySQL · Redis Cluster 2)
+    name: 통합 테스트 (MySQL · Redis Cluster 2 · Kafka)
     needs: build
     runs-on: ubuntu-latest
 
@@ -80,6 +81,29 @@ jobs:
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
           --health-interval=5s --health-timeout=5s --health-retries=20
+
+      # KRaft 단일 노드. 로컬은 3대지만 여기선 1대면 된다 — @Tag("kafka")가 재는 것은
+      # 복제가 아니라 프로듀서·컨슈머의 직렬화 계약이고, 테스트가 브로커 수에 맞춰
+      # RF를 정한다(KafkaSerdeContractTest). 복제 설정은 테스트가 아니라 런북 소관이다.
+      kafka:
+        image: apache/kafka:3.7.1
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd="/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval=10s --health-timeout=10s --health-retries=20
 
     steps:
       - uses: actions/checkout@v4
@@ -112,17 +136,21 @@ jobs:
           MYSQL_PASSWORD: root
         run: ./scripts/ci/load-schema.sh
 
+      # yml 기본값은 로컬 3대(9092,9094,9096)다. CI는 1대뿐이라 env로 좁힌다 —
+      # 프로덕션과 같은 오버라이드 경로(${KAFKA_BOOTSTRAP})를 그대로 쓴다.
       - name: 통합 테스트 (전체)
+        env:
+          KAFKA_BOOTSTRAP: localhost:9092
         run: ./gradlew --no-daemon test
 
       # 🔴 초록은 "돌았다"의 증거가 아니다.
       # 태그 설정이 깨지거나 누가 -PunitOnly를 흘려 넣으면 이 레인은 인프라를 다 띄워 놓고
       # 인프라 테스트를 0건 실행한 채 통과한다 — 정확히 이 레인이 막으려던 실패가 조용히 돌아온다.
-      # 그래서 대표 두 건(mysql 태그 하나, redis 태그 하나)이 실제로 실행됐는지 결과 XML로 못박는다.
+      # 그래서 대표 세 건(mysql·redis·kafka 태그 각 하나)이 실제로 실행됐는지 결과 XML로 못박는다.
       - name: 태그된 테스트가 실제로 돌았는지 확인
         run: |
           set -e
-          for t in TokenAdmitQueryIntegrationTest RedisQueueEngineRoutingTest; do
+          for t in TokenAdmitQueryIntegrationTest RedisQueueEngineRoutingTest KafkaSerdeContractTest; do
             f=$(find . -path '*/build/test-results/test/TEST-*'"$t"'.xml' | head -1)
             [ -n "$f" ] || { echo "$t 결과가 없다 — 인프라 테스트가 실행되지 않았다" >&2; exit 1; }
             n=$(grep -o 'tests="[0-9]*"' "$f" | head -1 | tr -dc 0-9)

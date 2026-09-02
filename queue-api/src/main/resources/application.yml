@@ -65,7 +65,12 @@ spring:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5   # idempotence 켠 상태의 상한
         # 컨슈머가 spring.json.use.type.headers=false 로 읽으므로 타입 헤더를 싣지 않는다.
-        # 양쪽이 어긋나면 역직렬화가 엉뚱한 타입으로 시도된다.
+        # ⚠️ 옛 주석은 "양쪽이 어긋나면 엉뚱한 타입으로 시도된다"였으나 실측으로 반증됐다
+        #    (2026-09-02, KafkaSerdeContractTest 반사실). 이 값을 true로 바꿔도, 컨슈머의
+        #    use.type.headers를 지워도 왕복은 성립한다 — 지금 조합에서 이 줄은 여분이고,
+        #    하중을 받는 것은 컨슈머의 spring.json.value.default.type 하나뿐이다.
+        #    그 표는 KafkaSerdeContractTest의 javadoc에 있다. 셋을 일관되게 맞춰 두는 것이지
+        #    각각이 계약을 지탱하는 게 아니다.
         spring.json.add.type.headers: false
 
         # ── 시한 설계 ────────────────────────────────────────────────
