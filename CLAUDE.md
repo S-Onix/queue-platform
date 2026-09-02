@@ -465,8 +465,8 @@ master(3306)  Com_select  2,893,040      replica(3307)  Com_select  26,728   ←
 
 | 호출 | 종류 | 라우팅 |
 |---|---|---|
-| `queueRepository.findAll()` (batch 2곳) | `SimpleJpaRepository` **CRUD** | **replica** |
-| `tenantRepository.findById()` (Rate Limit 캐시 미스) | `SimpleJpaRepository` **CRUD** | **replica** |
+| ~~`queueRepository.findAll()`~~ (batch 2곳) | 상속 CRUD → `findAllBy()` 선언으로 교체 (D-3) | ~~replica~~ → **master** |
+| ~~`tenantRepository.findById()`~~ (Rate Limit 캐시 미스) | 상속 CRUD → `findByIdEquals()` 선언으로 교체 (D-2) | ~~replica~~ → **master** |
 | `BatchProcessor.getMaxCapacity()` → `findByQueueId()` | 파생 쿼리, 트랜잭션 없음 | **master** |
 | 인증 필터 → `findByKeyHash()` | 파생 쿼리, 트랜잭션 없음 | **master** |
 | verify DB 폴백 → `findAdmittedByAdmitToken()` | **`@Query(nativeQuery)`**, 트랜잭션 없음 | **master** |
@@ -487,9 +487,13 @@ master(3306)  Com_select  2,893,040      replica(3307)  Com_select  26,728   ←
 (2026-08-27 정정). `AdmitApiTest`에도 같은 거짓이 남아 있다가 2026-09-01에야 정정됐다 —
 **정정이 소비처로 전파되지 않는 것이 이 레포의 반복 패턴이다.**
 
-🔴 **그 0.9% 안에 배치의 큐 목록이 있다.** `ReconcileJob:120`·`TokenReclaimJob:146`의
-`findAll()`이 replica에서 온다(20초에 replica 9회 = 2초 주기 10회와 일치, 실측).
-**새로 만든 큐가 복제 도착 전이면 그 주기의 회수·대사에서 빠진다.**
+✅ **그 0.9%는 없앴다 (2026-09-02).** 그 안에 있던 것이 배치의 큐 목록
+(`ReconcileJob:120`·`TokenReclaimJob:146`)과 Rate Limit의 테넌트 조회였고, 둘 다 파생 쿼리
+선언으로 master에 붙였다(D-2 `e1d9ac6` · D-3). **지금 앱이 replica를 읽는 경로는 0이다** —
+replica는 순수 DR 자산이고, 복제 지연이 앱 동작에 미치는 영향도 0이다.
+근거는 반사실 실측이다: 수정 전 코드로 되돌리면 35초에 replica 4회(10초 주기와 일치), 수정 후 0회.
+🪤 **그래도 위 함정 노트는 살아 있다** — 어댑터에서 상속 CRUD를 새로 부르면 같은 일이 다시
+벌어지고, 라우팅이라 아무 테스트도 빨개지지 않는다.
 
 ⚠️ **반대로 replica로 옮기면 안 되는 것도 있다.** `getMaxCapacity`는 못 찾으면
 `IllegalStateException("Queue not found during batch processing")`을 던진다 — 큐 생성 직후

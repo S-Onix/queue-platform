@@ -62,21 +62,12 @@ public class QueueJpaAdapter implements QueueRepository {
     /**
      * {@inheritDoc}
      *
-     * <p><b>이 메서드는 replica로 간다</b>(2026-08-27 라우팅 로그 실측: 20초에 replica 9회
-     * = {@code TokenReclaimJob} 2초 주기 10회와 일치). {@code SimpleJpaRepository}가 <b>직접 구현한</b>
-     * CRUD 메서드라 클래스 레벨 {@code @Transactional(readOnly = true)}가 실제로 걸린다.
-     *
-     * <p>🪤 <b>같은 리포지토리의 파생 쿼리는 반대다.</b> {@code findByQueueId}·{@code findByKeyHash}를
-     * 트랜잭션 없이 부르면 readOnly 트랜잭션이 <b>열리지 않아 master</b>로 간다(같은 날 실측).
-     * "Spring Data니까 replica"로 뭉뚱그리지 마라 — <b>CRUD냐 파생 쿼리냐가 갈린다</b>. CLAUDE.md §4-3.
-     *
-     * <p>🔴 <b>그래서 여기에 복제 지연이 붙는다.</b> {@code ReconcileJob}·{@code TokenReclaimJob}이
-     * 이걸로 큐 목록을 얻으므로, <b>새로 만든 큐가 복제 도착 전이면 그 주기의 회수·대사에서 빠진다.</b>
-     * 다음 주기(2초)에 잡히므로 자기 치유되지만, 복제가 <b>중단</b>되면 무음으로 낡은 목록을 돈다.
+     * <p>🔴 <b>{@code findAllBy}다. 상속받은 {@code findAll}을 쓰면 replica로 가고, replica가
+     * 죽으면 회수 배치 3경로가 통째로 멈춘다</b> ({@code QueueJpaRepository} 주석 참조).
      */
     @Override
     public List<Queue> findAll() {
-        return queueJpaRepository.findAll()
+        return queueJpaRepository.findAllBy()
                 .stream()
                 .map(QueueEntity::toDomain)
                 .toList();

@@ -592,8 +592,9 @@ rate(http_server_requests_seconds_count[5m])
     - ⚠️ ~~읽기 분산 정상 여부~~ — **잴 대상이 없다** (2026-09-01 실측). 읽기의 99% 이상이
       master로 간다. 라우팅은 `isCurrentTransactionReadOnly()`로만 갈리는데 명시적
       `@Transactional(readOnly = true)`가 붙은 곳이 0이 됐다(있던 한 곳은 read-after-write
-      404를 내서 제거). replica로 가는 것은 배치의 `findAll()`과 테넌트 캐시 미스 시
-      `findById`뿐이다. **이 서비스의 DB 읽기는 구조적으로 거의 전부 쓰기 직후라 옮길 읽기가 없다**
+      404를 내서 제거). 남아 있던 상속 CRUD 둘(배치 `findAll()` · 테넌트 캐시 미스 `findById`)도
+      2026-09-02에 파생 쿼리 선언으로 master에 붙였다(D-2·D-3) — **이제 replica로 가는 앱 읽기는
+      0이다.** **이 서비스의 DB 읽기는 구조적으로 거의 전부 쓰기 직후라 옮길 읽기가 없다**
 - 문제
   - DB 응답 지연이 발생해도 원인 추정 어려움
     - 쿼리 자체가 느린가
