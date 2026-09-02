@@ -12,6 +12,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.boot.web.context.WebServerGracefulShutdownLifecycle;
 
 import java.time.Instant;
@@ -414,6 +415,17 @@ public class BatchProcessorTest {
                         fromContext.processBatches();
                     }
                     verify(queueRepository, times(1)).findByQueueId("q_a");
+
+                    // 🔴 위 단정만으로는 "TTL != 0"밖에 못 잠근다 — 결함 주입 실측에서
+                    //    기본을 999999999(≈11.5일)로 바꿔도, 반대로 1ms로 바꿔도 453건이 전부
+                    //    초록이었다. 두 틱이 1ms 안에 끝나 우연히 히트하기 때문이다.
+                    //    그래서 값 자체를 잠근다. 이건 상수 잠금이 아니라 **런북과의 계약**이다:
+                    //    doc/monitoring/runbook/enqueue.md 가 QUEUE_FULL 대응으로
+                    //    "UPDATE 후 최대 30초 뒤 반영"을 단정하고, 운영자가 그 숫자를 보고 기다린다.
+                    //    리터럴이 드리프트하면 장애 중에만 드러나고 아무 테스트도 빨개지지 않는다.
+                    //    값을 바꿀 거면 런북도 같이 바꿔라 — 이 단정이 그걸 강제한다.
+                    assertThat(ReflectionTestUtils.getField(fromContext, "capacityCacheTtlMillis"))
+                            .isEqualTo(30_000L);
                 });
     }
 

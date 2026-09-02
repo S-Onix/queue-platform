@@ -107,6 +107,10 @@ public class BatchProcessor implements SmartLifecycle {
      * ⚠️ 다만 비용은 {@code 큐 수 ÷ TTL}이라 <b>큐 개수 상한이 정해지면 다시 봐야 한다</b>
      * (지금 상한은 0 — 릴리스 게이트에 열려 있다).
      *
+     * <p>🔑 <b>왜 5초가 아닌가:</b> 장애 반응만 보면 짧을수록 낫다. 30초를 지지하는 유일한 근거가
+     * <b>큐 개수 상한이 없다</b>는 것이다 — 큐 1만 개면 5초는 초당 2,000 SELECT로 원래 문제로
+     * 되돌아간다. 상한이 생기면 짧게 다시 잡아라.
+     *
      * <p>🪤 <b>인스턴스마다 만료 시점이 다르다.</b> 캐시가 JVM 안에 있어 N대가 각자 다른 순간에
      * 다시 읽는다. UPDATE 후 30초 창 동안 어떤 인스턴스는 새 정원, 어떤 인스턴스는 옛 정원으로
      * 판정한다 — 429가 줄어들다 사라지는 모양이고 30초 안에 수렴한다.
@@ -117,7 +121,7 @@ public class BatchProcessor implements SmartLifecycle {
     private final long capacityCacheTtlMillis;
 
     /**
-     * queueId → (용량, 만료 시각). ⚠️ {@code status}는 <b>여기 없다.</b> 드레인이 쓰는 것은 용량뿐이고,
+     * queueId → (용량, 만료 시각 — 단조 시계 기준). ⚠️ {@code status}는 <b>여기 없다.</b> 드레인이 쓰는 것은 용량뿐이고,
      * 정지 판정은 {@code QueueEngineService}가 요청마다 한다 — 그 경로는 캐시를 타지 않는다.
      * 그래서 이 캐시는 PAUSED 반영을 늦추지 않는다(2026-09-03 확정).
      *
@@ -128,7 +132,7 @@ public class BatchProcessor implements SmartLifecycle {
      */
     private final Map<String, CachedCapacity> capacityByQueueId = new ConcurrentHashMap<>();
 
-    private record CachedCapacity(long value, long expiresAtMillis) {}
+    private record CachedCapacity(long value, long expiresAtNanos) {}
 
     /**
      * SmartLifecycle 실행 여부. 인스턴스 로컬 상태이며 <b>서버마다 값이 달라도 무해</b>하다 —
@@ -442,7 +446,7 @@ public class BatchProcessor implements SmartLifecycle {
      * 모를 때 {@code queues.redis_cluster_no}를 한 번 더 읽는다
      * ({@code RedisQueueEngine.routeForWrite}). 다만 그 조회는 <b>(WAS, queueId)당 평생 1회</b>다 —
      * 결과가 인스턴스 로컬 맵에 남아 같은 큐의 이후 사이클에는 0회로 상각된다. 반면
-     * {@code getMaxCapacity}는 <b>캐시 히트면 DB를 안 탄다</b>(큐당 평생 1회 미스).
+     * {@code getMaxCapacity}는 <b>캐시 히트면 DB를 안 탄다</b>(큐당 <b>TTL당</b> 1회 미스).
      */
     private void processQueueGroup(String queueId, List<PendingEnqueue> pendings) {
         if (drainDeadlineExceeded()) {
@@ -564,13 +568,17 @@ public class BatchProcessor implements SmartLifecycle {
         }
         // computeIfAbsent를 쓰지 않는다 — 매핑 함수가 DB를 치는데, 그 안에서 예외가 나면
         // 맵 락을 쥔 채 풀려나가고 미존재 큐마다 락 구간이 생긴다. 미스는 드물다(큐당 TTL 1회).
-        long now = System.currentTimeMillis();
+        // 🔑 nanoTime이다. 벽시계가 아니라 단조 시계를 써야 NTP 역행에 만료가 밀리지 않는다
+        // (역행 폭만큼 UPDATE 반영이 늦어지고, 그건 장애 중에 겪을 일이 아니다).
+        // 같은 클래스가 종료 데드라인에도 nanoTime을 쓴다 — 일관성이 우연이 아니다.
+        long now = System.nanoTime();
         CachedCapacity cached = capacityByQueueId.get(queueId);
-        if (cached != null && cached.expiresAtMillis() > now) {
+        if (cached != null && cached.expiresAtNanos() > now) {
             return cached.value();
         }
         long loaded = loadMaxCapacity(queueId);
-        capacityByQueueId.put(queueId, new CachedCapacity(loaded, now + capacityCacheTtlMillis));
+        capacityByQueueId.put(queueId,
+                new CachedCapacity(loaded, now + capacityCacheTtlMillis * 1_000_000L));
         return loaded;
     }
 

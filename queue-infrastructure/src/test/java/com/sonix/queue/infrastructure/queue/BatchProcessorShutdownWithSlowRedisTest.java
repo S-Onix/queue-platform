@@ -165,7 +165,9 @@ class BatchProcessorShutdownWithSlowRedisTest {
      * {@code stop()} 경과가 그룹 수에 <b>선형 비례</b>한다(실측: DB 3s 가정 · 그룹 3개 → 9,016ms).
      * 그룹 진입 시 데드라인 검사가 그 호출을 최대 2회로 묶는다
      * (§75 이중 라우팅 이후 {@code routeForWrite}의 {@code redis_cluster_no} 조회가 더해졌다.
-     *  그 조회도 {@code getMaxCapacity}도 (WAS, queueId)당 평생 1회라 상각된다.
+     *  그 조회는 (WAS, queueId)당 평생 1회, {@code getMaxCapacity}는 <b>TTL당 1회</b>라 상각된다.
+     *  🪤 그래도 <b>안전의 근거는 상각이 아니라 데드라인 검사</b>다({@code processQueueGroup} 진입부).
+     *  TTL 만료가 겹친 순간 SIGTERM이 오면 여러 그룹이 동시에 미스가 될 수 있다.
      *  이 테스트는 그룹마다 <b>다른 queueId</b>를 써서 캐시 히트가 구조적으로 불가능하게 두었다 —
      *  그래야 "그룹 수에 비례하지 않는다"를 캐시와 무관하게 잰다).
      *

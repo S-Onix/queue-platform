@@ -48,7 +48,7 @@ flowchart TD
 ⚠️ 2026-08-27 주기 변경으로 33배가 아니라 **50배** 커졌다 — 이 상한은 사실상 도달 불가라
 스로틀로서는 죽은 상수다. ~~실제로 먼저 깨지는 것은 `getMaxCapacity`의 DB 조회다(미측정)~~
 → **측정됐고 해소됐다**(2026-09-02). 큐 20개·2,000 rps에서 그 조회가 초당 1,000회라 p99가
-SLO를 넘겼고(평균 73.95ms), 캐시로 40.02ms가 됐다. `queue.enqueue.capacity-cache` 기본 on.
+SLO를 넘겼고(평균 73.95ms), 캐시로 40.02ms가 됐다. `queue.enqueue.capacity-cache-ttl-ms` 기본 30,000.
 유입이 이를 넘으면
 globalQueue가 적체되어 30s 타임아웃으로 실패한다. WAS N대면 5,000×N.
 
