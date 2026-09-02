@@ -4,7 +4,6 @@ import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.*;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -12,7 +11,6 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.List;
 import java.util.Optional;
@@ -52,64 +50,14 @@ public class QueueEngineService {
     private final EnqueueEventPublisher eventPublisher;
     private final Clock clock;                        // 시간 주입(테스트 제어)
 
-    /**
-     * {@code /status} 응답 캐시 유지 시간(ms). <b>0이면 끈다 — 기본 0.</b>
-     *
-     * <p><b>왜 기본을 끄는가 (2026-09-02 실측):</b> 재봤더니 <b>Redis가 병목이 아니었다.</b>
-     * 캐시 없이도 20,000 rps에서 p99 18.25ms(SLO 50ms의 1/3)이고, 캐시로 MGET을 <b>448배</b>
-     * 줄여도 p99는 18.25 → 14.56ms로 20%만 좋아진다 — 지연의 80%가 Redis가 아니라 앱에 있다.
-     * 즉 지금 켜서 막히는 것이 없다. §4대로 "안 만들면 무엇이 깨지나"에 답이 없으므로 켜지 않는다.
-     * <pre>
-     *   유입      캐시OFF p99 / MGET      캐시1s p99 / MGET
-     *    2,000     1.47ms /  60,000        1.14ms /     44
-     *   20,000    18.25ms / 598,528       14.56ms /  1,337     ← 448배 감소
-     * </pre>
-     * ⚠️ 20,000 rps는 <b>하니스 한계에 가깝다</b>(k6가 서버와 같은 머신, 200 응답 99.75%).
-     * 목표 규모(마스터당 2큐 × 30만 = 약 30,900 rps)는 <b>측정 범위 밖</b>이라, 거기서도
-     * Redis가 여유로운지는 <b>미측정</b>이다. 그 구간을 재고 나서 다시 판단한다.
-     *
-     * <p>🪤 켤 때 알아야 할 것: 스탬피드를 막지 않아 만료 순간 동시 미스가 겹친다.
-     * 실측 증폭 <b>44배</b>(20,000 rps에서 이상적 30회 대비 1,337회). 그래도 448배 이득이라
-     * 락을 걸지 않았다 — 락이 곧 새 직렬화 지점이 된다.
-     *
-     * <p><b>왜 캐시가 가능한가:</b> 이 응답은 <b>30만 명 전원에게 동일</b>하다. §79가 일부러
-     * 개인화를 걷어냈고(rank는 클라이언트가 자기 seq와 lastAdmittedSeq로 계산한다), 그래서
-     * 같은 큐의 모든 폴링이 같은 바이트를 받는다.
-     *
-     * <p><b>무엇을 버는가:</b> pacing 구간표로 산술하면 30만 명 큐 하나가 초당 약 15,400건을
-     * 만든다. 그 전량이 지금 Redis {@code MGET}으로 간다. 1초 캐시면 <b>인스턴스당 초당 1회</b>가
-     * 된다 — 큐 하나에 대해 15,400 → (인스턴스 수).
-     *
-     * <p>⚠️ <b>이 값은 아래 사슬에 들어간다.</b> 캐시가 오래 살수록 입장 인지가 늦다:
-     * <pre>   pacing 최대 간격 + 캐시 TTL &lt; admitToken TTL(60초)   </pre>
-     * 지금은 20 + 1 &lt; 60이라 여유가 크다. pacing 꼬리를 늘릴 때 이 항도 같이 세라.
-     */
-    private final long statusCacheMillis;
-
-    /**
-     * queueId → (응답, 만료 시각). 🔴 <b>존재하는 큐만 넣는다.</b>
-     *
-     * <p>미존재 큐를 캐시하면 인증 없는 폴링(§79 permitAll)에 임의 queueId를 섞는 것만으로
-     * 이 맵이 무한히 자란다 — 폴링 리미터 버킷이 같은 이유로 겪는 문제다. 404는 캐시하지
-     * 않으므로 엔트리 수가 <b>실재하는 큐 수</b>로 묶인다.
-     *
-     * <p>🪤 만료된 엔트리를 청소하는 주체가 없다. 삭제된 큐의 엔트리는 프로세스 수명 동안 남는데,
-     * 큐 수가 수천 단위라 무해하다고 판단했다. 큐가 수십만이 되면 크기 상한이 필요하다.
-     */
-    private final Map<String, CachedBoard> statusCache = new ConcurrentHashMap<>();
-
-    private record CachedBoard(QueueBoard board, long expiresAtMillis) {}
-
     public QueueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher,
-                              Clock clock,
-                              @Value("${queue.status.cache-ms:0}") long statusCacheMillis) {
+                              Clock clock) {
         this.queueRepository = queueRepository;
         this.tokenRepository = tokenRepository;
         this.queueEngine = queueEngine;
         this.eventPublisher = eventPublisher;
         this.clock = clock;
-        this.statusCacheMillis = statusCacheMillis;
     }
 
     /**
@@ -426,6 +374,23 @@ public class QueueEngineService {
 
     /**
      * queue 조회 + 소유권 검증 (관리용 QueueService와 동일 패턴).
+     *
+     * <p>🔴 <b>이 조회를 캐시하지 않는다 — {@code status}를 매번 봐야 하기 때문이다</b>
+     * (2026-09-03 확정). 스테일의 대가가 비대칭이다:
+     * <ul>
+     *   <li>{@code maxCapacity}가 늦으면 → 정원 확대가 늦게 반영된다. 되돌릴 수 있다</li>
+     *   <li><b>{@code status}가 늦으면 → 정지시킨 큐에 사람이 계속 들어온다.</b> 장애가 커진다</li>
+     * </ul>
+     * 그래서 드레인의 용량은 캐시하되({@code BatchProcessor.capacityByQueueId}) 이쪽은 안 한다.
+     * {@code BatchProcessor.getMaxCapacity}의 옛 주석이 경고하던 PAUSED 문제의 주소가 여기다.
+     *
+     * <p>⚠️ <b>그 결정의 대가:</b> 이 조회는 <b>요청당 1회 DB SELECT</b>로 고정된다.
+     * 2,000 rps면 초당 2,000회이고, 드레인이 캐시로 없앤 양(초당 1,000회)보다 크다.
+     * 줄이려면 캐시가 아니라 <b>{@code status}의 거처를 옮겨야</b> 한다(예: Redis) — 그건
+     * 캐시가 아니라 정본 이동이라 새 키·해시태그·전손 복구 규약이 따라온다. §4 확대 심사 대상.
+     *
+     * <p>🪤 그리고 이 부담이 실제 병목인지는 <b>미측정</b>이다. 드레인은 한 스레드가 직렬로 도는데
+     * 이 경로는 가상 스레드로 병렬이라, 같은 초당 횟수라도 영향이 같지 않다.
      */
     private Queue findQueueAndVerifyOwner(Long tenantId, String queueId) {
         Queue queue = queueRepository.findByQueueId(queueId)
@@ -494,24 +459,12 @@ public class QueueEngineService {
      * @throws BusinessException 큐에 enqueue 기록이 없으면 404 {@code QUEUE_NOT_FOUND}
      */
     public QueueBoard status(String queueId) {
-        if (statusCacheMillis <= 0) {
-            return loadStatus(queueId);
-        }
-        long now = clock.millis();
-        CachedBoard hit = statusCache.get(queueId);
-        if (hit != null && hit.expiresAtMillis() > now) {
-            return hit.board();
-        }
-        // 미스가 겹치면 여럿이 같이 Redis를 친다(스탬피드). 막지 않는다 —
-        // 겹치는 창이 캐시 TTL 하나이고, 그 사이 중복은 인스턴스당 몇 건 수준이다.
-        // 락을 걸면 그 락이 곧 새 직렬화 지점이 되어 폴링 전체가 그 뒤에 선다.
-        QueueBoard board = loadStatus(queueId);
-        statusCache.put(queueId, new CachedBoard(board, now + statusCacheMillis));
-        return board;
-    }
-
-    /** 캐시를 거치지 않는 원본 조회. 404는 캐시하지 않으므로 여기서 던진다. */
-    private QueueBoard loadStatus(String queueId) {
+        // 🪤 응답 캐시를 넣었다가 <b>뺐다</b>(2026-09-03). 30만 명이 전원 같은 응답을 받으므로
+        //    캐시가 가능하고, 실측상 Redis MGET이 448배 줄었다(20,000 rps에서 598,528 → 1,337).
+        //    그런데 **Redis가 병목이 아니었다** — 캐시 없이도 20,000 rps에서 p99 18.25ms이고,
+        //    448배를 줄여도 p99는 20%만 좋아진다(지연의 대부분이 앱에 있다).
+        //    §4의 "안 만들면 무엇이 깨지나"에 답이 없어서 뺐다. 근거 실측은 FRS §13에 남아 있다.
+        //    목표 규모(마스터당 2큐 × 30만 ≈ 30,900 rps)를 재고 필요가 확인되면 그때 되살린다.
         return queueEngine.readStatus(queueId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.QUEUE_NOT_FOUND));
     }

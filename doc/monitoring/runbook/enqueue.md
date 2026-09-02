@@ -165,7 +165,7 @@ HTTP 요청
 
 ### [증상] 배치가 아예 안 돈다 (요청이 전부 30초 뒤 503)
 
-- **먼저 의심할 것**: `getMaxCapacity()`가 던지는 예외(`BatchProcessor.java:175`). `queueRepository.findByQueueId()`가 **매 사이클마다 큐별로 DB를 친다**(캐시 없음). DB 커넥션이 없으면 이 조회가 막히고, 그 사이 `processBatches()`가 반환하지 못해 다음 사이클도 밀린다.
+- **먼저 의심할 것**: `getMaxCapacity()`가 던지는 예외(`BatchProcessor.java:175`). `queueRepository.findByQueueId()`가 **캐시 미스일 때** DB를 친다(큐당 TTL 30초에 1회). DB 커넥션이 없으면 그 조회가 막히고, 그 사이 `processBatches()`가 반환하지 못해 다음 사이클도 밀린다. ⚠️ 캐시가 생기면서 **빈도는 줄었지만 경로는 그대로다** — 미스가 나는 순간 같은 일이 벌어진다.
 - **1분 안에 확인**:
   ```bash
   curl -s 'http://localhost:9090/api/v1/query?query=hikaricp_connections_pending' | jq -r '.data.result[]|"\(.metric.pool) \(.value[1])"'
@@ -242,7 +242,13 @@ HTTP 요청
     그래도 안 줄면 `TokenReclaimJob`이 도는지, 그 큐의 `waitingTtl` 설정이 과도하게 큰지 본다.
     `queue_waiting_orphans` 게이지(맨 앞 항목의 `tokens` Hash 미스)도 함께 본다.
   - 429(RL001)와 429(Q005)는 **같은 HTTP 상태 코드**다. 응답 본문의 `error` 필드로 구분: `Q005`=정원, `RL001`=Rate Limit.
-- **조치**: 정원을 늘린다 (다음 배치 사이클부터 반영 — `getMaxCapacity()`가 매 사이클 DB를 읽으므로 캐시 무효화 불필요):
+- **조치**: 정원을 늘린다 (**최대 30초 뒤 반영**):
+  > 🔴 옛 문구는 "다음 배치 사이클부터 반영 — `getMaxCapacity()`가 매 사이클 DB를 읽으므로 캐시
+  > 무효화 불필요"였는데 **2026-09-02에 거짓이 됐다.** 드레인이 용량을 캐시한다
+  > (`queue.enqueue.capacity-cache-ttl-ms`, 기본 30,000). 그래서 UPDATE는 **TTL만큼 늦게** 먹는다.
+  > TTL을 0으로 두면 즉시 반영되지만 큐 20개·2,000 rps에서 p99가 40 → 74ms로 SLO를 넘긴다.
+  > 🪤 **인스턴스마다 만료 시점이 다르다** — 30초 창 동안 429가 줄어들다 사라진다. 그게 정상이다.
+  > 30초를 기다려도 안 줄면 그때는 캐시가 아니라 다른 원인이다(ZCARD·좀비 WAITING 항목 참조).
   ```sql
   -- Master(3306)
   UPDATE queues SET max_capacity = <새값> WHERE queue_id = 'q_xxx';

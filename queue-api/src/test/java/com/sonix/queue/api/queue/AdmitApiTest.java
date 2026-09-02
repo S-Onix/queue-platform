@@ -93,7 +93,7 @@ class AdmitApiTest {
         QueueEngineService queueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher) {
             return new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher,
-                    Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC), 0L);
+                    Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
         }
     }
 

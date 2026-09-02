@@ -59,7 +59,7 @@ class BatchProcessorShutdownWithSlowRedisTest {
 
     @BeforeEach
     void setUpProcessor() {
-        batchProcessor = new BatchProcessor(queueEngine, queueRepository, false);
+        batchProcessor = new BatchProcessor(queueEngine, queueRepository, 0L);
     }
 
     @Test
@@ -159,13 +159,15 @@ class BatchProcessorShutdownWithSlowRedisTest {
     /**
      * <b>느린 것이 Redis가 아니라 DB일 때</b>의 회귀 방지.
      *
-     * <p>{@code getMaxCapacity}(= 캐시 없는 {@code findByQueueId})는 JDBC
+     * <p>{@code getMaxCapacity}(캐시 미스 시 {@code findByQueueId})는 JDBC
      * {@code socketTimeout} 미설정(Connector/J 기본 0 = 무기한)이라 <b>시한이 없는 호출</b>이다.
      * 데드라인 검사가 청크 루프에만 있으면 큐 그룹마다 이 호출을 한 번씩 물어
      * {@code stop()} 경과가 그룹 수에 <b>선형 비례</b>한다(실측: DB 3s 가정 · 그룹 3개 → 9,016ms).
      * 그룹 진입 시 데드라인 검사가 그 호출을 최대 2회로 묶는다
      * (§75 이중 라우팅 이후 {@code routeForWrite}의 {@code redis_cluster_no} 조회가 더해졌다.
-     *  그 조회는 (WAS, queueId)당 평생 1회라 상각되지만, {@code getMaxCapacity}는 매 그룹 든다).
+     *  그 조회도 {@code getMaxCapacity}도 (WAS, queueId)당 평생 1회라 상각된다.
+     *  이 테스트는 그룹마다 <b>다른 queueId</b>를 써서 캐시 히트가 구조적으로 불가능하게 두었다 —
+     *  그래야 "그룹 수에 비례하지 않는다"를 캐시와 무관하게 잰다).
      *
      * <p>이 테스트가 고정하는 것은 "빠르다"가 아니라 <b>"그룹 수에 비례하지 않는다"</b>다.
      * {@code processQueueGroup} 맨 위의 데드라인 검사를 제거하면 3그룹 ≈9s / 5그룹 ≈15s가 되어 깨진다.
@@ -192,7 +194,7 @@ class BatchProcessorShutdownWithSlowRedisTest {
     private long measureStopWithSlowCapacityLookup(int groupCount) {
         RedisQueueEngine engine = org.mockito.Mockito.mock(RedisQueueEngine.class);
         QueueRepository repository = org.mockito.Mockito.mock(QueueRepository.class);
-        BatchProcessor processor = new BatchProcessor(engine, repository, true);
+        BatchProcessor processor = new BatchProcessor(engine, repository, 30_000L);
 
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
         List<PendingEnqueue> all = new ArrayList<>();

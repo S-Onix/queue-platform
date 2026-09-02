@@ -84,37 +84,51 @@ public class BatchProcessor implements SmartLifecycle {
     private final QueueRepository queueRepository;
 
     /**
-     * 드레인의 {@code maxCapacity} 조회를 캐시할지. <b>기본 true.</b> 끄는 쪽에 플래그를 둔 것은
-     * 회귀를 의심할 때 반사실을 다시 재기 위해서다.
+     * 드레인의 {@code maxCapacity} 캐시 유지 시간(ms). <b>기본 30,000. 0이면 끈다.</b>
      *
-     * <p><b>왜 켜는가 (2026-09-02 A/B 실측, 큐 20개 · 총 2,000 rps · 각 4판):</b>
+     * <p><b>왜 캐시하는가 (2026-09-02 A/B 실측, 큐 20개 · 총 2,000 rps · 각 4판):</b>
      * <pre>
      *   OFF   p99  54.33 / 113.63 / 60.21 / 67.64 ms   평균 73.95   4판 전부 SLO(50ms) 초과
      *   ON    p99  39.87 /  39.61 / 40.14 / 40.47 ms   평균 40.02   4판 전부 충족
      * </pre>
      * 🔑 <b>가장 큰 신호는 평균이 아니라 분산이다.</b> 판 간 폭이 <b>60ms → 0.9ms</b>로 붙었다.
-     * 틱마다 큐 수만큼 DB를 치는 것이 불안정성의 원인이었고, 없애자 값이 결정적으로 변했다.
+     * 비용의 정체는 틱 50회/s × 큐 N개 = <b>초당 50N SELECT</b>다. 큐 8개(400/s)는 견디는데
+     * 큐 20개(1,000/s)에서 무너진다.
      *
-     * <p>비용의 정체: 틱 50회/s × 큐 N개 = <b>초당 50N SELECT</b>가 master로 간다. 큐 8개(400/s)는
-     * 견디는데 큐 20개(1,000/s)에서 무너진다 — 큐 8개 12판은 캐시 없이도 37~42ms였다.
+     * <p>🔴 <b>왜 TTL이 필요한가 — "불변"이 틀렸기 때문이다.</b> 처음엔 만료를 두지 않았다.
+     * {@code Queue.update()}가 {@code name}만 바꾸고 용량 변경 API가 없어 실질 불변이라고 봤는데,
+     * <b>코드만 전수하고 런북을 안 봤다.</b> 장애 대응 문서가 직접 SQL 경로를 지시하고 있었다:
+     * <pre>   UPDATE queues SET max_capacity = &lt;새값&gt; WHERE queue_id = 'q_xxx';   </pre>
+     * 만료가 없으면 {@code Q005 QUEUE_FULL} 장애 중에 운영자가 이 UPDATE를 쳐도 <b>아무 일도
+     * 일어나지 않고</b>, 회복 수단이 전 인스턴스 재기동뿐이다. 그건 장애 중에 칠 수 없는 카드다.
+     *
+     * <p>30초를 고른 근거는 <b>장애 대응 반응 시간</b>이다(비용이 아니다). 비용은 어느 값이든
+     * 무시할 만하다 — 큐 20개 기준 초당 1,000회가 <b>0.67회</b>가 된다(1,500배 감소).
+     * ⚠️ 다만 비용은 {@code 큐 수 ÷ TTL}이라 <b>큐 개수 상한이 정해지면 다시 봐야 한다</b>
+     * (지금 상한은 0 — 릴리스 게이트에 열려 있다).
+     *
+     * <p>🪤 <b>인스턴스마다 만료 시점이 다르다.</b> 캐시가 JVM 안에 있어 N대가 각자 다른 순간에
+     * 다시 읽는다. UPDATE 후 30초 창 동안 어떤 인스턴스는 새 정원, 어떤 인스턴스는 옛 정원으로
+     * 판정한다 — 429가 줄어들다 사라지는 모양이고 30초 안에 수렴한다.
      *
      * <p>🪤 <b>이 실측 덕에 안 만든 것이 둘이다</b>(§4): 큐 단위 병렬 드레인(구조 변경)과
      * Redis 마스터 증설(인프라). 캐시 하나로 SLO를 지키므로 지금 둘 다 필요 없다.
      */
-    private final boolean capacityCacheEnabled;
+    private final long capacityCacheTtlMillis;
 
     /**
-     * queueId → maxCapacity. 🔑 <b>이 값은 실질 불변이다</b> — {@code Queue.update()}는
-     * {@code name}만 바꾸고 용량을 바꾸는 API가 없다(전수 확인). 그래서 TTL도 무효화도 없다.
-     * 옆집 {@link RedisQueueEngine#ownerByQueueId}와 같은 부류다.
+     * queueId → (용량, 만료 시각). ⚠️ {@code status}는 <b>여기 없다.</b> 드레인이 쓰는 것은 용량뿐이고,
+     * 정지 판정은 {@code QueueEngineService}가 요청마다 한다 — 그 경로는 캐시를 타지 않는다.
+     * 그래서 이 캐시는 PAUSED 반영을 늦추지 않는다(2026-09-03 확정).
      *
-     * <p>🔴 <b>용량 변경 경로를 만드는 사람에게</b>: 그 순간 이 맵이 거짓이 된다. 무효화를 같이
-     * 넣거나 이 캐시를 지워라. 안 그러면 정원이 바뀌어도 드레인은 옛 값으로 판정한다.
-     *
-     * <p>⚠️ {@code status}는 여기 없다. 드레인이 쓰는 것은 용량뿐이고, 정지 판정은 요청 경로의
-     * {@code Queue.isEnqueueable()}가 이미 한다 — 이 캐시는 그 판정을 늦추지 않는다.
+     * <p>🪤 만료된 엔트리를 청소하는 주체가 없다. 삭제된 큐의 엔트리가 프로세스 수명 동안 남지만
+     * 큐 수가 수천 단위라 무해하다. 큐가 수십만이 되면 크기 상한이 필요하다.
+     * 미존재 큐는 {@code IllegalStateException}을 던져 캐시에 들어가지 않으므로,
+     * 엔트리 수는 <b>실재하는 큐 수</b>로 묶인다.
      */
-    private final Map<String, Long> capacityByQueueId = new ConcurrentHashMap<>();
+    private final Map<String, CachedCapacity> capacityByQueueId = new ConcurrentHashMap<>();
+
+    private record CachedCapacity(long value, long expiresAtMillis) {}
 
     /**
      * SmartLifecycle 실행 여부. 인스턴스 로컬 상태이며 <b>서버마다 값이 달라도 무해</b>하다 —
@@ -131,11 +145,11 @@ public class BatchProcessor implements SmartLifecycle {
     private volatile Long drainDeadlineNanos = null;
 
     public BatchProcessor(RedisQueueEngine queueEngine, QueueRepository queueRepository,
-                          @Value("${queue.enqueue.capacity-cache:true}") boolean capacityCacheEnabled) {
+                          @Value("${queue.enqueue.capacity-cache-ttl-ms:30000}") long capacityCacheTtlMillis) {
         this.queueEngine = queueEngine;
         this.queueRepository = queueRepository;
-        this.capacityCacheEnabled = capacityCacheEnabled;
-        log.info("enqueue drain: capacity-cache={}", capacityCacheEnabled);
+        this.capacityCacheTtlMillis = capacityCacheTtlMillis;
+        log.info("enqueue drain: capacity-cache-ttl={}ms (0=off)", capacityCacheTtlMillis);
     }
 
     @Override
@@ -428,7 +442,7 @@ public class BatchProcessor implements SmartLifecycle {
      * 모를 때 {@code queues.redis_cluster_no}를 한 번 더 읽는다
      * ({@code RedisQueueEngine.routeForWrite}). 다만 그 조회는 <b>(WAS, queueId)당 평생 1회</b>다 —
      * 결과가 인스턴스 로컬 맵에 남아 같은 큐의 이후 사이클에는 0회로 상각된다. 반면
-     * {@code getMaxCapacity}는 캐시가 없어 매 그룹마다 든다.
+     * {@code getMaxCapacity}는 <b>캐시 히트면 DB를 안 탄다</b>(큐당 평생 1회 미스).
      */
     private void processQueueGroup(String queueId, List<PendingEnqueue> pendings) {
         if (drainDeadlineExceeded()) {
@@ -534,26 +548,29 @@ public class BatchProcessor implements SmartLifecycle {
     /**
      * Queue의 최대 용량 조회.
      *
-     * <p>⚠️ 구 주석은 "Sprint 5-E: 상수 반환(임시)"이었으나 <b>이미 DB를 읽는다</b>
-     * ({@code queueRepository.findByQueueId}). 남은 미착수는 <b>캐싱뿐</b>이다 —
-     * 지금은 그룹마다 조회가 든다(같은 파일의 드레인 주석 참조).
+     * <p>✅ <b>캐싱은 2026-09-02에 들어왔다</b>({@code capacityByQueueId} 필드 주석에 A/B 실측).
+     * 옛 주석의 "남은 미착수는 캐싱뿐"·"캐시를 붙일 때 답해야 할 것"은 그 시점에 거짓이 됐다.
      *
-     * <p>캐시를 붙일 때 답해야 할 것: {@code Queue}는 {@code status}가 가변이라
-     * TTL만큼 PAUSED 반영이 늦으면 <b>정지시킨 큐에 사람이 계속 들어온다.</b>
-     * {@code ownerByQueueId}(불변이라 무해)와 사정이 다르다.
+     * <p>🔑 <b>그 옛 경고의 주소는 여기가 아니라 요청 경로였다.</b> 경고는 "{@code status}가
+     * 가변이라 TTL만큼 PAUSED 반영이 늦으면 정지시킨 큐에 사람이 계속 들어온다"였는데,
+     * <b>드레인은 {@code status}를 읽지 않는다</b> — 용량 하나만 쓴다. 정지 판정은
+     * {@code QueueEngineService}가 요청마다 하고 그 경로는 캐시를 타지 않는다.
+     * 그래서 그 경고는 <b>요청 경로를 캐시하려는 사람</b>이 읽어야 하며, 결론은 그쪽에 적었다
+     * ({@code QueueEngineService.findQueueAndVerifyOwner}).
      */
     private long getMaxCapacity(String queueId) {
-        if (!capacityCacheEnabled) {
+        if (capacityCacheTtlMillis <= 0) {
             return loadMaxCapacity(queueId);
         }
         // computeIfAbsent를 쓰지 않는다 — 매핑 함수가 DB를 치는데, 그 안에서 예외가 나면
-        // 맵 락을 쥔 채 풀려나가고 미존재 큐마다 락 구간이 생긴다. 미스는 드물다(큐당 평생 1회).
-        Long cached = capacityByQueueId.get(queueId);
-        if (cached != null) {
-            return cached;
+        // 맵 락을 쥔 채 풀려나가고 미존재 큐마다 락 구간이 생긴다. 미스는 드물다(큐당 TTL 1회).
+        long now = System.currentTimeMillis();
+        CachedCapacity cached = capacityByQueueId.get(queueId);
+        if (cached != null && cached.expiresAtMillis() > now) {
+            return cached.value();
         }
         long loaded = loadMaxCapacity(queueId);
-        capacityByQueueId.put(queueId, loaded);
+        capacityByQueueId.put(queueId, new CachedCapacity(loaded, now + capacityCacheTtlMillis));
         return loaded;
     }
 

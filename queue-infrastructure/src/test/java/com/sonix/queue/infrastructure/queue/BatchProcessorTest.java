@@ -8,8 +8,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.web.context.WebServerGracefulShutdownLifecycle;
 
 import java.time.Instant;
@@ -50,7 +52,7 @@ public class BatchProcessorTest {
 
     @BeforeEach
     void setUp() {
-        batchProcessor = new BatchProcessor(queueEngine, queueRepository, false);
+        batchProcessor = new BatchProcessor(queueEngine, queueRepository, 0L);
     }
 
     /** 발급 시각 고정값. BatchProcessor가 Instant.now()로 만들어 넘기므로 stub은 any()로 받는다. */
@@ -324,7 +326,7 @@ public class BatchProcessorTest {
         // 이 단정이 지키는 것: 틱마다 큐 수만큼 DB를 치던 비용. 실측 A/B(큐 20개·2,000 rps)에서
         // 캐시를 끄면 p99가 40.02 → 73.95ms로 오르고 4판 전부 SLO(50ms)를 넘겼다.
         // 캐시가 조용히 무력화되면 그 회귀가 지연으로만 나타나고 아무 테스트도 빨개지지 않는다.
-        BatchProcessor cached = new BatchProcessor(queueEngine, queueRepository, true);
+        BatchProcessor cached = new BatchProcessor(queueEngine, queueRepository, 30_000L);
         when(queueRepository.findByQueueId("q_a"))
                 .thenReturn(Optional.of(mockQueue(100)));
         when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))
@@ -342,9 +344,83 @@ public class BatchProcessorTest {
     }
 
     @Test
+    @DisplayName("🔴 TTL이 지나면 다시 읽는다 — 장애 중 정원 확대가 반영되는 근거다")
+    void capacityCache_expiresAfterTtl() throws Exception {
+        // 이 단정이 없으면 만료가 조용히 죽어도 아무도 모른다. 그 결과가 나쁘다 —
+        // 운영 런북이 QUEUE_FULL 대응으로 `UPDATE queues SET max_capacity`를 지시하는데,
+        // 만료가 없으면 그 UPDATE가 무음으로 실패하고 회복 수단이 전 인스턴스 재기동뿐이다.
+        BatchProcessor shortTtl = new BatchProcessor(queueEngine, queueRepository, 1L);   // 1ms
+        when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.of(mockQueue(100)));
+        when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))
+                .thenReturn(List.of(List.of("OK", 1L, 1L)));
+
+        for (int tick = 0; tick < 2; tick++) {
+            ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+            global.offer(new PendingEnqueue("q_a", "u" + tick, "tok_u" + tick));
+            when(queueEngine.getGlobalQueue()).thenReturn(global);
+            shortTtl.processBatches();
+            Thread.sleep(5);            // TTL(1ms)보다 충분히 길다
+        }
+
+        verify(queueRepository, times(2)).findByQueueId("q_a");   // 만료됐으므로 두 번
+    }
+
+    @Test
+    @DisplayName("🔴 캐시 키는 queueId다 — 정원이 다른 큐가 서로의 값을 쓰지 않는다")
+    void capacityCache_isKeyedByQueueId() {
+        // 이 단정이 없으면 키가 무너져도(예: 상수 키) 통합 테스트가 통과한다 —
+        // 거기 큐들은 정원이 전부 같아서 첫 큐의 값을 나눠 써도 결과가 같기 때문이다(실측).
+        // 운영에서 정원이 다른 큐가 섞이면 과수용 또는 조기 429가 된다.
+        BatchProcessor cached = new BatchProcessor(queueEngine, queueRepository, 30_000L);
+        when(queueRepository.findByQueueId("q_small")).thenReturn(Optional.of(mockQueue(10)));
+        when(queueRepository.findByQueueId("q_big")).thenReturn(Optional.of(mockQueue(9_999)));
+        when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))
+                .thenReturn(List.of(List.of("OK", 1L, 1L)));
+
+        ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+        global.offer(new PendingEnqueue("q_small", "u1", "tok_u1"));
+        global.offer(new PendingEnqueue("q_big", "u2", "tok_u2"));
+        when(queueEngine.getGlobalQueue()).thenReturn(global);
+
+        cached.processBatches();
+
+        ArgumentCaptor<Long> caps = ArgumentCaptor.forClass(Long.class);
+        verify(queueEngine, times(2))
+                .executeBulkLua(anyString(), anyList(), caps.capture(), any(Instant.class));
+        assertThat(caps.getAllValues()).containsExactlyInAnyOrder(10L, 9_999L);
+    }
+
+    @Test
+    @DisplayName("🔴 프로퍼티가 없으면 캐시는 켜져 있다 — 기본값 자체를 잠근다")
+    void capacityCache_defaultsToEnabled() {
+        // 🔴 이것이 없으면 @Value의 :true 리터럴이 :false로 되돌아가도 전 스위트가 초록이다(실측).
+        //    모든 다른 테스트가 boolean을 명시해 넘기고, yml에도 이 키가 정의돼 있지 않아
+        //    운영 동작이 소스의 리터럴 하나에만 달려 있다. 회귀는 p99 40 → 74ms로만 나타난다.
+        new ApplicationContextRunner()
+                .withBean(RedisQueueEngine.class, () -> queueEngine)
+                .withBean(QueueRepository.class, () -> queueRepository)
+                .withUserConfiguration(BatchProcessor.class)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    BatchProcessor fromContext = context.getBean(BatchProcessor.class);
+
+                    when(queueRepository.findByQueueId("q_a")).thenReturn(Optional.of(mockQueue(100)));
+                    when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))
+                            .thenReturn(List.of(List.of("OK", 1L, 1L)));
+                    for (int tick = 0; tick < 2; tick++) {
+                        ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+                        global.offer(new PendingEnqueue("q_a", "u" + tick, "tok_u" + tick));
+                        when(queueEngine.getGlobalQueue()).thenReturn(global);
+                        fromContext.processBatches();
+                    }
+                    verify(queueRepository, times(1)).findByQueueId("q_a");
+                });
+    }
+
+    @Test
     @DisplayName("용량 캐시를 끄면 틱마다 DB를 친다 — 반사실")
     void capacityCacheOff_hitsDbEveryTick() {
-        BatchProcessor uncached = new BatchProcessor(queueEngine, queueRepository, false);
+        BatchProcessor uncached = new BatchProcessor(queueEngine, queueRepository, 0L);
         when(queueRepository.findByQueueId("q_a"))
                 .thenReturn(Optional.of(mockQueue(100)));
         when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))

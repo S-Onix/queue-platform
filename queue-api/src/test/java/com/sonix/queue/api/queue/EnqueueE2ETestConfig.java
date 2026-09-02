@@ -59,7 +59,7 @@ public class EnqueueE2ETestConfig {
 
     @Bean
     public BatchProcessor batchProcessor(RedisQueueEngine engine, QueueRepository queueRepository) {
-        return new BatchProcessor(engine, queueRepository, true);
+        return new BatchProcessor(engine, queueRepository, 30_000L);
     }
 
     @Bean
@@ -68,7 +68,7 @@ public class EnqueueE2ETestConfig {
         // TokenRepository는 admit/verify/complete 전용이다. 이 config는 enqueue 흐름(Redis)만
         // 태우므로 JPA 컨텍스트를 끌어오지 않는다 → null.
         return new QueueEngineService(queueRepository, null, engine, eventPublisher,
-                java.time.Clock.systemUTC(), 0L);
+                java.time.Clock.systemUTC());
     }
 
     /**

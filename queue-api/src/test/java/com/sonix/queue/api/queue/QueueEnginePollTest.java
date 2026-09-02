@@ -58,7 +58,7 @@ class QueueEnginePollTest {
 
     @BeforeEach
     void setUp() {
-        service = new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher, clock, 0L);
+        service = new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher, clock);
     }
 
     // ──────────────────────────────────────────────────────────────────────

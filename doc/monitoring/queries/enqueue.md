@@ -205,7 +205,9 @@ UPDATE queues SET status = <PAUSED> WHERE queue_id = 'q_xxx';
 -- 되돌리기
 UPDATE queues SET status = <ACTIVE> WHERE queue_id = 'q_xxx';
 
--- 정원 확대 (다음 배치 사이클부터 반영 — getMaxCapacity가 매 사이클 DB를 읽는다)
+-- 정원 확대 (최대 30초 뒤 반영 — 드레인이 용량을 캐시한다.
+--            queue.enqueue.capacity-cache-ttl-ms 기본 30000. 옛 주석의 "매 사이클 DB를 읽는다"는
+--            2026-09-02에 거짓이 됐다. 인스턴스마다 만료 시점이 달라 429가 점진적으로 준다)
 UPDATE queues SET max_capacity = <새값> WHERE queue_id = 'q_xxx';
 -- 되돌리기: 원래 값으로 같은 UPDATE
 ```

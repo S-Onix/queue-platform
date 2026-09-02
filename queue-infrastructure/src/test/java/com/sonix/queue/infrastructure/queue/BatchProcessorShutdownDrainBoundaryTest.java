@@ -49,7 +49,7 @@ class BatchProcessorShutdownDrainBoundaryTest {
 
     @BeforeEach
     void setUpProcessor() {
-        batchProcessor = new BatchProcessor(queueEngine, queueRepository, false);
+        batchProcessor = new BatchProcessor(queueEngine, queueRepository, 0L);
     }
 
     @Test
