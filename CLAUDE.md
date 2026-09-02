@@ -199,10 +199,11 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 **CI 레인이 둘이고 가르는 기준은 모듈이 아니라 `@Tag`다.**
 ```
-./gradlew test              전부 444건 (로컬 기본, skipped 4 = 벤치마크)
-./gradlew test -PunitOnly   274건 (CI 단위 레인) — mysql/redis 태그 제외
+./gradlew test              전부 448건 (로컬 기본, skipped 4 = 벤치마크)
+./gradlew test -PunitOnly   277건 (CI 단위 레인) — mysql/redis/kafka 태그 제외
 ```
-- 실 MySQL을 쓰면 `@Tag("mysql")`, 실 Redis Cluster를 쓰면 `@Tag("redis")`
+- 실 MySQL을 쓰면 `@Tag("mysql")`, 실 Redis Cluster를 쓰면 `@Tag("redis")`,
+  실 Kafka 브로커를 쓰면 `@Tag("kafka")`
 - `@WebMvcTest`처럼 목으로 막힌 것은 **붙이지 않는다**
 - 🪤 **안 붙이면 단위 레인에서 인프라 없이 돌다 깨지고, 잘못 붙이면 CI에서 조용히 사라진다.**
   모듈 단위로 가르면 안 되는 이유가 이것이다 — 실제로 384건 중 104건만 돌던 상태였다
