@@ -373,6 +373,23 @@ public class QueueEngineService {
 
     /**
      * queue 조회 + 소유권 검증 (관리용 QueueService와 동일 패턴).
+     *
+     * <p>🔴 <b>이 조회를 캐시하지 않는다 — {@code status}를 매번 봐야 하기 때문이다</b>
+     * (2026-09-03 확정). 스테일의 대가가 비대칭이다:
+     * <ul>
+     *   <li>{@code maxCapacity}가 늦으면 → 정원 확대가 늦게 반영된다. 되돌릴 수 있다</li>
+     *   <li><b>{@code status}가 늦으면 → 정지시킨 큐에 사람이 계속 들어온다.</b> 장애가 커진다</li>
+     * </ul>
+     * 그래서 드레인의 용량은 캐시하되({@code BatchProcessor.capacityByQueueId}) 이쪽은 안 한다.
+     * {@code BatchProcessor.getMaxCapacity}의 옛 주석이 경고하던 PAUSED 문제의 주소가 여기다.
+     *
+     * <p>⚠️ <b>그 결정의 대가:</b> 이 조회는 <b>요청당 1회 DB SELECT</b>로 고정된다.
+     * 2,000 rps면 초당 2,000회이고, 드레인이 캐시로 없앤 양(초당 1,000회)보다 크다.
+     * 줄이려면 캐시가 아니라 <b>{@code status}의 거처를 옮겨야</b> 한다(예: Redis) — 그건
+     * 캐시가 아니라 정본 이동이라 새 키·해시태그·전손 복구 규약이 따라온다. §4 확대 심사 대상.
+     *
+     * <p>🪤 그리고 이 부담이 실제 병목인지는 <b>미측정</b>이다. 드레인은 한 스레드가 직렬로 도는데
+     * 이 경로는 가상 스레드로 병렬이라, 같은 초당 횟수라도 영향이 같지 않다.
      */
     private Queue findQueueAndVerifyOwner(Long tenantId, String queueId) {
         Queue queue = queueRepository.findByQueueId(queueId)
@@ -441,6 +458,12 @@ public class QueueEngineService {
      * @throws BusinessException 큐에 enqueue 기록이 없으면 404 {@code QUEUE_NOT_FOUND}
      */
     public QueueBoard status(String queueId) {
+        // 🪤 응답 캐시를 넣었다가 <b>뺐다</b>(2026-09-03). 30만 명이 전원 같은 응답을 받으므로
+        //    캐시가 가능하고, 실측상 Redis MGET이 448배 줄었다(20,000 rps에서 598,528 → 1,337).
+        //    그런데 **Redis가 병목이 아니었다** — 캐시 없이도 20,000 rps에서 p99 18.25ms이고,
+        //    448배를 줄여도 p99는 20%만 좋아진다(지연의 대부분이 앱에 있다).
+        //    §4의 "안 만들면 무엇이 깨지나"에 답이 없어서 뺐다. 근거 실측은 FRS §13에 남아 있다.
+        //    목표 규모(마스터당 2큐 × 30만 ≈ 30,900 rps)를 재고 필요가 확인되면 그때 되살린다.
         return queueEngine.readStatus(queueId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.QUEUE_NOT_FOUND));
     }

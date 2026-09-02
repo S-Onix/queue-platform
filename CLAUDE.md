@@ -162,7 +162,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   - 현재 상수: `MAX_DRAIN=5000`, `CHUNK_SIZE=500`, **`drain-interval=20ms`**, 타임아웃 30s
   - ✅ **주기 재조정 완료 (2026-08-27, k6).** 1000ms → 20ms.
     **FRS 목표 부하 200 rps에서 p99 32.32ms**로 목표(<50ms) 충족(여유 17.7ms, 큐 40개).
-    2.5배(500 rps)까지 여유. **5배(1,000 rps)부터 초과**한다.
+    2.5배(500 rps)까지 여유. ~~5배(1,000 rps)부터 초과~~ **철회**(역순 재측정 — 순서의 산물이었다).
+    견고한 것은 **200·500 충족과 2,000 초과**뿐이다.
     🔴 **p99는 큐 수의 함수다** — 2,000 RPS에서 큐 10개 64.42ms · 20개 77.37ms · 43개 130.50ms.
     🪤 **순서를 뒤집어 재라** — 정순만 재면 워밍업을 부하로 착각한다(1,000rps 정순 75ms vs 역순 37ms).
     "몇 RPS에서 몇 ms"는 **큐 수 없이는 의미가 없다.** 근거는 `BatchProcessor` 주석
@@ -203,8 +204,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 **CI 레인이 둘이고 가르는 기준은 모듈이 아니라 `@Tag`다.**
 ```
-./gradlew test              전부 448건 (로컬 기본, skipped 4 = 벤치마크)
-./gradlew test -PunitOnly   277건 (CI 단위 레인) — mysql/redis/kafka 태그 제외
+./gradlew test              전부 453건 (로컬 기본, skipped 4 = 벤치마크)
+./gradlew test -PunitOnly   282건 (CI 단위 레인) — mysql/redis/kafka 태그 제외
 ```
 - 실 MySQL을 쓰면 `@Tag("mysql")`, 실 Redis Cluster를 쓰면 `@Tag("redis")`,
   실 Kafka 브로커를 쓰면 `@Tag("kafka")`

@@ -4,10 +4,10 @@ import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -39,8 +39,18 @@ class BatchProcessorShutdownDrainBoundaryTest {
     @Mock
     private QueueRepository queueRepository;
 
-    @InjectMocks
+    /**
+     * 🪤 {@code @InjectMocks}를 쓰지 않는다 — 생성자에 primitive {@code boolean}이 있어
+     * Mockito가 주입하지 못하고 클래스 전체가 {@code MockitoException}으로 죽는다(실측).
+     * 이 테스트가 재는 것은 종료 경로이므로 캐시는 <b>끈다</b> — 켜면 그룹마다 DB를 친다는
+     * 이 클래스의 전제가 바뀐다.
+     */
     private BatchProcessor batchProcessor;
+
+    @BeforeEach
+    void setUpProcessor() {
+        batchProcessor = new BatchProcessor(queueEngine, queueRepository, 0L);
+    }
 
     @Test
     @DisplayName("MAX_DRAIN(5000)을 넘는 잔여가 있어도 종료 drain은 반복 실행되어 전부 완결시킨다")

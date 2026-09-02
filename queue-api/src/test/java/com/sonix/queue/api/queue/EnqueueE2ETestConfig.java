@@ -59,7 +59,7 @@ public class EnqueueE2ETestConfig {
 
     @Bean
     public BatchProcessor batchProcessor(RedisQueueEngine engine, QueueRepository queueRepository) {
-        return new BatchProcessor(engine, queueRepository);
+        return new BatchProcessor(engine, queueRepository, 30_000L);
     }
 
     @Bean
