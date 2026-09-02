@@ -1293,9 +1293,11 @@ C. 대시보드 변수 수정
 > CLAUDE.md §4-3). 인증 필터의 `findByKeyHash()`는 파생 쿼리이고 호출부에 `@Transactional`이
 > 없어 readOnly 트랜잭션이 **열리지 않는다** → **master로 간다.** 복제가 아무리 밀려도 인증은
 > 안 흔들린다. 실제로 읽기의 99%가 master다.
-> 그래도 이 지표를 재는 이유는 replica가 **DR 자산**이기 때문이다 — 지연이 곧 유실 가능 구간이고,
-> 배치의 큐 목록(`findAll()`, ReconcileJob·TokenReclaimJob)은 실제로 replica에서 온다.
-> 새 큐가 복제 도착 전이면 **그 주기의 회수·대사에서 빠진다.** 그게 지금 실재하는 위험이다.
+> 그래도 이 지표를 재는 이유는 replica가 **DR 자산**이기 때문이다 — 지연이 곧 유실 가능 구간이다.
+> ✅ **앱 동작에 미치는 영향은 이제 0이다** (2026-09-02). 남아 있던 replica 읽기 둘
+> — 배치의 큐 목록(`findAll()`)과 Rate Limit의 테넌트 조회(`findById()`) — 을 파생 쿼리 선언으로
+> master에 붙였다(D-2·D-3). 그전까지는 새 큐가 복제 도착 전이면 그 주기의 회수·대사에서 빠졌다.
+> **지금 이 지표는 순수하게 DR 유실 구간만 뜻한다.**
 
 | | 값 |
 |---|---|
@@ -1340,7 +1342,7 @@ GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'localhost';
 | 대기열이 조용히 사라졌나? | `redis_evicted_keys_total`, `redis_memory_max_bytes` |
 | failover 발생? | `redis_instance_info{job="redis"}` 의 `role` 라벨 변화, `redis_sentinel_master_config_epoch` 증가 |
 | Sentinel quorum 성립? | `redis_sentinel_master_ckquorum_status` |
-| replica 지연 (→ 배치가 새 큐를 건너뜀 · DR 유실 구간) | `mysql_slave_status_seconds_behind_master` |
+| replica 지연 (**DR 유실 구간 전용** — 앱 읽기는 replica로 안 간다) | `mysql_slave_status_seconds_behind_master` |
 
 **미설치 — 안 깔았을 때 안 보이는 것을 답할 수 있을 때만 추가**:
 `node_exporter`(호스트 CPU/디스크), `kafka_exporter`(컨슈머 lag — 단, Spring Kafka가

@@ -35,7 +35,7 @@ Grafana(`http://localhost:3000`) → **Dashboards → New → Import → Upload 
 ### 3행 · 인프라
 
 - **타깃 up** — 앱 3대를 안 띄우면 `25/28`이 정상이다. 그보다 낮으면 exporter나 인프라가 죽은 것
-- **MySQL 복제 지연** — `@Transactional(readOnly)`가 Replica로 라우팅되므로 이 값이 커지면 **읽기가 낡은 데이터를 본다**
+- **MySQL 복제 지연** — 🔑 **앱 읽기는 Replica로 가지 않는다**(readOnly 트랜잭션 0곳, 상속 CRUD 둘도 2026-09-02에 master로). 이 값은 **DR 유실 구간**만 뜻한다 — 커져도 응답이 낡아지지는 않는다
 - **Hikari pending** — 0이 아니면 풀이 말랐다. verify가 Kafka를 기다리며 커넥션을 쥐던 문제(F-3)가 여기 보인다
 - **Redis 메모리** — `maxmemory 1gb` / `noeviction`이라 차오르면 **evict가 아니라 쓰기 실패**다
 
