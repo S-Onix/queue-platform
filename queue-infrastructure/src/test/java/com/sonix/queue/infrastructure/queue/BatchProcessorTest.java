@@ -4,10 +4,10 @@ import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.boot.web.context.WebServerGracefulShutdownLifecycle;
@@ -38,8 +38,20 @@ public class BatchProcessorTest {
     @Mock
     private QueueRepository queueRepository;
 
-    @InjectMocks
+    /**
+     * 🪤 {@code @InjectMocks}를 쓰지 않는다 — 생성자에 primitive {@code boolean}이 있어
+     * Mockito가 주입하지 못하고 클래스 전체가 {@code MockitoException}으로 죽는다(실측).
+     * 게다가 캐시 여부는 테스트가 <b>명시적으로 통제해야 하는 변수</b>다.
+     *
+     * <p>기본은 캐시 <b>끔</b>이다. 기존 단정 대부분이 "틱마다 용량을 조회한다"를 전제로
+     * 쓰여 있어, 켜면 그 전제가 조용히 바뀐다. 캐시 동작은 전용 테스트 둘이 따로 잠근다.
+     */
     private BatchProcessor batchProcessor;
+
+    @BeforeEach
+    void setUp() {
+        batchProcessor = new BatchProcessor(queueEngine, queueRepository, false);
+    }
 
     /** 발급 시각 고정값. BatchProcessor가 Instant.now()로 만들어 넘기므로 stub은 any()로 받는다. */
     private static final Instant T0 = Instant.parse("2026-08-04T00:00:00Z");
@@ -304,5 +316,47 @@ public class BatchProcessorTest {
                 com.sonix.queue.domain.queue.QueueStatus.ACTIVE,
                 java.time.LocalDateTime.now(), null
         );
+    }
+
+    @Test
+    @DisplayName("🔴 용량 캐시가 켜지면 같은 큐의 DB 조회는 틱을 넘겨도 1회뿐이다")
+    void capacityCache_hitsDbOncePerQueue() {
+        // 이 단정이 지키는 것: 틱마다 큐 수만큼 DB를 치던 비용. 실측 A/B(큐 20개·2,000 rps)에서
+        // 캐시를 끄면 p99가 40.02 → 73.95ms로 오르고 4판 전부 SLO(50ms)를 넘겼다.
+        // 캐시가 조용히 무력화되면 그 회귀가 지연으로만 나타나고 아무 테스트도 빨개지지 않는다.
+        BatchProcessor cached = new BatchProcessor(queueEngine, queueRepository, true);
+        when(queueRepository.findByQueueId("q_a"))
+                .thenReturn(Optional.of(mockQueue(100)));
+        when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))
+                .thenReturn(List.of(List.of("OK", 1L, 1L)));
+
+        for (int tick = 0; tick < 3; tick++) {
+            ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+            global.offer(new PendingEnqueue("q_a", "u" + tick, "tok_u" + tick));
+            when(queueEngine.getGlobalQueue()).thenReturn(global);
+            cached.processBatches();
+        }
+
+        verify(queueEngine, times(3)).executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class));
+        verify(queueRepository, times(1)).findByQueueId("q_a");   // ← 3틱인데 DB는 1회
+    }
+
+    @Test
+    @DisplayName("용량 캐시를 끄면 틱마다 DB를 친다 — 반사실")
+    void capacityCacheOff_hitsDbEveryTick() {
+        BatchProcessor uncached = new BatchProcessor(queueEngine, queueRepository, false);
+        when(queueRepository.findByQueueId("q_a"))
+                .thenReturn(Optional.of(mockQueue(100)));
+        when(queueEngine.executeBulkLua(anyString(), anyList(), anyLong(), any(Instant.class)))
+                .thenReturn(List.of(List.of("OK", 1L, 1L)));
+
+        for (int tick = 0; tick < 3; tick++) {
+            ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
+            global.offer(new PendingEnqueue("q_a", "u" + tick, "tok_u" + tick));
+            when(queueEngine.getGlobalQueue()).thenReturn(global);
+            uncached.processBatches();
+        }
+
+        verify(queueRepository, times(3)).findByQueueId("q_a");
     }
 }

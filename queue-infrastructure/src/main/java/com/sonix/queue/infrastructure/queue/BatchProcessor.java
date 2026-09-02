@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.context.WebServerGracefulShutdownLifecycle;
 import org.springframework.context.SmartLifecycle;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -16,6 +17,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 
@@ -82,6 +84,39 @@ public class BatchProcessor implements SmartLifecycle {
     private final QueueRepository queueRepository;
 
     /**
+     * 드레인의 {@code maxCapacity} 조회를 캐시할지. <b>기본 true.</b> 끄는 쪽에 플래그를 둔 것은
+     * 회귀를 의심할 때 반사실을 다시 재기 위해서다.
+     *
+     * <p><b>왜 켜는가 (2026-09-02 A/B 실측, 큐 20개 · 총 2,000 rps · 각 4판):</b>
+     * <pre>
+     *   OFF   p99  54.33 / 113.63 / 60.21 / 67.64 ms   평균 73.95   4판 전부 SLO(50ms) 초과
+     *   ON    p99  39.87 /  39.61 / 40.14 / 40.47 ms   평균 40.02   4판 전부 충족
+     * </pre>
+     * 🔑 <b>가장 큰 신호는 평균이 아니라 분산이다.</b> 판 간 폭이 <b>60ms → 0.9ms</b>로 붙었다.
+     * 틱마다 큐 수만큼 DB를 치는 것이 불안정성의 원인이었고, 없애자 값이 결정적으로 변했다.
+     *
+     * <p>비용의 정체: 틱 50회/s × 큐 N개 = <b>초당 50N SELECT</b>가 master로 간다. 큐 8개(400/s)는
+     * 견디는데 큐 20개(1,000/s)에서 무너진다 — 큐 8개 12판은 캐시 없이도 37~42ms였다.
+     *
+     * <p>🪤 <b>이 실측 덕에 안 만든 것이 둘이다</b>(§4): 큐 단위 병렬 드레인(구조 변경)과
+     * Redis 마스터 증설(인프라). 캐시 하나로 SLO를 지키므로 지금 둘 다 필요 없다.
+     */
+    private final boolean capacityCacheEnabled;
+
+    /**
+     * queueId → maxCapacity. 🔑 <b>이 값은 실질 불변이다</b> — {@code Queue.update()}는
+     * {@code name}만 바꾸고 용량을 바꾸는 API가 없다(전수 확인). 그래서 TTL도 무효화도 없다.
+     * 옆집 {@link RedisQueueEngine#ownerByQueueId}와 같은 부류다.
+     *
+     * <p>🔴 <b>용량 변경 경로를 만드는 사람에게</b>: 그 순간 이 맵이 거짓이 된다. 무효화를 같이
+     * 넣거나 이 캐시를 지워라. 안 그러면 정원이 바뀌어도 드레인은 옛 값으로 판정한다.
+     *
+     * <p>⚠️ {@code status}는 여기 없다. 드레인이 쓰는 것은 용량뿐이고, 정지 판정은 요청 경로의
+     * {@code Queue.isEnqueueable()}가 이미 한다 — 이 캐시는 그 판정을 늦추지 않는다.
+     */
+    private final Map<String, Long> capacityByQueueId = new ConcurrentHashMap<>();
+
+    /**
      * SmartLifecycle 실행 여부. 인스턴스 로컬 상태이며 <b>서버마다 값이 달라도 무해</b>하다 —
      * 종료는 인스턴스별로 독립적으로 일어나고, 이 값은 자기 프로세스의 종료 훅을 부를지만
      * 결정한다(분산 상태가 아님).
@@ -95,9 +130,12 @@ public class BatchProcessor implements SmartLifecycle {
      */
     private volatile Long drainDeadlineNanos = null;
 
-    public BatchProcessor(RedisQueueEngine queueEngine, QueueRepository queueRepository) {
+    public BatchProcessor(RedisQueueEngine queueEngine, QueueRepository queueRepository,
+                          @Value("${queue.enqueue.capacity-cache:true}") boolean capacityCacheEnabled) {
         this.queueEngine = queueEngine;
         this.queueRepository = queueRepository;
+        this.capacityCacheEnabled = capacityCacheEnabled;
+        log.info("enqueue drain: capacity-cache={}", capacityCacheEnabled);
     }
 
     @Override
@@ -505,6 +543,21 @@ public class BatchProcessor implements SmartLifecycle {
      * {@code ownerByQueueId}(불변이라 무해)와 사정이 다르다.
      */
     private long getMaxCapacity(String queueId) {
+        if (!capacityCacheEnabled) {
+            return loadMaxCapacity(queueId);
+        }
+        // computeIfAbsent를 쓰지 않는다 — 매핑 함수가 DB를 치는데, 그 안에서 예외가 나면
+        // 맵 락을 쥔 채 풀려나가고 미존재 큐마다 락 구간이 생긴다. 미스는 드물다(큐당 평생 1회).
+        Long cached = capacityByQueueId.get(queueId);
+        if (cached != null) {
+            return cached;
+        }
+        long loaded = loadMaxCapacity(queueId);
+        capacityByQueueId.put(queueId, loaded);
+        return loaded;
+    }
+
+    private long loadMaxCapacity(String queueId) {
         return queueRepository.findByQueueId(queueId)
                 .map(Queue::getMaxCapacity)
                 .orElseThrow(() -> new IllegalStateException(

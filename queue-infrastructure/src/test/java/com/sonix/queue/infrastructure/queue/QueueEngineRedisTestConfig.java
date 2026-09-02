@@ -53,7 +53,7 @@ public class QueueEngineRedisTestConfig {
 
     @Bean
     public BatchProcessor batchProcessor(RedisQueueEngine engine, QueueRepository queueRepository) {
-        return new BatchProcessor(engine, queueRepository);
+        return new BatchProcessor(engine, queueRepository, true);
     }
 
     @Bean

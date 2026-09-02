@@ -4,10 +4,10 @@ import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.QueueStatus;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.QueryTimeoutException;
@@ -49,8 +49,18 @@ class BatchProcessorShutdownWithSlowRedisTest {
     @Mock
     private QueueRepository queueRepository;
 
-    @InjectMocks
+    /**
+     * 🪤 {@code @InjectMocks}를 쓰지 않는다 — 생성자에 primitive {@code boolean}이 있어
+     * Mockito가 주입하지 못하고 클래스 전체가 {@code MockitoException}으로 죽는다(실측).
+     * 이 테스트가 재는 것은 종료 경로이므로 캐시는 <b>끈다</b> — 켜면 그룹마다 DB를 친다는
+     * 이 클래스의 전제가 바뀐다.
+     */
     private BatchProcessor batchProcessor;
+
+    @BeforeEach
+    void setUpProcessor() {
+        batchProcessor = new BatchProcessor(queueEngine, queueRepository, false);
+    }
 
     @Test
     @DisplayName("데드라인 직전에 시작된 Redis 커맨드가 commandTimeout(5s)까지 매달려도 stop()은 10초대에서 끝난다")
@@ -182,7 +192,7 @@ class BatchProcessorShutdownWithSlowRedisTest {
     private long measureStopWithSlowCapacityLookup(int groupCount) {
         RedisQueueEngine engine = org.mockito.Mockito.mock(RedisQueueEngine.class);
         QueueRepository repository = org.mockito.Mockito.mock(QueueRepository.class);
-        BatchProcessor processor = new BatchProcessor(engine, repository);
+        BatchProcessor processor = new BatchProcessor(engine, repository, true);
 
         ConcurrentLinkedQueue<PendingEnqueue> global = new ConcurrentLinkedQueue<>();
         List<PendingEnqueue> all = new ArrayList<>();
