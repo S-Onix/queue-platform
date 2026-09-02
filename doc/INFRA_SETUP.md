@@ -1075,9 +1075,11 @@ scrape_configs:
       - targets: ['localhost:8082']
         labels: { application: 'queue-consumer', env: 'local' }
 
-  # queue-batch(8081)는 actuator 의존성이 없어 /actuator/prometheus를 노출하지 않는다.
-  # job을 넣으면 항상 DOWN이므로 의존성 추가 후에 등록할 것 (Sprint 7 예정).
-  # reconciliation 스위퍼가 queue-batch에 들어가므로 batch actuator가 그 관측의 선행 조건이다.
+  # 🔧 옛 주석은 "queue-batch는 actuator 의존성이 없어 노출하지 않는다 / job을 넣으면 항상
+  #    DOWN이다"였는데 **3중으로 거짓**이었다(2026-09-02 정정) — 의존성이 있고(`6647ca5`),
+  #    노출되며, 실가동 Prometheus에 queue-batch job이 이미 등록돼 있다.
+  # ⚠️ 단 prod 프로필은 prometheus를 노출하지 않는다(경계가 없는 동안은 열지 않는다).
+  #    prod job을 추가할 때는 노출 재개가 선행이다 — 아니면 up=0으로 상시 firing이다.
 
   # redis_exporter 멀티타깃 — 프로세스 1개(9121)가 22개 노드를 커버 (§7-11)
   - job_name: 'redis'           # 6379, 6380, 6381        (Sentinel 구성 데이터 노드)

@@ -523,7 +523,7 @@ flowchart TD
 - [ ] TTL 만료 후 verify → **404**
 - [ ] complete가 `status = 0`(복귀 후)에도 성공한다 — 유효 창 안이면
 - [ ] 중복 complete 요청 → 1번만 성공 (조건부 UPDATE가 0행)
-- [ ] **`queue-batch`의 `/actuator/prometheus`가 200** (claim-Lua 계측의 전제)
+- [ ] **`queue-batch`의 `/actuator/prometheus`가 200 (**local·dev 프로필 한정** — prod는 노출하지 않는다, 2026-09-02)** (claim-Lua 계측의 전제)
 - [ ] Rich Domain 상태 전환 메서드로 비즈니스 로직 검증
 
 **착수 전 검증 2건 (§80):**
@@ -656,7 +656,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 
 **완료 기준 (DoD):**
 - [x] Batch Server 기동 후 `TokenReclaimJob` 10초 주기 실행 로그 확인 — 실측 `회수 admitTokenTTL=1건 inactiveTTL=0건 waitingTTL=4000건`
-- [ ] `queue-batch`의 `/actuator/prometheus`가 200을 반환 (위 1번 — reconciliation 지표의 전제)
+- [ ] `queue-batch`의 `/actuator/prometheus`가 200 (**local·dev 프로필 한정** — prod는 노출하지 않는다, 2026-09-02)을 반환 (위 1번 — reconciliation 지표의 전제)
 - [x] 회수 후 `waiting`·`tokens`·`last-active` **세 키에서 모두 빠진다** — `InactiveReclaimTest`가 실제 Redis로 단언(§82)
 - [ ] `zcard last-active` ≤ `zcard waiting` **부등식 자체**는 아직 안 잰다 — 위 테스트는 개별 키의 잔존 멤버만 단언한다
 - [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
