@@ -225,7 +225,7 @@ JWT 필요 · body 없음 · 응답 `data: null`
 | `identifier` | string | 요청한 값 그대로 |
 | **`tokenId`** | string | `tok_{UUIDv7}`. **폴링·complete에 필요하니 반드시 유저에게 전달** |
 | **`seq`** | long | 발급 순번. **폴링 쿼리에 필수** |
-| `rank` | long | 현재 대기 순위. **1-based** (첫 사람이 1) |
+| `rank` | long | 현재 대기 순위. **1-based** (첫 사람이 1). 🔴 **`-1`은 순번이 아니라 상태** — 아래 |
 | `total` | long | 현재 대기 인원 |
 | **`already`** | boolean | 🔑 **같은 `identifier`가 이미 줄 서 있었으면 `true`** |
 
@@ -234,7 +234,19 @@ JWT 필요 · body 없음 · 응답 `data: null`
 `HSETNX`다. 그래서 **새로고침해도 자리를 잃지 않는다** — 단, 같은 `identifier`를 써야 한다.
 (실측: 같은 identifier 3회 → 전부 200, tokenId·seq 동일, 2·3회차만 `already: true`)
 
-에러: `Q005`(429, 정원 초과) · `Q004`(503, PAUSED) · `QE001`(503, **재시도 가능**) · `Q001`
+🔴 **`already: true` + `rank: -1` = 이미 입장권이 나갔다** — 줄에 없다는 뜻이지 순번이 아니다.
+`admit`은 대기줄에서 빼면서 `tokens` Hash 게이트는 남기므로(그래야 재진입이 새 줄로 안 세어져
+중복 과금이 안 생긴다), 그 창에 재-enqueue가 오면 이 조합이 된다. 원인은 셋 — 입장 직후
+새로고침 / Tenant가 `admit` 응답 전달 실패 후 재시도 / 막 만료됐고 회수 배치(10초)가 아직 안 돎.
+그 `tokenId`로 폴링하면 앞 둘은 즉시 `ready: true` + `admitToken`, 마지막은 `TK001`(종료 신호)다.
+`getDisplayRank()`가 `-1`을 그대로 보존한다 — `rank + 1`을 하면 와이어에 **0**이 나가 존재하지
+않는 순번이 된다.
+
+⚠️ **정원(`maxCapacity`)이 차 있어도 이 응답이 나온다.** `Q005`는 **신규 진입자에게만** 준다 —
+이미 발급받은 사람은 정원과 무관하게 `already: true`다 (`enqueue_bulk.lua`의 FULL 분기가
+`HGET`으로 먼저 가른다).
+
+에러: `Q005`(429, 정원 초과 — **신규만**) · `Q004`(503, PAUSED) · `QE001`(503, **재시도 가능**) · `Q001`
 
 ### `GET /api/v1/queues/{queueId}/tokens/{tokenId}` — 폴링
 **인증 없음 (permitAll).** 유저 브라우저가 직접 부른다.
