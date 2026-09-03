@@ -64,7 +64,6 @@ class TenantServiceTest {
                 PASSWORD_HASH,
                 "Test Tenant",
                 TenantStatus.ACTIVE,
-                Plan.FREE,
                 LocalDateTime.now()
         );
 

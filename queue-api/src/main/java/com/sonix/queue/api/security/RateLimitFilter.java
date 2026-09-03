@@ -26,7 +26,7 @@ import java.util.Optional;
  *
  * <p>알고리즘별 적합한 상황에 따라 두 Rate Limiter 사용:
  * <ul>
- *   <li>인증 후 (Tenant Plan SLA): Token Bucket — burst 허용 (콘서트 티켓팅 등)</li>
+ *   <li>인증 후 (테넌트 단위): Token Bucket — burst 허용 (콘서트 티켓팅 등). 한도는 상수다(§88)</li>
  *   <li>인증 전 (보안): Fixed Window — burst 불허 (Brute Force 방지)</li>
  * </ul>
  *
@@ -37,7 +37,7 @@ import java.util.Optional;
  *   <li>{@link JwtAuthenticationFilter}가 이미 SecurityContext에 TenantAuth 저장</li>
  *   <li>이 Filter가 인증 여부 확인 후 키 + 알고리즘 결정
  *     <ul>
- *       <li>인증 후 (TenantAuth 있음): Token Bucket + Tenant Plan 한도</li>
+ *       <li>인증 후 (TenantAuth 있음): Token Bucket + 테넌트 한도(상수)</li>
  *       <li>인증 전 (signup/login/refresh): Fixed Window + 고정 한도</li>
  *     </ul>
  *   </li>
@@ -65,6 +65,26 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * ({@code QueueStatusResponse} 참조) — pacing 하한이나 지터 폭을 바꿀 때 이 값을 같이 봐라.
      */
     private static final double POLL_REFILL_PER_SEC = 1.0;
+
+    /**
+     * 테넌트 한도 — <b>모든 테넌트에 동일</b>. 예전 {@code Plan.ENTERPRISE}와 같은 값이라
+     * 등급제를 걷어내도(§88) <b>동작이 바뀌지 않는다</b>(전 테넌트가 이미 ENTERPRISE였다).
+     *
+     * <p>🔴 <b>이 값은 지금 방어 역할을 못 한다 — 재조정 대상이다.</b> 100,000/분 = 지속
+     * <b>1,667 rps</b>인데, FRS 실측의 플랫폼 수용량이 동시 오픈 8개 × 200 rps = <b>1,600 rps</b>다.
+     * 즉 <b>테넌트 하나의 한도가 플랫폼 전체 실측 수용량과 같다.</b> 독식을 막으라고 있는 값이
+     * 독식을 정확히 허용하는 크기다.
+     *
+     * <p>그래도 이번에 안 내린다 — <b>구조 변경(등급제 제거)과 값 재조정을 같은 커밋에 넣으면
+     * 무엇이 원인인지 못 가린다.</b> 값은 k6로 재서 별도로 정한다. 내릴 때 함께 볼 것:
+     * 이 버킷은 enqueue 전용이 아니라 <b>인증된 요청 전부</b>가 공유하므로(admit·complete 포함),
+     * 낮추면 진행 중인 이벤트의 <b>입장까지</b> 함께 조인다.
+     *
+     * <p>비율 {@code capacity = refill × 60}은 §62에서 온 것이고 그 근거는 유지된다 —
+     * 티켓팅은 오픈 1분 안에 몰리므로 1분치 burst를 허용한다.
+     */
+    static final int TENANT_CAPACITY = 100_000;
+    static final double TENANT_REFILL_PER_SEC = 1_666.67;
 
     private final RateLimiter tokenBucketRateLimiter;
     private final FixedWindowRateLimiter fixedWindowRateLimiter;
@@ -140,7 +160,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         // 🔴 예전엔 아래 3)의 else 가지에서만 걸었다. 그러면 **클라이언트가 한도를 고를 수 있다** —
         //    /login은 permitAll이라 남의(또는 자기) Access 토큰을 Authorization 헤더에 붙여도 그대로
         //    통과하고, JwtAuthenticationFilter가 컨텍스트를 채운 뒤라 3)이 "인증된 요청"으로 분기한다.
-        //    결과: brute force가 LOGIN(10/분/IP)이 아니라 **공격자 자신의 테넌트 버킷(FREE 100/분)**을
+        //    결과: brute force가 LOGIN(10/분/IP)이 아니라 **공격자 자신의 테넌트 버킷**을
         //    소비한다. 계정을 K개 만들면 버킷도 K개라 IP 기준 한도가 사실상 사라진다.
         //
         //    로그인 시도의 신원은 **body의 email**이지 헤더의 토큰이 아니다. 그러니 이 세 경로에서는
@@ -157,7 +177,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
 
         if (auth != null && auth.getPrincipal() instanceof TenantAuth tenantAuth) {
-            // 인증된 요청 → Token Bucket + Tenant Plan
+            // 인증된 요청 → Token Bucket (테넌트 단위, 한도는 상수)
             if (!checkAuthenticatedRateLimit(tenantAuth, response)) {
                 return;  // 429 응답으로 종료
             }
@@ -206,7 +226,16 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * 인증된 요청 — Token Bucket으로 Tenant Plan 한도 체크.
+     * 인증된 요청 — Token Bucket으로 테넌트 한도 체크.
+     *
+     * <p><b>한도는 모든 테넌트에 동일한 상수다.</b> 예전엔 {@code Plan} enum이 등급별로 값을
+     * 정했는데(§62), 그 등급제를 걷어냈다(§88). 근거는 아래 두 줄이다 —
+     * <b>과금은 plan을 읽지 않고</b>({@code billing_snapshots}에 컬럼이 없다. 청구는 token 개수다),
+     * plan을 읽는 코드가 <b>여기 하나뿐</b>이었다. 즉 등급제가 실제로 하던 일은
+     * "SaaS 약속"이 아니라 <b>테넌트 하나가 플랫폼을 독식하지 못하게 막는 방어</b> 하나였고,
+     * <b>방어는 등급이 아니라 상수여야 한다</b> — 차등을 두는 순간 그건 방어가 아니라 판매다.
+     * §87이 {@code maxCapacity} 상한을 "플랜별"이 아니라 상수로 둔 것과 같은 판단이다.
+     *
      * @return true=통과, false=거부 (429 응답 완료)
      */
     private boolean checkAuthenticatedRateLimit(
@@ -225,16 +254,13 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
         Tenant tenant = tenantOpt.get();
         String key = RateLimitKeys.tenant(tenant.getTenantId());
-        int capacity = tenant.getPlan().getCapacity();
-        double refillRate = tenant.getPlan().getRefillRatePerSecond();
 
-        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, capacity, refillRate);
+        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, TENANT_CAPACITY, TENANT_REFILL_PER_SEC);
 
         if (!allowed) {
-            log.debug("Token Bucket rate limit exceeded: key={}, plan={}",
-                    key, tenant.getPlan());
-            // Retry-After: refillRate 기반 (1 토큰 회복 시간)
-            long retryAfter = Math.max(1, (long) Math.ceil(1.0 / refillRate));
+            log.debug("Token Bucket rate limit exceeded: key={}", key);
+            // Retry-After: refill 기반 (1 토큰 회복 시간)
+            long retryAfter = Math.max(1, (long) Math.ceil(1.0 / TENANT_REFILL_PER_SEC));
             writeTooManyRequests(response, retryAfter);
             return false;
         }

@@ -13,7 +13,6 @@ public class Tenant {
     private String passwordHash;
     private String name;
     private TenantStatus status;
-    private Plan plan;
     private LocalDateTime createdAt;
 
     /**
@@ -28,10 +27,6 @@ public class Tenant {
         this.passwordHash = passwordHash;
         this.name = name;
         this.status = TenantStatus.ACTIVE;
-        // 기본 플랜은 ENTERPRISE다. 플랜 변경 API가 아직 없어(릴리스 게이트 12) FREE로 두면
-        // 신규 테넌트가 rl:tenant:{id} 버킷 100/분에 갇히고, 등급을 올릴 유일한 수단이 SQL이다.
-        // ⚠️ 이 버킷은 enqueue 전용이 아니라 **인증된 요청 전부**가 공유한다.
-        this.plan = Plan.ENTERPRISE;
         this.createdAt = LocalDateTime.now();
         this.tenantId = IdGenerator.generate("t_");
     }
@@ -48,7 +43,7 @@ public class Tenant {
      * */
     public static Tenant reconstruct(Long id, String tenantId, String email,
                                      String passwordHash, String name,
-                                     TenantStatus status, Plan plan,
+                                     TenantStatus status,
                                      LocalDateTime createdAt) {
         Tenant tenant = new Tenant();
         tenant.id = id;
@@ -57,7 +52,6 @@ public class Tenant {
         tenant.passwordHash = passwordHash;
         tenant.name = name;
         tenant.status = status;
-        tenant.plan = plan;
         tenant.createdAt = createdAt;
         return tenant;
     }
@@ -77,11 +71,6 @@ public class Tenant {
         if(this.status == TenantStatus.DEACTIVATED)
             throw new IllegalStateException("이미 비활성화된 Tenant 입니다.");
         this.status = TenantStatus.DEACTIVATED;
-    }
-
-    public void changePlan(Plan newPlan) {
-        if (newPlan == null) throw new IllegalArgumentException("Plan은 필수값입니다.");
-        this.plan = newPlan;
     }
 
 }

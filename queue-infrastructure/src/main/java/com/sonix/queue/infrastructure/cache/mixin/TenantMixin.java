@@ -2,7 +2,6 @@ package com.sonix.queue.infrastructure.cache.mixin;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.sonix.queue.domain.tenant.Plan;
 import com.sonix.queue.domain.tenant.Tenant;
 import com.sonix.queue.domain.tenant.TenantStatus;
 
@@ -32,7 +31,6 @@ public abstract class TenantMixin {
             @JsonProperty("passwordHash") String passwordHash,
             @JsonProperty("name") String name,
             @JsonProperty("status") TenantStatus status,
-            @JsonProperty("plan") Plan plan,
             @JsonProperty("createdAt") LocalDateTime createdAt
     ) {
         return null;  // 사용 안 됨, 시그니처만 중요

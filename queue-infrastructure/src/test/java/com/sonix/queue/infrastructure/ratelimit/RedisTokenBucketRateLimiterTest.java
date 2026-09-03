@@ -1,7 +1,6 @@
 package com.sonix.queue.infrastructure.ratelimit;
 
 import com.sonix.queue.domain.ratelimit.RateLimiter;
-import com.sonix.queue.domain.tenant.Plan;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -58,10 +57,8 @@ class RedisTokenBucketRateLimiterTest {
     void cleanUp() {
         List<String> keys = new ArrayList<>(List.of(
                 testKey, testKey + ":1", testKey + ":2",
-                testKey + ":poll", testKey + ":zero", testKey + ":tiny"));
-        for (Plan plan : Plan.values()) {
-            keys.add(testKey + ":plan:" + plan);
-        }
+                testKey + ":poll", testKey + ":zero", testKey + ":tiny",
+                testKey + ":tenant"));
         redisTemplate.delete(keys);
     }
 
@@ -115,11 +112,11 @@ class RedisTokenBucketRateLimiterTest {
     }
 
     @Test
-    @DisplayName("키 TTL은 full refill 시간 + 60초 — 폴링(cap5,refill1)=65s, Tenant Plan 전 등급=120s")
+    @DisplayName("키 TTL은 full refill 시간 + 60초 — 폴링(cap5,refill1)=65s, 테넌트(10만/1666.67)=120s")
     void ttlFollowsFullRefillTime() {
         // 3600 고정이던 시절엔 폴링 키가 토큰 하나당 1시간씩 남았다. 폴링 키는 대기 토큰 수만큼
         // 생기므로 이 상수가 곧 Redis 메모리 상한이다. 파라미터가 달라도 같은 스크립트를
-        // 폴링/Tenant Plan이 공유하므로, 두 호출자 값을 모두 여기서 못박는다.
+        // 폴링/테넌트 버킷이 공유하므로, 두 호출자 값을 모두 여기서 못박는다.
         RateLimiter limiter = new RedisTokenBucketRateLimiter(redisTemplate, tokenBucketScript);
 
         String pollKey = testKey + ":poll";
@@ -128,13 +125,16 @@ class RedisTokenBucketRateLimiterTest {
                 .as("폴링 버킷 TTL = ceil(5/1.0) + 60")
                 .isBetween(64L, 65L);                        // 1초 여유: TTL 조회까지의 경과분
 
-        for (Plan plan : Plan.values()) {
-            String planKey = testKey + ":plan:" + plan;
-            limiter.tryAcquire(planKey, plan.getCapacity(), plan.getRefillRatePerSecond());
-            assertThat(redisTemplate.getExpire(planKey))
-                    .as("%s TTL = ceil(%d/%s) + 60", plan, plan.getCapacity(), plan.getRefillRatePerSecond())
-                    .isBetween(119L, 120L);                  // Plan은 capacity = refill×60 비율 고정
-        }
+        // 🔑 이 값은 RateLimitFilter 상수의 **복사본이고 자동 동기화되지 않는다.**
+        //    queue-infrastructure는 queue-api를 모르므로(의존 방향) 상수를 참조할 수 없다.
+        //    🪤 그래서 상수가 바뀌어도 **여기는 안 빨개진다** — 잠그는 것은 값이 아니라
+        //    "cap = refill × 60이면 TTL이 120s"라는 스크립트 동작이다(§62 계약).
+        //    상수 자체의 비율은 queue-api의 TenantRateLimitConstantsTest가 잠근다.
+        String tenantKey = testKey + ":tenant";
+        limiter.tryAcquire(tenantKey, 100_000, 1_666.67);     // RateLimitFilter.TENANT_CAPACITY / TENANT_REFILL_PER_SEC
+        assertThat(redisTemplate.getExpire(tenantKey))
+                .as("테넌트 버킷 TTL = ceil(100000/1666.67) + 60")
+                .isBetween(119L, 120L);
     }
 
     @Test
@@ -145,7 +145,7 @@ class RedisTokenBucketRateLimiterTest {
         //   refill 0    → ceil(inf) → EXPIRE 인자 오류로 스크립트 중단.
         //                 HMSET은 이미 실행된 뒤라 TTL=-1(영구) 키가 남았다. 실제 확인함.
         //   refill 0.001 → TTL 100,060초(27.8시간). 줄이려던 메모리가 오히려 늘었다.
-        // 현재 호출자(폴링 1.0, Plan 1.67~1666.67)는 둘 다 안 밟지만, 포트 시그니처가
+        // 현재 호출자(폴링 1.0, 테넌트 1666.67)는 둘 다 안 밟지만, 포트 시그니처가
         // double을 그대로 받으므로 새 호출자가 언제든 밟을 수 있다.
         RateLimiter limiter = new RedisTokenBucketRateLimiter(redisTemplate, tokenBucketScript);
 

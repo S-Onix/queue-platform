@@ -29,14 +29,15 @@
 | 경로 | 알고리즘 | 키 | 한도 | 코드 |
 |---|---|---|---|---|
 | 폴링 `GET /queues/*/tokens/*` | Token Bucket | `rl:poll:token:{tokenId}` | **cap 5, refill 1.0/s** (하드코딩) | `RateLimitFilter.java:121-134` |
-| 인증 후 (X-API-Key / JWT) | Token Bucket | `rl:tenant:{tenantId}` | Tenant `Plan`의 capacity/refill | `:148-179` |
+| 인증 후 (X-API-Key / JWT) | Token Bucket | `rl:tenant:{tenantId}` | **상수** `TENANT_CAPACITY`/`TENANT_REFILL_PER_SEC` (전 테넌트 동일, §88) | `RateLimitFilter` |
 | 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip{ip}` | SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분 | `:185-219` |
 | `/actuator/**` | 적용 제외 | — | — | `:139-142` |
 
 거부 시 HTTP **429** + `Retry-After` + 본문 `{"error":"RL001",...}`.
 Redis 키 TTL: token-bucket은 **고정값이 아니라 한도에서 계산**된다(`token-bucket.lua`).
 `max(60, min(3600, ceil(capacity / refillRate) + 60))` — 버킷이 full refill되면 그 상태는 키가
-없을 때와 결과가 같으므로 그 시간만 버티면 된다. **폴링 65s, Tenant Plan 4종 전부 120s**(실측).
+없을 때와 결과가 같으므로 그 시간만 버티면 된다. **폴링 65s, 테넌트 120s**(실측).
+> ⚠️ 옛 판은 "Plan 4종 전부 120s"였다 — 등급제는 §88에서 폐기됐고 한도는 상수 하나다.
 상·하한은 호출자 인자 방어용이다(refill 0 → 3600, refill 음수 → 60).
 fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 
@@ -178,7 +179,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 
 ### [증상] Redis에 `rl:*` 키가 수백만 개 쌓였다
 
-- **먼저 의심할 것**: TTL은 정상적으로 걸려 있다(token-bucket **폴링 65s / Plan 120s**, fixed-window 윈도우+1s). 개수가 많다면 **실제로 그만큼의 고유 키가 만들어지고 있다**는 뜻 — 대부분 `rl:poll:token:{tokenId}`다(토큰마다 1개).
+- **먼저 의심할 것**: TTL은 정상적으로 걸려 있다(token-bucket **폴링 65s / 테넌트 120s**, fixed-window 윈도우+1s). 개수가 많다면 **실제로 그만큼의 고유 키가 만들어지고 있다**는 뜻 — 대부분 `rl:poll:token:{tokenId}`다(토큰마다 1개).
 - **1분 안에 확인**:
   ```bash
   redis-cli -c -p 7001 info keyspace     # db0 keys=N, expires=M

@@ -340,6 +340,8 @@ public class BatchProcessor implements SmartLifecycle {
      * 🪤 이 표는 <b>같은 환경 안의 상대 비교로만</b> 읽어라 — 위 유입별 표와 환경이 달라
      * 절대값을 섞으면 안 된다. (초기화까지 한 판이 따로 있으나 그 판은 {@code enq_429}가
      * 39.7%/7.3% 섞여 p99를 신뢰할 수 없어 쓰지 않았다. 원인은 {@code plan=FREE} —
+     * ✏️ <b>§88에서 등급제를 걷어내 이 원인은 재발할 수 없다</b>(한도가 전 테넌트 동일 상수다).
+     *    아래 서술은 <b>그 시점의 실측 이력</b>으로 읽어라.
      * ENTERPRISE 승격이 캐시 TTL 안에 반영되기 전에 부하가 시작된 하니스 산물이다.)
      * 틱당 그룹 수가 늘면 그룹마다 {@code getMaxCapacity}(DB) + {@code enqueue_bulk}(Lua)가 붙는다.
      * <b>그래서 "2,000 RPS에서 몇 ms"라는 문장은 큐 수 없이는 의미가 없다.</b>

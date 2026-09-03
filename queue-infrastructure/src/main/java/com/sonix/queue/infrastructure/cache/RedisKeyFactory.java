@@ -17,7 +17,7 @@ package com.sonix.queue.infrastructure.cache;
  *
  * <p>Sprint 5-D 캐시 대상:
  * <ul>
- *   <li>Tenant — Rate Limiter Plan 조회 부담 해소 (즉시 실효)</li>
+ *   <li>Tenant — Rate Limiter의 테넌트 조회 부담 해소 (버킷 키용 tenantId 문자열)</li>
  *   <li>Refresh Token — 재사용 감지 성능 향상</li>
  *   <li>ApiKey — Sprint 6 ApiKey 인증 도입 대비</li>
  * </ul>
