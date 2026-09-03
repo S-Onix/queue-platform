@@ -213,7 +213,7 @@ Redis (QueueKeys — §8 참조):
 | 파라미터 | 타입 | 필수 | 기본값 | 설명 |
 |----------|------|------|--------|------|
 | name | String | ✅ | - | 큐 이름 (Tenant 내 유일) |
-| maxCapacity | Int | ✅ | - | 대기열 최대 인원 |
+| maxCapacity | Int | ✅ | - | 대기열 최대 인원. **1 ~ 300,000** (§87) |
 | waitingTtl | Int(초) | ❌ | 7200 | 대기 중 절대 만료 시간 |
 | inactiveTtl | Int(초) | ❌ | 300 | 비활동 만료 시간 |
 
@@ -918,6 +918,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | `DUPLICATE_QUEUE_NAME` | `Q003` | 409 | 큐 이름 중복 |
 | `QUEUE_NOT_ACTIVE` | `Q004` | 503 | 큐 PAUSED / DRAINING |
 | `QUEUE_FULL` | `Q005` | 429 | maxCapacity 초과. **신규 진입자만 받는다** — 기존자는 EXISTS |
+| `QUEUE_LIMIT_EXCEEDED` | `Q006` | 409 | 테넌트당 큐 개수 상한(20) 초과 |
 | `QUEUE_ENGINE_UNAVAILABLE` | `QE001` | 503 | 대기열 처리 일시 오류 |
 | `DUPLICATE_EMAIL` | `T001` | 409 | 이메일 중복 |
 | `TENANT_NOT_FOUND` | `T002` | 404 | Tenant 없음 |
@@ -954,7 +955,7 @@ SDK가 없으므로 아래 제약은 **명세에 명시**한다. 순서를 지�
 > 검증하므로 verify를 건너뛴 호출도 정당하다. "Tenant 책임을 명세로 못박는다"는 원칙은 유지된다.
 
 > 📖 **Tenant가 읽어야 하는 문서는 [`TENANT_INTEGRATION.md`](TENANT_INTEGRATION.md)다.**
-> 통합 순서, 계약 6건(완료 호출 / 429 / 폴링 한도 / 세션 경계 / 창 비대칭 / 첫 폴링 예약), 흔한 실수가 거기 있다.
+> 통합 순서, 계약 7건(완료 호출 / 429 / 폴링 한도 / 세션 경계 / 창 비대칭 / 첫 폴링 예약 / **상한 둘**), 흔한 실수가 거기 있다.
 > 아래 표는 그 계약의 **요약**이다.
 
 | Tenant가 지켜야 할 것 | 위반 시 | Platform의 대응 |

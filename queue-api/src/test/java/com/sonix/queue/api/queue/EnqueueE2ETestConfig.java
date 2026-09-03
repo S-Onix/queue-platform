@@ -3,6 +3,7 @@ package com.sonix.queue.api.queue;
 import com.sonix.queue.domain.queue.EnqueueEventPublisher;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueRepository;
+import com.sonix.queue.domain.queue.QueueStatus;
 import com.sonix.queue.domain.tenant.Tenant;
 import com.sonix.queue.domain.tenant.TenantRepository;
 import com.sonix.queue.infrastructure.config.RedisConfig;
@@ -145,6 +146,11 @@ public class EnqueueE2ETestConfig {
             @Override public boolean existsByTenantIdAndName(Long tenantId, String name) {
                 return byQueueId.values().stream()
                         .anyMatch(q -> tenantId.equals(q.getTenantId()) && q.getName().equals(name));
+            }
+            @Override public int countActiveByTenantId(Long tenantId) {
+                return (int) byQueueId.values().stream()
+                        .filter(q -> tenantId.equals(q.getTenantId()) && q.getStatus() != QueueStatus.DELETED)
+                        .count();
             }
         };
     }

@@ -17,6 +17,7 @@ public enum ErrorCode {
     QUEUE_NOT_OWNED("Q002", "본인의 대기열이 아닙니다.", 403),
     QUEUE_NOT_ACTIVE("Q004", "현재 진입할 수 없는 대기열입니다", 503),
     QUEUE_FULL("Q005", "대기열이 가득 찼습니다", 429),
+    QUEUE_LIMIT_EXCEEDED("Q006", "테넌트당 생성 가능한 대기열 수를 초과했습니다.", 409),
     /**
      * 지금 상태에서 갈 수 없는 전이를 요청했다 (예: ACTIVE 큐에 바로 DELETE).
      *

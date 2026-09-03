@@ -429,6 +429,43 @@ class QueueLifecycleContractTest {
         }
     }
 
+    // ── ④ 테넌트당 큐 개수 상한이 세는 방식 ──────────────────────────────────
+
+    @Nested
+    @DisplayName("④ countActiveByTenantId")
+    class TenantQueueCount {
+
+        @Test
+        @DisplayName("DELETED 큐는 정원에 안 센다 — 지우고 다시 만드는 운용이 영구히 막히지 않는다")
+        void deletedQueue_isNotCounted() {
+            // 🔴 이 테스트가 없으면 어댑터 쪽 결함이 하나도 안 잡힌다(결함 주입으로 확인):
+            //    ① countByTenantIdAndStatusNot → countByTenantId 로 바꿔 DELETED를 포함시켜도 초록
+            //    ② 어댑터가 항상 0을 반환해도(= 상한이 프로덕션에서 무동작) 초록
+            //    QueueService 단위 테스트는 리포지토리를 목으로 끊어서 저 둘을 볼 수 없고,
+            //    QueueJpaAdapterTest도 JpaRepository가 목이라 파생 쿼리가 실제로 돌지 않는다.
+            //    여기가 `countByTenantIdAndStatusNot`가 실 MySQL에서 실행되는 유일한 지점이다
+            //    (이름 오타는 컨텍스트 기동에서 죽지만, 세는 기준이 틀린 것은 기동으로 안 잡힌다).
+            int before = queueRepository.countActiveByTenantId(tenantId);
+
+            saveQueue("cnt_active_1", QueueStatus.ACTIVE);
+            saveQueue("cnt_active_2", QueueStatus.ACTIVE);
+            saveQueue("cnt_deleted", QueueStatus.DELETED);
+
+            // 절대값이 아니라 증분으로 본다 — 이 클래스의 다른 테스트가 만든 큐가 같은 테넌트에
+            // 이미 있고, 실행 순서에 기대면 순서가 바뀌는 순간 깨진다.
+            assertThat(queueRepository.countActiveByTenantId(tenantId)).isEqualTo(before + 2);
+        }
+
+        private void saveQueue(String suffix, QueueStatus status) {
+            String queueId = NS + suffix + "_" + System.nanoTime();
+            queueRepository.save(Queue.reconstruct(
+                    null, queueId, tenantId, uniqueName(suffix),
+                    100, 7200, 300, status, LocalDateTime.now(),
+                    status == QueueStatus.DELETED ? LocalDateTime.now() : null));
+            createdQueueIds.add(queueId);
+        }
+    }
+
     // ── 헬퍼 ────────────────────────────────────────────────────────────────
 
     private RequestPostProcessor auth() {

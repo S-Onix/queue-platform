@@ -146,11 +146,23 @@ jobs:
       # 🔴 초록은 "돌았다"의 증거가 아니다.
       # 태그 설정이 깨지거나 누가 -PunitOnly를 흘려 넣으면 이 레인은 인프라를 다 띄워 놓고
       # 인프라 테스트를 0건 실행한 채 통과한다 — 정확히 이 레인이 막으려던 실패가 조용히 돌아온다.
-      # 그래서 대표 세 건(mysql·redis·kafka 태그 각 하나)이 실제로 실행됐는지 결과 XML로 못박는다.
+      # 그래서 대표 네 건(mysql·redis·kafka 태그 각 하나 + queue-api 한 건)이 실제로 실행됐는지
+      # 결과 XML로 못박는다.
+      #
+      # 🪤 **모듈을 섞어야 한다.** 앞 셋은 전부 queue-infrastructure다. 그것만으로도 전역 실패
+      #    모드(-PunitOnly 유입·태그 설정 붕괴)는 잡히지만 — 전 모듈에서 태그가 함께 빠지므로 —
+      #    **queue-api에만 국한된 누락은 못 잡는다.** 그 모듈은 로그로도 확인이 안 된다:
+      #    testLogging(events "passed")이 queue-infrastructure/build.gradle에만 있어 queue-api의
+      #    테스트 이름은 CI 로그에 한 줄도 안 찍힌다. 그래서 네 번째는 반드시 다른 모듈이어야 한다.
+      #
+      # 🪤 **@Nested는 바깥 클래스 이름으로 세면 안 된다.** JUnit이 중첩 클래스마다 XML을 따로 쓰고
+      #    바깥 클래스의 XML은 항상 tests="0"이다. 아래 find는 head -1이라 5개 중 아무거나 집으므로,
+      #    `QueueLifecycleContractTest`로 적으면 **깨지거나 운으로 통과한다**(실측: 0건을 집었다).
+      #    그래서 중첩 클래스를 직접 지목한다. 작은따옴표는 $가 셸에서 전개되지 않게 하려는 것이다.
       - name: 태그된 테스트가 실제로 돌았는지 확인
         run: |
           set -e
-          for t in TokenAdmitQueryIntegrationTest RedisQueueEngineRoutingTest KafkaSerdeContractTest; do
+          for t in TokenAdmitQueryIntegrationTest RedisQueueEngineRoutingTest KafkaSerdeContractTest 'QueueLifecycleContractTest$TenantQueueCount'; do
             f=$(find . -path '*/build/test-results/test/TEST-*'"$t"'.xml' | head -1)
             [ -n "$f" ] || { echo "$t 결과가 없다 — 인프라 테스트가 실행되지 않았다" >&2; exit 1; }
             n=$(grep -o 'tests="[0-9]*"' "$f" | head -1 | tr -dc 0-9)

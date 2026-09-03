@@ -12,6 +12,34 @@ import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class QueueService {
+
+    /**
+     * 테넌트당 큐 개수 상한 (2026-09-03 실측 확정).
+     *
+     * <p><b>막는 것은 성능이 아니라 Redis 마스터 용량이다.</b> 드레인 비용은 그 틱에 유입이 있는
+     * <b>활성</b> 큐의 함수라({@code BatchProcessor.groupByQueueId}) 유휴 큐는 0이고, DB도 큐
+     * 10,000개에서 목록 조회 7.75ms로 안 깨진다(실측). 즉 <b>개수 자체는 느려지지 않는다.</b>
+     *
+     * <p>깨지는 것은 이쪽이다 — {@code maxCapacity} 상한 30만은 <b>큐 하나만</b> 막고 마스터
+     * 합계를 아무도 안 막는다. 실측 477 B/명 기준 마스터({@code maxmemory} 4GB)는 약 900만 명이고
+     * §75 D27-3의 50% 임계는 450만 명 = 30만짜리 큐 <b>15개</b>다. 큐→마스터 분포는 균등하므로
+     * (해시태그 keyslot 1,000개 실측 25.1/25.0/24.9/25.0%) <b>전체 60개</b>면 한 마스터가 15개를
+     * 받아 임계가 무너지고, 120개면 OOM이다. 목표 전제는 마스터당 2개 = <b>전체 8개</b>다.
+     *
+     * <p>🔴 <b>그때 막아 세울 코드가 없다.</b> {@code RedisClusterAssigner.assign()}은 1 아니면 2를
+     * 반환할 뿐 <b>거절 경로가 없고</b>, cluster2가 꽉 차도 계속 cluster2로 보낸다(D29 단조 가드로
+     * 되돌아오지도 않는다). 종착점은 {@code noeviction}의 OOM이며, <b>실측으로 재현했다</b>:
+     * 같은 마스터에 놓인 다른 테넌트의 enqueue가 {@code OOM command not allowed}로 죽고
+     * <b>폴링(읽기)은 살아</b> 대기자는 "줄은 보이는데 못 들어가는" 상태가 된다.
+     * 즉 이 상한이 지키는 것은 자기 큐가 아니라 <b>같은 마스터에 sticky로 묶인 남의 큐</b>다.
+     *
+     * <p>값 20인 이유: 모든 테넌트가 한도를 꽉 채워도 3개 테넌트까지 50% 임계 안에 산다.
+     * 목표 전제(8개)의 2.5배 여유라 미래 이벤트를 미리 만들어 두는 운용을 막지 않는다.
+     * <b>올리는 것은 하위호환이고 내리는 것은 파괴적 변경</b>이라 "견딜 수 있는 최대"가 아니라
+     * "필요를 채우는 최소"에서 시작한다(§80 ⑦의 {@code count} 상한 100과 같은 기준).
+     */
+    static final int MAX_QUEUES_PER_TENANT = 20;
+
     private final QueueRepository queueRepository;
 
     public QueueService(QueueRepository queueRepository) {
@@ -23,6 +51,21 @@ public class QueueService {
         boolean isExist = queueRepository.existsByTenantIdAndName(tenantId, request.getName());
         if(isExist) {
             throw new BusinessException(ErrorCode.DUPLICATE_QUEUE_NAME);
+        }
+
+        // 🪤 동시 생성의 초과분 상계는 "한두 개"가 아니라 **동시 요청 수**다. COUNT와 INSERT가
+        // 원자적이 아닐 뿐 아니라, 이 메서드는 package-private이라 위의 @Transactional이 아예
+        // 안 걸린다(실측: AnnotationTransactionAttributeSource가 NULL을 준다 — 기본
+        // publicMethodsOnly=true). exists·count·save가 각각 다른 autocommit 커넥션에서 돈다.
+        // 큐 0개인 테넌트가 서로 다른 이름으로 50개를 동시에 쏘면 50개 전부 COUNT=0을 읽는다
+        // (이름 UNIQUE는 이름이 다르면 안 걸린다). IaC 병렬 생성이 그 형태다.
+        //
+        // 그래도 잠그지 않는다 — 임계가 60개인데 상한이 20이라 여유가 3배이고, 큐 생성은
+        // 초당 수십 번 부르는 경로가 아니다. "테넌트당 N행"은 DB 제약으로 표현할 수 없고
+        // (UNIQUE로 표현하려면 slot 컬럼·마이그레이션·재사용 로직이 붙는다), 분산 락은
+        // 콜드패스에 과하다. **막는 대상이 악의가 아니라 오타이므로 상계가 유계면 족하다.**
+        if (queueRepository.countActiveByTenantId(tenantId) >= MAX_QUEUES_PER_TENANT) {
+            throw new BusinessException(ErrorCode.QUEUE_LIMIT_EXCEEDED);
         }
 
         Queue queue = Queue.create(tenantId, request.getName(), request.getMaxCapacity(), request.getWaitingTtl(), request.getInactiveTtl());

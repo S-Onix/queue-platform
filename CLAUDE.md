@@ -98,6 +98,9 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  /status 분할 · admitWatermark · pacing 구간표                     (§79)
   구현됨  poll_verify의 keepalive 분기 삭제 — 폴링이 곧 생존 신호            (§82 F안)
   폐기    Cancel(DELETE /tokens/:id) — 이탈은 inactiveTtl 배치가 전담        (§82)
+  구현됨  큐 상한 둘 — maxCapacity 1~30만(@Max) · 테넌트당 큐 20개(Q006)     (§87)
+          🔑 막는 것은 성능이 아니라 Redis 마스터 용량이다. 실측 477 B/명이고,
+             상한이 없으면 같은 마스터의 **다른 테넌트** enqueue가 OOM으로 죽는다(재현)
   미착수  관측 메트릭 3종(queue_admit_*) — 좀비 탐지 수단이 아직 0          (§80 U9)
   폐기    RedisSyncJob + redis_sync_needed — 전제가 성립 불가 (2026-08-27, schema.sql 주석)
   미착수  JS SDK — 리더 탭(BroadcastChannel) 확정만 되고 코드 0             (§78)
@@ -604,8 +607,8 @@ mysql -u root -p -P 3307  # Replica
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
 | `doc/API.md` | ⭐ **엔드포인트 17개 필드 단위 명세** — 요청/응답/에러/인증. 코드에서 추출 |
-| `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 6건 + 흔한 실수 |
-| `doc/DECISIONS.md` | 84개 설계 결정 + 근거 + 면접 포인트 (최신 §84 — BillingSnapshotJob) |
+| `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 7건 + 흔한 실수 |
+| `doc/DECISIONS.md` | 87개 설계 결정 + 근거 + 면접 포인트 (최신 §87 — 큐 상한 둘: maxCapacity 30만 · 테넌트당 20개) |
 | `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (§79 분할은 **반영 완료**) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |
