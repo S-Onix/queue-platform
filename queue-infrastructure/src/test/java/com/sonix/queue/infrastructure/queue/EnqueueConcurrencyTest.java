@@ -1,12 +1,14 @@
 package com.sonix.queue.infrastructure.queue;
 
 import com.sonix.queue.domain.queue.EnqueueResult;
+import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.infrastructure.config.RedisConfig;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
@@ -154,6 +156,41 @@ public class EnqueueConcurrencyTest {
 
     static List<String> multiSlotQueueIds() {
         return QueueKeysSlotTest.QUEUE_IDS;
+    }
+
+    @Test
+    @DisplayName("정원이 차도 이미 줄에 선 사람은 FULL이 아니라 EXISTS다")
+    void full_existingWaiter_getsExists() {
+        // 🔴 이 단정이 없으면 "줄 맨 앞에서 기다리던 사람이 새로고침하면 마감 페이지를 본다"가
+        //    되돌아온다. FULL 판정이 중복 게이트(HSETNX)보다 앞이라 벌어졌던 일이고,
+        //    응답의 tokenId가 빈 문자열이라 폴링조차 못 하게 된다(계약 ③의 전제가 깨진다).
+        //    enqueue()는 큐의 실제 maxCapacity(10만)를 쓰므로 FULL을 만들 수 없다 —
+        //    그래서 BatchProcessor가 쓰는 것과 같은 executeBulkLua를 직접 부른다.
+        long capacity = 3;
+        List<PendingEnqueue> firstChunk = IntStream.range(0, 3)
+                .mapToObj(i -> new PendingEnqueue(TEST_QUEUE_ID, "seat_" + i, "tok_" + i))
+                .toList();
+        queueEngine.parseBulkResult(
+                queueEngine.executeBulkLua(TEST_QUEUE_ID, firstChunk, capacity, Instant.now()));
+
+        assertThat(redisTemplate.opsForZSet().size(QUEUE_KEY)).isEqualTo(capacity);
+
+        // 맨 앞 사람(seat_0)이 새로고침 + 처음 보는 사람(newcomer)이 같은 청크로 들어온다
+        List<PendingEnqueue> secondChunk = List.of(
+                new PendingEnqueue(TEST_QUEUE_ID, "seat_0", "tok_regenerated"),
+                new PendingEnqueue(TEST_QUEUE_ID, "newcomer", "tok_new"));
+        List<EnqueueResult> results = queueEngine.parseBulkResult(
+                queueEngine.executeBulkLua(TEST_QUEUE_ID, secondChunk, capacity, Instant.now()));
+
+        EnqueueResult refreshed = results.get(0);
+        assertThat(refreshed.getStatus()).isEqualTo(EnqueueResult.Status.EXISTS);
+        assertThat(refreshed.getRank()).isZero();                    // 자리를 그대로 지킨다
+        assertThat(refreshed.getTokenId()).isEqualTo("tok_0");       // 최초 tokenId여야 폴링이 된다
+
+        // 반대 방향도 잠근다 — 신규는 여전히 막히고, 게이트에 심기지도 않는다
+        assertThat(results.get(1).getStatus()).isEqualTo(EnqueueResult.Status.FULL);
+        assertThat(redisTemplate.opsForHash().hasKey(TOKEN_KEY, "newcomer")).isFalse();
+        assertThat(redisTemplate.opsForZSet().size(QUEUE_KEY)).isEqualTo(capacity);
     }
 
     @Test

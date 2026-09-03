@@ -31,7 +31,7 @@ flowchart TD
     SCHED["⑥ BatchProcessor (Consumer)\n@Scheduled drain-interval=20ms"]
     --> DRAIN["drain (최대 MAX_DRAIN=5000)\nqueueId별 groupBy"]
     --> CHUNK["CHUNK_SIZE=500씩 분할"]
-    --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\nKEYS[3]=queue:{queueId}:tokens\n(Hash Tag — 세 키가 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity? → FULL\n  INCR seq → score 발급\n  HSETNX tokens[identifier]='tokenId|issuedAt' → 신규? OK : EXISTS\n  (게이트는 이 Hash다 — waiting은 admit되면 빠진다)\n  신규면 ZADD waiting member=identifier score=seq\n  ZRANK → 순번(EXISTS인데 admit됐으면 -1)\n결과 array (입력과 동일 순서)"]
+    --> BULKLUA["⑦ enqueue_bulk.lua 실행\nKEYS[1]=queue:{queueId}:waiting\nKEYS[2]=queue:{queueId}:seq\nKEYS[3]=queue:{queueId}:tokens\n(Hash Tag — 세 키가 같은 slot 필수)\n\nfor i = 1..requestCount:\n  ZCARD ≥ maxCapacity?\n    → HGET tokens[identifier] 히트면 EXISTS (기존자는 정원과 무관)\n    → 미스면 FULL\n  INCR seq → score 발급\n  HSETNX tokens[identifier]='tokenId|issuedAt' → 신규? OK : EXISTS\n  (게이트는 이 Hash다 — waiting은 admit되면 빠진다)\n  신규면 ZADD waiting member=identifier score=seq\n  ZRANK → 순번(EXISTS인데 admit됐으면 -1)\n결과 array (입력과 동일 순서)"]
     --> COMPLETE["⑧ 위치(index)로 매칭하여\n각 future.complete(result)\n※ identifier는 중복 가능하므로 key로 쓰면 안 됨"]
 
     COMPLETE --> PUB["⑨ KafkaEnqueueEventPublisher.publish()\ntoken-lifecycle, key=tokenId (§73 D16)\n**동기** — 브로커 ack까지 최대 12s 대기\n실패 시 QE001(503) — 200이 안 나간다"]
