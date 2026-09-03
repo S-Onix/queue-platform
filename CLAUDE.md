@@ -607,7 +607,7 @@ mysql -u root -p -P 3307  # Replica
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
 | `doc/API.md` | ⭐ **엔드포인트 17개 필드 단위 명세** — 요청/응답/에러/인증. 코드에서 추출 |
-| `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 6건 + 흔한 실수 |
+| `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 7건 + 흔한 실수 |
 | `doc/DECISIONS.md` | 87개 설계 결정 + 근거 + 면접 포인트 (최신 §87 — 큐 상한 둘: maxCapacity 30만 · 테넌트당 20개) |
 | `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (§79 분할은 **반영 완료**) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
