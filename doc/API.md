@@ -88,6 +88,7 @@ GET  /actuator/{health,info,prometheus}
 | `Q003` | 409 | 이미 존재하는 대기열 이름 |
 | `Q004` | 503 | 현재 진입할 수 없는 대기열 (PAUSED 등) |
 | `Q005` | 429 | 대기열이 가득 참 (`maxCapacity` 초과) |
+| `Q006` | 409 | 테넌트당 큐 개수 상한(20) 초과 |
 | `QE006` | 409 | 현재 상태에서 수행할 수 없는 작업 |
 | `QE001` | 503 | 대기열 처리 중 일시적 오류 — **재시도하라** |
 | `TK001` | 404 | 대기 토큰을 찾을 수 없음 |
@@ -181,7 +182,7 @@ JWT 필요 · body 없음 · 응답 `data: null`
 | 필드 | 타입 | 필수 | 제약 |
 |---|---|---|---|
 | `name` | string | ✅ | `@NotBlank` |
-| `maxCapacity` | int | ✅ | **최소 1**. 초과 enqueue는 `Q005`(429) |
+| `maxCapacity` | int | ✅ | **1 ~ 300,000**. 범위 밖은 400. 초과 enqueue는 `Q005`(429) |
 | `waitingTtl` | Integer | ⬜ | 최소 1 **(초)** |
 | `inactiveTtl` | Integer | ⬜ | 최소 1 **(초)** |
 
@@ -202,6 +203,7 @@ JWT 필요 · body 없음 · 응답 `data: null`
 | `DELETE` | `/api/v1/queues/{queueId}` | 없음 | |
 
 에러 공통: `Q001`(없음) · `Q002`(남의 큐) · `QE006`(상태 위반)
+생성 전용: `Q003`(이름 중복) · `Q006`(테넌트당 큐 20개 상한. DELETED는 안 센다)
 
 ---
 

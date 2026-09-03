@@ -110,6 +110,50 @@ class QueueControllerTest {
                 .andExpect(status().isConflict());
     }
 
+    @Test
+    @DisplayName("POST /queues → 400 maxCapacity 상한(300000) 초과")
+    void createQueue_maxCapacity_over_limit() throws Exception {
+        mockMvc.perform(
+                        post("/api/v1/queues")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"name\":\"이벤트 대기열\",\"maxCapacity\":300001}")
+                )
+                .andExpect(status().isBadRequest());
+
+        // 서비스까지 안 갔는지 — @Max가 안 걸리면 여기가 호출된다
+        verify(queueService, never()).createQueue(anyLong(), any(QueueCreateRequest.class));
+    }
+
+    @Test
+    @DisplayName("POST /queues → 200 maxCapacity 경계값(300000)은 통과")
+    void createQueue_maxCapacity_at_limit() throws Exception {
+        // given — 경계가 <= 인지 < 인지를 잠근다. 상한값 자체가 막히면 문서와 어긋난다.
+        when(queueService.createQueue(anyLong(), any(QueueCreateRequest.class)))
+                .thenReturn(mockResponse());
+
+        mockMvc.perform(
+                        post("/api/v1/queues")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"name\":\"이벤트 대기열\",\"maxCapacity\":300000}")
+                )
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("POST /queues → 409 테넌트당 큐 개수 상한 초과(Q006)")
+    void createQueue_tenant_queue_limit() throws Exception {
+        when(queueService.createQueue(anyLong(), any(QueueCreateRequest.class)))
+                .thenThrow(new BusinessException(ErrorCode.QUEUE_LIMIT_EXCEEDED));
+
+        mockMvc.perform(
+                        post("/api/v1/queues")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content("{\"name\":\"이벤트 대기열\",\"maxCapacity\":100000}")
+                )
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorResponse.code").value("Q006"));
+    }
+
     // ── 조회 ──
 
     @Test

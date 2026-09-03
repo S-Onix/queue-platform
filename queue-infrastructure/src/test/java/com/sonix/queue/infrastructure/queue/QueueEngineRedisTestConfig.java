@@ -73,6 +73,7 @@ public class QueueEngineRedisTestConfig {
             @Override public List<Queue> findAllByTenantId(Long tenantId) { return List.of(); }
             @Override public List<Queue> findAll() { return List.of(); }
             @Override public boolean existsByTenantIdAndName(Long tenantId, String name) { return false; }
+            @Override public int countActiveByTenantId(Long tenantId) { return 0; }
         };
     }
 }

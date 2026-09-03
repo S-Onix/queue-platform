@@ -41,6 +41,26 @@ public interface QueueJpaRepository extends JpaRepository<QueueEntity, Long> {
     boolean existsByTenantIdAndName(Long tenantId, String name);
 
     /**
+     * 테넌트가 보유한 큐 수 (DELETED 제외). 큐 생성 상한 판정용.
+     *
+     * <p><b>master로 간다.</b> 여기서는 그게 필수다 — 방금 만든 큐가 복제 도착 전이면 상한을
+     * 넘겨서 통과한다.
+     *
+     * <p>🪤 <b>근거를 "선언한 파생 쿼리라서"로 적지 마라.</b> §4-3의 판정 기준은
+     * <b>"readOnly 트랜잭션이 열렸는가"</b> 하나다. 여기서 안 열리는 실제 이유는 호출자
+     * {@code QueueService.createQueue}가 <b>package-private이라 그 메서드의
+     * {@code @Transactional}이 아예 안 걸리기 때문</b>이다(실측:
+     * {@code AnnotationTransactionAttributeSource}가 NULL을 준다 — 기본
+     * {@code publicMethodsOnly=true}). 걸렸더라도 {@code readOnly}가 아니라 master였겠지만,
+     * <b>이 COUNT를 {@code readOnly=true} 메서드에서 재사용하는 순간 replica로 가고
+     * 복제 지연 안에 만든 큐가 안 세어져 상한이 조용히 뚫린다.</b> 아무 테스트도 안 빨개진다.
+     *
+     * <p>인덱스는 {@code idx_queues_tenant_status(tenant_id, status)}가 그대로 커버한다
+     * (2026-09-03까지 이 인덱스를 쓰는 쿼리가 0건이었다 — 이게 첫 소비자다).
+     */
+    int countByTenantIdAndStatusNot(Long tenantId, int status);
+
+    /**
      * 큐의 Redis 클러스터 배정 조회 (§75).
      *
      * <p>Redis에 아직 키가 없는 큐(생성 후 첫 enqueue)의 목적지를 정할 때만 쓴다.

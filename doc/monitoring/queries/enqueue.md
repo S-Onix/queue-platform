@@ -212,6 +212,13 @@ UPDATE queues SET max_capacity = <새값> WHERE queue_id = 'q_xxx';
 -- 되돌리기: 원래 값으로 같은 UPDATE
 ```
 
+> 🔴 **이 UPDATE는 API 상한(`maxCapacity` ≤ 300,000)을 우회한다** (§87). 상한은 `QueueCreateRequest`의
+> Bean Validation이라 DB 직접 수정에는 걸리지 않는다. 여기서 30만을 넘기면 그 값을 드레인 용량
+> 캐시가 30초 안에 읽어가고 Lua 가드가 그 값에서 열린다 — 큐 하나가 마스터를 채우면 **같은
+> 마스터에 사는 다른 테넌트의 enqueue가 OOM으로 죽는다**(실측). 넘길 거면 그 큐가 어느 마스터에
+> 있는지와 그 노드의 `used_memory`를 먼저 봐라. 대기자 1명당 **477 B**다.
+
+
 status 코드 값은 `doc/STATE.md` 참조.
 
 ```bash

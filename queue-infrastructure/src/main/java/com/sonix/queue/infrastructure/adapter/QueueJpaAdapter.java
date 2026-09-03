@@ -1,6 +1,7 @@
 package com.sonix.queue.infrastructure.adapter;
 
 import com.sonix.queue.domain.queue.Queue;
+import com.sonix.queue.domain.queue.QueueStatus;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.infrastructure.entity.QueueEntity;
 import com.sonix.queue.infrastructure.queue.RedisClusterAssigner;
@@ -76,5 +77,10 @@ public class QueueJpaAdapter implements QueueRepository {
     @Override
     public boolean existsByTenantIdAndName(Long tenantId, String name) {
         return queueJpaRepository.existsByTenantIdAndName(tenantId, name);
+    }
+
+    @Override
+    public int countActiveByTenantId(Long tenantId) {
+        return queueJpaRepository.countByTenantIdAndStatusNot(tenantId, QueueStatus.DELETED.getStatusCode());
     }
 }

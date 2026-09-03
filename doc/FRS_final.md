@@ -213,7 +213,7 @@ Redis (QueueKeys — §8 참조):
 | 파라미터 | 타입 | 필수 | 기본값 | 설명 |
 |----------|------|------|--------|------|
 | name | String | ✅ | - | 큐 이름 (Tenant 내 유일) |
-| maxCapacity | Int | ✅ | - | 대기열 최대 인원 |
+| maxCapacity | Int | ✅ | - | 대기열 최대 인원. **1 ~ 300,000** (§87) |
 | waitingTtl | Int(초) | ❌ | 7200 | 대기 중 절대 만료 시간 |
 | inactiveTtl | Int(초) | ❌ | 300 | 비활동 만료 시간 |
 
@@ -918,6 +918,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | `DUPLICATE_QUEUE_NAME` | `Q003` | 409 | 큐 이름 중복 |
 | `QUEUE_NOT_ACTIVE` | `Q004` | 503 | 큐 PAUSED / DRAINING |
 | `QUEUE_FULL` | `Q005` | 429 | maxCapacity 초과. **신규 진입자만 받는다** — 기존자는 EXISTS |
+| `QUEUE_LIMIT_EXCEEDED` | `Q006` | 409 | 테넌트당 큐 개수 상한(20) 초과 |
 | `QUEUE_ENGINE_UNAVAILABLE` | `QE001` | 503 | 대기열 처리 일시 오류 |
 | `DUPLICATE_EMAIL` | `T001` | 409 | 이메일 중복 |
 | `TENANT_NOT_FOUND` | `T002` | 404 | Tenant 없음 |

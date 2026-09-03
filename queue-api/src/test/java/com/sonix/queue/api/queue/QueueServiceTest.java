@@ -4,6 +4,7 @@ import com.sonix.queue.api.queue.dto.QueueCreateRequest;
 import com.sonix.queue.api.queue.dto.QueueResponse;
 import com.sonix.queue.api.queue.dto.QueueUpdateRequest;
 import com.sonix.queue.common.exception.BusinessException;
+import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.QueueStatus;
@@ -50,6 +51,50 @@ class QueueServiceTest {
         assertEquals("이벤트 대기열", response.getName());
         assertEquals(100000, response.getMaxCapacity());
         assertEquals(QueueStatus.ACTIVE, response.getStatus());
+        verify(queueRepository).save(any(Queue.class));
+    }
+
+    @Test
+    @DisplayName("Queue 생성 - 테넌트당 상한 도달 시 Q006")
+    void createQueue_tenant_limit_exceeded() {
+        // given
+        QueueCreateRequest request = new QueueCreateRequest();
+        request.setName("21번째 대기열");
+        request.setMaxCapacity(100000);
+
+        when(queueRepository.existsByTenantIdAndName(1L, "21번째 대기열")).thenReturn(false);
+        // 🔑 상수를 참조하면 상수 자체가 안 잠긴다 — MAX_QUEUES_PER_TENANT를 999999로 바꿔도
+        //    스텁이 함께 999999가 되어 초록이었다(결함 주입으로 확인). 그래서 리터럴 20이다.
+        //    이 값은 DECISIONS §87과 doc/API.md가 단정하는 숫자다. 바꾸려면 여기도 같이 고쳐라.
+        when(queueRepository.countActiveByTenantId(1L)).thenReturn(20);
+
+        // when
+        BusinessException e = assertThrows(BusinessException.class,
+                () -> queueService.createQueue(1L, request));
+
+        // then
+        assertEquals(ErrorCode.QUEUE_LIMIT_EXCEEDED, e.getErrorCode());
+        verify(queueRepository, never()).save(any(Queue.class));
+    }
+
+    @Test
+    @DisplayName("Queue 생성 - 상한 직전(19개)은 통과한다")
+    void createQueue_just_below_limit() {
+        // given
+        QueueCreateRequest request = new QueueCreateRequest();
+        request.setName("20번째 대기열");
+        request.setMaxCapacity(100000);
+
+        when(queueRepository.existsByTenantIdAndName(1L, "20번째 대기열")).thenReturn(false);
+        when(queueRepository.countActiveByTenantId(1L)).thenReturn(19);  // 리터럴 — 위 주석 참조
+        when(queueRepository.save(any(Queue.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        // when
+        QueueResponse response = queueService.createQueue(1L, request);
+
+        // then — 경계가 >= 인지 > 인지를 잠근다. > 로 잘못 쓰면 21개가 만들어진다.
+        assertNotNull(response);
         verify(queueRepository).save(any(Queue.class));
     }
 
