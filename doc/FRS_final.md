@@ -255,7 +255,10 @@ Body: { identifier: string }        ← UUIDv7. 생성·전달 주체는 Tenant 
 4. 요청을 Global Queue에 적재 → BatchProcessor가 주기적으로 drain (FLOW.md Enqueue 참조)
 5. enqueue_bulk.lua 원자 실행 — KEYS 3개 (같은 해시태그)
    queue:{queueId}:waiting / queue:{queueId}:seq / queue:{queueId}:tokens
-   항목마다: ZCARD ≥ maxCapacity → FULL
+   항목마다: ZCARD ≥ maxCapacity → HGET tokens[identifier] 히트면 EXISTS, 미스면 FULL
+             (🔴 정원이 차도 **이미 발급받은 사람은 FULL이 아니다** — 새로고침·재시도로 같은
+              identifier가 다시 오는 것은 정상 경로이고, FULL을 주면 줄 맨 앞에서 기다리던
+              사람에게 마감 페이지가 뜬다. 응답 tokenId가 빈 문자열이라 폴링도 못 한다)
              INCR seq → score 발급 (§70 D9)
              HSETNX tokens[identifier] = "tokenId|issuedAt" → 신규 OK / 기존 EXISTS
                ← **중복 판정의 원장은 이 Hash다** (waiting ZSet이 아니다).
@@ -914,7 +917,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | `QUEUE_NOT_OWNED` | `Q002` | 403 | 본인 큐 아님 |
 | `DUPLICATE_QUEUE_NAME` | `Q003` | 409 | 큐 이름 중복 |
 | `QUEUE_NOT_ACTIVE` | `Q004` | 503 | 큐 PAUSED / DRAINING |
-| `QUEUE_FULL` | `Q005` | 429 | maxCapacity 초과 |
+| `QUEUE_FULL` | `Q005` | 429 | maxCapacity 초과. **신규 진입자만 받는다** — 기존자는 EXISTS |
 | `QUEUE_ENGINE_UNAVAILABLE` | `QE001` | 503 | 대기열 처리 일시 오류 |
 | `DUPLICATE_EMAIL` | `T001` | 409 | 이메일 중복 |
 | `TENANT_NOT_FOUND` | `T002` | 404 | Tenant 없음 |
