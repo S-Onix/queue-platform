@@ -15,6 +15,11 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import org.springframework.transaction.annotation.AnnotationTransactionAttributeSource;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAttribute;
+
+import java.lang.reflect.Method;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -28,6 +33,50 @@ class QueueServiceTest {
 
     @InjectMocks
     private QueueService queueService;
+
+    /**
+     * 🔴 이 단정이 없으면 누군가 {@code createQueue}에 {@code @Transactional}을 되붙였을 때
+     * <b>아무 일도 안 일어난 채 초록</b>이다 — package-private이라 Spring이 무시하기 때문이다.
+     * 그러면 다음 사람이 "트랜잭션이 있다"고 읽고 그 위에 가정을 쌓는다(§87에서 실제로 그랬다).
+     * 반대 방향도 함께 잠근다: 형제 셋은 public이고 트랜잭션이 <b>걸려야</b> 한다.
+     */
+    @Test
+    @DisplayName("createQueue에는 트랜잭션이 걸리지 않는다 (형제 셋은 걸린다)")
+    void createQueue_hasNoTransaction_siblingsDo() {
+        AnnotationTransactionAttributeSource source = new AnnotationTransactionAttributeSource();
+
+        // ① 효력: 트랜잭션이 실제로 안 걸린다.
+        //    이것만으로는 부족하다 — package-private이면 애노테이션을 되붙여도 여전히 NULL이라
+        //    이 단정은 통과한다(결함 주입으로 확인했다). 잡히는 건 "public + @Transactional"뿐이고,
+        //    그게 Redis INFO 왕복을 DB 트랜잭션 안으로 끌어들이는 위험한 조합이다.
+        assertNull(txAttrOf(source, "createQueue"),
+                "createQueue에 트랜잭션이 걸렸다. public으로 바뀌었다면 되돌려라 — "
+                        + "RedisClusterAssigner.assign()의 INFO 왕복이 DB 트랜잭션 안으로 들어온다 "
+                        + "(QueueService 주석 참조)");
+
+        // ② 표기: 애노테이션 자체가 없어야 한다.
+        //    달려 있는데 무시되는 상태가 지뢰다 — 다음 사람이 "트랜잭션이 있다"고 읽는다.
+        assertFalse(methodOf("createQueue").isAnnotationPresent(Transactional.class),
+                "createQueue에 @Transactional이 다시 붙었다. package-private이라 무시되므로 "
+                        + "동작은 그대로지만, 달려 있는 것 자체가 다음 사람을 속인다 (§87)");
+
+        for (String name : new String[]{"updateQueue", "pauseQueue", "deleteQueue"}) {
+            assertNotNull(txAttrOf(source, name), name + "에는 트랜잭션이 걸려야 한다");
+        }
+    }
+
+    private static TransactionAttribute txAttrOf(AnnotationTransactionAttributeSource source, String name) {
+        return source.getTransactionAttribute(methodOf(name), QueueService.class);
+    }
+
+    private static Method methodOf(String name) {
+        for (Method m : QueueService.class.getDeclaredMethods()) {
+            if (m.getName().equals(name)) {
+                return m;
+            }
+        }
+        throw new AssertionError("메서드를 찾지 못했다: " + name);
+    }
 
     // ── 생성 ──
 

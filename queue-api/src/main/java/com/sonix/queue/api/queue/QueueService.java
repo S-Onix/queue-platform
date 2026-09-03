@@ -46,7 +46,36 @@ public class QueueService {
         this.queueRepository = queueRepository;
     }
 
-    @Transactional
+    /**
+     * 🔴 <b>{@code @Transactional}을 붙이지 않는다 — 붙여도 안 걸리고, 걸려도 사줄 것이 없다.</b>
+     *
+     * <p>여기엔 {@code @Transactional}이 달려 있었지만 <b>한 번도 동작한 적이 없다.</b> 이 메서드만
+     * package-private인데({@code QueueController}가 같은 패키지라 의도된 캡슐화다), 프록시 기반
+     * 트랜잭션은 {@code AnnotationTransactionAttributeSource}의 기본
+     * {@code publicMethodsOnly = true} 때문에 <b>non-public 메서드의 애노테이션을 무시한다.</b>
+     * 실측으로 확인했다 — 이 메서드만 {@code getTransactionAttribute}가 {@code null}이고
+     * {@code updateQueue}·{@code pauseQueue}·{@code deleteQueue} 셋은
+     * {@code PROPAGATION_REQUIRED}가 나온다. <b>즉 이 제거는 런타임 동작을 바꾸지 않는다.</b>
+     *
+     * <p><b>그러면 public으로 바꿔 살리면 되지 않나 — 아니다. 셋 다 손해다.</b>
+     * <ul>
+     *   <li><b>원자성을 못 산다.</b> 이 메서드의 쓰기는 {@code save} <b>하나뿐</b>이다.
+     *       단일 쓰기에 트랜잭션을 감싸도 롤백할 대상이 없다</li>
+     *   <li><b>경쟁도 못 막는다.</b> 격리 수준은 {@code REPEATABLE-READ}(실측)이고 평범한
+     *       {@code SELECT COUNT}는 <b>비잠금 스냅샷 읽기</b>라 갭 락을 잡지 않는다. 동시 생성이
+     *       상한을 넘기는 것은 트랜잭션 유무와 무관하다</li>
+     *   <li>🔴 <b>Redis I/O가 DB 트랜잭션 안으로 들어온다.</b> {@code QueueJpaAdapter.save}는
+     *       <b>신규 큐일 때만</b> {@code RedisClusterAssigner.assign()}을 부르고(§75), 그건
+     *       master 노드 수만큼 {@code INFO memory} 왕복을 낸다. 지금은 그 왕복이 DB 커넥션을
+     *       잡지 않는데, 트랜잭션을 살리면 잡게 된다 — 이 레포가 다른 곳에서 일부러 피해온
+     *       형태다({@code QueueEngineService.admit}에 트랜잭션을 안 붙인 이유와 같다)</li>
+     * </ul>
+     *
+     * <p>🪤 <b>남겨두는 쪽이 더 위험하다.</b> 달려 있으면 다음 사람이 "트랜잭션이 있다"고 읽고
+     * 그 위에 가정을 쌓는다. 실제로 {@code QueueJpaRepository.countByTenantIdAndStatusNot}의
+     * 라우팅 근거가 이것 때문에 한 번 틀리게 적혔다(§87) — <b>결론은 master로 같았지만
+     * 근거가 우연이었다.</b>
+     */
     QueueResponse createQueue(Long tenantId, QueueCreateRequest request) {
         boolean isExist = queueRepository.existsByTenantIdAndName(tenantId, request.getName());
         if(isExist) {
@@ -54,9 +83,9 @@ public class QueueService {
         }
 
         // 🪤 동시 생성의 초과분 상계는 "한두 개"가 아니라 **동시 요청 수**다. COUNT와 INSERT가
-        // 원자적이 아닐 뿐 아니라, 이 메서드는 package-private이라 위의 @Transactional이 아예
-        // 안 걸린다(실측: AnnotationTransactionAttributeSource가 NULL을 준다 — 기본
-        // publicMethodsOnly=true). exists·count·save가 각각 다른 autocommit 커넥션에서 돈다.
+        // 원자적이 아닐 뿐 아니라 **이 메서드에는 트랜잭션이 없다**(위 javadoc 참조 — 붙여도
+        // 안 걸리고 걸려도 사줄 것이 없어서 뗐다). exists·count·save가 각각 다른 autocommit
+        // 커넥션에서 돈다.
         // 큐 0개인 테넌트가 서로 다른 이름으로 50개를 동시에 쏘면 50개 전부 COUNT=0을 읽는다
         // (이름 UNIQUE는 이름이 다르면 안 걸린다). IaC 병렬 생성이 그 형태다.
         //
