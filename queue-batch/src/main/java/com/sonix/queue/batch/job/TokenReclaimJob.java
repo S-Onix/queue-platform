@@ -30,37 +30,26 @@ import java.util.concurrent.atomic.AtomicLong;
  *       {@code last-active}에 멤버가 없어 inactive sweep이 영영 못 본다</li>
  * </ol>
  *
- * <p><b>한 잡에 셋을 넣는다.</b> 잡을 나누면 {@code queueRepository.findAll()}이 주기마다
- * 그만큼 더 돈다 — batch 3대면 큐 수 × 18회/분이다. 같은 루프에서 {@code EVAL} 세 번이 싸다.
+ * <p><b>회수는 {@code tokens} Hash 필드를 지우는 일이다.</b> 그 필드가
+ * {@code enqueue_bulk.lua}의 {@code HSETNX} 중복 게이트이고 지우는 경로가
+ * {@code cleanupCompleted} 하나뿐이라, 안 지우면 그 사람은 재-enqueue에서
+ * {@code EXISTS}(rank -1)를 받아 <b>영구 락아웃</b>된다. 회수해도 대기열로 <b>되돌리지 않는다</b>(§36).
  *
- * <p>Tenant가 admit으로 뽑아갔지만 60초 안에 입장시키지 못한 사람을 정리한다.
- * <b>🔴 대기열로 되돌리지 않는다 (§36).</b> Platform은 만료 원인(유저 이탈 / 네트워크 / Tenant
- * 지연 / 폴링 수령 지연)을 구분할 수단이 없고, 그 중 유일한 Platform 귀책분(폴링 수령 지연)은
- * 실측상 이미 60초 예산 안이다 — 최악 20초, 소요는 10초 미만. 봐줄 근거가 사라졌으므로 판정하지
- * 않고 그대로 끝낸다.
- *
- * <p><b>이 잡의 존재 이유는 이제 {@code tokens} Hash 필드를 지우는 것이다.</b> 그 필드가
- * {@code enqueue_bulk.lua}의 {@code HSETNX} 중복 게이트이고, 지우는 경로가
- * {@code cleanupCompleted} 하나뿐이라 만료자는 아무도 치워주지 않는다. 안 지우면 그 사람은
- * 재-enqueue에서 {@code EXISTS}(rank -1)를 받아 <b>영구 락아웃</b>된다.
+ * <p><b>한 잡에 셋을 넣는다.</b> 나누면 {@code queueRepository.findAll()}이 주기마다 그만큼 더
+ * 돈다 — batch 3대면 큐 수 × 18회/분이다. 같은 루프에서 {@code EVAL} 세 번이 싸다.
  *
  * <p><b>🔴 ShedLock도 분산 락도 쓰지 않는다 — {@code EVAL} 자체가 claim이다 (§80 ⑧).</b>
- * {@code ZRANGEBYSCORE 0 now} + {@code ZREM}이 {@code admit_expire.lua} 한 스크립트 안에 있어
- * Redis 단일 스레드가 둘을 쪼개지 않는다. queue-batch가 3대여도 멤버를 가져가는 것은 한 대뿐이고
- * 나머지는 빈 목록을 받는다. 중복 실행의 대가는 낭비된 {@code EVAL} 한 번이지 중복 회수가 아니다.
- * 동시성 사다리에서 <b>2단(Redis 원자 연산)이 5단(분산 락)을 이긴다</b> — {@code CLAUDE.md}
- * "{@code @Scheduled} 단독 금지, leader election 필요"의 <b>명시적 예외</b>이며 근거는
- * {@code doc/CONCURRENCY.md} 매트릭스에도 같은 행으로 있다.
- * 리더 선출을 얹으면 락 획득·갱신·만료라는 실패 모드만 새로 생기고 얻는 것이 없다.
+ * {@code ZRANGEBYSCORE} + {@code ZREM}이 한 스크립트 안이라 Redis 단일 스레드가 쪼개지 않는다.
+ * batch가 3대여도 멤버를 가져가는 것은 한 대뿐이고, 중복 실행의 대가는 낭비된 {@code EVAL}
+ * 한 번이지 중복 회수가 아니다. {@code CLAUDE.md}의 "{@code @Scheduled} 단독 금지"에 대한
+ * <b>명시적 예외</b>이며 같은 행이 {@code doc/CONCURRENCY.md} 매트릭스에도 있다.
  *
- * <p><b>큐 목록은 DB에서 읽는다.</b> Cluster에서 {@code SCAN queue:*:admitted}는 접속한 노드만
- * 훑으므로 다른 마스터에 사는 큐가 <b>조용히</b> 누락된다 — 누락된 토큰은 아무 에러도 없이
- * 영원히 회수되지 못한다 — 그 사람은 재-enqueue도 막힌 채 남는다 (§80 ⑧).
+ * <p><b>큐 목록은 DB에서 읽는다.</b> Cluster에서 {@code SCAN queue:*}은 접속한 노드만 훑으므로
+ * 다른 마스터에 사는 큐가 <b>조용히</b> 누락되고, 그 토큰은 에러 없이 영원히 회수되지 못한 채
+ * 재-enqueue도 막힌다 (§80 ⑧).
  *
- * <p><b>{@code last-active}는 건드리지 않는다</b>(§80 확정). §36으로 복귀가 사라져 리셋 논점
- * 자체가 없어졌지만, 이 잡이 만료자의 {@code last-active}를 지우지도 않는다 — 그 사람은
- * {@code waiting}에 없으므로 {@code inactiveTtl} sweep(§82)의 대상이 아니고, 남은 멤버는
- * 회수 배치가 정리한다.
+ * <p><b>{@code last-active}는 건드리지 않는다</b>(§80). 만료자는 {@code waiting}에 없어
+ * {@code inactiveTtl} sweep(§82) 대상이 아니고, 남은 멤버는 회수 배치가 정리한다.
  */
 @Slf4j
 @Component
@@ -98,12 +87,11 @@ public class TokenReclaimJob {
      * 직전에 로그로 남긴 좀비 수. <b>값이 바뀔 때만</b> 찍기 위한 것이다.
      *
      * <p>고아는 정리 로직이 없어 <b>스스로 회복되지 않는다</b> — 조건이 참인 동안 10초마다,
-     * batch 3대면 하루 2만 줄이 쌓인다. 바로 아래 {@code reclaim}이 0건 회수를 안 찍는 이유와
-     * 같은 사고이고(로드 테스트 로그 98%가 한 줄이었던 전례), 조사해야 할 순간에 다른 큐의 단서가
-     * 이 줄에 덮인다. <b>추이는 gauge가 갖고 로그는 전이만 기록한다.</b>
+     * batch 3대면 하루 2만 줄이 쌓여 다른 큐의 단서를 덮는다.
+     * <b>추이는 gauge가 갖고 로그는 전이만 기록한다.</b>
      *
-     * <p>인스턴스 지역 상태다 — 분산 상태가 아니라 이 JVM의 로그 중복 억제일 뿐이라
-     * {@code CLAUDE.md}의 "static/메모리 상태 금지"(분산 가정 훼손) 대상이 아니다.
+     * <p>분산 상태가 아니라 이 JVM의 로그 중복 억제일 뿐이라 {@code CLAUDE.md}의
+     * "static/메모리 상태 금지"(분산 가정 훼손) 대상이 아니다.
      */
     private long lastLoggedOrphans;
 
@@ -172,16 +160,13 @@ public class TokenReclaimJob {
      * {@code waiting} 맨 앞에서 {@code tokens} Hash 항목이 <b>없는</b> 사람을 센다는 것이다 —
      * {@code admit.lua}가 되돌려 놓는 조건 그대로다.
      *
-     * <p><b>정리 로직을 붙이지 않는 이유</b>: 정상 경로({@code ZREM waiting} → {@code HDEL tokens}
-     * 순서)에서는 고아가 생기지 않는다. Redis 부분 유실·eviction에서만 생기므로 <b>실제로 생기는지
-     * 아직 모른다.</b> 관측되지 않은 것에 삭제 코드를 먼저 쓰지 않는다.
+     * <p><b>정리 로직을 붙이지 않는다</b>: 정상 경로({@code ZREM waiting} → {@code HDEL tokens})
+     * 에서는 고아가 생기지 않고, Redis 부분 유실·eviction에서만 생기므로 실제로 생기는지 아직
+     * 모른다. 큐 이름은 <b>로그로만</b> 남긴다 — gauge에 태그를 달면 큐 수만큼 시계열이 늘어난다.
      *
-     * <p>큐 이름은 <b>로그로만</b> 남긴다. gauge에 queueId 태그를 달면 큐 수만큼 시계열이 늘어난다.
-     *
-     * <p>⚠️ <b>예외를 삼키면 그 큐는 정확히 0으로 집계된다.</b> 즉 한 클러스터가 죽으면 총합이
-     * 조용히 <b>내려가</b> 더 건강해 보인다("못 찾으면 통과"). 이 메서드가 보장하는 것은
-     * <b>나머지 큐의 관측이 계속된다</b>는 것뿐이고, 실패 자체의 단서는 아래 에러 로그가 유일하다.
-     * 실패 카운터를 따로 만들지 않는 것은 batch의 {@code up} 알람이 먼저 울려야 할 사안이기 때문이다.
+     * <p>⚠️ <b>예외를 삼키면 그 큐는 0으로 집계된다.</b> 한 클러스터가 죽으면 총합이 조용히
+     * <b>내려가</b> 더 건강해 보인다. 실패의 단서는 아래 에러 로그가 유일하고, 실패 카운터를
+     * 안 만드는 것은 batch의 {@code up} 알람이 먼저 울릴 사안이기 때문이다.
      */
     private long countOrphans(Queue queue) {
         try {
@@ -321,15 +306,13 @@ public class TokenReclaimJob {
      * {@link EnqueueEvent}의 타입별 null 규약 표 그대로다. 여기서 옛 admitToken을 실어 보내면
      * 이미 무효가 된 값이 DB에 되살아난다.
      *
-     * <p><b>발행 실패를 삼킨다.</b> Redis는 이미 커밋됐다 — 회수 대상이 키에서 빠졌고
-     * {@code tokens} 필드도 지워졌다. 되돌릴 수단이 없으므로 재시도해봐야 상태가 나아지지 않는다
-     * (admit의 Kafka 발행과 같은 비대칭, §80 Consequences ③).
+     * <p><b>발행 실패를 삼킨다.</b> Redis는 이미 커밋됐고(키에서 빠졌고 {@code tokens} 필드도
+     * 지워졌다) 되돌릴 수단이 없어 재시도해도 상태가 나아지지 않는다 (§80 Consequences ③).
      *
-     * <p><b>🔴 그러나 삼킴의 대가도 경로마다 다르다.</b> admit 만료분은 위 표대로 발행에 성공해도
-     * 결과가 같아 <b>피해가 없다</b>. inactive 회수분은 다르다 — 발행이 유실되면 Redis 세 키에서는
-     * 사라졌는데 DB는 <b>영원히 {@code WAITING(0)}</b>으로 남고, Redis에 흔적이 없어
-     * <b>reconciliation이 대조할 원본조차 없다</b>. 삼키는 선택은 유지하되(되돌릴 수단이 없다)
-     * 이 갭은 Sprint 9 reconciliation의 몫이며 <b>지금은 에러 로그가 유일한 단서</b>다.
+     * <p><b>🔴 대가는 경로마다 다르다.</b> admit 만료분은 위 표대로 no-op이라 피해가 없지만,
+     * inactive·waitingTtl 회수분은 발행이 유실되면 Redis에서 사라진 채 DB가 영원히
+     * {@code WAITING(0)}으로 남고 <b>reconciliation이 대조할 원본조차 없다</b>.
+     * <b>지금은 에러 로그가 유일한 단서</b>다.
      */
     private void publishExpired(Queue queue, ExpiredReason reason, ReclaimedToken expired) {
         if (!expired.publishable()) {

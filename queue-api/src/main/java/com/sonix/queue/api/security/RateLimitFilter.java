@@ -24,26 +24,16 @@ import java.util.Optional;
 /**
  * Rate Limit Filter.
  *
- * <p>알고리즘별 적합한 상황에 따라 두 Rate Limiter 사용:
+ * <p>알고리즘을 상황별로 나눈다 (§60·§61).
  * <ul>
- *   <li>인증 후 (테넌트 단위): Token Bucket — burst 허용 (콘서트 티켓팅 등). 한도는 상수다(§88)</li>
- *   <li>인증 전 (보안): Fixed Window — burst 불허 (Brute Force 방지)</li>
+ *   <li>인증 후(테넌트 단위): Token Bucket — burst 허용(티켓팅). 한도는 전 테넌트 상수(§88)</li>
+ *   <li>인증 전(signup/login/refresh): Fixed Window + IP — burst 불허(brute force 방지)</li>
+ *   <li>폴링: Token Bucket + tokenId. 인증이 없어 <b>선처리</b>한다</li>
  * </ul>
  *
- * *** 반드시 JwtAuthenticationFilter 실행 이후 RateLimitFilter가 실행되야함
- *
- * <p>요청 흐름:
- * <ol>
- *   <li>{@link JwtAuthenticationFilter}가 이미 SecurityContext에 TenantAuth 저장</li>
- *   <li>이 Filter가 인증 여부 확인 후 키 + 알고리즘 결정
- *     <ul>
- *       <li>인증 후 (TenantAuth 있음): Token Bucket + 테넌트 한도(상수)</li>
- *       <li>인증 전 (signup/login/refresh): Fixed Window + 고정 한도</li>
- *     </ul>
- *   </li>
- *   <li>해당 Limiter 호출 → 한도 초과면 429 응답 + {@code Retry-After} 헤더</li>
- * </ol>
- * */
+ * <p>🔴 <b>반드시 {@link JwtAuthenticationFilter} 뒤에 실행돼야 한다</b> — 인증 여부로 키와
+ * 알고리즘을 고르기 때문이다. 한도 초과는 429 + {@code Retry-After}로 여기서 끝낸다.
+ */
 @Component
 @Log4j2
 public class RateLimitFilter extends OncePerRequestFilter {
@@ -54,15 +44,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /**
      * 폴링 버킷 회복 속도.
      *
-     * <p>0.5/s였을 때 pacing 최저 구간 2초와 소비 속도가 정확히 같아, 앞줄(rank≤50) 사용자는
-     * 여유가 0이었다. 시계 오차나 재시도 한 번이 곧바로 429가 됐다.
-     * 1.0/s면 2초 간격 폴링이 토큰 1개를 쓰고 2개를 회복해 버킷이 늘 차 있다.
+     * <p>0.5/s는 pacing 최저 구간(2초)과 소비 속도가 정확히 같아 앞줄 사용자의 여유가 0이었다 —
+     * 시계 오차나 재시도 한 번이 곧바로 429였다. 1.0/s면 2초 간격이 1개를 쓰고 2개를 회복한다.
      *
-     * <p>⚠️ <b>이 한도는 pacing 최저 구간(2초)과 클라이언트 지터에 매여 있다</b> (§79).
-     * 지터가 아래로도 흩어지면 실효 간격이 2초 밑으로 내려간다 — {@code /status}는 이 필터를
-     * 지나가지 않으므로 여기서 소비되는 것은 개인 엔드포인트 호출뿐이고, 그래서 -20%(1.6초)까지는
-     * 0.625/s로 여유가 남는다. 다만 <b>지터 규약 자체가 §79 안에서 갈린다</b>
-     * ({@code QueueStatusResponse} 참조) — pacing 하한이나 지터 폭을 바꿀 때 이 값을 같이 봐라.
+     * <p>⚠️ <b>이 값은 pacing 하한(2초)과 지터 폭에 매여 있다</b>(§79). 둘 중 하나를 바꾸면
+     * 여기도 같이 봐라. 현재 여유는 지터 -20%(1.6초)까지다.
      */
     private static final double POLL_REFILL_PER_SEC = 1.0;
 
@@ -70,29 +56,23 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * 테넌트 한도 — <b>모든 테넌트에 동일</b>. 예전 {@code Plan.ENTERPRISE}와 같은 값이라
      * 등급제를 걷어내도(§88) <b>동작이 바뀌지 않는다</b>(전 테넌트가 이미 ENTERPRISE였다).
      *
-     * <p><b>100,000 → 50,000으로 내렸다 (§89, 2026-09-04).</b> 내린 근거는 실측 하나다 —
-     * 100,000에서 <b>리미터가 한 건도 막지 않았다</b>. 다른 테넌트가 3,000 rps를 30초간
-     * (90,000건) 밀어넣는 판에서 429가 <b>0건</b>이었다. capacity 안에서 끝나기 때문이다.
-     * 50,000이면 같은 공격이 23.1초에 개입해 15,000건을 막는다.
+     * <p><b>100,000 → 50,000 (§89).</b> 근거는 실측 하나다 — 100,000에서는 <b>리미터가 한 건도
+     * 막지 않았다</b>(3,000 rps × 30초 = 90,000건이 capacity 안에서 끝나 429가 0건). 50,000이면
+     * 같은 공격이 23.1초에 개입해 15,000건을 막는다.
      *
-     * <p>🔑 <b>버스트 순간의 비용은 유저 1명당 3.01이 아니라 1이다.</b> verify·complete는 몇 분
-     * 뒤에 오므로, 몰리는 순간 버킷을 먹는 것은 enqueue뿐이다. 그래서 "동시 N명이 통과하나"는
-     * {@code capacity} 하나로 정해진다 — 50,000이면 동시 5만 명까지 0초에 통과한다.
-     * 지속 소비는 다르다: 유저 1명이 생애 전체로 <b>3.01</b>을 먹는다(enqueue 1 + verify 1 +
-     * complete 1 + admit 1/20, 실측 382.46÷126.97). 그래서 지속 수용은 833.33÷3.01 =
-     * <b>초당 277명</b>이고, 한 테넌트가 FRS 목표 부하(enqueue 200 rps = 버킷 602)를 혼자 다
-     * 써도 38% 여유가 남는다.
+     * <p>🔑 <b>버스트 비용과 지속 비용이 다르다.</b> 몰리는 순간 버킷을 먹는 것은 enqueue뿐이라
+     * "동시 N명 통과"는 {@code capacity}가 정한다(5만 명). 지속 소비는 유저 1명당 <b>3.01</b>
+     * (enqueue 1 + verify 1 + complete 1 + admit 1/20, 실측)이라 833.34÷3.01 = <b>초당 277명</b>,
+     * FRS 목표 부하를 한 테넌트가 혼자 다 써도 38% 여유가 남는다.
      *
-     * <p>🪤 <b>이 버킷은 enqueue 전용이 아니다</b> — 인증된 요청 전부가 공유한다(admit·complete
-     * 포함). 그래서 값을 내리면 진행 중인 이벤트의 <b>입장까지</b> 함께 조인다. 위 3.01이 그 사실을
-     * 담은 숫자다.
+     * <p>🪤 <b>enqueue 전용 버킷이 아니다</b> — 인증된 요청 전부가 공유하므로(admit·complete 포함)
+     * 값을 내리면 진행 중인 이벤트의 <b>입장까지</b> 조인다.
      *
-     * <p>🪤 <b>버킷은 테넌트 단위다 — 큐를 나눠도 늘지 않는다</b>({@code rl:tenant:&#123;id&#125;},
-     * 키에 queueId가 없다). 테넌트가 §87의 상한인 큐 20개를 만들면 큐당 지속 14명/s다. 큐마다
-     * 버킷을 주는 안(㉢)은 기각했다 — <b>§87과 같은 이유로 개수로 우회된다.</b>
+     * <p>🪤 <b>테넌트 단위라 큐를 나눠도 늘지 않는다</b>({@code rl:tenant:&#123;id&#125;}에 queueId가
+     * 없다). 큐마다 버킷을 주는 안은 기각했다 — <b>§87과 같은 이유로 개수로 우회된다.</b>
      *
-     * <p>비율 {@code capacity = refill × 60}은 §62에서 온 것이고 그 근거는 유지된다 —
-     * 티켓팅은 오픈 1분 안에 몰리므로 1분치 burst를 허용한다.
+     * <p>비율 {@code capacity = refill × 60}은 §62에서 왔고 근거는 유지된다 — 티켓팅은 오픈
+     * 1분 안에 몰리므로 1분치 burst를 허용한다.
      *
      * <p>🪤 <b>refill이 833.33이 아니라 833.34인 이유.</b> 833.33이면 {@code capacity/refill}이
      * 60.0002가 되어 {@code token-bucket.lua}의 {@code ceil()}이 <b>61</b>로 올라가고 버킷 TTL이
@@ -123,25 +103,15 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /**
      * 경로 판정에 쓰는 <b>유일한</b> 문자열원.
      *
-     * <p>🔴 <b>{@code getRequestURI()}를 직접 쓰면 안 된다.</b> 그건 디코딩 전 원문이라
-     * 디스패처·시큐리티가 보는 문자열과 다르다. 두 계층이 다른 문자열을 보면 한도가 통째로 사라진다
-     * — 2026-08-28 실측으로 두 곳이 뚫렸다:
-     * <ul>
-     *   <li>{@code POST /api/v1/tenants/log%69n} → 15회 전부 401(한도 없음).
-     *       평문은 11회째 429다. 본문이 {@code T003}이라 <b>자격 증명 비교가 실제로 수행됐다</b>
-     *       = brute force에 한도가 없다</li>
-     *   <li>폴링에서 {@code tokenId}의 한 글자만 인코딩하면 <b>버킷이 새로 생긴다</b>.
-     *       평문 소진(429) 상태에서 {@code %74} 변형이 200을 5번 더 받았다. 변형은 글자 수만큼 있다</li>
-     * </ul>
+     * <p>🔴 <b>{@code getRequestURI()}를 쓰면 안 된다.</b> 디코딩 전 원문이라 디스패처가 보는
+     * 문자열과 다르고, 두 계층이 다른 문자열을 보면 한도가 통째로 사라진다. 2026-08-28에 두 곳이
+     * 실제로 뚫렸다 — {@code /tenants/log%69n}이 15회 전부 한도 없이 자격 증명 비교까지 갔고,
+     * 폴링은 {@code tokenId}를 한 글자 인코딩할 때마다 <b>버킷이 새로 생겼다</b>.
      *
-     * <p>고치는 방향은 "인코딩을 막는다"가 아니라 <b>디스패처와 같은 문자열을 본다</b>이다.
-     * 막는 쪽은 목록 관리가 되고, 목록은 언젠가 어긋난다. {@link UrlPathHelper}는 Spring MVC가
-     * 쓰는 것과 같은 정규화(1회 디코딩 · 컨텍스트 경로 제거 · 경로 파라미터 {@code ;x=1} 제거)를 한다.
-     *
-     * <p>🔑 <b>"완전히 디코딩"이 목표가 아니다.</b> 이중 인코딩({@code %2569})은 1회 디코딩하면
-     * {@code %69}로 남아 여기서도 안 맞지만, <b>디스패처에서도 안 맞아 404</b>가 된다.
-     * 두 계층이 같은 규칙으로 어긋나므로 우회가 성립하지 않는다. 필요한 성질은 "같은 문자열"이지
-     * "원본 복원"이 아니다.
+     * <p>🔑 <b>목표는 "완전한 디코딩"이 아니라 "같은 문자열"이다.</b> {@link UrlPathHelper}는
+     * Spring MVC와 같은 정규화(1회 디코딩 · 컨텍스트 경로 제거 · {@code ;x=1} 제거)를 한다.
+     * 이중 인코딩({@code %2569})은 여기서도 안 맞지만 <b>디스패처에서도 안 맞아 404</b>라
+     * 우회가 성립하지 않는다. 인코딩을 목록으로 막는 방향은 목록이 언젠가 어긋난다.
      */
     private static final UrlPathHelper PATH_HELPER = new UrlPathHelper();
     static {
@@ -173,14 +143,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
         // 2) 공개 endpoint(signup/login/refresh)는 인증 여부와 무관하게 IP Fixed Window를 먼저 태운다.
         //
-        // 🔴 예전엔 아래 3)의 else 가지에서만 걸었다. 그러면 **클라이언트가 한도를 고를 수 있다** —
-        //    /login은 permitAll이라 남의(또는 자기) Access 토큰을 Authorization 헤더에 붙여도 그대로
-        //    통과하고, JwtAuthenticationFilter가 컨텍스트를 채운 뒤라 3)이 "인증된 요청"으로 분기한다.
-        //    결과: brute force가 LOGIN(10/분/IP)이 아니라 **공격자 자신의 테넌트 버킷**을
-        //    소비한다. 계정을 K개 만들면 버킷도 K개라 IP 기준 한도가 사실상 사라진다.
-        //
-        //    로그인 시도의 신원은 **body의 email**이지 헤더의 토큰이 아니다. 그러니 이 세 경로에서는
-        //    헤더를 보고 한도를 고르면 안 된다. 위 폴링 선처리와 같은 모양이다.
+        // 🔴 3)의 else 가지에 맡기면 **클라이언트가 한도를 고를 수 있다** — /login은 permitAll이라
+        //    Authorization 헤더를 붙이면 3)이 "인증된 요청"으로 분기하고, brute force가
+        //    LOGIN(10/분/IP)이 아니라 공격자 자신의 테넌트 버킷을 먹는다(계정 K개 = 버킷 K개).
+        //    로그인 시도의 신원은 **body의 email**이지 헤더의 토큰이 아니다.
         if (resolvePublicEndpoint(path) != null) {
             if (!checkPublicRateLimit(request, path, response)) {
                 return;   // 429로 종료
@@ -244,13 +210,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /**
      * 인증된 요청 — Token Bucket으로 테넌트 한도 체크.
      *
-     * <p><b>한도는 모든 테넌트에 동일한 상수다.</b> 예전엔 {@code Plan} enum이 등급별로 값을
-     * 정했는데(§62), 그 등급제를 걷어냈다(§88). 근거는 아래 두 줄이다 —
-     * <b>과금은 plan을 읽지 않고</b>({@code billing_snapshots}에 컬럼이 없다. 청구는 token 개수다),
-     * plan을 읽는 코드가 <b>여기 하나뿐</b>이었다. 즉 등급제가 실제로 하던 일은
-     * "SaaS 약속"이 아니라 <b>테넌트 하나가 플랫폼을 독식하지 못하게 막는 방어</b> 하나였고,
-     * <b>방어는 등급이 아니라 상수여야 한다</b> — 차등을 두는 순간 그건 방어가 아니라 판매다.
-     * §87이 {@code maxCapacity} 상한을 "플랜별"이 아니라 상수로 둔 것과 같은 판단이다.
+     * <p><b>한도는 전 테넌트 동일한 상수다</b>(§88, 등급제 철회). 과금은 plan을 읽지 않고
+     * (청구는 token 개수다) plan을 읽는 코드가 여기 하나뿐이었다 — 등급제가 실제로 하던 일은
+     * <b>한 테넌트의 독식 방어</b> 하나였고, <b>방어는 등급이 아니라 상수여야 한다.</b>
      *
      * @return true=통과, false=거부 (429 응답 완료)
      */
@@ -324,11 +286,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * Cache Aside 패턴
-     * 캐시에 있으면 캐시 없으면 DB 조회
-     * */
-    /**
-     * Tenant 조회 (Cache Aside).
+     * Tenant 조회 (Cache Aside — 캐시 미스면 DB 조회 후 적재).
      *
      * <p>PK로 조회하는 이유: JWT와 API-Key 두 인증 경로가 공통으로 확보하는 식별자가 PK뿐이다.
      * API-Key는 {@code api_keys.tenant_id}(PK)만 들고 있어 {@code t_xxx} 형태를 모른다.

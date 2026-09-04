@@ -21,26 +21,18 @@ import java.util.Set;
 /**
  * 토큰 생명주기 이벤트 → tokens 테이블 적재.
  *
- * <p><b>왜 토픽 이름이 {@code enqueue-events}가 아닌가:</b> 같은 토큰의 상태 전이
- * (admit·complete·cancel·expire)가 이 토픽에 함께 실릴 예정이기 때문이다. Kafka의 순서
- * 보장은 <b>같은 토픽의 같은 파티션</b> 안에서만 성립하므로, 토픽을 나누면 파티션 키를
- * {@code tokenId}로 잡아도 {@code WAITING → ADMIT_ISSUED} 순서가 보장되지 않는다.
- * 지금은 enqueue 이벤트만 흐르지만 이름을 미리 맞춰 두어 나중에 옮길 일을 없앤다.
+ * <p><b>토픽은 {@code token-lifecycle} 하나다</b>(§73 D16). Kafka의 순서 보장이
+ * <b>같은 토픽의 같은 파티션</b> 안에서만 성립하므로, 상태 전이를 다른 토픽으로 나누면 키를
+ * {@code tokenId}로 잡아도 {@code WAITING → ADMIT_ISSUED} 순서가 깨진다.
  *
- * <p><b>🔴 배포 순서: 이 컨슈머가 먼저, 새 이벤트를 발행하는 프로듀서가 나중이다.</b>
- * 반대로 하면 판별 필드를 모르는 구 컨슈머가 admit 이벤트를 받는데, Spring의
- * {@code JsonDeserializer}는 모르는 필드를 무시하고 {@code spring.json.value.default.type}으로
- * 역직렬화하므로 <b>예외 없이</b> enqueue로 해석돼 {@code Token.issue()}로 조용히 적재된다.
- * 판별 필드를 본문에 둔 이유가 이것이고(§80이 Kafka 헤더 방식을 기각한 이유와 같다),
- * 필드를 넣는 것만으로는 이 함정을 못 막는다 — <b>읽는 쪽이 먼저 떠 있어야</b> 막힌다.
- * (판별 필드 도입 자체는 순서 무관하다: 구 컨슈머는 {@code eventType}을 무시하고,
- * 새 컨슈머는 필드 없는 구 메시지를 {@code ENQUEUED}로 읽는다. 순서가 문제되는 것은
- * <b>새 타입을 실제로 발행하기 시작하는</b> Sprint 7 배포다.)
+ * <p><b>🔴 새 이벤트 타입을 낼 때는 이 컨슈머를 먼저 배포한다.</b> {@code JsonDeserializer}는
+ * 모르는 필드를 무시하고 {@code spring.json.value.default.type}으로 역직렬화하므로, 구 컨슈머는
+ * 새 타입을 <b>예외 없이</b> enqueue로 해석해 조용히 적재한다. 판별 필드를 본문에 둔 것만으로는
+ * 못 막고 <b>읽는 쪽이 먼저 떠 있어야</b> 막힌다.
  *
- * <p><b>수동 ack을 쓰지 않는 이유:</b> 컨테이너 기본값({@code AckMode.BATCH})은 리스너가
- * <b>정상 반환한 뒤에</b> 오프셋을 커밋한다. 이 메서드는 트랜잭션이 커밋된 뒤에야 반환하므로
- * "DB 커밋 후 ack"이라는 원래 의도가 그대로 성립한다. 오히려 수동 ack은 실패 경로에서
- * 오프셋 관리를 리스너와 에러 핸들러가 나눠 갖게 만들어 DLT 처리와 어긋난다.
+ * <p><b>수동 ack을 쓰지 않는다.</b> 기본값({@code AckMode.BATCH})은 리스너가 정상 반환한 뒤
+ * 커밋하고, 이 메서드는 트랜잭션 커밋 후에 반환하므로 "DB 커밋 후 ack"이 이미 성립한다.
+ * 수동 ack은 실패 경로의 오프셋 관리를 리스너와 에러 핸들러가 나눠 갖게 해 DLT 처리와 어긋난다.
  */
 @Slf4j
 @Component
@@ -59,20 +51,11 @@ public class TokenLifecycleConsumer {
      * 순서는 의미가 없고(서로 다른 토큰이므로), 같은 파티션 안의 상대 순서는 리스트에
      * 그대로 유지된다.
      *
-     * <p><b>🔴 같은 {@code tokenId}가 두 번 이상 있는 배치를 타입별로 모으지 말 것.</b> 그러면 파티션이 지켜준 같은 토큰의 순서가
-     * 애플리케이션에서 다시 깨진다. 한 배치에 {@code [ADMITTED tok1, COMPLETED tok1]}이 있을 때
-     * COMPLETED를 먼저 적용하면 그 가드({@code status = 1}에서만)가 거짓이라 <b>조용히 no-op</b>이
-     * 되고, 이어서 ADMITTED가 1로 만든다 — 그 토큰은 영원히 완료되지 않는다. 구간을 나누면
-     * 도착 순서가 그대로 보존된다. 정상 운영에서는 대부분 ENQUEUED 하나라 구간도 하나다.
-     *
-     * <p>🔑 <b>중복 {@code tokenId}가 없으면 그 위험 자체가 없다</b> — 뒤집힐 두 이벤트가 없기
-     * 때문이다. 그 경우에만 {@code canGroupByType}이 참이 되어 타입별로 모은다. 구간 분할은
-     * 지워지지 않았고, 중복이 하나라도 있으면 그대로 내려간다(실측: 배치 9,443개 중 2개, 0.02%).
-     *
-     * <p>⚠️ 위 반례를 정확히 읽어라. {@code [ADMITTED tok1, COMPLETED tok1]}은 <b>그룹 경로에서도
-     * 뒤집히지 않는다</b> — {@code EnumMap} 순회가 ADMITTED를 먼저 내보내기 때문이다. 중복 가드가
-     * 실제로 막는 것은 <b>도착 순서가 상태 전이 순서와 어긋난 배치</b>(재전달이 끼어드는 등)다.
-     * 그런 배치에서 타입별로 모으면 애플리케이션이 파티션의 도착 순서를 다시 어기게 된다.
+     * <p><b>🔴 같은 {@code tokenId}가 두 번 이상 있는 배치는 타입별로 모으지 않는다.</b> 모으면
+     * 파티션이 지켜준 도착 순서를 애플리케이션이 다시 어긴다. 예: COMPLETED를 ADMITTED보다 먼저
+     * 적용하면 가드({@code status = 1}에서만)가 거짓이라 <b>조용히 no-op</b>이 되고, 뒤이은
+     * ADMITTED가 1로 만들어 그 토큰은 영원히 완료되지 않는다. 중복이 없으면 뒤집힐 두 이벤트가
+     * 없으므로 그 위험 자체가 없다 — {@code canGroupByType}이 참인 경우가 그것이다.
      *
      * <p>제약 위반 외의 예외는 그대로 전파한다 → 에러 핸들러가 재시도한다.
      *
@@ -82,43 +65,21 @@ public class TokenLifecycleConsumer {
      */
     @KafkaListener(topics = "${queue.consumer.topic:token-lifecycle}")
     public void consume(List<EnqueueEvent> events) {
-        // 위 주석의 반례(`[ADMITTED tok1, COMPLETED tok1]`)는 **같은 tokenId가 한 배치에 두 번**
-        // 나올 때만 성립한다. 없으면 타입별로 모아도 도착 순서가 깨질 대상 자체가 없다.
-        //
         // 왜 모으는가: 구간 분할은 타입이 바뀔 때마다 트랜잭션을 연다. 타입이 섞인 배치는
-        // 구간이 잘게 부서져 커밋이 폭주하고, 그 랙이 complete를 죽였다.
-        // 타입은 4종뿐이므로 모으면 배치당 최대 4회다.
-        //
-        // 🔑 **이득은 파티션당 유입률의 함수다. 저부하에서는 정확히 0이다.**
-        //    2026-08-27 실측(반사실 splitTx 직접 측정, 전 구간 32만 이벤트):
-        //      파티션당 105~113건/s → 배치 73~158건 → 절감 84~96%
-        //      파티션당   2~3건/s   → 배치  5~ 10건 → 절감 **0%**
-        //      전체 합계: 커밋 76,806 → 13,080 (절감 83.0%)
-        //    파티션당 유입이 낮으면 한 배치에 타입이 한 종류뿐이라 분할 경로도 트랜잭션을
-        //    하나만 연다 — 줄일 것이 없다. 대략 **파티션당 50건/s**가 손익 경계다.
-        //
-        // 🪤 **저부하 벤치로 "효과 없다"고 판단해 지우지 말 것.** 위 0% 구간이 정상이다.
-        //    되돌리려면 파티션당 50건/s 이상을 걸고 splitTx/tx를 다시 재라. 로컬에서 그 부하를
-        //    내려면 부하 도구가 서버를 굶기지 않아야 한다(하니스가 죽은 판의 유입은 파티션당
-        //    10건/s까지 눌려 절감이 0으로 보였다 — 코드가 아니라 측정이 틀린 것이었다).
-        //
+        // 구간이 잘게 부서져 커밋이 폭주하고, 그 랙이 complete를 죽였다. 타입은 4종뿐이라
+        // 모으면 배치당 최대 4회다. 절감 83.0%(실측) — 표·측정 함정은 doc/perf/CONSUMER_BATCHING.md.
+        // 🪤 이득은 **파티션당 유입률의 함수**라 저부하에서는 정확히 0이다. 저부하 벤치로
+        //    "효과 없다"고 판단해 지우지 마라.
         // ⚠️ 이건 위 금지의 예외가 아니라 **그 금지가 필요 없는 배치만 우회**하는 것이다.
-        //    중복이 하나라도 있으면 아래 구간 분할로 내려간다 (실측 9,443개 중 2개).
         if (canGroupByType(events)) {
             try {
                 int types = persistGrouped(events);
                 // 반사실: 같은 배치를 분할 경로로 태웠다면 열렸을 트랜잭션 수.
                 // 이게 types와 같으면 그룹 적재가 줄인 커밋이 0이다 — 값을 하는지의 유일한 직접 근거다.
                 int wouldSplit = countSegments(events);
-                // 🔑 **debug인 이유와, 올려야 할 때.**
-                // 이 줄은 그룹 적재가 값을 하는지 재는 **유일한 직접 근거**다(tx 대 splitTx).
-                // 2026-08-27 측정은 끝났다 — 절감 83.0% / 82.8%로 두 판 재현했다. 상시로 두면
-                // 13분에 1만 줄이라 상용에서는 그 자체가 부하다(로드 테스트 로그 억제 전례).
-                //
-                // 🪤 **다시 재려면 반드시 이 줄을 INFO로 올리고 재라.** 2026-08-27 첫 판은 이게
-                //    debug라 0건이 찍혀 커밋 수를 ReplicationRoutingDataSource 로그로 **유도**했고,
-                //    그 유도값(2.33)이 실측(18.5)과 8배 어긋나 판정이 하루 밀렸다.
-                //    올리는 법: --logging.level.com.sonix.queue.consumer.token=DEBUG
+                // 🪤 이 줄이 그룹 적재의 값을 재는 **유일한 직접 근거**(tx 대 splitTx)다.
+                //    다시 잴 때는 반드시 INFO로 올려라 — 유도값으로 대체하면 8배 어긋난다
+                //    (doc/perf/CONSUMER_BATCHING.md). 상시 INFO는 13분에 1만 줄이라 debug다.
                 log.debug("token-lifecycle 적재 완료: path=grouped events={} tx={} splitTx={}", events.size(), types, wouldSplit);
                 return;
             } catch (DataIntegrityViolationException e) {
@@ -301,22 +262,14 @@ public class TokenLifecycleConsumer {
     /**
      * 이벤트 → 도메인 토큰.
      *
-     * <p>{@code issuedAt}을 UTC로 고정 변환하는 것이 중요하다. 이유가 둘이다.
-     *
-     * <p><b>1) 멱등성.</b> 이 값은 {@code UNIQUE (token_id, issued_at)}의 절반이라
-     * 재처리 때 1ms만 어긋나도 다른 행이 되어 멱등 적재가 깨진다.
-     * {@code ZoneOffset.UTC}는 고정 오프셋이라 어느 서버에서 몇 번을 재처리하든 같은 값이 나온다.
-     * {@code ZoneId.systemDefault()}로 바꾸면 인스턴스별 TZ 설정에 따라 갈리고,
-     * DST가 있는 지역에서는 같은 인스턴스에서도 갈린다.
-     *
-     * <p><b>2) 컬럼 규약.</b> 이 프로젝트의 시각 컬럼은 전부 UTC다
-     * ({@code doc/schema.sql}의 [시각 규약], DECISIONS §77). 다른 경로는 JVM 기본 TZ가 UTC라
-     * {@code LocalDateTime.now()}만으로 UTC가 되지만, <b>이 메서드만은 이벤트가 실어 온
-     * {@code Instant}를 변환</b>하므로 존을 명시해야 한다. 여기서 {@code systemDefault()}를 쓰면
-     * JVM TZ 설정에 결과가 좌우돼 (1)의 멱등성이 함께 깨진다.
-     *
-     * <p>따라서 이 줄을 {@code LocalDateTime.now()}나 {@code ofInstant(..., systemDefault())}로
-     * "단순화"하면 안 된다. 멱등성과 컬럼 규약이 동시에 깨진다.
+     * <p><b>🔴 {@code ZoneOffset.UTC}를 {@code systemDefault()}나 {@code now()}로 "단순화"하지
+     * 마라.</b> 둘이 함께 깨진다.
+     * <ul>
+     *   <li><b>멱등성</b> — 이 값은 {@code UNIQUE (token_id, issued_at)}의 절반이라 재처리 때
+     *       1ms만 어긋나도 다른 행이 된다. 고정 오프셋이라야 어디서 몇 번을 재처리하든 같다</li>
+     *   <li><b>컬럼 규약</b> — 시각 컬럼은 전부 UTC다({@code doc/schema.sql} [시각 규약], §77).
+     *       이 메서드만 이벤트가 실어 온 {@code Instant}를 변환하므로 존을 명시해야 한다</li>
+     * </ul>
      */
     private static Token toToken(EnqueueEvent e) {
         LocalDateTime issuedAt = LocalDateTime.ofInstant(e.issuedAt(), ZoneOffset.UTC);
