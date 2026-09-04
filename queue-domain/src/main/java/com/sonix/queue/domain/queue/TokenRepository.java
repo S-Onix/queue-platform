@@ -8,12 +8,9 @@ public interface TokenRepository {
     /**
      * WAITING 토큰들을 벌크로 멱등 적재한다.
      *
-     * <p><b>멱등 계약</b>: 이미 존재하는 토큰(동일 {@code (tokenId, issuedAt)})은
-     * 조용히 무시되고 오류를 던지지 않는다. outbox at-least-once로 같은 이벤트가
-     * 재처리되거나 발행 재시도로 중복돼도 중복 row가 생기지 않는다.
-     *
-     * <p>구현은 UNIQUE(token_id, issued_at) 위에서 upsert(no-op)로 이 계약을 만족한다.
-     * 따라서 호출자는 중복 여부를 사전 검사하지 않아도 되고, 재소비 시 그대로 다시 넘기면 된다.
+     * <p><b>멱등 계약</b>: 같은 {@code (tokenId, issuedAt)}는 조용히 무시된다
+     * (UNIQUE 위 no-op upsert). Kafka At-Least-Once 재전달이 일상이므로 호출자는
+     * 중복 검사 없이 그대로 다시 넘기면 된다.
      *
      * @param tokens 적재할 토큰들 (Consumer가 poll한 배치 단위, 보통 수백 건)
      */
@@ -23,18 +20,12 @@ public interface TokenRepository {
      * {@code ENQUEUED} 외의 생명주기 이벤트를 <b>가드 UPSERT</b>로 적재한다 (§80 / FRS §6.4).
      *
      * <p>행이 없으면 {@code type.targetStatus()}로 INSERT하고, 있으면 <b>허용 출발 상태일 때만</b>
-     * 전이한다. 두 성질이 함께 필요하다:
-     * <ul>
-     *   <li><b>INSERT</b> — 프로듀서가 여러 WAS라 도착 순서가 뒤집힌다. 특히 enqueue Lua의
-     *       {@code ZADD}가 Kafka 발행보다 먼저라 {@code ENQUEUED}보다 {@code ADMITTED}가 먼저
-     *       올 수 있다. 그때 행을 만들어 두면 뒤늦은 {@code ENQUEUED}의 no-op UPSERT가 흡수한다.</li>
-     *   <li><b>가드</b> — Kafka는 At-Least-Once라 재전달이 일상이다. {@code COMPLETED}(2)인 행에
-     *       {@code ADMITTED}가 다시 와도 2가 유지돼야 한다. 멱등이 본질이지 예외 처리가 아니다.</li>
-     * </ul>
+     * 전이한다. INSERT가 필요한 이유는 도착 순서가 뒤집히기 때문이고({@code ZADD}가 Kafka 발행보다
+     * 먼저라 {@code ADMITTED}가 {@code ENQUEUED}보다 앞설 수 있다), 가드가 필요한 이유는 재전달이
+     * 일상이기 때문이다({@code COMPLETED}인 행에 {@code ADMITTED}가 다시 와도 2를 유지한다).
      *
-     * <p><b>호출자는 같은 타입이 연속하는 구간 단위로 넘긴다.</b> 타입별로 모아서 넘기면
-     * 같은 토큰의 {@code ADMITTED}→{@code COMPLETED} 순서가 뒤집혀
-     * {@code COMPLETED}가 먼저 no-op이 되고 그 토큰은 영원히 완료되지 않는다.
+     * <p>🔴 <b>호출자는 같은 타입이 연속하는 구간 단위로 넘긴다.</b> 타입별로 모으면 같은 토큰의
+     * {@code ADMITTED}→{@code COMPLETED} 순서가 뒤집혀 그 토큰이 영원히 완료되지 않는다.
      *
      * @param type {@code ENQUEUED}는 허용하지 않는다 — 그건 {@link #saveAllIfAbsent}의 몫이다
      */
@@ -43,10 +34,9 @@ public interface TokenRepository {
     /**
      * 신원 조회 — verify가 Redis 히트일 때 identifier를 얻는 경로 (FRS §6.5).
      *
-     * <p><b>status·admitted_at 술어를 걸지 않는다.</b> Redis {@code admit-by-admit} 키가 살아 있다는
-     * 사실이 이미 "60초 안에 admit됐다"를 증명하고, DB의 {@code status}/{@code admit_token}은
-     * ADMITTED 이벤트를 컨슈머가 소비한 뒤에야 갱신되기 때문이다(§6.4 — 200이 보장하지 않는 것).
-     * 여기에 status=1을 걸면 컨슈머 랙 구간의 <b>정상 토큰이 404</b>가 된다.
+     * <p>🔴 <b>status·admitted_at 술어를 걸지 마라.</b> DB의 status는 컨슈머가 ADMITTED를 소비한
+     * 뒤에야 갱신되므로, status=1을 걸면 컨슈머 랙 구간의 <b>정상 토큰이 404</b>가 된다.
+     * 자격 증명은 이미 Redis {@code admit-by-admit} 키의 생존이 하고 있다.
      *
      * <p>{@code queue_id}·{@code tenant_id}는 소유권 술어라 생략 불가.
      */
@@ -91,18 +81,15 @@ public interface TokenRepository {
     /**
      * {@code complete} 유효 창이 지나도록 {@code ADMIT_ISSUED}에 남은 토큰을 만료로 정리한다.
      *
-     * <p><b>왜 필요한가</b>: Tenant가 {@code verify}도 {@code complete}도 안 부르면 그 행은
-     * {@code status = 1}로 <b>영원히 남는다</b>(실서버로 재현됨). 회수 배치는 Redis 게이트만 풀고
-     * status는 안 건드린다 — {@code EXPIRED} 소비 가드가 {@code IF(status = 0, 4, status)}라
-     * 1에서는 no-op이기 때문이고, 그건 {@code complete}의 유효 창을 살리려는 의도다(§36).
+     * <p>Tenant가 {@code verify}도 {@code complete}도 안 부르면 그 행은 {@code status = 1}로
+     * <b>영원히 남는다</b>(실서버 재현). 회수 배치가 안 고치는 이유는 {@code EXPIRED} 소비 가드가
+     * {@code IF(status = 0, 4, status)}라 1에서 no-op이고, 그게 {@code complete} 유효 창을 살리려는
+     * 의도이기 때문이다(§36).
      *
-     * <p>🔴 <b>Kafka 이벤트로는 고칠 수 없다.</b> 위 가드 때문이다. 가드를 넓히면 늦은 입장이 죽는다.
-     * 그래서 이것만은 <b>직접 UPDATE</b>다 — 도메인 전이가 아니라 <b>원장 교정</b>이라는 뜻이기도 하다.
-     *
-     * <p><b>Redis를 보지 않는다.</b> 판정이 DB만으로 성립하므로("창이 지났다") Redis 전손 시
-     * 전원을 만료로 오판하는 위험이 없다 — 다른 대사 방향과 갈리는 지점이다.
-     *
-     * <p><b>큐 단위다.</b> 전역으로 두면 한 큐의 백로그가 {@code limit}을 다 먹어 다른 큐를 굶긴다.
+     * <p>🔴 <b>Kafka 이벤트로는 고칠 수 없다</b> — 가드를 넓히면 늦은 입장이 죽는다. 그래서
+     * 이것만 <b>직접 UPDATE</b>다(도메인 전이가 아니라 원장 교정). 판정이 DB만으로 성립하므로
+     * Redis 전손 시 전원을 오판할 위험도 없다. 큐 단위인 것은 한 큐의 백로그가 {@code limit}을
+     * 다 먹어 다른 큐를 굶기지 않게 하기 위해서다.
      *
      * @param admittedBefore 이 시각 <b>이전</b>에 admit된 것이 대상
      *                       (= {@code now - }{@link Token#COMPLETE_VALID_WINDOW_SECONDS}).
@@ -115,9 +102,9 @@ public interface TokenRepository {
     /**
      * 대사 기준선 — 이 시각 이전에 발급된 것 중 가장 큰 seq.
      *
-     * <p>정착 시간(settle window)을 seq로 환산하는 값이다. 방금 들어온 사람은 아직 Kafka를
-     * 타는 중이라 Redis에는 있고 DB에는 없는 게 <b>정상</b>이다. 그 구간을 갭으로 세면
-     * 컨슈머 지연이 곧 오탐이 된다(실측: 회수 중 앱을 끊자 -500이 찍혔다가 40초 만에 0으로 회복).
+     * <p>정착 시간(settle window)을 seq로 환산한다. 방금 들어온 사람은 Kafka를 타는 중이라
+     * Redis에만 있는 것이 <b>정상</b>이고, 그 구간을 갭으로 세면 컨슈머 지연이 곧 오탐이 된다
+     * (실측: -500이 찍혔다가 40초 만에 0으로 회복).
      *
      * @return 해당 토큰이 없으면 {@code 0}
      */
