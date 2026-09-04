@@ -1,0 +1,205 @@
+# 애플리케이션 알람 규칙 — Queue Platform
+#
+# infra.yml / kafka.yml과 **원칙이 다른 파일**이다. 그 둘은 "임계값이 필요 없는 것"과
+# "코드에 박힌 상수"만 골랐다. 이 파일의 규칙은 **근거 없는 임계값을 의도적으로 박는다.**
+#
+#   근거: 사용자 결정(2026-09-04) — "모니터링에 대한 경고는 일단 전부 알람으로 간다.
+#         실제로 대응하는 것은 그 다음 문제다."
+#
+# 그래서 이 파일의 각 규칙에는 **임계값 근거 유무를 반드시 명시**한다. 근거가 없으면
+# "근거 없음"이라고 쓴다. 이 표기를 지우지 마라 — 지우는 순간 그 숫자는 "이미 정해진 값"이
+# 되어 아무도 다시 묻지 않는다. 이 레포가 계속 경계해 온 그 패턴이다.
+#
+# severity 체계·전제(evaluation_interval=15s, scrape_interval=15s, Alertmanager 미설치)는
+# infra.yml 상단 정의를 그대로 따른다.
+#
+# ⚠️ 이 파일의 규칙은 전부 queue-api의 /actuator/prometheus 에만 존재하는 커스텀 메트릭에
+#    의존한다. **prod와 dev 둘 다** 그 엔드포인트를 열지 않으므로 그쪽 job을 붙이면
+#    규칙은 firing이 아니라 **침묵**한다. 빈 벡터는 알람을 울리지 않는다.
+#    실측(2026-09-04) — application.yml:143 `health,info,prometheus` /
+#    local:68 `'*'` / **dev:42 `health, info, metrics` (prometheus 없음)** / prod:62 `health, info`.
+#    🪤 dev는 404라 "안 울리네 = 정상이네"로 오독되기 쉽다. prod만 경고하면 그 함정이 남는다.
+# ─────────────────────────────────────────────────────────────────────────────
+# 메트릭 계약 (backend 구현과 여기가 어긋나면 알람은 영원히 안 뜬다)
+#
+#   Micrometer Timer  이름: queue.admission.wait
+#   노출 이름         queue_admission_wait_seconds_{bucket,count,sum}
+#   기록 지점         admit 성공 시, issuedAt → admittedAt 차이 (QueueEngineService admit 경로)
+#   라벨              queue_id 하나  (MONITORING_DESIGN.md 4-3)
+#   버킷(SLO)         10, 30, 60, 120, 300, 600, 1800, 3600 (초) + +Inf
+#                     = QueueEngineService.ADMISSION_WAIT_SLO (구현과 대조 완료 2026-09-04)
+#   부수 카운터       queue_admission_clock_skew_total{queue_id}
+#                     — 음수 대기(admit 시각 < enqueue 시각)를 표본에서 빼고 여기 센다
+#
+# 🔴 **publishPercentileHistogram(true) 를 쓰면 안 된다.** 기본 버킷은 실측 69개다(§80).
+#    큐 1,000개면 69,000 시계열이고 현재 head 전체가 18,062다(2026-09-04 실측). 4배가 된다.
+#    반드시 serviceLevelObjectives(...) 로 위 7개만 낸다 → 큐당 10 시계열(버킷 8 + count + sum).
+#
+# 🔴 **60 과 300 은 버킷 경계로 반드시 존재해야 한다.** histogram_quantile은 버킷 안에서
+#    선형보간을 하므로, 경계가 없으면 "p95 > 60" 판정이 보간값 위에서 이뤄진다.
+#    경계가 정확히 60·300이면 판정은 "60초 이하가 95% 미만인가"와 **정확히 동치**가 된다.
+#    나머지 10·30·120·600·1800·3600은 판정용이 아니라 분포를 볼 수 있게 하는 해상도다.
+#    (1800·3600은 §86이 queue_daily_stats 히스토그램 후보로 검토했던 le_60~le_3600과 같은 범위다.
+#     내가 처음 제안한 목록에는 5초가 있고 1800·3600이 없었는데, 구현 쪽 목록을 따랐다 —
+#     판정에 쓰는 60·300이 양쪽에 다 있어 알람 동작은 동일하고, 상단 꼬리는 저쪽이 더 넓다.)
+#
+# 🔴 **sum by (queue_id, le) 없이 histogram_quantile을 쓰면 안 된다.** queue-api는 N대이고
+#    같은 큐의 admit이 아무 인스턴스에서나 처리된다. instance 라벨을 남기면 인스턴스별
+#    p95가 나와 실제 사용자 분포와 다른 값이 된다.
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔴 이 메트릭이 **못 잡는 것** — 알람을 만든 동기와 직결되므로 먼저 읽어라
+#
+# 이 규칙의 명분은 "대기 시간 p95 폭증 = admit을 안 부르는 테넌트 = 그 큐가 계속 자라
+# Redis 마스터를 독식(§87 co-tenant OOM)"이다. 그런데 관측은 **admit 성공 시에만** 기록된다.
+#
+#   → Tenant가 admit을 **완전히 멈추면 관측이 0건**이 되고, rate()가 0이라
+#     histogram_quantile은 NaN을 낸다. 비교는 거짓이 되어 **알람은 침묵한다.**
+#     가장 심한 경우가 가장 조용하다.
+#
+# 즉 이 규칙이 잡는 것은 "admit이 **느려지는** 테넌트"지 "admit이 **멈춘** 테넌트"가 아니다.
+# 후자는 카운터가 아니라 "대기자가 있는데 admit 관측이 없다"는 결합 조건이 필요하고,
+# 그건 임계값 문제가 아니라 설계 문제다(infra.yml <보류> 절의 B2 항목과 같은 계열).
+# 여기에 규칙을 하나 더 만들어 덮지 않는다 — 대상 메트릭(queue_admit_requests_total)이 아직 없다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+groups:
+
+  - name: queue-platform-admission-wait
+    rules:
+
+      # 대기 시간 p95가 60초를 넘었다.
+      #
+      # 🔴 **임계값 근거: 없다.** MONITORING_DESIGN.md 4-3이 "p95 1분 → 경고"라고 적어 놨을 뿐이고,
+      #    그 문서에도 산출 근거는 없다. 설계 문서에 적혀 있다는 것은 근거가 아니다.
+      #    부하 기준선(프로덕션 테넌트가 실제로 얼마나 빨리 admit을 부르는가)은 아직 0이다.
+      #
+      # 참고로 잰 것 — **근거가 아니라 "지금은 안 울린다"의 확인**이다:
+      #    2026-09-04 replica(3307) `tokens` 실측 745건 (issued_at→admitted_at):
+      #    min 0s / avg 4.29s / max 24s, ≤10s 가 679건(91%), ≤30s 가 745건(100%).
+      #    → 60초는 관측 최댓값의 2.5배라 이 부하로는 발화하지 않는다.
+      #    ⚠️ WSL2 단일 머신 + k6 합성 부하다. **프로덕션 용량·행동의 근거로 쓰지 마라.**
+      #       admit을 부른 것도 실제 Tenant가 아니라 부하 스크립트다.
+      #
+      # for: 5m — rate[5m] 자체가 이미 5분 평활이라 그 위에 짧은 for를 얹어도 얻는 게 없다.
+      #           20회 연속 스크레이프 동안 유지돼야 발화한다.
+      #
+      # 표본 수 가드를 넣지 않았다: 5분에 admit이 1건뿐인 큐에서 그 1명이 10분 기다렸다면
+      # 그것 자체가 "Tenant가 거의 안 부르고 있다"는 신호다. 가드를 걸면 그게 사라진다.
+      - alert: QueueAdmissionWaitP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (queue_id, le) (rate(queue_admission_wait_seconds_bucket[5m]))
+          ) > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "큐 {{ $labels.queue_id }} 입장 대기 p95 = {{ $value | humanizeDuration }} (경고선 1분)"
+          action: "Tenant가 admit을 충분히 안 부르고 있다는 뜻이다. ① `redis-cli -c -p 7001 zcard 'queue:{{ $labels.queue_id }}:waiting'` 로 대기 인원과 추세 확인 → ② 그 큐가 사는 마스터의 `INFO memory`. 대기자 1명당 477 B이고 같은 마스터의 **다른 테넌트**가 OOM으로 먼저 죽는다(§87). ③ 조치 절차는 `doc/monitoring/runbook/enqueue.md`의 [증상] enqueue가 429(Q005)를 반환한다."
+
+  # ===========================================================================
+  # admit 경로 — 구현 0으로 지금 쓸 수 있는 것 (2026-09-04 <보류>에서 승격, 사용자 결정)
+  # ===========================================================================
+  # 🔑 여기 두 규칙은 **커스텀 메트릭이 필요 없다.** Spring Boot 기본 `http_server_requests`를 쓴다.
+  #    application.yml:160-164 가 `percentiles-histogram: http.server.requests: true` 라
+  #    버킷까지 이미 나온다.
+  #
+  #    실측(2026-09-04, Prometheus 24h): uri="/api/v1/queues/{queueId}/admit" 시계열이
+  #    실재한다(status=200/outcome=SUCCESS, 표본 66). http_server_requests_seconds_bucket 은
+  #    16개 조합에 대해 **897 시계열**(조합당 약 56)이다.
+  #    → §80이 "기본 히스토그램은 버킷이 너무 많다"고 판정한 그 숫자가 여기서 다시 확인된다.
+  #      기존 uri 라벨은 queueId를 **템플릿으로 접으므로** 큐 수와 무관해 문제가 없지만,
+  #      queue_admission_wait_seconds 에 기본 히스토그램을 쓰면 큐 수만큼 곱해진다.
+  # ===========================================================================
+  - name: queue-platform-admit-http
+    rules:
+
+      # admit 호출이 5xx로 실패하고 있다.
+      #
+      # 🔴 **임계값 근거: 없다.** 5%는 임의다. 정상 오류율의 기준선이 0이다
+      #    (24h 실측 admit 응답은 status=200 66건뿐, 5xx 시계열은 아예 없다).
+      #    기준선이 0에 가깝다면 임계는 5%가 아니라 0에 가까워야 맞을 수도 있다. 첫 실부하에서 재라.
+      #
+      # 왜 이게 중요한가: admit이 실패하면 Tenant는 입장을 못 시키고 그 큐는 계속 자란다.
+      # QueueAdmissionWaitP95High 와 같은 종착점(§87 co-tenant OOM)이지만 **원인이 반대**다 —
+      # 저쪽은 Tenant가 안 부르는 것이고, 이쪽은 불렀는데 Platform이 실패시키는 것이다.
+      #
+      # 🪤 분자(5xx)는 오류가 한 번도 없으면 **시계열 자체가 없다.** 그래서 평상시 이 식은
+      #    값이 0이 아니라 **빈 벡터**이고 발화하지 않는다 — 의도한 동작이다.
+      #    "0이 안 나온다"를 결함으로 보고 `or vector(0)`을 붙이지 마라. 붙이면 앱이 죽어
+      #    분모까지 사라졌을 때 0/0이 되어 조용해진다.
+      - alert: QueueAdmitErrorRatioHigh
+        expr: |
+          sum(rate(http_server_requests_seconds_count{job="queue-api",uri="/api/v1/queues/{queueId}/admit",status=~"5.."}[5m]))
+          /
+          sum(rate(http_server_requests_seconds_count{job="queue-api",uri="/api/v1/queues/{queueId}/admit"}[5m]))
+            > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "admit 5xx 비율 {{ $value | humanizePercentage }} 5분 지속 — Tenant가 입장을 못 시키고 있다"
+          action: "① queue-api 로그에서 admit 스택트레이스 확인 → ② Redis Cluster 상태(`redis-cli -c -p 7001 cluster info`)와 RedisClusterDegraded / RedisInstanceDown firing 여부. admit.lua는 다중 키라 슬롯이 갈리면 통째로 실패한다 → ③ Kafka 발행 실패면 QE001 계열이다. ⚠️ **앱을 먼저 재시작하지 마라** — 재시작하면 원인 스택이 사라지고 5xx는 그대로 난다."
+
+      # 🔴 B2 — "admit 요청이 아예 안 온다". <보류> 절이 남긴 함정을 여기서 푼다.
+      #
+      # 함정: `rate() == 0`으로만 쓸 수 없다. Micrometer는 **첫 호출 때 미터를 만든다.**
+      #       앱 기동 후 admit이 한 번도 없으면 시계열 자체가 없고, 빈 벡터는 발화하지 않는다.
+      # 반대로 `absent_over_time()`으로만 쓸 수도 없다. 한 번이라도 불린 뒤 멈추면 카운터는
+      #       평평한 값으로 **계속 보고된다** — absent가 아니다.
+      # → 둘은 서로의 사각을 메운다. **OR가 정답이고, 둘 중 하나만 쓰면 절반이 안 잡힌다.**
+      #
+      #   (a) rate == 0        : 불리다가 멈춘 경우
+      #   (b) absent_over_time : 기동 후 한 번도 안 불린 경우
+      #
+      # `and on() (sum(up) > 0)` 가드가 필수다. 앱이 죽으면 (a)(b) 둘 다 참이 되는데
+      # 그건 admit 문제가 아니라 AppInstanceDown 담당이다. 두 알람이 같은 사건에 겹치면
+      # 새벽에 잘못된 조치(admit 조사)부터 하게 된다. `on()`인 이유는 좌변이 sum/absent라
+      # **라벨이 비어 있어** 기본 매칭이 성립하지 않기 때문이다.
+      #
+      # 🔴 **큐별 판정은 불가능하다.** uri 라벨은 `{queueId}`를 **템플릿으로 접는다.**
+      #    즉 이 규칙은 "플랫폼 전체에서 15분간 admit이 0건"만 잡는다. "특정 테넌트만 멈췄다"는
+      #    잡지 못한다. 그건 queue_admit_requests_total{queueId}(§80 U9, 미구현)가 선행이다.
+      #    큐별로 보이게 하려고 uri 라벨을 풀지 마라 — 큐 수만큼 uri가 생겨 카디널리티가 터진다.
+      #
+      # severity=info인 이유: 로컬에서 앱을 띄워 두고 부하를 안 주면 상시 firing이다.
+      #   AppInstanceDown과 같은 처리다(그 규칙 주석 참조). prod job이 추가되면 그 job만 warning으로 올린다.
+      #
+      # 15m: 임계값 근거 없음. Tenant의 정상 admit 주기를 모른다.
+      #      Backpressure Pull이라 주기는 Tenant 소관이고, 계약상 정해진 값이 없다.
+      - alert: QueueAdmitRequestsAbsent
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{job="queue-api",uri="/api/v1/queues/{queueId}/admit"}[15m])) == 0
+            or
+            absent_over_time(http_server_requests_seconds_count{job="queue-api",uri="/api/v1/queues/{queueId}/admit"}[15m])
+          )
+          and on() (sum(up{job="queue-api"}) > 0)
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "queue-api는 살아 있는데 admit 호출이 15분간 0건 — 전 테넌트가 입장을 안 시키고 있다"
+          action: "로컬이면 부하를 안 준 것이 원인이다. 그 외에는 ① 대기자가 실제로 있는지부터: `redis-cli -c -p 7001 --scan --pattern 'queue:*:waiting'` 로 큐를 찾고 각 `zcard`. 대기자 0이면 정상이다. ② 대기자가 있는데 admit이 0이면 Tenant 쪽 문제다(Backpressure Pull — Platform은 먼저 안 뺀다). ③ 이 상태가 길어지면 `waiting`이 단조 증가해 Redis 마스터를 채운다(대기자 1명당 477 B, §87)."
+
+      # 음수 대기 시간이 관측됐다 = API 서버들 사이 시계가 어긋나 있다.
+      #
+      # 🔴 **임계값 근거: 필요 없다. 0이 유일한 정상값이다.** 음수 대기는 물리적으로 불가능하고
+      #    (enqueue보다 먼저 admit될 수 없다), 나오면 원인은 하나 — 서버 간 시계 스큐다.
+      #    §86에서 queue_daily_stats.max_wait_sec 에 **-398초**가 실측됐다. 이미 일어난 일이다.
+      #
+      # 왜 알람인가: 이 카운터가 오르는 만큼 위 p95 규칙의 **표본이 빠진다.**
+      #    구현이 음수를 clamp하지 않고 표본에서 제외하기 때문이다(그게 맞는 선택이다 —
+      #    clamp하면 스큐가 영원히 안 보인다). 즉 이 값이 크면 QueueAdmissionWaitP95* 는
+      #    **편향된 부분집합 위에서 계산된 값**이고, 그 사실이 이 규칙 없이는 어디에도 안 드러난다.
+      #    p95 알람을 믿으려면 이게 0이어야 한다.
+      #
+      # for: 15m — 스큐는 급한 일이 아니다(NTP 조정으로 끝난다). 다만 조용히 쌓이면 안 된다.
+      - alert: QueueAdmissionClockSkewDetected
+        expr: sum by (queue_id) (increase(queue_admission_clock_skew_total[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "큐 {{ $labels.queue_id }} 에서 음수 대기 {{ $value }}건/1h — API 서버 간 시계 스큐 (p95 표본이 그만큼 빠진다)"
+          action: "queue-api 인스턴스 전부에서 `timedatectl status` 의 'System clock synchronized' 확인 → 어긋난 노드에서 `chronyc tracking` 또는 `systemctl status systemd-timesyncd`. ⚠️ **`date -s` 로 손으로 맞추지 마라** — 시간이 뒤로 점프하면 이미 발급된 토큰의 TTL 계산이 어긋난다. NTP가 slew로 서서히 맞추게 둔다."

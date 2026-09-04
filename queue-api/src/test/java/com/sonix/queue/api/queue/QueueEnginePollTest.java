@@ -19,6 +19,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Optional;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -58,7 +59,7 @@ class QueueEnginePollTest {
 
     @BeforeEach
     void setUp() {
-        service = new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher, clock);
+        service = new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher, clock, new SimpleMeterRegistry());
     }
 
     // ──────────────────────────────────────────────────────────────────────

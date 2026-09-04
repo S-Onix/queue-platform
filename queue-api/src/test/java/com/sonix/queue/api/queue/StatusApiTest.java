@@ -23,6 +23,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import java.time.Clock;
 import java.util.List;
 import java.util.Optional;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.never;
@@ -64,7 +65,7 @@ class StatusApiTest {
         QueueEngineService queueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher) {
             return new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher,
-                    Clock.systemUTC());
+                    Clock.systemUTC(), new SimpleMeterRegistry());
         }
     }
 
