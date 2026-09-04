@@ -139,19 +139,8 @@ flowchart TD
     RESPCACHE -.->|"동일 재요청"| POLL
 ```
 
-### 미래 확장 - Rank Query 전용 서비스 (Sprint 9+)
-
-```mermaid
-flowchart LR
-    Client["Client (Polling)"]
-    --> Ctrl["QueueController.getRank()"]
-    --> Svc["QueueService.getRank()"]
-    --> Cache["CaffeineRankCache"]
-    Cache -->|"HIT (80-95%)"| Return1["즉시 반환 (0.0001ms)"]
-    Cache -->|"MISS (5-20%)"| Engine["RankQueryEngine (Redis 조회, 1-2ms)"]
-    Engine --> Cache2["Caffeine에 저장 (TTL 1s)"]
-    Cache2 --> Return2["반환 (1-2ms)"]
-```
+> **미채택.** 여기 있던 Rank Query 전용 서비스 + Caffeine 캐시 다이어그램은 삭제했다 —
+> `QueueSnapshotCache`는 2026-08-19에 제거됐고 `/rank` 엔드포인트는 만들지 않았다.
 
 ---
 
@@ -187,12 +176,13 @@ flowchart TD
     --> COMPLETE["POST /queues/:queueId/tokens/:tokenId/complete\n{ admitToken }\nTenant → Platform"]
 
     COMPLETE --> DB["DB 권위로 판정 (Redis 아님)\nUPDATE tokens SET status=2, completed_at=?\n WHERE token_id=? AND admit_token=?\n   AND status IN (0, 1)   ← 관대하게\n   AND admitted_at > now - 300초\n   (COMPLETE_VALID_WINDOW_SECONDS, §80 구현)\n\n0을 허용하는 이유: 컨슈머 랙으로 status가\n아직 0인 정상 입장자가 실재한다\n(§36으로 TTL 만료 복귀는 폐기됐다)"]
-    DB -->|"0행"| E404C(["404 INVALID_ADMIT_TOKEN (TK002)\n409를 따로 두지 않는다 — 원인이 무엇이든\nTenant가 할 일은 같다"])
+    DB -->|"0행"| FB["① findCompletedAt — 이미 COMPLETED면 200\n② Redis admit-by-admit 폴백 → cleanup + COMPLETED 발행 (WARN)\n※ 순서를 뒤집지 마라 — ReconcileJob이 완료 토큰을 EXPIRED로 확정한다"]
+    FB -->|"둘 다 실패"| E404C(["404 INVALID_ADMIT_TOKEN (TK002)\n409를 따로 두지 않는다 — 원인이 무엇이든\nTenant가 할 일은 같다"])
     DB -->|"1행"| ZREM["Redis 정리 — cleanup_completed.lua (EVAL 1회, 원자)\nZREM admitted · DEL admit-by-token + admit-by-admit ← 무조건\n(회차마다 유일한 값이 키에 박혀 있다)\nHGET tokens {identifier} → tokenId 대조\n일치할 때만 ZREM waiting → HDEL tokens ← HDEL 마지막\n불일치 = 재-enqueue한 다음 회차다. 지우면 그 사람을 축출한다"]
     --> KAFKA2["Kafka COMPLETED 발행 (key=tokenId)\n※ 발행 실패는 삼킨다(로그만) — DB는 이미 status=2로 확정"]
     --> COK(["200 OK\n{ status: COMPLETED, completedAt }"])
 
-    DB -->|"ZREM 실패 시"| FIX["Batch 10초 내\nZREM 재실행 (멱등)"]
+    DB -->|"ZREM 실패 시"| FIX["재시도 없음 — 잔류분은 inactiveTtl 배치가 걷어간다"]
 
     LUA -->|"admitToken TTL 60초 초과"| BACK["종료 — 복귀 없음 (queue-batch, §36·§80)\nadmit_expire.lua: ZRANGEBYSCORE queue:{queueId}:admitted 0 now\n→ ZREM queue:{queueId}:admitted\n→ HGET queue:{queueId}:tokens {identifier} (tokenId·issuedAt 확보)\n→ HDEL queue:{queueId}:tokens {identifier} ← 중복 게이트 해제\n→ Kafka EXPIRED 발행\n※ waiting으로 ZADD 하지 않는다 — 재접속하면 맨 뒤다\n※ DB status는 1에 머문다 — EXPIRED 소비 가드가\n   IF(status=0,4,status)라 1에서는 no-op (complete 300초 창을 살리려는 의도)\n※ ShedLock 없음 — EVAL 자체가 claim (§80)\n※ 큐 목록은 DB queues에서 (Cluster SCAN은 노드별)"]
 ```
@@ -225,7 +215,7 @@ flowchart TD
     WAIT -->|"창 안에 개인 폴링 재개(ka 무관)"| BACK["poll_verify.lua가 ZADD last-active\n(재-enqueue는 순번만 복원할 뿐\nlast-active를 갱신하지 않는다)"]
     WAIT -->|"창을 넘김"| JOB["TTL 만료 Batch가 회수\nlast-active member=seq → waiting에서 identifier 역산\nHGET tokens로 issuedAt 원본 확보(HDEL 전!)\nZREM waiting + ZREM last-active + HDEL tokens"]
 
-    JOB --> EXP["Kafka EXPIRED 발행 (key=tokenId)\nDB status = EXPIRED(4)\nexpiredReason = INACTIVE_TTL"]
+    JOB --> EXP["Kafka EXPIRED 발행 (key=tokenId)\nDB status = EXPIRED(4)\nexpiredReason = INACTIVE(3)"]
     EXP --> BILL(["과금 대상 — 자리를 끝까지 점유했다 (§82)"])
     JOB --> NEW["이후 재-enqueue는 신규\n새 tokenId·새 seq → 맨 뒤\n과금 +1건"]
 ```
@@ -248,8 +238,8 @@ flowchart TD
     W2["inactiveTtl 체크 (WAITING)\nZRANGEBYSCORE queue:{queueId}:last-active\n0 ~ now_ms - inactiveTtl_ms\n(member=seq, score=마지막 ka 시각)"]
     W3["admitToken TTL 체크 (ADMIT_ISSUED) — claim-Lua (§80)\nZRANGEBYSCORE queue:{queueId}:admitted 0 now\n(score=만료 epoch ms, member='seq|identifier')\n※ EXISTS 스캔 폐기 — 만료된 키는 이미 사라져\n   무엇이 만료됐는지 알 수단이 없었다"]
 
-    W1 -->|"WAITING_TTL(0)"| EXP["waiting_expire.lua / inactive_expire.lua\nZREM waiting + ZREM last-active + HGET/HDEL tokens\n→ Kafka EXPIRED 발행 → 컨슈머가 DB status=4\n※ DB를 직접 UPDATE하지 않는다 — 이벤트 경로다\n※ expiredReason은 이벤트에 싣지 않는다 (컬럼은 있으나 미사용)\n※ 큐당 상한으로 끊는다 (한 주기가 다른 큐를 굶기지 않게)"]
-    W2 -->|"INACTIVE_TTL(1)"| EXP
+    W1 -->|"WAITING_TTL(4)"| EXP["waiting_expire.lua / inactive_expire.lua\nZREM waiting + ZREM last-active + HGET/HDEL tokens\n→ Kafka EXPIRED 발행 → 컨슈머가 DB status=4\n※ DB를 직접 UPDATE하지 않는다 — 이벤트 경로다\n※ expiredReason을 이벤트에 싣는다 → 컨슈머가 expired_reason 컬럼에 적재 (§86)\n※ 큐당 상한으로 끊는다 (한 주기가 다른 큐를 굶기지 않게)"]
+    W2 -->|"INACTIVE(3)"| EXP
 
     W3 -->|"ADMIT_TOKEN_TTL(2)"| BACK["종료 — 복귀 없음 (queue-batch, §36)\nadmit_expire.lua 한 스크립트: ZREM admitted → HGET/HDEL tokens\nKafka EXPIRED 발행\n※ waiting으로 되돌리지 않는다\n※ DB status는 1에 머문다 (소비 가드가 1에서 no-op)\n   → 잔류분은 ReconcileJob이 complete 창 300초 뒤 4로 정리"]
 
@@ -274,7 +264,7 @@ flowchart TD
 flowchart LR
     subgraph API["Queue Platform API"]
         E1["Enqueue 처리\nRedis ZADD 완료"]
-        E2["admit 처리\nDB INSERT PENDING"]
+        E2["admit 처리\nadmit.lua 원자 실행"]
     end
 
     subgraph TOPICS["Kafka"]
@@ -286,7 +276,7 @@ flowchart LR
     end
 
     E1 -->|"produce"| T1
-    E2 -.->|"admit 요청 전달 수단 미판정\n(Sprint 7)"| T1
+    E2 -->|"produce (ADMITTED)"| T1
     T1 -->|"consume"| C1
 ```
 
@@ -304,7 +294,7 @@ flowchart TD
 
     CLIENT --> POLL["JS SDK 내부\npoll() 실행"]
     --> REQ["GET /queues/:queueId/status\nPlatform 직접 호출 (인증 없음)\n30만 명 전원 동일 응답 → 캐시"]
-    --> PLATFORM["Queue Platform\nMGET admit-watermark, pacing\n(rank 계산 없음)"]
+    --> PLATFORM["Queue Platform\nMGET admit-watermark, pacing, seq\n(rank 계산 없음 / seq는 큐 실재 판정)"]
     --> RESP["응답\n{ lastAdmittedSeq, pacing }"]
 
     RESP --> CALC["JS SDK 계산\nrank = mySeq − lastAdmittedSeq\n간격 = pacing 표 + ±20% 지터"]
@@ -363,69 +353,18 @@ flowchart TD
 
 ---
 
-## Cluster 라우팅 흐름 (Sprint 10+ 반영)
+## Cluster 라우팅 (현행)
 
-Sprint 10 이후 Redis Cluster 도입 시의 Enqueue 라우팅 상세.
+큐를 만들 때 **큐 단위로** 두 클러스터 중 하나를 고르고, 그 큐의 키 4종은 전부 같은 클러스터에
+같은 slot으로 들어간다(해시태그, `QueueKeys`).
 
-### Sprint 10 - 단일 Cluster (자동 slot 분배)
+- 배정 기준은 **cluster1의 메모리 사용률**이다 — 0.5 이상이면 cluster2 (`RedisClusterAssigner`).
+- 클러스터 안에서는 Lettuce가 slot으로 자동 라우팅한다. 개발자 개입이 없다.
 
-```mermaid
-flowchart TD
-    Client["Client (Enqueue 요청)"]
-    --> WAS["WAS (Spring MVC)"]
-    --> Lettuce["Lettuce Client"]
+> 🔴 여기 있던 "Sprint 12+ 이중 라우팅" 다이어그램은 삭제했다. 키 형식 `queue:{shard_X}:...`와
+> Tenant Tier(VIP/Premium) 분기는 **둘 다 철회된 설계**다(태그는 shard로 이동하지 않았고,
+> 등급제는 §88에서 사라졌다). 계획으로 읽히면 되돌리기 어려운 키 변경을 부른다.
 
-    Lettuce --> CRC["① CRC16 계산\nkey: 'queue:{queueId}:waiting'\nslot = CRC16(key) % 16384"]
-
-    CRC --> Route["② Topology 조회\nslot → 담당 Master"]
-
-    Route --> M1["Master 1\nSlot 0-5460"]
-    Route --> M2["Master 2\nSlot 5461-10922"]
-    Route --> M3["Master 3\nSlot 10923-16383"]
-
-    M1 & M2 & M3 --> Lua["Lua Script 실행\n(각 Master 원자 실행)"]
-    Lua --> Return["결과 반환"]
-```
-
-**특징**:
-- Lettuce 자동 라우팅 (개발자 개입 X)
-- Queue별 다른 Master 자동 배치
-- 완전 격리 (다른 Master 영향 X)
-
-### Sprint 12+ - 이중 라우팅 (Cluster + Hash Tag)
-
-```mermaid
-flowchart TD
-    Client["Client (Queue 생성 요청)"]
-    --> Router1["Layer 1: Cluster Router\n(Application)"]
-
-    Router1 --> Analyze1["Tenant Tier 확인\n예상 규모 확인\nLeast Load 알고리즘"]
-
-    Analyze1 --> ClusterA["Cluster A\n(대다수 Tenant)"]
-    Analyze1 --> ClusterB["Cluster B\n(대형 Tenant)"]
-    Analyze1 --> ClusterC["Cluster C\n(VIP)"]
-
-    ClusterA & ClusterB & ClusterC --> Router2["Layer 2: Shard Router\n(각 Cluster 내부)"]
-
-    Router2 --> Analyze2["각 Master 부하 조회\nLeast Load 알고리즘\nShard 결정 (shard_X)"]
-
-    Analyze2 --> KeyGen["Redis Key 구성\n'queue:{shard_X}:{queueId}:waiting'"]
-
-    KeyGen --> Store["Queue 도메인 저장\nclusterName + shard 필드"]
-    Store --> Enqueue["이후 Enqueue 시\n저장된 정보로 정확한 Master 접근"]
-```
-
-**Layer 1 (Cluster) 결정 기준**:
-- Tenant Tier (VIP/Premium/일반)
-- 예상 규모 (500만+ 대기 → Cluster B)
-- 지역 (Multi-region)
-
-**Layer 2 (Master) 결정 기준**:
-- 부하 기반 (Least Load)
-- Hash Tag 문법 `{shard_X}`
-- Cluster 내 4-16 Master 중 선택
-
----
 
 ## Enqueue 순서 보장 제약 (Sprint 5-E 확정)
 
@@ -461,10 +400,9 @@ Redis 저장 순서: B, A (도착 순)
 - 대기 없음
 - 처리량 극대화
 
-**Kafka 도입 가능 (Sprint 11)**:
-- 완전 비동기 가능
-- 순서 보장 안 함 (대기열 UX 관점 무관)
-- 처리량 폭증
+**Kafka 적재 (구현 완료, §73)**:
+- DB INSERT만 비동기 — 발행은 응답 전에 동기로 기다린다
+- 같은 tokenId는 같은 파티션이라 상태 전이 순서가 보장된다
 
 ### 실무 관행
 
@@ -477,18 +415,9 @@ Ticketmaster, 인터파크 등:
 
 ---
 
-## 부하 감소 요약 (오늘 세션 반영)
+## 부하 감소 요약
 
-| 단계 | Before | After | 감소 |
-|------|--------|-------|------|
-| Enqueue (평상시) | 개별 처리 3ms | 일반 Lua 1-3ms | 유지 |
-| Enqueue (피크) | 순차 실패/재시도 | Bulk Lua 10-30ms | 안정화 |
-| Polling (일반) | 스파이크 500k/s | Jitter 200k/s | -40~50% |
-| Polling (캐싱 후) | Redis 200k/s | Caffeine 80% + Redis 40k/s | -80% |
+> 여기 있던 Before/After 표와 Sprint별 최적화 목록은 삭제했다. 측정 출처가 없는 추정치였고,
+> 네 항목 중 셋이 이미 죽었다(Caffeine 미채택 · Kafka 도입 완료 · 이중 라우팅 철회).
+> **실측은 `doc/perf/ENQUEUE_TUNING.md`에 있다.**
 
-**Sprint별 최적화 도입**:
-- Sprint 5-E: Enqueue Bulk 단독 + Hash Tag (완료, §70 — 하이브리드는 폐기)
-- Sprint 9: Rank Query + Caffeine 캐싱
-- Sprint 10: Cluster 도입 (부하 격리)
-- Sprint 11-12: Kafka (비동기 처리량 증가)
-- Sprint 12+: 이중 라우팅 (부하 균등)

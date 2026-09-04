@@ -13,3 +13,10 @@ Result: PASSED
 
 BUILD SUCCESSFUL
 2 tests passed, 0 failed
+
+--- ✏️ 정정 (2026-09-04) ---
+[Test 2]의 "replica"는 라우팅 키가 갈렸다는 뜻일 뿐, 실제 3307에 붙었다는 뜻이 아니다.
+테스트 설정은 replica url을 master(3306)로 준다 — 라우팅이 물리적으로 갈리지 않는다.
+실제 라우팅 확인 수단은 로그다:
+  --logging.level.com.sonix.queue.infrastructure.config=DEBUG
+현재 앱이 replica를 읽는 경로는 0이다(PR #63). 근거는 CLAUDE.md §4-3.

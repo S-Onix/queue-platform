@@ -191,6 +191,9 @@ current-epoch 1
 >
 > 클라이언트는 Sentinel 주소만 알면 되고, Lettuce가 +switch-master Pub/Sub 이벤트로 새 Master를 자동 인식해 코드 변경 없이 복구됩니다.
 >
+> (⚠️ **Sentinel 구성 기준의 설명이다.** 이 프로젝트의 운영 구성은 Cluster이고 `RedisConfig`에
+> Sentinel 분기는 없다 — §75 D28.)
+>
 > Sentinel은 감시·결정만 하고 프로세스 부활은 systemd/Docker/k8s의 책임입니다. 이 분리가 Redis HA 설계 철학입니다."
 
 ---

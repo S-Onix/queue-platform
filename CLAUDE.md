@@ -101,7 +101,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  큐 상한 둘 — maxCapacity 1~30만(@Max) · 테넌트당 큐 20개(Q006)     (§87)
           🔑 막는 것은 성능이 아니라 Redis 마스터 용량이다. 실측 477 B/명이고,
              상한이 없으면 같은 마스터의 **다른 테넌트** enqueue가 OOM으로 죽는다(재현)
-  미착수  관측 메트릭 3종(queue_admit_*) — 좀비 탐지 수단이 아직 0          (§80 U9)
+  일부구현 관측 메트릭 — `queue_admission_wait_seconds` ✅(2026-09-04) ·
+          `queue_admit_requests_total`/`_tokens_issued_total`은 여전히 계측 0건  (§80 U9)
   폐기    RedisSyncJob + redis_sync_needed — 전제가 성립 불가 (2026-08-27, schema.sql 주석)
   미착수  JS SDK — 리더 탭(BroadcastChannel) 확정만 되고 코드 0             (§78)
 
@@ -340,7 +341,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 ## 진행 중인 작업 / 알려진 이슈
 
 ### Sprint 4 빈틈 (Sprint 5에서 보강 완료 / 진행 중)
-- **Refresh Token 저장 로직 미구현**: Sprint 5-D 이후 결정 (Redis 캐시 완료 후 Sprint 6 이전 검토)
+- ~~**Refresh Token 저장 로직 미구현**~~ → **구현 완료.** `RefreshToken`(domain) · `RefreshTokenRepository`(port) ·
+  `RefreshTokenEntity`/`RefreshTokenJpaRepository`/`RefreshTokenJpaAdapter`(infra) 전부 있다. DB 저장 + Rotation + 재사용 감지
 - ~~**ApiResponse 위치**: queue-common에 있으나 queue-api로 이동 검토 중~~ → Sprint 5 진입 시 `com.sonix.queue.api.common.response`로 이동 완료 (Batch가 사용 안 함)
 
 ### Sprint 5에서 함께 구현할 것
@@ -349,7 +351,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 - ✅ HTTP Filter 통합 (429 + Retry-After)
 - ✅ API Key 캐시 (`apikey:{keyHash}`, TTL 60s) (5-D)
 - ✅ Queue Engine Lua Script (enqueue_bulk.lua 단독 + Hash Tag, 5-E / DECISIONS §70)
-- ⬜ Refresh Token 도메인 모델 + DB 저장 + Redis 캐시 (5-E 이후)
+- ✅ Refresh Token 도메인 모델 + DB 저장 (Rotation·재사용 감지). Redis 캐시는 안 붙였다 — DB 조회로 충분하고 §4 대상
 
 ### Cluster 로컬 학습 완료 자산 (2026-07-08)
 - Sentinel + Cluster A + Cluster B 병행 실행 (WSL2)
@@ -608,7 +610,7 @@ mysql -u root -p -P 3307  # Replica
 |------|------|
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
-| `doc/API.md` | ⭐ **엔드포인트 17개 필드 단위 명세** — 요청/응답/에러/인증. 코드에서 추출 |
+| `doc/API.md` | ⭐ **엔드포인트 18개 필드 단위 명세** — 요청/응답/에러/인증. 코드에서 추출 |
 | `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 7건 + 흔한 실수 |
 | `doc/DECISIONS.md` | 88개 설계 결정 + 근거 + 면접 포인트 (최신 §88 — Plan 등급제 철회, rate limit 상수화) |
 | `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (§79 분할은 **반영 완료**) |

@@ -48,7 +48,7 @@
 - [부록 C: Redis Cluster 실전 명령어 가이드](#부록-c-redis-cluster-실전-명령어-가이드)
 - [부록 D: Redis Cluster 설정 파일 상세](#부록-d-redis-cluster-설정-파일-상세)
 - [부록 E: Cluster 학습 실습 절차](#부록-e-cluster-학습-실습-절차)
-- [부록 F: 이중 라우팅 아키텍처 (Cluster + Hash Tag)](#부록-f-이중-라우팅-아키텍처)
+- [부록 F: 이중 라우팅 — Layer 1만 채택, Layer 2는 기각](#부록-f-이중-라우팅-아키텍처--layer-1만-채택-layer-2는-기각)
 - [부록 G: 1억 대기 처리 인프라 실측 계산](#부록-g-1억-대기-처리-인프라-실측-계산)
 - [부록 H: Master 크기 최적화 원리 (Single Thread 병목 해결)](#부록-h-master-크기-최적화-원리)
 - [부록 I: 극대 분산 아키텍처 (4x4x4GB 최종 설계)](#부록-i-극대-분산-아키텍처)
@@ -2155,138 +2155,30 @@ sudo systemctl restart redis-cluster-<port>
 
 ---
 
-## 부록 F: 이중 라우팅 아키텍처
+## 부록 F: 이중 라우팅 아키텍처 — **Layer 1만 채택, Layer 2는 기각**
 
-### F.1 개념 - 두 층위 결합
+> ✏️ **2026-09-04 정정.** 이 부록의 원안(Layer 1 Cluster Router + Layer 2 Shard Resolver)
+> 중 **Layer 2(부하 기반 `{shard_N}` 태그 배정)는 기각됐다.** 아래는 실제로 구현된 것이다.
 
-Cluster Routing과 Hash Tag Master Routing을 동시에 사용하여 완전한 제어를 확보하는 아키텍처.
+**Layer 1 — Cluster 선택 (구현 완료, §75)**
+- `RedisClusterAssigner`가 큐 생성 시 A/B 중 하나를 고른다.
+- 기준은 `used_memory ÷ maxmemory` **0.5 규칙**이다. Tenant Tier가 아니다 —
+  등급제는 §88에서 통째로 걷어냈다.
+- 한 큐의 키 4종(`waiting`·`seq`·`tokens`·`last-active`)은 같은 클러스터에 놓인다 (§75 D26).
+- 매핑은 `queues` 행에 남고, 기존 항목에 대해 불변이다 (§75 D27-2).
 
-**Layer 1: Cluster 선택 (애플리케이션 라우팅)**
-- Tenant Tier 기반
-- 예상 규모 기반
-- 지역 (Multi-region)
-- 규정 준수 요구
-- 결과: Cluster A, B, C, D 중 하나 선택
+**Layer 2 — Shard 태그 (⛔ 기각)**
+- 해시태그의 용도는 **부하 분산이 아니라 CROSSSLOT 방지**다. 다중 키 Lua
+  (`enqueue_bulk.lua` 3키 · `poll_verify.lua` 3키)가 한 슬롯에 모이게 하는 것이 전부다.
+- 그래서 태그는 `queueId` 하나뿐이다: `queue:{q_bts_002}:waiting`.
+  슬롯 배치는 Redis가 CRC16으로 정하고, 애플리케이션은 Master를 고르지 않는다.
+- 부하 기반 재배정을 하려면 태그를 바꿔야 하는데, 태그를 바꾸면 **키가 바뀐다** —
+  운영 중인 큐의 대기열을 옮기는 일이 된다. 얻는 것(균등 배치)보다 잃는 것이 크다.
+- 키 생성은 전부 `queue/QueueKeys.java`를 거친다. 태그 없는 키를 다중 키 Lua의 KEYS에
+  끼우면 **Cluster에서만** `CROSSSLOT`으로 깨지고, 로컬 Sentinel 테스트로는 안 잡힌다.
 
-**Layer 2: Master 선택 (Hash Tag)**
-- 각 Master 부하 상태
-- 각 Master Queue 수
-- 균등 분배 알고리즘
-- 결과: 선택한 Cluster 내 특정 Master
-
-### F.2 실제 흐름
-
-```
-1. Queue 생성 요청 도착
-   ↓
-2. Layer 1: Cluster Router
-   - Tenant Tier 확인
-   - 예상 규모 확인
-   - Cluster 결정 (A/B/C/D)
-   ↓
-3. Layer 2: Shard Resolver
-   - 선택한 Cluster의 Master 부하 조회
-   - Least Load 알고리즘
-   - Shard 결정 (shard_1/2/3/4)
-   ↓
-4. Redis key 구성
-   "queue:{shard_A2}:q_bts_002:waiting"
-   ↓
-5. 해당 Cluster의 Lettuce로 전송
-   ↓
-6. Lettuce가 {shard_A2}로 slot 계산
-   → 담당 Master 결정
-   ↓
-7. 최종 배치 완료
-```
-
-### F.3 Spring Boot 구현 예시
-
-```java
-@Configuration
-public class MultiClusterRedisConfig {
-    
-    @Bean("clusterA")
-    public RedisTemplate<String, String> clusterA() {
-        return createClusterTemplate(List.of(
-            "127.0.0.1:7001", "127.0.0.1:7002",
-            "127.0.0.1:7003", "127.0.0.1:7004"
-        ));
-    }
-    
-    @Bean("clusterB")
-    public RedisTemplate<String, String> clusterB() {
-        return createClusterTemplate(List.of(
-            "127.0.0.1:8001", "127.0.0.1:8002",
-            "127.0.0.1:8003", "127.0.0.1:8004"
-        ));
-    }
-    // Cluster C, D도 동일 패턴
-}
-
-@Service
-public class SmartQueueService {
-    
-    @Transactional
-    public QueueResponse createQueue(String tenantId, QueueCreateRequest request) {
-        // Layer 1 - Cluster 결정
-        ClusterAssignment cluster = clusterRouter.selectCluster(tenantId, request);
-        
-        // Layer 2 - Master 결정 (Hash Tag)
-        ShardAssignment shard = shardResolver.selectShard(cluster.getTemplate());
-        
-        // Queue 도메인 저장 (Cluster + Shard 정보 포함)
-        Queue queue = Queue.create(...);
-        queue.setClusterName(cluster.getName());
-        queue.setShard(shard.getShardName());
-        queueRepository.save(queue);
-        
-        return QueueResponse.from(queue);
-    }
-    
-    public EnqueueResult enqueue(String queueId, String identifier) {
-        Queue queue = queueRepository.findByQueueId(queueId).orElseThrow();
-        
-        // Cluster + Shard로 정확한 Master 결정
-        RedisTemplate<String, String> cluster = 
-            clusterRouter.getCluster(queue.getClusterName());
-        
-        String key = String.format(
-            "queue:{%s}:%s:waiting",
-            queue.getShard(),
-            queue.getQueueId()
-        );
-        
-        return executeLuaEnqueue(cluster, key, identifier, queue.getMaxCapacity());
-    }
-}
-```
-
-### F.4 실무 관행 (대형 서비스)
-
-- **Netflix EVCache**: Service Clusters + 각 Cluster 내 Sharding
-- **Twitter**: Region Clusters + User/Tweet ID hash 기반 Sharding
-- **Uber**: Service Clusters + Geographic Sharding
-
-### F.5 도입 시점 판단
-
-**Layer 2 (Hash Tag) 도입 조건**:
-- Master 부하 편차 30%+
-- Queue 수 100+
-- 특정 Queue 격리 필요
-- **시점**: Sprint 12+
-
-**Layer 1 (Multi Cluster) 도입 조건**:
-- 대형 Tenant 등장 (500만+ 대기)
-- SLA 차등 요구
-- 규정 준수 필요
-- 지역 확장
-- **시점**: Sprint 15+
-
-### F.6 핵심 통찰
-
-- **통찰 84**: Cluster의 애플리케이션 제어 방식 (Hash Tag + Cluster Routing)
-- **통찰 85**: 이중 라우팅의 완전한 제어 아키텍처
+🪤 **다른 슬롯이라도 같은 노드에 떨어지면 CROSSSLOT이 안 난다**(실측 25%).
+Cluster에서 초록은 태그가 맞다는 증거가 아니다.
 
 ---
 

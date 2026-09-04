@@ -28,7 +28,7 @@
 
 [필요]
 Tenant 단위 자원 사용량 제한
-- SaaS Plan별 차등 한도
+- 테넌트별 한도 (지금은 전 테넌트 동일 상수 — §88)
 - 콘서트 티켓팅 같은 burst 흡수
 - 공정한 자원 분배
 ```
@@ -149,7 +149,7 @@ weighted_count = current + previous × (1 - elapsed_ratio)
 - Burst 허용 (양동이 가득찬 상태 즉시 통과)
 - O(1) 메모리 (Hash 필드 in-place 갱신)
 - 평균 처리량 + 순간 burst 분리 제어
-- SaaS Plan과 자연스러운 매핑
+- 테넌트별 한도를 키 하나로 분리 가능
 
 **단점:**
 - 장시간 미사용 후 큰 burst 가능 (양동이 가득참)
@@ -157,7 +157,7 @@ weighted_count = current + previous × (1 - elapsed_ratio)
 
 **Queue Platform 선택 이유:**
 - 콘서트 티켓팅 같은 burst 흡수 필요
-- Tenant Plan과 매핑 (capacity = refillRate × 60)
+- capacity = refillRate × 60 (1분치 버스트)
 - SLA 보장 (평균 처리량) + Burst 허용 (순간 폭증)
 
 ### 2.6 Leaky Bucket
@@ -212,12 +212,12 @@ SIGNUP에 Token Bucket 적용
 **시나리오 2: Fixed Window로 통합**
 ```
 Tenant SLA에 Fixed Window 적용
-  PRO Plan: 분당 10,000회
+  테넌트 한도: 분당 50,000회
 
 문제:
   - 콘서트 시작 시 폭증 흡수 X
   - 시간 경계 burst (이전 윈도우 + 현재 윈도우)
-  - SaaS Plan과 매핑 어색 (burst 개념 없음)
+  - 버스트 개념이 없어 티켓팅 트래픽과 안 맞음
 
 결론: 비즈니스 목적에 부적합
 ```
@@ -225,7 +225,7 @@ Tenant SLA에 Fixed Window 적용
 ### 3.3 알고리즘 분리 정당성
 
 **다른 책임:**
-- Tenant SLA = 비즈니스 약속 (Plan별 차등)
+- Tenant SLA = 독식 방어 (전 테넌트 동일 상수)
 - 보안 한도 = 시스템 보호
 
 **다른 시그니처:**
@@ -261,77 +261,23 @@ FixedWindowRateLimiter (Fixed Window용)
 
 ---
 
-## 4. Tenant Plan — SaaS 등급 시스템
+## 4. 테넌트 한도 — 등급 없는 단일 상수
 
-### 4.1 Plan 정의
+> 🔴 **여기 있던 `Plan` enum(FREE/STARTER/PRO/ENTERPRISE)과 DB 매핑·도메인 배치 서술은
+> 삭제했다.** `Plan.java`는 레포에 없다(§88 철회). 등급별 수치가 필요하면 `DECISIONS.md §62`(도입)와
+> `§88`(철회)를 봐라.
 
-```java
-public enum Plan {
-    FREE(100, 1.67),             // 분당 100 RPS
-    STARTER(1_000, 16.67),       // 분당 1,000 RPS
-    PRO(10_000, 166.67),         // 분당 10,000 RPS
-    ENTERPRISE(100_000, 1_666.67); // 분당 100,000 RPS
-
-    private final int capacity;
-    private final double refillRatePerSecond;
-}
-```
-
-### 4.2 비율 결정 — capacity = refillRate × 60
-
-**시나리오:**
-```
-콘서트 티켓팅 시작:
-  시작 1초: 5,000 요청 (폭증)
-  시작 5초: 평균으로 안정화
-  1분 후: 매진
-
-Token Bucket 동작:
-  capacity 10,000 (PRO Plan)
-  refillRate 166.67/초
-
-  시작 1초: 5,000 요청 → 양동이 50% 사용
-  → 모두 통과 ✓
-
-  시작 5초: 양동이 회복 + 사용
-  → 평균 처리량 내에서 통과
-```
-
-**왜 1분치인가?**
-- 콘서트 매진까지 일반적 시간 = 1분
-- 1분 후엔 트래픽 안정화
-- 1분치 burst가 비즈니스 시나리오와 일치
-
-### 4.3 DB 매핑
-
-```sql
-ALTER TABLE tenants ADD COLUMN plan TINYINT NOT NULL DEFAULT 0;
-
--- Plan ordinal:
--- 0 = FREE
--- 1 = STARTER
--- 2 = PRO
--- 3 = ENTERPRISE
-```
-
-TenantStatus 패턴과 동일 (DECISIONS §50).
-
-### 4.4 Plan 도메인 위치
-
-**Plan은 Tenant 도메인에 두는 이유:**
-- Plan = SaaS 비즈니스 약속 (Tenant의 속성)
-- Rate Limit은 그 약속의 한 구현
-- 도메인 객체로 자연스러움
+**현행 (`RateLimitFilter.java:102-103`, §89):**
 
 ```java
-public class Tenant {
-    private Plan plan;
-
-    public void changePlan(Plan newPlan) {
-        // 업그레이드/다운그레이드 로직
-    }
-}
+static final int    TENANT_CAPACITY      = 50_000;   // 버스트 허용량
+static final double TENANT_REFILL_PER_SEC = 833.34;  // 지속 처리율 (= capacity / 60)
 ```
+
+- **모든 테넌트가 같은 값**을 쓴다. 키만 테넌트별이다(`rl:tenant:{id}`).
+- `capacity = refillRate × 60` 관계는 유지된다 — 1분치 버스트를 허용하고 그 뒤 평균으로 수렴시킨다.
+  이 비율은 `TenantRateLimitConstantsTest`가 강제한다(둘 중 하나만 바꾸면 빨개진다).
+- **왜 10만이 아니라 5만인가** — 10만에서는 429가 한 건도 안 나서 방어가 무동작이었다(§89 실측).
 
 ---
 
@@ -370,13 +316,16 @@ public enum PublicEndpointRateLimit {
 ### 5.3 키 패턴
 
 ```
-rl:signup:ip:127.0.0.1:{windowNo}
-rl:login:ip:127.0.0.1:{windowNo}
-rl:refresh:ip:127.0.0.1:{windowNo}
+rl:signup:ip127.0.0.1:{windowNo}      ← "ip" 뒤에 콜론이 없다 (RateLimitKeys.java:13)
+rl:login:ip127.0.0.1:{windowNo}
+rl:refresh:ip127.0.0.1:{windowNo}
 
 windowNo = currentTimeMillis / windowSizeMillis
 → 윈도우별로 키 분리 → 자동 만료 (메모리 효율)
 ```
+
+⚠️ 윈도우 번호를 **Java에서** 이어붙인다(`RateLimitKeys.fixedWindow()`). Lua 안에서 조립하면
+선언한 KEYS와 실제 접근 키가 달라 Cluster가 거부한다 — §7.2 참조.
 
 ### 5.4 IP 추출
 
@@ -433,35 +382,18 @@ Controller
 
 ### 6.2 RateLimitFilter 구현
 
-```java
-@Component
-public class RateLimitFilter extends OncePerRequestFilter {
+> 여기 있던 골격 예제는 삭제했다. 실물이 그 뒤로 네 번 갈렸고(폴링 버킷 선처리, 공개 엔드포인트
+> 선처리, 경로 정규화, 테넌트 캐시), 예제를 따라 쓰면 그 결함들이 되살아난다.
+> **정본은 `RateLimitFilter.java`다** — 분기 순서와 근거가 주석에 있다.
 
-    private final RateLimiter tokenBucketLimiter;
-    private final FixedWindowRateLimiter fixedWindowLimiter;
-    private final TenantRepository tenantRepository;
+현재 분기 순서만 기록해 둔다. **순서가 곧 결함 이력이다.**
 
-    @Override
-    protected void doFilterInternal(...) {
-        if (shouldSkip(request)) {
-            filterChain.doFilter(request, response);
-            return;
-        }
+1. `isPollPath` — 폴링은 `rl:poll:token:{tokenId}` 버킷으로 먼저 뺀다(cap 5 · refill 1.0/s).
+2. 공개 엔드포인트(signup/login/refresh) — **인증 여부보다 먼저** 본다.
+   나중에 보면 brute force가 남의 테넌트 버킷을 먹는다.
+3. 인증된 요청 — `rl:tenant:{id}` Token Bucket.
 
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-
-        if (auth != null && auth.getPrincipal() instanceof TenantAuth tenantAuth) {
-            // 인증 후 → Token Bucket
-            if (!checkAuthenticatedRateLimit(tenantAuth, response)) return;
-        } else {
-            // 인증 전 → Fixed Window
-            if (!checkPublicRateLimit(request, response)) return;
-        }
-
-        filterChain.doFilter(request, response);
-    }
-}
-```
+경로 비교는 `UrlPathHelper`로 정규화한 뒤 한다(PR #59). 두 계층이 다른 문자열을 보면 한도가 사라진다.
 
 ### 6.3 SecurityConfig 등록
 
@@ -502,77 +434,32 @@ Content-Type: application/json;charset=UTF-8
 
 ### 7.1 token-bucket.lua
 
+전문은 `queue-infrastructure/src/main/resources/lua/token-bucket.lua`. **여기 복사하지 않는다** —
+옛 전문이 `EXPIRE key 60` 고정이었고, 실물은 그 뒤 클램프로 바뀌었다.
+
 ```lua
--- KEYS[1]: 양동이 키 (예: "rl:tenant:t_abc123")
--- ARGV[1]: capacity (양동이 크기)
--- ARGV[2]: refillRatePerSecond (토큰 회복 속도)
--- ARGV[3]: nowMillis (현재 시간)
--- 반환: 1 = 허용, 0 = 거부
-
-local key = KEYS[1]
-local capacity = tonumber(ARGV[1])
-local refillRate = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-
--- 1. 현재 상태 조회
-local bucket = redis.call('HMGET', key, 'tokens', 'lastRefillMillis')
-local tokens = tonumber(bucket[1]) or capacity
-local lastRefillMillis = tonumber(bucket[2]) or now
-
--- 2. 회복 계산 (경과 시간만큼 토큰 회복)
-local elapsedSeconds = (now - lastRefillMillis) / 1000.0
-local refillTokens = elapsedSeconds * refillRate
-tokens = math.min(capacity, tokens + refillTokens)
-
--- 3. 토큰 사용 시도
-if tokens >= 1 then
-    tokens = tokens - 1
-    redis.call('HMSET', key, 'tokens', tokens, 'lastRefillMillis', now)
-    redis.call('EXPIRE', key, 60)  -- 1분 미사용 시 정리
-    return 1  -- 허용
-else
-    redis.call('HMSET', key, 'tokens', tokens, 'lastRefillMillis', now)
-    redis.call('EXPIRE', key, 60)
-    return 0  -- 거부
-end
+-- 실물의 TTL (버킷이 다 차는 시간 + 여유 60초, 60~3600으로 클램프)
+local ttl = math.max(60, math.min(3600, math.ceil(capacity / refillRate) + 60))
 ```
+
+고정 60초면 **회복이 60초보다 오래 걸리는 버킷이 회복 도중에 지워져** 한도가 리셋된다.
+클램프는 `refillRate`가 0·음수여도 안전한 값을 낸다.
 
 ### 7.2 fixed-window.lua
 
-```lua
--- KEYS[1]: 카운터 키 (예: "rl:signup:ip:127.0.0.1")
--- ARGV[1]: limit (윈도우당 허용 요청 수)
--- ARGV[2]: windowSizeMillis (윈도우 크기, ms)
--- ARGV[3]: nowMillis (현재 시간)
--- 반환: 1 = 허용, 0 = 거부
+전문은 `queue-infrastructure/src/main/resources/lua/fixed-window.lua`.
+**ARGV는 2개(limit, windowSizeMillis)다. 키는 완성된 상태로 KEYS[1]에 들어온다.**
 
-local baseKey = KEYS[1]
-local limit = tonumber(ARGV[1])
-local windowSizeMillis = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
+🔴 **여기 있던 옛 전문(ARGV[3] = nowMillis를 받아 Lua 안에서 `KEYS[1] .. ':' .. windowNo`로
+키를 조립)은 삭제했다.** 선언한 KEYS와 실제 접근 키가 달라 Cluster가 거부한다:
 
--- 1. 윈도우 번호 계산
-local windowNo = math.floor(now / windowSizeMillis)
-
--- 2. 윈도우별 키 (자동 만료를 위해 분리)
-local key = baseKey .. ":" .. windowNo
-
--- 3. 카운터 증가
-local current = redis.call('INCR', key)
-
--- 4. 첫 증가 시 TTL 설정
-if current == 1 then
-    local ttlSeconds = math.floor(windowSizeMillis / 1000) + 1
-    redis.call('EXPIRE', key, ttlSeconds)
-end
-
--- 5. 한도 체크
-if current > limit then
-    return 0  -- 거부
-end
-
-return 1  -- 허용
 ```
+ERR Script attempted to access a non local key in a cluster node
+```
+
+Sentinel에는 슬롯 개념이 없어 안 드러났고, **Cluster 전환 즉시 signup/login/refresh가 전부 죽었다.**
+윈도우 번호 조립은 `RateLimitKeys.fixedWindow()`가 한다.
+TTL 설정만 Lua에 남는다 — "첫 증가일 때만 EXPIRE"는 INCR과 원자적으로 묶여야 하기 때문이다.
 
 ### 7.3 Lua Script 원자성
 
@@ -755,27 +642,12 @@ curl -i -X POST http://localhost:8080/api/v1/tenants/signup ...
 
 ### 10.1 Redis Lua Script 의존도
 
-```
-[Queue Platform Redis 사용]
-- Rate Limiter: 매 요청 1-2 ops
-- Token 캐시: 매 Polling 1 op
-- Queue 순서: ZADD/ZREM/ZSCORE
-- 합계: 요청당 평균 3-5 ops
+Rate Limiter는 요청당 Redis 1~2 ops를 더한다. 그 자체가 병목이 된 적은 없다 —
+버스트 실측에서 병목은 리미터가 아니라 드레인 주기였다(`doc/perf/ENQUEUE_TUNING.md`).
 
-[Redis 단일 Master 한도]
-- ~100,000 ops/sec
-- Lua Script 1회 = 여러 ops (HMGET + HMSET 등)
+> 여기 있던 "단일 Master ~100,000 ops/sec → 20,000~25,000 RPS" 추정은 삭제했다.
+> 근거가 제시된 적 없고, Redis는 이미 독립 2 Cluster다(§75).
 
-[처리 가능 RPS 추정]
-20,000 ~ 25,000 RPS (Queue Platform)
-```
-
-**콘서트급 처리 (10만 명 / 5초 = 20,000 RPS):**
-- 현재 인프라로 한계점 도달
-- Sprint 10+에서 검토:
-    - Lua Script 통합 (Rate Limit + Queue 등 한 Script로)
-    - Redis Cluster (Sharding)
-    - 일부 한도를 Application 레벨로 분산
 
 ### 10.2 공정성 vs 시스템 보호
 
@@ -790,21 +662,13 @@ curl -i -X POST http://localhost:8080/api/v1/tenants/signup ...
 - User 한도가 불공정 발생
 ```
 
-### 10.3 Tenant 조회 비용
+### 10.3 Tenant 조회 비용 — 해소됨
 
-```
-[현재]
-RateLimitFilter가 매 요청 Tenant DB 조회
-- TenantRepository.findByTenantId() → DB 1회
+`RateLimitFilter.loadTenant()`가 `TenantCache`(TTL 60s)를 먼저 보고 미스일 때만 DB를 친다.
 
-[부담]
-2,000 RPS × Tenant 조회 = 2,000 DB QPS
+🔴 **조회 키는 PK(`Long id`)다. `tenantId`(String)가 아니다.** 예전에 `tenantId`로 조회했는데
+API-Key 경로에서는 그 값이 항상 null이라 **리미터가 통째로 꺼져 있었다.**
 
-[해결 (Sprint 5-D)]
-Redis 캐시 도입
-- tenant-cache:{tenantId} (TTL 60s)
-- DB QPS → 0에 가까움
-```
 
 ### 10.4 NAT 공유 IP
 
@@ -857,7 +721,7 @@ SDK가 두 타이머 중 어느 걸 따를지
 > - Token Bucket: capacity + refillRate로 burst와 평균 처리량 분리 제어
 > - Leaky Bucket: burst 거부 → 비즈니스와 충돌
 >
-> Token Bucket의 capacity는 1분치 burst를 허용하도록 `refillRate × 60`으로 설정했고, 양동이 모델이 SaaS Plan(FREE/STARTER/PRO/ENTERPRISE)과 자연스럽게 매핑됩니다.
+> Token Bucket의 capacity는 1분치 burst를 허용하도록 `refillRate × 60`으로 설정했고, 버스트를 허용하되 지속 처리율은 묶는 모델이 티켓팅 트래픽 형태와 맞습니다.
 
 ### 11.2 알고리즘 분리
 
@@ -872,22 +736,24 @@ SDK가 두 타이머 중 어느 걸 따를지
 >
 > 인터페이스를 분리해도 인터페이스의 다른 가치(의존성 역전, 테스트 용이성, 명세)는 유지되므로 손해 없이 의미 명확화를 얻을 수 있었습니다.
 
-### 11.3 Tenant Plan
+### 11.3 테넌트 한도 — 등급제를 걷어낸 이야기
 
-> **Q: Tenant Plan은 어떻게 설계했나요?**
+> **Q: 테넌트별 한도는 어떻게 설계했나요?**
 >
-> A: SaaS 비즈니스 모델을 Rate Limit에 매핑한 구조입니다.
+> A: 처음엔 SaaS 등급제(FREE/STARTER/PRO/ENTERPRISE)로 차등을 뒀는데, **걷어냈습니다.**
+> 등급이 실제로 하는 일을 세어 보니 하나뿐이었기 때문입니다 — 과금은 등급이 아니라 발급된 토큰
+> 개수로 매기고 있었고, `plan`을 읽는 코드는 `RateLimitFilter` 한 곳이었습니다. 즉 등급제는
+> "SaaS 약속"이 아니라 **한 테넌트의 독식을 막는 방어** 하나였고, **방어는 등급이 아니라 상수로 충분합니다.**
 >
-> | Plan | capacity | refillRate |
-> |------|----------|-----------|
-> | FREE | 100 | 1.67/초 (분당 100) |
-> | STARTER | 1,000 | 16.67/초 (분당 1,000) |
-> | PRO | 10,000 | 166.67/초 (분당 10,000) |
-> | ENTERPRISE | 100,000 | 1,666.67/초 (분당 100,000) |
+> 지금은 전 테넌트가 `capacity 50,000 / refill 833.34per sec`를 씁니다. `capacity = refillRate × 60`
+> 관계는 유지해서 1분치 버스트를 허용하고, 그 비율은 테스트가 강제합니다.
 >
-> 비율은 `capacity = refillRate × 60`으로 1분치 burst를 허용합니다. 콘서트 매진까지 일반적 시간이 1분이라 비즈니스 시나리오와 일치합니다.
+> **왜 10만이 아니라 5만인가** — 10만에서는 429가 한 건도 안 나왔습니다. 한도가 있는데 아무도
+> 안 걸리면 그건 방어가 아니라 장식입니다. 부하를 걸어 실제로 걸리는 지점까지 내렸습니다.
 >
-> Plan은 Tenant 도메인에 enum으로 두고, DB에는 TINYINT로 저장합니다. TenantStatus 패턴과 동일해서 일관성 있고, ordinal 매핑이라 추가 컬럼 없이 확장 가능합니다.
+> 등급별 요금제가 다시 필요해지면 그때 되살리면 됩니다. 안 쓰는 컬럼과 enum을 미리 들고 있는
+> 비용이 더 컸습니다.
+
 
 ### 11.4 인증 전 보안 한도
 
@@ -929,12 +795,12 @@ SDK가 두 타이머 중 어느 걸 따를지
 
 > **Q: RateLimitFilter를 왜 JWT 인증 뒤에 두었나요?**
 >
-> A: Tenant Plan 한도를 적용하려면 먼저 Tenant 식별이 필요하기 때문입니다.
+> A: 테넌트 한도를 적용하려면 먼저 Tenant 식별이 필요하기 때문입니다.
 >
 > ```
 > JwtAuthenticationFilter → SecurityContext에 TenantAuth 저장
 >    ↓
-> RateLimitFilter → SecurityContext에서 Tenant 조회 → Plan 한도 적용
+> RateLimitFilter → SecurityContext에서 Tenant 조회 → 한도 적용
 > ```
 >
 > 순서가 반대였다면:
@@ -974,7 +840,7 @@ SDK가 두 타이머 중 어느 걸 따를지
 
 ## 12. 향후 개선 (Sprint 5-D 이후)
 
-### 12.1 Sprint 5-D: Tenant 캐시
+### 12.1 ~~Sprint 5-D: Tenant 캐시~~ → **완료** (`TenantCache`, TTL 60s)
 - TenantRepository에 Redis 캐시 도입
 - TTL 60s
 - DB QPS 감소
@@ -989,15 +855,13 @@ SDK가 두 타이머 중 어느 걸 따를지
 - Grafana 대시보드
 - Alert 설정 (한도 도달 빈도)
 
-### 12.4 Sprint 10+: 부하 테스트
+### 12.4 ~~Sprint 10+: 부하 테스트~~ → **완료** (k6, §89 — 자산은 `~/queue-platform-it/`)
 - k6 시나리오: Rate Limit 한도 검증
-- Tenant Plan별 burst 동작 실측
+- 버스트 동작 실측
 - Redis Lua 부하 한계 측정
 
-### 12.5 향후: Redis Cluster
-- 단일 Master 한계 도달 시
-- Sharding으로 Rate Limit 분산
-- 또는 Application 레벨 분산
+### 12.5 ~~향후: Redis Cluster~~ → **완료**
+- 독립 2 Cluster + 큐 단위 라우팅으로 전환 완료 (§75). `RedisConfig`는 Cluster 전용이다.
 
 ---
 
@@ -1006,7 +870,6 @@ SDK가 두 타이머 중 어느 걸 따를지
 ### 코드
 - `queue-domain/src/main/java/com/sonix/queue/domain/ratelimit/RateLimiter.java`
 - `queue-domain/src/main/java/com/sonix/queue/domain/ratelimit/FixedWindowRateLimiter.java`
-- `queue-domain/src/main/java/com/sonix/queue/domain/tenant/Plan.java`
 - `queue-infrastructure/src/main/java/com/sonix/queue/infrastructure/ratelimit/RedisTokenBucketRateLimiter.java`
 - `queue-infrastructure/src/main/java/com/sonix/queue/infrastructure/ratelimit/RedisFixedWindowRateLimiter.java`
 - `queue-infrastructure/src/main/resources/lua/token-bucket.lua`
@@ -1018,7 +881,7 @@ SDK가 두 타이머 중 어느 걸 따를지
 ### 문서
 - DECISIONS §60 (Rate Limiter 알고리즘 선택)
 - DECISIONS §61 (알고리즘 분리)
-- DECISIONS §62 (Tenant Plan 도입)
+- DECISIONS §62 (Tenant Plan 도입) → **§88에서 철회**, §89(한도 5만)
 - DECISIONS §63 (RateLimitFilter HTTP 통합)
 - DECISIONS §64 (Lua Script Bean 등록 패턴)
 - DECISIONS §65 (인증 전 알고리즘 의도)

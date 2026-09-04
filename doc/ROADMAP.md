@@ -294,7 +294,7 @@ flowchart TD
 - ✅ `RedisFixedWindowRateLimiter` (운영, INCR + EXPIRE 원자 실행)
 - ✅ `token-bucket.lua` (HMGET → 회복 계산 → HMSET + EXPIRE)
 - ✅ `fixed-window.lua` (시간 윈도우별 키 분리 + 자동 만료)
-- ✅ Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE, DECISIONS §62)
+- 🗑 ~~Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE, §62)~~ → **§88에서 철회.** 한도는 전 테넌트 동일 상수
 - ✅ `RateLimitFilter` HTTP 통합 (JwtAuthFilter 후 실행, addFilterAfter)
 - ✅ `PublicEndpointRateLimit` (SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분)
 - ✅ ErrorCode RL_001_KEY_LIMIT (HTTP 429 + Retry-After 헤더)
@@ -375,7 +375,7 @@ flowchart TD
 
 **5-C (완료) — Rate Limiter**
 - [x] Rate Limiter 알고리즘 분리 (Token Bucket + Fixed Window)
-- [x] Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE)
+- [x] ~~Tenant Plan 도입~~ → §88 철회. `TENANT_CAPACITY = 50_000` 상수 하나(§89)
 - [x] RateLimitFilter HTTP 통합 (JwtAuthenticationFilter 후 실행)
 - [x] 동시 1,000 요청 → 정확히 capacity개만 통과 (Lua 원자성)
 - [x] HTTP 429 + Retry-After 응답 표준 준수
@@ -409,7 +409,7 @@ flowchart TD
 **Sprint 핵심 차별 포인트:**
 - Lua Script 원자성 + Sentinel Failover 실증
 - **Token Bucket + Fixed Window 알고리즘 분리** (책임/의도 명확)
-- **Tenant Plan 기반 동적 SLA 한도 적용** (SaaS 비즈니스 모델 매핑)
+- ~~**Tenant Plan 기반 동적 SLA 한도**~~ → **§88 철회.** 등급제가 하던 일은 독식 방어 하나였고, 그건 상수로 충분하다
 - **인증 전 보안 한도** (Brute Force/회원가입 남용 방지)
 - 슬라이스 파티셔닝
 
@@ -811,7 +811,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 **E. AWS 환경 k6 부하 실측**
 - Polling 2,000 rps 지속 → p99 확인 (AWS 네트워크 레이턴시 감안)
 - Enqueue 10,000 rps 급증 (MSK Serverless 버퍼 효과 검증)
-- Rate Limit Tenant Plan 한도 실측 (PRO 10,000 RPS burst 검증)
+- Rate Limit 상수 한도 실측 (`TENANT_CAPACITY` 50,000 · refill 833.34/s — §89)
 - **로컬 vs AWS 비교 리포트** (레이턴시, 비용, 가용성)
 
 **F. CloudWatch 모니터링**
@@ -993,7 +993,7 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 | 1 | Virtual Thread 실증 (isVirtual=true) + autoconfigure.exclude 단계적 활성화 전략 |
 | 2 | ReplicationRoutingDataSource + @Transactional(readOnly) 자동 라우팅 (GTID 복제 기반) |
 | 4 | Refresh Token 버전 기반 재사용 감지 + Rotation |
-| **5** | **Lua Script 원자성 + Sentinel Failover 실증 + Rate Limiter 알고리즘 분리 + Tenant Plan 동적 SLA** ⭐ |
+| **5** | **Lua Script 원자성 + Sentinel Failover 실증 + Rate Limiter 알고리즘 분리** ⭐ |
 | 6 | 폴링 소유권 검증을 Lua 원자 1회로 (§74) — seq 존재 판정만으로는 남의 자리를 훔칠 수 있었다 |
 | **7** | **admitToken TTL 만료 → 종료. 복귀하지 않는다(§36) — 재접속 → 맨 뒤** ⭐ |
 | 8 | Kafka KRaft + At-Least-Once + 동기→비동기 리팩토링 경험 |

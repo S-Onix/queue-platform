@@ -1,5 +1,5 @@
 -- ================================================================
--- Queue Platform — DDL v1.10
+-- Queue Platform — DDL v1.11
 -- MySQL 8.0
 --
 -- [DATETIME(3)] 밀리초 단위. Redis 복구 시 issued_at.toEpochMilli() → score
@@ -125,7 +125,7 @@ CREATE TABLE queues (
 --      (미해결, DECISIONS §77 Consequences)
 -- ----------------------------------------------------------------
 --
--- [seq] ADMIT_ISSUED→WAITING 복귀 시 Redis ZADD score 복원 필수
+-- [seq] Redis 전손 시 DB로 대기열을 재구성하기 위한 값(§71). 복귀 경로는 없다(§36 폐기)
 -- [admit_token] verify DB Fallback + Polling Fallback용
 -- [admitted_at] admit 시각. verify·complete의 유효 창 판정 기준 (DECISIONS §80)
 --   ⚠️ issued_at을 그 판정에 쓰면 안 된다 — 줄을 선 시각이라 두 시간 전일 수 있다.
