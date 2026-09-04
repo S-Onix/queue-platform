@@ -53,9 +53,8 @@ Tenant가 직접 짜면 틀리기 쉬운 넷이다.
 node test.mjs
 ```
 
-## ⚠️ 서버 CORS 미설정
+## CORS
 
-`queue-api`에 CORS 설정이 없다. Tenant 페이지(다른 오리진)에서 부르면 브라우저가 **응답을 막는다**.
-`GET /status`·`GET /tokens/*`는 공개 엔드포인트라 예비요청(preflight) 없는 단순 요청이지만,
-`Access-Control-Allow-Origin`이 없으면 JS가 본문을 읽지 못한다. 데모는 API와 **같은 오리진**에서
-띄워야 돈다.
+`GET /status`·`GET /tokens/*` 둘만 모든 오리진에 열려 있다(`PublicPollingCorsConfig`).
+429의 `Retry-After`도 노출된다 — 안전 목록이 아니라 안 열면 교차 오리진에서 `null`이다.
+나머지 경로는 닫혀 있다. 브라우저에서 enqueue를 시도하지 마라는 뜻이기도 하다.
