@@ -70,21 +70,37 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * 테넌트 한도 — <b>모든 테넌트에 동일</b>. 예전 {@code Plan.ENTERPRISE}와 같은 값이라
      * 등급제를 걷어내도(§88) <b>동작이 바뀌지 않는다</b>(전 테넌트가 이미 ENTERPRISE였다).
      *
-     * <p>🔴 <b>이 값은 지금 방어 역할을 못 한다 — 재조정 대상이다.</b> 100,000/분 = 지속
-     * <b>1,667 rps</b>인데, FRS 실측의 플랫폼 수용량이 동시 오픈 8개 × 200 rps = <b>1,600 rps</b>다.
-     * 즉 <b>테넌트 하나의 한도가 플랫폼 전체 실측 수용량과 같다.</b> 독식을 막으라고 있는 값이
-     * 독식을 정확히 허용하는 크기다.
+     * <p><b>100,000 → 50,000으로 내렸다 (§89, 2026-09-04).</b> 내린 근거는 실측 하나다 —
+     * 100,000에서 <b>리미터가 한 건도 막지 않았다</b>. 다른 테넌트가 3,000 rps를 30초간
+     * (90,000건) 밀어넣는 판에서 429가 <b>0건</b>이었다. capacity 안에서 끝나기 때문이다.
+     * 50,000이면 같은 공격이 23.1초에 개입해 15,000건을 막는다.
      *
-     * <p>그래도 이번에 안 내린다 — <b>구조 변경(등급제 제거)과 값 재조정을 같은 커밋에 넣으면
-     * 무엇이 원인인지 못 가린다.</b> 값은 k6로 재서 별도로 정한다. 내릴 때 함께 볼 것:
-     * 이 버킷은 enqueue 전용이 아니라 <b>인증된 요청 전부</b>가 공유하므로(admit·complete 포함),
-     * 낮추면 진행 중인 이벤트의 <b>입장까지</b> 함께 조인다.
+     * <p>🔑 <b>버스트 순간의 비용은 유저 1명당 3.01이 아니라 1이다.</b> verify·complete는 몇 분
+     * 뒤에 오므로, 몰리는 순간 버킷을 먹는 것은 enqueue뿐이다. 그래서 "동시 N명이 통과하나"는
+     * {@code capacity} 하나로 정해진다 — 50,000이면 동시 5만 명까지 0초에 통과한다.
+     * 지속 소비는 다르다: 유저 1명이 생애 전체로 <b>3.01</b>을 먹는다(enqueue 1 + verify 1 +
+     * complete 1 + admit 1/20, 실측 382.46÷126.97). 그래서 지속 수용은 833.33÷3.01 =
+     * <b>초당 277명</b>이고, 한 테넌트가 FRS 목표 부하(enqueue 200 rps = 버킷 602)를 혼자 다
+     * 써도 38% 여유가 남는다.
+     *
+     * <p>🪤 <b>이 버킷은 enqueue 전용이 아니다</b> — 인증된 요청 전부가 공유한다(admit·complete
+     * 포함). 그래서 값을 내리면 진행 중인 이벤트의 <b>입장까지</b> 함께 조인다. 위 3.01이 그 사실을
+     * 담은 숫자다.
+     *
+     * <p>🪤 <b>버킷은 테넌트 단위다 — 큐를 나눠도 늘지 않는다</b>({@code rl:tenant:&#123;id&#125;},
+     * 키에 queueId가 없다). 테넌트가 §87의 상한인 큐 20개를 만들면 큐당 지속 14명/s다. 큐마다
+     * 버킷을 주는 안(㉢)은 기각했다 — <b>§87과 같은 이유로 개수로 우회된다.</b>
      *
      * <p>비율 {@code capacity = refill × 60}은 §62에서 온 것이고 그 근거는 유지된다 —
      * 티켓팅은 오픈 1분 안에 몰리므로 1분치 burst를 허용한다.
+     *
+     * <p>🪤 <b>refill이 833.33이 아니라 833.34인 이유.</b> 833.33이면 {@code capacity/refill}이
+     * 60.0002가 되어 {@code token-bucket.lua}의 {@code ceil()}이 <b>61</b>로 올라가고 버킷 TTL이
+     * 120초 → 121초로 어긋난다. 비율 단정({@code within(1)})은 둘 다 통과하므로
+     * <b>테스트가 이 어긋남을 안 잡는다</b>. 나눗셈이 정확히 60 이하로 떨어지는 값을 써야 한다.
      */
-    static final int TENANT_CAPACITY = 100_000;
-    static final double TENANT_REFILL_PER_SEC = 1_666.67;
+    static final int TENANT_CAPACITY = 50_000;
+    static final double TENANT_REFILL_PER_SEC = 833.34;
 
     private final RateLimiter tokenBucketRateLimiter;
     private final FixedWindowRateLimiter fixedWindowRateLimiter;
