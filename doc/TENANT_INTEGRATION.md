@@ -266,7 +266,7 @@ curl -X POST .../api/v1/queues/{queueId}/tokens/{tokenId}/complete \
 
 | `errorCode` | 뜻 | `Retry-After` | 대응 |
 |---|---|---|---|
-| `RL001` | 요청 한도 초과 (Plan별 Token Bucket) | ✅ **붙는다** | 그 초만큼 기다렸다 재시도 |
+| `RL001` | 요청 한도 초과 (Token Bucket) | ✅ **붙는다** | 그 초만큼 기다렸다 재시도 |
 | `Q005` | **대기열 정원이 찼다** (`maxCapacity` 도달) | ❌ **안 붙는다** | **재시도하지 마라.** 계약 ⑦ |
 
 `Retry-After`를 붙이는 것은 Rate Limit 필터뿐이다. `Q005`는 그 필터를 지나온 **정상 처리 결과**라
@@ -287,7 +287,7 @@ if (res.status === 429) {
 
 | 어디 | 한도 | `Retry-After` |
 |---|---|---|
-| Tenant API (`enqueue`/`admit`/…) | Plan별 Token Bucket (`RL001`) | Plan 기준 값 |
+| Tenant API (`enqueue`/`admit`/…) | Token Bucket (`RL001`). **모든 테넌트 동일** | refill 기준 값 |
 | 브라우저 폴링 | 아래 ③ | **2초** |
 
 ### ③ **한 `tokenId`의 폴링 한도는 탭·기기를 통틀어 하나다**

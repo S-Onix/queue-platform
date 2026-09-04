@@ -129,7 +129,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
     - 인증 전 (signup/login/refresh) → Fixed Window (`rl:{action}:ip:{ip}`)
 - RateLimiter / FixedWindowRateLimiter 도메인 포트
 - Redis Lua Script 2개 (token-bucket.lua, fixed-window.lua)
-- Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE, DECISIONS §62)
+- ~~Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE, DECISIONS §62)~~ → **§88에서 철회.** 한도는 모든 테넌트 동일 상수 (등급제가 하던 일은 "SaaS 약속"이 아니라 독식 방어 하나였다)
 - RateLimitFilter HTTP 통합 (JwtAuthFilter 후)
 - PublicEndpointRateLimit (SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분)
 - ErrorCode RL_001 (HTTP 429 + Retry-After 헤더)
@@ -345,7 +345,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 ### Sprint 5에서 함께 구현할 것
 - ✅ Rate Limiter (Token Bucket + Fixed Window 분리 적용)
-- ✅ Tenant Plan 도입 (SaaS 등급)
+- ~~Tenant Plan 도입 (SaaS 등급)~~ → **§88에서 철회** (한도는 모든 테넌트 동일 상수)
 - ✅ HTTP Filter 통합 (429 + Retry-After)
 - ✅ API Key 캐시 (`apikey:{keyHash}`, TTL 60s) (5-D)
 - ✅ Queue Engine Lua Script (enqueue_bulk.lua 단독 + Hash Tag, 5-E / DECISIONS §70)
@@ -608,7 +608,7 @@ mysql -u root -p -P 3307  # Replica
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
 | `doc/API.md` | ⭐ **엔드포인트 17개 필드 단위 명세** — 요청/응답/에러/인증. 코드에서 추출 |
 | `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 7건 + 흔한 실수 |
-| `doc/DECISIONS.md` | 87개 설계 결정 + 근거 + 면접 포인트 (최신 §87 — 큐 상한 둘: maxCapacity 30만 · 테넌트당 20개) |
+| `doc/DECISIONS.md` | 88개 설계 결정 + 근거 + 면접 포인트 (최신 §88 — Plan 등급제 철회, rate limit 상수화) |
 | `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (§79 분할은 **반영 완료**) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |

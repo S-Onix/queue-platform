@@ -19,7 +19,19 @@ CREATE TABLE tenants (
     password_hash VARCHAR(255) NOT NULL,
     name          VARCHAR(100) NOT NULL,
     status        TINYINT      NOT NULL DEFAULT 0,
-    plan          TINYINT      NOT NULL DEFAULT 3,   -- 3=ENTERPRISE (Tenant.create와 같은 값)
+    -- ⚠️ 읽는 코드가 0이다 (§88 — Plan 등급제 제거). 의도적으로 남긴 §4-1 예외다.
+    --    엔티티(TenantEntity)가 매핑하지 않으므로 INSERT에 안 실리고 DEFAULT가 채운다.
+    --    남긴 이유: 요금제를 팔게 되면 컬럼이 있어야 ALTER 없이 매핑만 되살리면 된다.
+    --
+    -- 🪤 **되살릴 때 DEFAULT를 반드시 확인하라. 한 번 어긋난 적이 있다.**
+    --    이 컬럼은 원래 `ALTER TABLE ADD COLUMN ... DEFAULT 0`으로 추가됐고
+    --    (`doc/sprint-5/RATE_LIMITER.md:308`), 그래서 기존 DB는 **맨 뒤 위치 · DEFAULT 0**이었다.
+    --    §88 전까지는 앱이 항상 plan=3을 명시적으로 INSERT해서 그 드리프트가 가려져 있었다.
+    --    §88이 컬럼을 매핑에서 빼면서 DEFAULT가 처음으로 하중을 받았고, 그때 드러났다.
+    --    → 2026-09-04에 `ALTER TABLE tenants ALTER COLUMN plan SET DEFAULT 3`으로 맞췄다.
+    --      실측: master·replica 둘 다 DEFAULT 3, plan 없이 INSERT하면 3, 전 행 3.
+    --      (컬럼 **위치**는 여전히 맨 뒤다 — 아래 선언 순서와 다르지만 무해하다)
+    plan          TINYINT      NOT NULL DEFAULT 3,   -- 3=옛 ENTERPRISE. 현재 무의미
     created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 
     PRIMARY KEY (id),

@@ -96,7 +96,7 @@ public class EnqueueE2ETestConfig {
                 Long id = tenant.getId() != null ? tenant.getId() : seq.incrementAndGet();
                 Tenant persisted = Tenant.reconstruct(
                         id, tenant.getTenantId(), tenant.getEmail(), tenant.getPasswordHash(),
-                        tenant.getName(), tenant.getStatus(), tenant.getPlan(), tenant.getCreatedAt());
+                        tenant.getName(), tenant.getStatus(), tenant.getCreatedAt());
                 byId.put(id, persisted);
                 byEmail.put(persisted.getEmail(), persisted);
                 return persisted;

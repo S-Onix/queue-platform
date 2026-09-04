@@ -6,7 +6,8 @@ import java.util.Optional;
  * Redis 구현
  * @code infrastructure.cache.RedisTenantCache
  *
- * 주 사용처 : Plan 정보 조회시
+ * 주 사용처 : Rate Limit이 매 인증 요청마다 테넌트를 찾을 때 (버킷 키에 tenantId 문자열이 필요하다).
+ * ⚠️ 한도 자체는 상수라 캐시가 한도를 바꾸지는 않는다 (§88 — 등급제 제거).
  *
  * 사용 패턴 : Cache Aside (캐시에 존재? 캐시에서 가져오기 아니면 DB에서 가져오기)
  *
@@ -39,7 +40,8 @@ public interface TenantCache {
     /**
      * 특정 tenantId의 캐시 무효화.
      *
-     * <p>Tenant 변경 시점(예: Plan 변경) 호출.
+     * <p>Tenant 변경 시점 호출. ⚠️ <b>현재 호출자 0건이다</b>(§4-1) — 캐시에 담기는 것 중
+     * 60초 안에 바뀌는 필드가 없어서다. plan이 사라진 뒤로는 더 그렇다(§88).
      * 캐시에 없어도 예외 X (idempotent 보장).
      *
      * @param id Tenant PK

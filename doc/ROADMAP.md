@@ -699,7 +699,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - 시나리오 1: Enqueue 200 rps 지속
 - 시나리오 2: **Polling 2,000 rps 지속 → p99 < 50ms 검증 (포트폴리오 핵심)**
 - 시나리오 3: Enqueue 10,000 rps 급증 (Kafka 버퍼 효과 검증)
-- 시나리오 4: Rate Limit 한도 초과 시나리오 (Tenant Plan별 burst 동작)
+- 시나리오 4: Rate Limit 한도 초과 시나리오 (테넌트 버킷 burst 동작 — 한도는 상수, §88)
 - p50/p95/p99 레이턴시, 에러율, Throughput 측정
 
 **C. Grafana 대시보드 확장** (Sprint 5에서 기초 구축)

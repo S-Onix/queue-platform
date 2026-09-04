@@ -7328,3 +7328,152 @@ D27-3의 50% 임계 = 450만 명 = 30만짜리 큐 15개
 이 커밋의 결함이 아니라 레인 분리의 성질이다 → 별건
 | OOM → HTTP 503 매핑 | 코드 추적(`processChunk` → `failAllPending` → QE001) | ⚠️ **E2E 미실행** |
 | 다중 인스턴스 동시 생성 초과분 | — | ⚠️ **미측정** (위 🪤) |
+
+---
+
+## §88 — Plan 등급제를 걷어낸다 (rate limit은 상수, §62 철회)
+
+### Context
+
+플랜 변경 API를 설계하려고 착수했는데, 설계 도중 **API가 아니라 등급제 자체가 근거를 잃었다**는
+것이 드러났다. 릴리스 게이트의 "관리자 역할 + 플랜 변경 API"가 그 전제 위에 있었다.
+
+### 실측 — `Plan`이 실제로 하던 일
+
+```
+plan을 읽는 코드          RateLimitFilter:228-229  단 한 곳 (getPlan() 전수)
+과금                      billing_snapshots·queue_daily_stats에 plan 컬럼 0건.
+                          집계 SQL도 plan을 안 읽는다 — 청구는 tokens 개수다
+Tenant.create             Plan.ENTERPRISE 하드코딩 → FREE/STARTER/PRO 3분기가 도달 불가 (§4-1)
+Tenant.changePlan         호출자 0건
+```
+
+§62는 등급제의 근거를 **"SaaS 등급 = 약속(계약)"**, Consequences를 **"Tenant별 SLA 차등"**
+이라고 적었다. 그런데 **그 약속을 파는 수단이 없다** — 단가 컬럼조차 없다. 남은 실효는
+"한 테넌트가 플랫폼을 독식하지 못하게 막는 방어" 하나다.
+
+🔑 **방어는 등급이 아니라 상수여야 한다 — 차등을 두는 순간 그건 방어가 아니라 판매다.**
+§87이 `maxCapacity` 상한을 "플랜별"이 아니라 상수로 둔 것과 **같은 판단**이다.
+
+### 🔴 그리고 지금 값은 방어 역할을 못 한다
+
+```
+ENTERPRISE = capacity 100,000 · refill 1,666.67/s  →  지속 1,667 rps   (테넌트 1개)
+FRS 실측    = 동시 오픈 8개 × 200 rps = 1,600 rps  →  플랫폼 전체가 p99 < 50ms
+```
+
+**한 테넌트의 한도가 플랫폼 전체 실측 수용량과 같다.** 독식을 막으라고 있는 값이 독식을
+정확히 허용하는 크기다. 다만 이번에 **안 내린다** — 구조 변경(등급제 제거)과 값 재조정을 같은
+커밋에 넣으면 무엇이 원인인지 못 가린다. 값은 k6로 재서 별도로 정한다.
+
+### Decision
+
+- `Plan` enum·`Tenant.plan`·`Tenant.changePlan` **삭제**. 한도는 `RateLimitFilter`의 상수 둘
+  (`TENANT_CAPACITY = 100_000`, `TENANT_REFILL_PER_SEC = 1_666.67`) — **옛 ENTERPRISE와 같은 값**이라
+  **동작이 바뀌지 않는다**(전 테넌트가 이미 ENTERPRISE였다)
+- `tenants.plan` **컬럼은 남긴다.** 엔티티가 매핑하지 않고 `NOT NULL DEFAULT 3`이 채운다
+- **비율 `capacity = refill × 60`은 유지**한다 — §62에서 온 계약이고 근거(티켓팅은 오픈 1분에 몰린다)가
+  살아 있다
+- 플랜 변경 API·관리자 역할은 **만들지 않는다.** 바꿀 대상이 사라졌으므로 릴리스 게이트에서 **삭제**된다
+
+### Rationale
+
+- **§4**: "안 만들면 무엇이 깨지는가"에 답이 없었다. 전원 ENTERPRISE라 등급을 바꿀 이유가 0이다
+- **컬럼을 남긴 이유**: 요금제를 팔게 되면 컬럼이 있어야 ALTER 없이 매핑만 되살리면 된다.
+  **읽는 코드가 0인 상태를 의도적으로 허용한 §4-1의 명시적 예외**이며 그 사실을 `schema.sql`
+  컬럼 주석·`TenantEntity` javadoc·런북·쿼리집에 적었다.
+  🔴 **DEFAULT가 실물과 달랐다 — 리뷰가 잡았고 고쳤다.** 처음엔 "`NOT NULL DEFAULT 3`이
+  채운다"고 단정했는데 **우리가 실제로 돌리는 DB에서는 0이었다.** 이 컬럼이 원래
+  `ALTER TABLE ADD COLUMN ... DEFAULT 0`으로 추가됐기 때문이다(`doc/sprint-5/RATE_LIMITER.md:308`).
+  🔑 **§88 전까지는 앱이 항상 `plan=3`을 명시적으로 INSERT해서 그 드리프트가 가려져 있었다.
+  매핑에서 빼는 이 변경이 DEFAULT에 처음 하중을 실었고, 그때 드러났다** — 값을 안 쓰기로 한
+  변경이 오히려 그 값의 결함을 드러낸 셈이다.
+  → 2026-09-04에 `ALTER TABLE tenants ALTER COLUMN plan SET DEFAULT 3`으로 맞췄다.
+  실측: master·replica 둘 다 DEFAULT 3 / `plan` 없이 INSERT → 3 / 전 행 3.
+  (컬럼 **위치**는 여전히 맨 뒤라 `schema.sql` 선언 순서와 다르지만 무해하다)
+- **배포 안전**: 캐시 ObjectMapper가 `FAIL_ON_UNKNOWN_PROPERTIES = false`라 옛 캐시 JSON의
+  `"plan"`이 무시된다(확인). 역직렬화 실패 시에도 삭제 후 DB 폴백이 있다
+
+### Consequences
+
+- ✅ **security가 낸 RED 3건이 통째로 사라진다** — 셀프 업그레이드(한도 자율신고) · 셀프
+  다운그레이드(탈취 Access 15분으로 피해자 데이터플레인을 100/분으로) · **자기참조 락아웃**.
+  바꿀 수단이 없으면 그 공격면이 0이다
+  - 🔑 자기참조 락아웃은 **실측했다**: FREE 강등 후 버킷이 마르면 ENTERPRISE 인자로 되돌리는
+    호출조차 `0`(429)을 받는다. 스크립트가 먼저 보는 것이 `tokens`이고 그건 이미 0이기 때문이다
+- ✅ `Tenant.changePlan`·`Plan` 3분기 죽은 코드 해소(§4-1)
+- ⚠️ **`CONCURRENCY.md`에 `Plan.maxQueues()` 세계를 보여주는 코드 예시가 3곳 남아 있다**
+  (`:131` · `:301` `lock:tenant:{id}:plan-change` · `:597`). §58도 같은 세계를 문서화했는데
+  **구현은 0건이었다**(`findByIdForUpdate`·`QuotaExceededException` grep 0). 이력 문서라 본문은
+  고치지 않지만, **§87 재제안 통로**로 남는다는 것을 여기 적어 둔다
+- ⚠️ `RateLimitFilter.loadTenant()`는 **남는다.** 버킷 키가 `t_xxx` 문자열을 쓰기 때문이다.
+  키를 PK로 바꾸면 인증 요청마다 Redis 왕복 1회가 사라지지만, **이번 범위 밖**이다
+  (배포 시 기존 버킷 키가 한 번 리셋된다 — 무해하지만 별건으로 판단할 사안)
+- 📌 §62는 **철회**된다. 다만 DECISIONS 본문은 이력이라 고치지 않는다 — §62의
+  "Plan 변경 시 다음 요청부터 자동 반영"은 5-D 캐시(TTL 60초) 도입으로 **이미 거짓이었고**,
+  이제 변경 자체가 없어져 무의미해졌다
+
+### 검증
+
+| 항목 | 방법 | 결과 |
+|---|---|---|
+| 전체 회귀 | `./gradlew test` | ✅ **463건 실패 0**(skipped 4). 등급제 제거 직후는 461로 dev와 동일했고, 가드 2건이 더해져 463이다 |
+| 동작 불변 | 상수가 옛 `ENTERPRISE`와 같은 값 | ✅ |
+| 배포 안전(캐시) — 구→신 | `cacheObjectMapper`의 `FAIL_ON_UNKNOWN_PROPERTIES=false` | ✅ 옛 JSON의 `"plan"`은 무시된다 |
+| 배포 안전(캐시) — **신→구** | 아래 🔴 | 🔴 **안전하지 않다** |
+| 스키마 | `ddl-auto: validate`는 엔티티→테이블 방향만 검사 | ✅ 미매핑 컬럼이 있어도 기동 |
+| 상수 가드 | **결함 주입 3종** | ✅ 아래 |
+| 자기참조 락아웃 | 실제 `token-bucket.lua`를 소유 노드에서 실행 | ✅ 재현 |
+
+**결함 주입 3종** — 🔴 **처음엔 그물이 아예 없었다.** 상수를 100으로 바꿔도, 비율을 깨뜨려도
+461건이 전부 초록이었다(이 레포가 드레인 캐시에서 이미 당한 형태 — "0이 아님"만 잠그면 값은 안 잠긴다).
+`TenantRateLimitConstantsTest`를 넣어 닫았다.
+
+| 변이 | 기대 | 결과 |
+|---|---|---|
+| `capacity`만 100으로 (비율 깨짐) | 빨감 | ✅ 1 FAILED |
+| `refill`만 1.67로 (비율 깨짐) | 빨감 | ✅ 1 FAILED |
+| 둘 다 비율 지키며 24,000/400 으로 | **통과해야** | ✅ 통과 |
+
+🔑 **잠그는 것은 절대값이 아니라 비율이다.** 값 재조정은 정당한 후속 작업이므로 막으면 안 되고,
+막아야 하는 것은 "비율을 깬 채 한쪽만 바꾸는 것"이다 — 그러면 버킷 TTL(`ceil(capacity/refill)+60`)과
+`Retry-After`(`ceil(1/refill)`)가 함께 어긋난다.
+
+🪤 **필드만 지우고 애노테이션을 남겼다가 기동이 깨졌다** — `int plan` 위의
+`@JdbcTypeCode(SqlTypes.TINYINT)`가 다음 필드 `createdAt`에 붙어
+*"wrong column type ... found [datetime], but expecting [tinyint]"*. 통합 테스트가 잡았고,
+**단위 레인은 초록이었다.**
+
+### 🔴 롤링 배포/롤백의 역방향은 안전하지 않다 (리뷰가 잡았다)
+
+처음엔 "배포 안전 ✅"라고 적었는데 **한 방향만 봤다.** `FAIL_ON_UNKNOWN_PROPERTIES=false`가
+막아주는 것은 **미지 속성**이지 **누락 속성**이 아니다.
+
+```
+신 인스턴스가 캐시 미스로 tenant:{id}에 plan 없는 JSON을 쓴다 (TTL 60s)
+  → 구 인스턴스가 그 키를 읽는다
+  → 구 TenantMixin은 @JsonCreator 파라미터에 @JsonProperty("plan")을 요구한다
+  → 누락 → plan = null (역직렬화는 **성공**한다 → DB 폴백도 안 탄다)
+  → 구 RateLimitFilter:228 tenant.getPlan().getCapacity() → NPE
+  → 인증된 요청 전부 500 (enqueue·admit·complete 데이터플레인)
+```
+
+`RedisTenantCache.get`의 catch는 `JsonProcessingException`뿐이라 이걸 못 잡는다.
+**코드 추적으로 확인했고 실행 재현은 미측정이다.**
+
+**지금은 안 깨진다** — 배포 산출물이 `docker-compose.local.yml` 하나뿐이고 롤링 배포 인프라가
+없다(AWS 배포는 릴리스 게이트에 미착수로 남아 있다). 그래서 **이번에 아무것도 만들지 않는다**(§4).
+🪤 다만 **api 3대를 순차 재기동하는 로컬 통합 절차에서도 같은 창이 열린다.**
+
+무중단 배포를 도입할 때 선택지는 셋이고, 그때 정한다:
+① 캐시 키에 버전(`tenant:v2:{id}`) — 구·신이 같은 키를 아예 안 본다
+② 배포 전후 `tenant:*` 무효화 ③ 구 코드에 null 가드를 먼저 배포하는 2단계
+
+🔑 **일반화하면: `@JsonCreator` 미믹스인에서 필드를 빼는 것은 캐시의 하위호환을 한 방향으로만
+깬다.** 다음에 캐시 대상 도메인에서 필드를 지울 때 같은 질문을 해야 한다.
+
+### 후속 (이 커밋에서 안 함)
+
+- **한도 값 재조정** — 지금 1,667 rps는 플랫폼 수용량과 같다. k6 실측 후 결정
+- **버킷 키를 PK로** — 인증 요청마다 Redis 왕복 1회 절감
+- **`CONCURRENCY.md` 3곳** — §87/§88 재제안 통로

@@ -54,7 +54,7 @@ class RateLimitFilterIpSourceTest {
      *
      * <p>{@code /login}은 {@code permitAll}이고 {@code JwtAuthenticationFilter}는 경로를 안 가리므로,
      * <b>유효한 Access 토큰을 헤더에 붙이면 SecurityContext가 채워진 채로 이 필터에 도달한다.</b>
-     * 예전엔 그때 "인증된 요청" 분기로 빠져 {@code rl:tenant:&#123;id&#125;}(FREE 100/분)를 썼다 —
+     * 예전엔 그때 "인증된 요청" 분기로 빠져 {@code rl:tenant:&#123;id&#125;}를 썼다 —
      * 즉 <b>클라이언트가 자기 한도를 고를 수 있었다.</b> LOGIN 10/분 대비 10배이고,
      * 계정을 K개 만들면 버킷도 K개라 IP 기준 한도가 사실상 사라진다.
      *

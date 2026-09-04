@@ -39,7 +39,7 @@ alias RW='redis-cli -c -p 7001'    # 쓰기
 | 경로 | 키 | 한도 | TTL |
 |---|---|---|---|
 | 폴링 | `rl:poll:token:{tokenId}` (Hash) | cap 5, refill 1.0/s **하드코딩** | 65s |
-| 인증 후 | `rl:tenant:{tenantId}` (Hash) | Tenant `Plan` | 120s (4종 동일) |
+| 인증 후 | `rl:tenant:{tenantId}` (Hash) | **상수** (전 테넌트 동일, §88) | 120s |
 | signup | `rl:signup:ip{ip}:{윈도우번호}` (String) | 5 / 60s | 윈도우+1s |
 | login | `rl:login:ip{ip}:{윈도우번호}` | 10 / 60s | 윈도우+1s |
 | refresh | `rl:refresh:ip{ip}:{윈도우번호}` | 30 / 60s | 윈도우+1s |
@@ -62,11 +62,12 @@ RR hgetall "rl:tenant:$TENANT"
 | ≥ 1.0 | 다음 요청 통과 |
 | < 1.0 | **지금 거부 상태.** 1.0까지 회복에 `(1 - tokens) / refill` 초 소요 (폴링이면 refill 1.0/s → 1초 이내) |
 | 0에 붙어 있음 | 지속 초과. 클라이언트가 한도보다 빠르게 폴링 중 |
-| 키 없음 | 아직 요청이 없었거나 TTL 만료(폴링 65초 / Plan 120초 무요청) |
+| 키 없음 | 아직 요청이 없었거나 TTL 만료(폴링 65초 / 테넌트 120초 무요청) |
 
 **TTL은 고정값이 아니다.** `max(60, min(3600, ceil(capacity / refillRate) + 60))` (`token-bucket.lua`).
 버킷이 full refill되면 그 상태는 키가 없을 때와 결과가 같으므로 그 시간만 버티면 된다.
-Plan 4종이 전부 `cap = refill×60` 비율이라 등급과 무관하게 120s로 같다.
+`cap = refill×60` 비율이라 값을 재조정해도 120s로 같다(§62에서 온 계약, §88에서도 유지).
+`TenantRateLimitConstantsTest`가 그 비율을 잠근다 — 깨지면 이 TTL과 `Retry-After`가 함께 어긋난다.
 
 **폴링 한도의 여유** (2026-08-12 이전에는 여유가 0이었다):
 refill 1.0/s에 `pacing` 최저 구간 2초(`PacingTier.DEFAULT`)라 정상 클라이언트 하나는
@@ -155,8 +156,10 @@ UPDATE api_keys SET status = <REVOKED> WHERE id = <id>;
 ```
 
 ```sql
--- Tenant 등급별 한도 확인 (Plan enum: FREE/STARTER/PRO/ENTERPRISE)
-SELECT tenant_id, plan, status FROM tenants WHERE tenant_id = 't_xxx';
+-- Tenant 상태 확인
+-- ⚠️ plan 컬럼은 읽지 마라 — 아무 의미가 없다(§88, 등급제 제거). 한도는 모든 테넌트에
+--    동일한 상수이고 정본은 RateLimitFilter.TENANT_CAPACITY / TENANT_REFILL_PER_SEC다.
+SELECT tenant_id, status FROM tenants WHERE tenant_id = 't_xxx';
 ```
 
 ---
@@ -172,7 +175,7 @@ RR --scan --pattern 'rl:*' -i 0.01 | head -50 | \
 
 | 관찰 | 판정 |
 |---|---|
-| TTL이 전부 양수 | 정상. 개수가 많아도 폴링 65초 / Plan 120초 내 자연 감소 |
+| TTL이 전부 양수 | 정상. 개수가 많아도 폴링 65초 / 테넌트 120초 내 자연 감소 |
 | TTL `-1`인 `rl:` 키 존재 | **이상.** Lua의 EXPIRE가 안 걸렸다 → `RW script exists <sha>` 로 스크립트 확인 |
 | `rl:poll:token:*` 수 >> 활성 대기자 수 | **랜덤 tokenId 공격 의심** (키가 공격자 통제값) |
 
