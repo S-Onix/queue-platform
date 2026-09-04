@@ -27,20 +27,16 @@ public class BillingJdbcAdapter implements BillingRepository {
      * 예약어(INTERVAL 단위)라 백틱 없이 쓰면 {@code ERROR 1064}다. 컬럼 <b>정의</b> 자리에서는
      * 통과해서 {@code CREATE TABLE}은 멀쩡히 성공한다 — 그래서 스키마만 보면 안 보인다.
      *
-     * <p>🔴 <b>{@code INSERT ... SELECT}에는 행 별칭({@code AS new})을 못 붙인다.</b>
-     * {@code TokenJpaAdapter}가 deprecated {@code VALUES(col)}을 피하려고 쓰는 그 문법인데,
-     * 여기서는 {@code ERROR 1064}다(실측). 대신 <b>SELECT 쪽을 서브쿼리로 감싸 별칭</b>을 주고
-     * ODKU에서 그 별칭을 참조한다 — 경고 없이 같은 목적을 달성한다.
+     * <p>🔴 <b>{@code INSERT ... SELECT}에는 행 별칭({@code AS new})을 못 붙인다</b>({@code ERROR
+     * 1064}, 실측). 대신 SELECT 쪽을 서브쿼리로 감싸 별칭을 주고 ODKU에서 참조한다.
      *
-     * <p>🔴 <b>{@code updated_at = NOW(3)}을 쓰지 않는다.</b> {@code NOW()}는 세션 TZ를 따르는데
-     * {@code mysql} CLI 세션은 KST라 UTC 컬럼에 KST가 들어간다({@code schema.sql}의 [시각 규약]이
-     * 경고하는 그 함정). SET 절에서 빼면 {@code ON UPDATE CURRENT_TIMESTAMP(3)}이 <b>값이 실제로
-     * 바뀔 때만</b> 찍어 주므로, 재실행해도 "마지막으로 금액이 변한 시각"이 보존된다.
+     * <p>🔴 <b>{@code updated_at = NOW(3)}을 쓰지 않는다.</b> {@code NOW()}는 세션 TZ를 따라 UTC
+     * 컬럼에 KST가 들어간다. SET 절에서 빼면 {@code ON UPDATE CURRENT_TIMESTAMP(3)}이 값이 실제로
+     * 바뀔 때만 찍어 "마지막으로 금액이 변한 시각"이 보존된다.
      *
-     * <p><b>{@code PARTITION (pYYYY_MM)}은 §83이 확정한 결정이다.</b> {@code PARTITION BY RANGE
-     * (YEAR(c)*100 + MONTH(c))}는 옵티마이저가 단조성을 증명하지 못해 <b>범위 조건으로는 프루닝이
-     * 안 된다</b> — 13개 파티션을 전부 스캔한다(§83 실측). §83이 {@code RANGE COLUMNS} 재구축안을
-     * 기각한 근거가 "집계 배치는 대상 월을 알고 있으니 이 절로 공짜로 얻는다"였다.
+     * <p><b>{@code PARTITION (pYYYY_MM)}은 §83 결정이다.</b> {@code RANGE (YEAR*100 + MONTH)}는
+     * 옵티마이저가 단조성을 증명하지 못해 <b>범위 조건으로는 프루닝이 안 되고</b> 13개를 전부
+     * 스캔한다(실측). 집계 배치는 대상 월을 아니까 이 절로 공짜로 얻는다.
      *
      * <p>🪤 대가는 <b>fail-loud</b>다. 미생성 파티션을 지목하면 {@code ERROR 1735}로 죽는다 —
      * 범위 조건이라면 {@code p_future}로 조용히 성공했을 자리다. 파티션 사전 생성 누락을
@@ -252,20 +248,14 @@ public class BillingJdbcAdapter implements BillingRepository {
      * 아무것도 보호하지 못한다. 걸어 두면 "롤백되겠지"라는 잘못된 안심만 준다.
      *
      * <h2>🔴 {@code lock_wait_timeout}이 이 메서드의 핵심이다</h2>
-     * {@code DROP PARTITION}은 <b>테이블 전체에 배타적 메타데이터 락(MDL)</b>을 잡는다.
-     * 대상 파티션이 비어 있어도 소용없다 — MDL은 파티션 단위가 아니다.
+     * {@code DROP PARTITION}은 <b>테이블 전체에 배타적 MDL</b>을 잡는다(파티션 단위가 아니라
+     * 비어 있어도 소용없다). 긴 트랜잭션이 {@code tokens}를 물고 있으면 DDL이 대기하고,
+     * <b>그 뒤에 도착한 평범한 INSERT가 전부 줄을 선다</b> — 실측 3.05초 블록. 그러면 컨슈머
+     * 적재가 밀려 Kafka lag → {@code ReconcileJob} 정착 판정 오염으로 번진다.
      *
-     * <p>긴 트랜잭션이 {@code tokens}를 물고 있으면 이 DDL이 대기하는데, <b>그 뒤에 도착한
-     * 평범한 INSERT가 전부 그 뒤에 줄을 선다</b>(실측: 5초짜리 트랜잭션 뒤에서 DROP이 4.17초 대기,
-     * <b>그 사이 도착한 INSERT가 3.05초 블록</b>). 그러면 {@code queue-consumer}의 적재가 밀리고
-     * Kafka lag → {@code ReconcileJob}의 정착 판정 오염으로 번진다.
-     *
-     * <p><b>MySQL 기본값은 31,536,000초 = 365일</b>이다(실측). 즉 <b>대기에 상한이 없다</b>.
-     * 짧게 걸어 두면 못 잡았을 때 {@code ERROR 1205}로 <b>즉시 포기</b>하고, 뒤에 막혔던 요청도
-     * 그 시점에 풀린다(실측: INSERT 블록 3.05초 → 1.04초).
-     *
-     * <p>포기해도 되는 이유: <b>DROP이 늦어서 잃는 것은 스토리지뿐</b>이다. 유예가 한 달이라
-     * 다음 달 주기가 다시 시도하면 되고, 그때까지 파티션이 남아 있는 것은 아무것도 깨지 않는다.
+     * <p><b>MySQL 기본값은 365일</b>이라 대기에 상한이 없다. 짧게 걸면 {@code ERROR 1205}로
+     * 즉시 포기하고 뒤에 막힌 요청도 그때 풀린다(블록 3.05초 → 1.04초).
+     * 포기해도 되는 이유는 <b>DROP이 늦어서 잃는 것이 스토리지뿐</b>이라서다 —
      * <b>지연은 공짜고 블로킹은 사고다.</b>
      *
      * <p>🪤 세션 변수라 커넥션 풀에 남는다. {@code SET SESSION}을 DDL과 <b>한 문장으로 보내면</b>
