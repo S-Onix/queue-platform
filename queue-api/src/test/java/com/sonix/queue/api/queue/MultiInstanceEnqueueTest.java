@@ -22,6 +22,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -96,7 +97,7 @@ class MultiInstanceEnqueueTest {
             // Kafka 브로커 없이 Enqueue(Redis) 흐름만 검증 → no-op 발행자
             // enqueue 경로는 TokenRepository를 쓰지 않는다(admit/verify/complete 전용) → null
             QueueEngineService service = new QueueEngineService(queueRepository, null, engine, event -> { },
-                    java.time.Clock.systemUTC());
+                    java.time.Clock.systemUTC(), new SimpleMeterRegistry());
             instances.add(new Was(engine, batch, service));
 
             Thread consumer = new Thread(() -> {

@@ -7037,6 +7037,12 @@ watermark에 들어가는 값이 `ZPOPMIN`이 뱉은 score이고 그건 `INCR se
   히스토그램 버킷(`le_60`~`le_3600`, 추가 스캔 0)이 유일한 합산 가능 형태로 검토됐으나,
   **읽는 사람이 0건이라 §4에 걸려 보류**했다. 대안인 `queue_admission_wait_seconds` 메트릭도
   현재 구현 0건이므로, **지금은 대기 시간 분포가 어디에도 안 남는다.**
+  🔧 **정정 (2026-09-04).** 뒷문장은 더 이상 참이 아니다 — `queue_admission_wait_seconds`를
+  구현했다(`QueueEngineService.recordAdmissionWait`, Timer `queue.admission.wait`,
+  SLO 버킷 10\~3600초, 라벨 `queue_id`). 읽는 사람이 생긴 것이 착수 근거였다:
+  `doc/monitoring/alerts/app.yml`의 `QueueAdmissionWaitP95High`.
+  **앞문장(`queue_daily_stats`에 버킷을 넣지 않는다)은 그대로다** — 장기 이력은 여전히
+  `sum`/`max` 두 숫자뿐이고, Prometheus 보존 기간을 넘긴 달의 p50/p99는 소실된다.
 - ~~만료 사유는 구분되지 않는다~~ → **해소했다(아래 별항)**.
 - **`max_wait_sec`에 음수가 들어올 수 있다.** `issued_at`·`admitted_at` 둘 다 앱 시계라 API 서버
   N대의 스큐만큼 어긋난다(실측 -398초 1건, 1행짜리 큐라 그 값이 곧 MAX였다).

@@ -426,7 +426,9 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 > - `queue_daily_stats.total_admit_count` — 집계 SQL이 `0`을 상수로 박아 넣고 있었다 (§86에서 해소)
 > - `tokens.expired_reason` — 쓰는 코드 0건이었다 (§86에서 해소. `insertable = false`는 유지가 맞았다 —
 >   막히는 건 JPA 경로뿐이고 사유를 쓰는 전이는 raw JDBC를 탄다)
-> - `queue_admission_wait_seconds` — `MONITORING_DESIGN.md`가 경보 정본이라 지목하는데 구현 0건 (미해결)
+> - `queue_admission_wait_seconds` — `MONITORING_DESIGN.md`가 경보 정본이라 지목하는데 구현 0건
+>   → **2026-09-04 해소.** `QueueEngineService.recordAdmissionWait`가 admit 성공 시 기록하고,
+>   읽는 쪽은 `doc/monitoring/alerts/app.yml`의 `QueueAdmissionWaitP95High`다 (쓰는 코드·읽는 코드 둘 다 생김)
 > - `queue_daily_stats` 자체 — 쓰는 배치만 있고 읽는 코드가 0건이었다 (§86 롤업 대사로 해소)
 
 판정 기준은 **"쓰는 코드와 읽는 코드가 둘 다 있는가"** 다. 한쪽만 있으면 미완성이다.

@@ -40,6 +40,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -93,7 +94,7 @@ class AdmitApiTest {
         QueueEngineService queueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher) {
             return new QueueEngineService(queueRepository, tokenRepository, queueEngine, eventPublisher,
-                    Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
+                    Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC), new SimpleMeterRegistry());
         }
     }
 

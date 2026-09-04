@@ -1,16 +1,35 @@
 # 인프라 알람 규칙 — Queue Platform
 #
-# 이 파일에 있는 규칙은 전부 "임계값이 필요 없는 것"만 골랐다.
-# 이 프로젝트는 아직 부하 기준선이 없다. 근거 없는 숫자를 규칙에 박으면 그 숫자가
-# 나중에 "이미 정해진 값"으로 굳어 아무도 다시 묻지 않는다. 그래서 아래 4종만 쓴다.
+# 🔴 **이 파일의 원칙이 2026-09-04에 바뀌었다.** 아래 옛 원칙을 먼저 읽고, 그다음 무엇이
+#    바뀌었는지를 읽어라. 옛 원칙만 읽고 규칙을 지우는 일이 없게 하기 위해 둘 다 남긴다.
 #
-#   1) 프로세스가 죽었다        (up == 0 / redis_up == 0 — 임계값 개념이 없다)
-#   2) 이진 상태가 뒤집혔다      (quorum 실패, 복제 링크 끊김)
-#   3) 구성 사고               (master가 둘)
-#   4) 한도가 명시된 자원의 추세  (maxmemory 1GB가 config에 박혀 있다 → 절대값이 아니라 도달 예측)
+# [옛 원칙 — 2026-08~09-03]
+#   이 파일에 있는 규칙은 전부 "임계값이 필요 없는 것"만 골랐다.
+#   이 프로젝트는 아직 부하 기준선이 없다. 근거 없는 숫자를 규칙에 박으면 그 숫자가
+#   나중에 "이미 정해진 값"으로 굳어 아무도 다시 묻지 않는다. 그래서 아래 4종만 썼다.
 #
-# 기준선이 필요해 "쓰지 않은" 규칙은 파일 맨 아래 <보류> 절에 이유와 함께 남겼다.
-# 주석은 발화하지 않으므로 "규칙이 있다"는 착각을 만들지 않는다.
+#     1) 프로세스가 죽었다        (up == 0 / redis_up == 0 — 임계값 개념이 없다)
+#     2) 이진 상태가 뒤집혔다      (quorum 실패, 복제 링크 끊김)
+#     3) 구성 사고               (master가 둘)
+#     4) 한도가 명시된 자원의 추세  (maxmemory 1GB가 config에 박혀 있다 → 절대값이 아니라 도달 예측)
+#
+# [지금 원칙 — 2026-09-04, 사용자 결정]
+#   "모니터링에 대한 경고는 일단 전부 알람으로 간다. 실제로 대응하는 것은 그 다음 문제다."
+#
+#   즉 **"기준선이 없다" / "조치 레버가 없다"는 더 이상 보류 사유가 아니다.** 관측이 되는
+#   것은 일단 규칙으로 만든다. 그 대신 옛 원칙이 지키려던 것은 **표기**로 지킨다:
+#
+#     ▸ 임계값을 쓴 규칙은 **근거 유무를 주석에 반드시 명시한다.** 근거가 없으면
+#       "🔴 임계값 근거: 없다"라고 쓴다. 이 문구를 지우지 마라 — 지우는 순간 그 숫자가
+#       "이미 정해진 값"으로 굳는다. 옛 원칙이 막으려던 것이 정확히 그것이었다.
+#     ▸ 기준선을 잰 것은 "임계값의 근거"가 아니라 **"지금은 안 울린다"의 확인**으로만 쓴다.
+#       로컬 WSL2 수치를 프로덕션 근거로 승격하지 않는다.
+#
+#   그래서 이 파일은 이제 위 4종에 더해 **5) 기준선 없이 정한 임계값**을 포함한다.
+#   커스텀 애플리케이션 메트릭 규칙은 이 파일이 아니라 `app.yml`에 있다.
+#
+# 아직 규칙으로 만들지 못한 것(= 대상 메트릭이 아예 없는 것)은 파일 맨 아래 <보류> 절에
+# 남겼다. 주석은 발화하지 않으므로 "규칙이 있다"는 착각을 만들지 않는다.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # severity 체계 (이 레포 첫 규칙이라 여기서 정의한다)
@@ -168,6 +187,64 @@ groups:
           action: "⚠️ **Sentinel 명령을 치지 마라.** `redis-cli -c -p 7001 cluster info` 로 cluster_state·slots_assigned·slots_fail 확인 → `cluster nodes` 로 fail 표시된 노드 특정 → 그 유닛만 `systemctl start redis-cluster-{a|b}-N`. 슬롯 담당이 사라진 것이면 승격 대상 replica가 살아 있는지부터 본다. 앱 재시작보다 이게 먼저다."
 
   # ===========================================================================
+  # 2-b. MySQL 복제 (2026-09-04 <보류>에서 승격 — 사용자 결정)
+  # ===========================================================================
+  # ⚠️ 시계열은 **replica 익스포터(9105) 한 곳에서만** 나온다(실측: 위 세 메트릭 전부 count=1).
+  #    master(9104)에는 slave_status가 없다. 그래서 instance 필터를 걸지 않는다 —
+  #    걸면 포트가 바뀔 때 조용히 침묵한다.
+  # ===========================================================================
+  - name: queue-platform-mysql-replication
+    rules:
+
+      # 복제가 멈췄다. IO 스레드(master에서 가져오기) 또는 SQL 스레드(적용하기)가 죽었다.
+      #
+      # 임계값 근거: **불필요하다.** 값이 0/1뿐인 이진 상태다(옛 원칙 2번 분류).
+      #
+      # 왜 critical인가: 지금 사용자 경로는 안 깨진다 — 앱이 replica를 읽는 경로는 **0곳**이다
+      # (CLAUDE.md §4-3, 2026-09-02 반사실 실측). replica는 순수 DR 자산이다.
+      # 그래서 이것은 "다음 장애를 복구할 수단이 사라졌다"는 전형적 critical이다.
+      # RedisSentinelQuorumLost와 같은 계열이며 severity 정의 그대로다.
+      #
+      # for: 1m — 4회 연속. 복제 재시작(STOP/START SLAVE) 중의 순간적 0을 넘긴다.
+      - alert: MysqlReplicationStopped
+        expr: |
+          mysql_slave_status_slave_sql_running == 0
+          or mysql_slave_status_slave_io_running == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MySQL 복제 정지 — {{ $labels.instance }} (IO 또는 SQL 스레드 중단)"
+          action: "`mysql -h127.0.0.1 -P3307 -uroot -p -e 'SHOW REPLICA STATUS\\G'` 로 Last_IO_Error / Last_SQL_Error 를 먼저 읽는다. ⚠️ **오류를 읽기 전에 `SET GLOBAL SQL_SLAVE_SKIP_COUNTER`나 GTID 건너뛰기를 하지 마라** — 건너뛴 트랜잭션은 영원히 사라지고 그 사실이 어디에도 안 남는다. 되돌리기: 원인 해소 후 `START REPLICA`."
+
+      # 복제 지연이 30초를 넘어 5분간 유지된다.
+      #
+      # 🔴 **임계값 근거: 약하다(로컬 관측 기반, 프로덕션 근거 아님).**
+      #    2026-09-04 Prometheus 24시간 실측(job=mysql, instance=9105):
+      #      - lag > 0 인 분(分)이 **992분 중 4분** (01:20 / 13:24 / 15:50 / 16:01)
+      #      - 15초 스크레이프 기준 lag>0 표본 10개 / p99 = 0초 / p99.9 = 1초 / 최댓값 = 40초
+      #      - 30초를 넘긴 표본은 **1개**이고 연속되지 않았다(단발 스파이크)
+      #    → "30초가 5분간 유지"는 관측된 기준선에서 **발화 0회**다. 그래서 오탐은 안 난다.
+      #    ⚠️ 그러나 "30"이라는 숫자 자체는 여전히 임의다. 부하 중 분포는 아직 안 쟀다.
+      #       프로덕션에서 다시 재라. 로컬 WSL2 idle 수치를 용량 근거로 승격하지 마라.
+      #
+      # 🔴 **이 규칙은 "복제가 멈춘 것"을 못 잡는다.** SQL 스레드가 죽으면
+      #    seconds_behind_master 는 커지는 게 아니라 **NULL**이 되고 시계열이 사라진다.
+      #    빈 벡터는 발화하지 않는다. 그 경우는 위 MysqlReplicationStopped 담당이다.
+      #    둘은 겹치는 규칙이 아니라 **서로의 사각을 메우는 짝**이다. 하나만 남기지 마라.
+      #
+      # warning인 이유: 앱이 replica를 읽지 않으므로 사용자 영향이 지금은 0이다.
+      # 방치하면 DR 복구 지점이 뒤로 밀린다 → 방치 시 critical, 정확히 warning 정의다.
+      - alert: MysqlReplicationLagHigh
+        expr: mysql_slave_status_seconds_behind_master > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MySQL 복제 지연 {{ $value }}초 5분 지속 — {{ $labels.instance }} (DR 복구 지점이 그만큼 뒤에 있다)"
+          action: "`SHOW REPLICA STATUS\\G` 의 Seconds_Behind_Source 와 Relay_Log_Space 를 본다. 지연의 흔한 원인은 대량 DDL/DELETE다 — `doc/schema.sql` 파티션 DROP이 방금 돌았는지 확인(DROP은 테이블 MDL을 3초 잡는다, 실측). ⚠️ 지연 중에 replica로 조회를 옮기지 마라. 앱은 지금 replica를 읽지 않는 것이 정상이다(§4-3)."
+
+  # ===========================================================================
   # 3. 한도가 명시된 자원의 추세
   # ===========================================================================
   - name: queue-platform-capacity
@@ -231,46 +308,108 @@ groups:
           summary: "{{ $labels.instance }} 루트 파일시스템 현 추세면 24시간 내 고갈 — MySQL 쓰기가 멈춘다"
           action: "`df -h /` → `du -sh /var/lib/mysql/*` 로 tokens 파티션 크기 확인 → `doc/schema.sql`의 파티션 운영 쿼리로 오래된 파티션 DROP 상태 점검. ⚠️ DROP은 테이블 MDL을 잡아 INSERT를 함께 막는다(실측 3.05초) — lock_wait_timeout을 걸고 실행한다."
 
+      # Redis 마스터 단일 스레드가 포화에 다가간다. (2026-09-04 <보류>에서 승격)
+      #
+      # 🔴 **임계값 근거: 있다. 단 "기준선"이 아니라 "물리 상한"이다.**
+      #    Redis 명령 실행은 단일 스레드다 → main thread CPU rate의 상한이 **1.0(코어 1개)**이다.
+      #    0.8은 그 상한의 80%다. 즉 이 숫자는 부하 추정치가 아니라 옛 원칙 4번 분류
+      #    ("한도가 명시된 자원")와 같은 성질이다. maxmemory 규칙과 같은 계열이다.
+      #
+      #    "지금은 안 울린다"의 확인 (2026-09-04 실측, job=redis-cluster 16노드):
+      #      - 현재 rate[5m] 최댓값 0.0018 (0.18%)
+      #      - 24시간 max_over_time 최댓값 0.0594 (5.9%, 7002)
+      #      → 0.8은 관측 최댓값의 13배다.
+      #    ⚠️ 이 24시간 동안 앱은 대부분 안 떠 있었다. **부하 중 기준선이 아니다.**
+      #
+      # user + sys를 더하는 이유: 네트워크 syscall이 sys에 잡힌다. user만 보면 포화를 놓친다.
+      #
+      # 🔴 **조치 레버가 있다.** 옛 <보류> 사유 "깨워도 할 수 있는 게 없다"는 거짓이 됐다 —
+      #    `doc/monitoring/runbook/enqueue.md`의 [증상] Redis master CPU가 100%에 붙었다 가
+      #    즉시 조치(해당 큐의 max_capacity UPDATE, 되돌리기 포함)를 이미 적고 있었다.
+      #
+      # for: 10m — 40회 연속. 배치 드레인은 20ms 주기라 짧은 버스트가 정상이다.
+      #            버스트로 깨우지 않기 위해 이 파일에서 가장 긴 for를 쓴다.
+      - alert: RedisMainThreadSaturated
+        expr: |
+          rate(redis_cpu_user_main_thread_seconds_total{job="redis-cluster"}[5m])
+          + rate(redis_cpu_sys_main_thread_seconds_total{job="redis-cluster"}[5m])
+            > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis {{ $labels.instance }} 단일 스레드 {{ $value | humanizePercentage }} — 상한(코어 1개)에 근접"
+          action: "핫키를 먼저 의심한다. 키가 전부 `{queueId}` 해시태그라 Cluster여도 큐 하나 = 마스터 한 대다. 절차 전체는 `doc/monitoring/runbook/enqueue.md` 의 [증상] Redis master CPU가 100%에 붙었다 — `redis-cli -c -p 7001 --stat` 와 `info commandstats`. ⚠️ **`KEYS *` / `DEBUG SLEEP` 금지** — 단일 스레드를 통째로 막아 전면 장애가 된다. 스케일업으로 못 푼다(코어를 늘려도 단일 스레드다)."
+
 # ─────────────────────────────────────────────────────────────────────────────
-# <보류> — 지금 쓰지 않은 규칙과 그 이유
+# <보류> — 2026-09-04 전면 재구성
 #
-# 규칙을 안 쓴 것에도 근거가 있어야 한다. 나중에 "왜 이건 없지"를 다시 묻지 않도록 남긴다.
+# 사용자 결정("모니터링에 대한 경고는 일단 전부 알람으로 간다")으로
+# **"기준선이 없다" / "조치 레버가 없다"는 더 이상 보류 사유가 아니다.**
+# 그래서 이 절은 **승격된 것**과 **아직 못 쓰는 것**이 한눈에 갈리도록 두 표로 나눈다.
 #
-# ● redis-cluster(7001-7008 / 8001-8008) 16노드의 up / redis_cluster_state
-#   → 로컬 학습 자산이다(doc/INFRA_SETUP.md §6.5). 앱이 붙지 않으므로 죽어도 서비스 영향 0이다.
-#     여기에 up==0을 걸면 알람 16개가 소음으로 깔린다. §75(Cluster 전환) 시점에
-#     `redis_cluster_state != 1` / `redis_cluster_slots_fail > 0`을 그때 추가한다.
+# ═══ [A] 승격 완료 — 여기 없다. 규칙으로 존재한다 ══════════════════════════════
 #
-# ● MySQL 복제 중단 / 복제 지연 증가
-#   → **보류 사유가 사라졌다 (2026-08-28).** 이 블록은 "전용 계정이 없어 시계열이 없다"는
-#     전제 위에 있었는데, 계정이 생겨 시계열이 실재한다(mysql_up 양쪽 1, 실측).
-#     이름도 확정됐다 — 미검증 약칭이 아니라 실측한 실제 이름이다:
-#       - 복제 중단: mysql_slave_status_slave_sql_running == 0   (이진값, 임계값 불필요)
-#       - 지연 증가: deriv(mysql_slave_status_seconds_behind_master[15m]) > 0  (절대값 아닌 추세)
-#     즉 **지금은 쓸 수 있다.** 그래도 아직 안 만든 이유는 하나뿐이다 — 임계와 for 구간을
-#     정할 기준선을 아직 안 쟀다(idle 15~25ms 말고, 부하 중 분포). CLAUDE.md §4대로
-#     "안 만들면 무엇이 깨지나"에 답하고 만든다: 지금은 replica를 읽는 코드가 사실상 없어
-#     (읽기의 99%가 master, §4-3) 지연이 커져도 당장 깨지는 사용자 경로가 없다.
-#     🔑 그래서 이건 "못 만든다"가 아니라 "쓸 곳이 생기면 만든다"다. 전제를 다시 확인하지 마라 —
-#        계정은 있다. 확인 명령: promtool 없이도
-#        curl -s 'localhost:9090/api/v1/query?query=mysql_slave_status_seconds_behind_master'
+#   ● MySQL 복제 중단           → MysqlReplicationStopped      (이 파일, critical)
+#   ● MySQL 복제 지연 증가        → MysqlReplicationLagHigh      (이 파일, warning)
+#   ● Redis 단일 스레드 포화      → RedisMainThreadSaturated     (이 파일, warning)
+#   ● admit 5xx 비율            → QueueAdmitErrorRatioHigh     (app.yml, critical)
+#   ● B2 "admit 요청이 안 온다"   → QueueAdmitRequestsAbsent     (app.yml, info)
+#   ● p95 지연                  → QueueAdmissionWaitP95High (app.yml, warning)
+#     🔑 p95 300초 critical은 **만들지 않았다**(2026-09-04 사용자 결정). 이 서비스에서
+#        p95 5분은 장애가 아니라 설계 의도일 수 있다(30만 명 티켓 오픈인데 severity=critical은
+#        사람을 깨운다). 사유는 MONITORING_DESIGN.md 4-3의 미채택 표기에 있다.
 #
-# ● Redis master 단일 스레드 포화
-#   rate(redis_cpu_user_main_thread_seconds_total{job="redis"}[1m]) — 1.0이 물리 상한이다.
-#   → 두 가지가 없어서 보류한다.
-#     (1) 기준선 — 평상시 값이 0.02인지 0.6인지 모른다. 경보선을 정할 근거가 없다.
-#     (2) **조치 레버가 없다.** ~~pacing은 아직 Redis 키가 아니고~~ → ✏️ `QueueKeys.pacing()` 구현됨.(§79 설계만),
-#         Rate Limit cap/refill은 코드 하드코딩이라 런타임 변경이 불가능하다.
-#         깨워도 할 수 있는 게 없는 알람은 쓰지 않는다.
-#     레버가 생긴 뒤(pacing 키 구현) 부하 테스트로 기준선을 잡고 쓴다.
+#   승격하면서 옛 보류 사유가 **이미 거짓이었던 것 셋**을 함께 정정했다:
+#     1. "Redis 포화는 조치 레버가 없다" → 거짓. `runbook/enqueue.md`의
+#        [증상] Redis master CPU가 100%에 붙었다 가 즉시 조치(해당 큐 max_capacity UPDATE,
+#        되돌리기 포함)를 이미 적고 있었다. **보류 사유가 자기 런북과 모순이었다.**
+#     2. "redis-cluster 16노드는 앱이 붙지 않으므로 규칙을 안 만든다" → 거짓.
+#        §75로 앱이 붙는 곳이 **Cluster다**. 그리고 RedisInstanceDown·RedisClusterDegraded·
+#        ExporterDown·RedisMemoryWillHitMaxmemory 가 **이미 job="redis-cluster"를 보고 있었다.**
+#        규칙은 이미 있는데 보류 문구만 남아 있었다. 항목 통째로 삭제.
+#        ⚠️ 반대로 job="redis"(6379-6381)·job="redis-sentinel"은 §75로 코드에서 제거된
+#           학습 자산이다. **새 규칙을 그쪽에 걸지 마라** — 런북이 다른 Redis를 가리키던 전례가 있다.
+#     3. "admit 계열은 대상 메트릭이 미구현이라 전부 못 쓴다" → **절반이 거짓이었다.**
+#        admit 5xx 비율과 B2는 Spring Boot 기본 `http_server_requests`로 **구현 0으로 쓸 수 있다.**
+#        (실측 2026-09-04: uri="/api/v1/queues/{queueId}/admit" 시계열 실재, 24h 표본 66)
+#        "커스텀 메트릭이 없다"를 "관측이 없다"로 착각한 것이다. 기본 메트릭을 먼저 봐라.
 #
-# ● 애플리케이션 규칙 전부 (admit 5xx 비율 / B2 판정 시한 / 만료율 / p95 지연)
-#   → 대상 메트릭이 **미구현**이다. 커스텀 메트릭 사용처 0건(MeterRegistry grep 0건).
-#     Sprint 7에서 queue_admit_requests_total / queue_admit_tokens_issued_total이 생기고,
-#     부하로 기준선을 잡은 뒤에 쓴다. 그전까지는 전부 "기준선 수집 필요"다.
+# ═══ [B] 아직 못 쓴다 — 사유는 단 하나, **대상 메트릭이 존재하지 않는다** ═══════════
 #
-#   ⚠️ 그중 하나는 임계값을 정하기 전에 함정부터 풀어야 한다:
-#      "admit 요청이 안 온다"(B2)를 rate()==0 으로 쓸 수 없다. 카운터는 0을 내지 않는다 —
-#      한 번도 요청이 없던 (queueId, instance) 조합은 **시계열 자체가 없다**. absent_over_time()
-#      이나 "대기자 존재" 조건과의 결합이 필요하다. 이건 임계값이 아니라 설계 문제다.
+#   임계값을 못 정해서 보류하는 항목은 이제 **없다.** 못 정하면 정하지 말고 "🔴 임계값 근거:
+#   없다"를 달고 만든다. 아래는 만들면 **영원히 안 뜨는 알람**이 되는 것들이다 —
+#   시계열이 없으면 규칙은 firing이 아니라 **침묵**하고, 그건 없는 것보다 나쁘다(있다고 착각시킨다).
+#
+#   ● 만료율 (회수 3경로: admitTtl / inactiveTtl / waitingTtl 각각 몇 건인가)
+#     - 대체 가능한가 → **아니다(실측 확인).** 지금 존재하는 batch 커스텀 메트릭 5종
+#       (queue_waiting_orphans · queue_reconcile_ghosts · queue_reconcile_stale ·
+#        queue_billing_mismatch · queue_billing_snapshot_total)은 전부 **다른 것을 센다.**
+#       queue_waiting_orphans는 "waiting 맨 앞의 tokens Hash 미스"이지 만료 건수가 아니다.
+#       회수 건수는 `TokenReclaimJob:163`의 **log.info 한 줄로만** 남는다(Counter 없음).
+#     - 🔑 선행 구현: `TokenReclaimJob`에 회수 3경로 Counter
+#       (예: queue.token.reclaimed{reason=admit_ttl|inactive_ttl|waiting_ttl}).
+#       라벨은 reason 3종뿐이라 카디널리티 부담이 없다. queueId는 붙이지 마라
+#       (같은 클래스 javadoc:179가 이미 그렇게 정해 놨다).
+#
+#   ● 큐별 admit 판정 — "특정 테넌트만 admit을 멈췄다"
+#     - QueueAdmitRequestsAbsent(app.yml)는 **플랫폼 전체**만 잡는다. uri 라벨이 queueId를
+#       템플릿으로 접기 때문이다. 큐별로는 못 본다.
+#     - 🔑 선행 구현: `queue_admit_requests_total{queue_id, result}` /
+#       `queue_admit_tokens_issued_total{queue_id}` (§80 U9). 둘 다 grep 0건.
+#       🔴 **라벨은 `queue_id`다 — §80(DECISIONS:5822)의 `queueId` 표기를 따르지 마라.**
+#       queue_admission_wait_seconds가 `queue_id`(MONITORING_DESIGN 4-3)를 쓰므로
+#       철자가 갈리면 `and on(queue_id)` 조인이 성립하지 않는다. Micrometer는 태그 키를
+#       snake_case로 바꿔 주지 않는다 — 구현할 때 손으로 맞춰야 한다.
+#     - ⚠️ 그때도 `rate() == 0`만으로는 안 된다. 카운터는 0을 내지 않는다 —
+#       한 번도 요청이 없던 (queue_id, instance) 조합은 시계열 자체가 없다.
+#       app.yml의 QueueAdmitRequestsAbsent 가 쓴 **`rate()==0 or absent_over_time()` 형태**를
+#       queue_id 라벨 위에서 그대로 쓰면 된다(그 규칙 주석에 함정과 근거를 적어 뒀다).
+#
+#   ● queue-batch 커스텀 메트릭 5종에 대한 규칙 (queue_billing_mismatch != 0 등)
+#     - 임계값은 자명하다(0이 정상, -1은 대사 실패). 못 만드는 이유는 임계값이 아니라
+#       **batch가 안 떠 있으면 시계열이 사라져 `!= 0` 규칙이 침묵**하기 때문이다.
+#       `absent()` 결합이 선행이고, 그건 AppInstanceDown(job=queue-batch)과 겹친다.
+#       겹치는 규칙을 놓지 않는다는 원칙(RedisClusterDegraded 주석)은 아직 유효하다.
+#     - ⚠️ 이건 "기준선이 없어서"가 아니다. 새 원칙과 충돌하지 않는다.
 # ─────────────────────────────────────────────────────────────────────────────

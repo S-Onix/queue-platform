@@ -3,16 +3,21 @@ package com.sonix.queue.api.queue;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.*;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Service
@@ -48,15 +53,29 @@ public class QueueEngineService {
     private final QueueEngine queueEngine;
     private final EnqueueEventPublisher eventPublisher;
     private final Clock clock;                        // 시간 주입(테스트 제어)
+    private final MeterRegistry meterRegistry;
+
+    /**
+     * {@code queue_admission_wait_seconds}의 버킷 경계 (MONITORING_DESIGN 4-3).
+     *
+     * <p><b>여기 한 곳에만 있다.</b> 경계는 SLO 판단이라 바뀔 값이고(경고 p95 1분 · 위험 5분이
+     * 60·300에 걸려 있다), 흩어 놓으면 알람과 어긋난다. 늘리면 시계열이 큐당 버킷 수만큼 는다.
+     */
+    private static final Duration[] ADMISSION_WAIT_SLO = {
+            Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(60),
+            Duration.ofSeconds(120), Duration.ofSeconds(300), Duration.ofSeconds(600),
+            Duration.ofSeconds(1800), Duration.ofSeconds(3600)
+    };
 
     public QueueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher,
-                              Clock clock) {
+                              Clock clock, MeterRegistry meterRegistry) {
         this.queueRepository = queueRepository;
         this.tokenRepository = tokenRepository;
         this.queueEngine = queueEngine;
         this.eventPublisher = eventPublisher;
         this.clock = clock;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -105,9 +124,66 @@ public class QueueEngineService {
         long now = clock.millis();
         AdmitResult result = queueEngine.admit(queueId, requestId, count, now);
 
-        publishAdmitted(tenantId, queueId, result, Instant.ofEpochMilli(now));
+        Instant admittedAt = Instant.ofEpochMilli(now);
+        recordAdmissionWait(queueId, result, admittedAt);
+        publishAdmitted(tenantId, queueId, result, admittedAt);
 
         return result;
+    }
+
+    /**
+     * 대기 시간 분포를 기록한다 — {@code queue_admission_wait_seconds{queue_id}} (MONITORING_DESIGN 4-3).
+     *
+     * <p>{@code issuedAt}("줄 선 시각")과 이번 admit 시각의 차. <b>추가 조회 0</b>이다 —
+     * 두 값 모두 admit.lua 반환과 호출자가 이미 손에 쥔 것이다.
+     *
+     * <p><b>REPLAY는 기록하지 않는다.</b> 같은 requestId의 재시도는 <b>첫 호출과 같은 records</b>를
+     * 돌려주는데, 여기서 쓸 수 있는 admit 시각은 <b>재시도 시각</b>뿐이다(멱등 payload에 시각이
+     * 없다 — publishAdmitted 주석 참조). 기록하면 같은 사람이 두 번 세어지고, 그 두 번째 값은
+     * 재시도가 늦은 만큼 부풀어 p95를 위로 끈다.
+     *
+     * <p>🪤 <b>큐당 시계열이 늘어난다</b>(버킷 8 + count + sum) 그리고 <b>전역 상한은 없다.</b>
+     * §87의 "테넌트당 20개"는 {@code countByTenantIdAndStatusNot(tenantId, DELETED)}라
+     * <b>삭제된 큐를 안 세고</b>, 테넌트 수 자체도 무제한이다. 즉 생성→삭제를 반복하면
+     * 미터는 계속 쌓인다(Micrometer는 회수하지 않는다 — 재기동 전엔 안 줄어든다).
+     * 그럼에도 라벨을 뗄 수 없다: 알람의 존재 이유가 "<b>어느</b> 테넌트가 마스터를
+     * 독식하는가"라 라벨이 없으면 깨워도 대상을 특정 못 한다. 큐가 수만 개가 되면 재검토.
+     * ({@code TokenReclaimJob}의 gauge가 queueId 태그를 <b>피하는</b> 것과 반대 판단인데, 그쪽은
+     * 큐마다 매 틱 갱신되는 상시 게이지이고 이쪽은 admit이 실제로 일어난 큐에만 생긴다.)
+     */
+    private void recordAdmissionWait(String queueId, AdmitResult result, Instant admittedAt) {
+        if (result.replay()) {
+            return;
+        }
+        Timer timer = null;
+        for (AdmitResult.AdmitRecord record : result.records()) {
+            if (record.issuedAt() == null) {
+                continue;   // 구 포맷 — 발행과 같은 이유로 뺀다(publishAdmitted 참조)
+            }
+            long waitMillis = admittedAt.toEpochMilli() - record.issuedAt().toEpochMilli();
+            if (waitMillis < 0) {
+                // 🔴 **음수는 0으로 눕히지 않는다.** issuedAt·admittedAt은 둘 다 앱 시계고
+                //    API 서버가 N대라 스큐가 그대로 들어온다(queue_daily_stats에 -398초 실측).
+                //    GREATEST(...,0)류의 clamp는 §86에서 이미 기각됐다 — 스큐 신호가 사라진다.
+                //    Timer는 음수를 조용히 버리므로(AbstractTimer) 그냥 record하면 표본만 없어지고
+                //    아무 데도 안 남는다. 그래서 **표본에서 빼되 별도 카운터로 드러낸다** —
+                //    누락 건수를 알아야 남은 분포를 믿을 수 있다.
+                Counter.builder("queue.admission.clock.skew")
+                        .description("admit 시각이 enqueue 시각보다 앞선 건수 (API 서버 간 시계 스큐)")
+                        .tag("queue_id", queueId)
+                        .register(meterRegistry)
+                        .increment();
+                continue;
+            }
+            if (timer == null) {
+                timer = Timer.builder("queue.admission.wait")
+                        .description("enqueue부터 admit까지 걸린 시간")
+                        .tag("queue_id", queueId)
+                        .serviceLevelObjectives(ADMISSION_WAIT_SLO)
+                        .register(meterRegistry);
+            }
+            timer.record(waitMillis, TimeUnit.MILLISECONDS);
+        }
     }
 
     /**

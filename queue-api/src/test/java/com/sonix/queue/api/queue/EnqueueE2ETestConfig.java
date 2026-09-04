@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 /**
  * Enqueue E2E 통합 테스트 전용 부트스트랩.
@@ -69,7 +70,7 @@ public class EnqueueE2ETestConfig {
         // TokenRepository는 admit/verify/complete 전용이다. 이 config는 enqueue 흐름(Redis)만
         // 태우므로 JPA 컨텍스트를 끌어오지 않는다 → null.
         return new QueueEngineService(queueRepository, null, engine, eventPublisher,
-                java.time.Clock.systemUTC());
+                java.time.Clock.systemUTC(), new SimpleMeterRegistry());
     }
 
     /**

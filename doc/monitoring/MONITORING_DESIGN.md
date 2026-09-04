@@ -999,7 +999,12 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
   - 대기 시간 임계치?
     - 결정:
       - p95 대기 시간 1분 → 경고
-      - p95 대기 시간 5분 → 위험 (Tenant Backpressure 점검)
+      - ~~p95 대기 시간 5분 → 위험 (Tenant Backpressure 점검)~~
+        - **2026-09-04 미채택.** 대기열 서비스에서 p95 5분은 **정상일 수 있다**
+          (30만 명 티켓 오픈에서 5분 대기는 설계 의도다). 그런데 severity=critical은
+          사람을 깨우는 등급이라, 오탐하는 critical 하나가 등급 전체를 오염시킨다.
+        - 1분 경고(`QueueAdmissionWaitP95High`)만 만들었다 — 같은 신호를 깨우지 않고 본다.
+          기준선이 쌓여 "이 큐에서 N분은 비정상"을 말할 수 있게 되면 그때 다시 판단한다.
 - 활용방안
   - 대기 시간 추세로 Queue 용량 조정 제안
   - Tenant Backpressure 정상성 검증
