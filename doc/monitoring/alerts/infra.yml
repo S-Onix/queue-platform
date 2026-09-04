@@ -206,6 +206,31 @@ groups:
           summary: "Redis {{ $labels.instance }} 현 추세면 6시간 내 maxmemory 도달 — noeviction이라 쓰기(enqueue)가 거부된다"
           action: "`redis-cli -c -p 7001 CONFIG GET maxmemory` (앱이 붙는 Cluster. 6379는 Sentinel이라 다른 값이다) 로 현재 한도 확인 → `INFO memory`의 used_memory → `--bigkeys`로 어느 큐가 키우는지 본다. ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다."
 
+      # 디스크 고갈 예측.
+      #
+      # 🔴 이 규칙은 2026-09-04까지 **쓸 수 없었다** — node_exporter가 설치돼 있지 않았다.
+      #    MONITORING_DESIGN.md는 있다고 적고 있었다(문서 드리프트). 지금은 9100에 떠 있다.
+      #
+      # 왜 필요한가: `tokens`는 월별 RANGE 파티션이고, DROP이 멈추면 **아무 에러 없이** 계속
+      # 쌓인다. 배치 실패 알림보다 디스크 추세가 먼저 잡히는 경우가 있다(DROP은 성공했는데
+      # 유지보수 쿼리가 밀린 경우 등). 디스크가 차면 MySQL은 쓰기를 거부한다 = Kafka 적재 정지.
+      #
+      # 절대값(예: 85%)을 안 쓴 이유는 위 Redis 규칙과 같다 — 증가 속도의 기준선이 없다.
+      # 24h는 임계값이 아니라 리드타임이다. 파티션 추가/DROP은 사람 손이 필요하고 하루면 된다.
+      # 기울기가 음수(청소해서 공간이 늘면)면 예측값이 커져 자동으로 해제된다.
+      #
+      # 🪤 mountpoint="/" 로 좁히는 이유: WSL이 같은 ext4를 /var/lib/docker 에도 붙여
+      #    동일 파일시스템이 2중으로 잡힌다. 안 좁히면 같은 사건에 알람이 두 번 뜬다.
+      - alert: DiskWillFill
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{job="node",mountpoint="/"}[6h], 24 * 3600) < 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} 루트 파일시스템 현 추세면 24시간 내 고갈 — MySQL 쓰기가 멈춘다"
+          action: "`df -h /` → `du -sh /var/lib/mysql/*` 로 tokens 파티션 크기 확인 → `doc/schema.sql`의 파티션 운영 쿼리로 오래된 파티션 DROP 상태 점검. ⚠️ DROP은 테이블 MDL을 잡아 INSERT를 함께 막는다(실측 3.05초) — lock_wait_timeout을 걸고 실행한다."
+
 # ─────────────────────────────────────────────────────────────────────────────
 # <보류> — 지금 쓰지 않은 규칙과 그 이유
 #
