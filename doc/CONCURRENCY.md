@@ -2,7 +2,7 @@
 
 > Queue Platform의 동시성 제어 전략과 `@DistributedLock` 사용 가이드.
 > CLAUDE.md "동시성 제어" 섹션의 상세 문서.
-> **최종 업데이트**: 2026-07-08 (Cluster 학습 반영, Sprint 8+ 대비)
+> **최종 업데이트**: 2026-09-04 (코드 대조)
 
 ---
 
@@ -68,7 +68,7 @@ public synchronized Queue createQueue(...) { ... }  // 인스턴스 #2가 무력
 
 ```sql
 -- 동일 tenant 내 queueName 중복 방지
-ALTER TABLE queue ADD CONSTRAINT uk_tenant_queue_name UNIQUE (tenant_id, queue_name);
+ALTER TABLE queues ADD CONSTRAINT uq_queues_tenant_name UNIQUE (tenant_id, name);
 ```
 
 ```java
@@ -124,16 +124,21 @@ kafkaTemplate.send(topic, event.tokenId(), event);
 `SELECT ... FOR UPDATE`로 row를 잠근다.
 
 ```java
+// 일반형 (이 절의 설명용)
 @Transactional
 public Queue createQueue(Long tenantId, CreateQueueCommand cmd) {
     Tenant tenant = tenantRepository.findByIdForUpdate(tenantId).orElseThrow();
-    long count = queueRepository.countByTenantId(tenantId);
-    if (count >= tenant.getPlan().maxQueues()) {
+    if (queueRepository.countByTenantId(tenantId) >= MAX_QUEUES_PER_TENANT) {
         throw new QuotaExceededException();
     }
     return queueRepository.save(Queue.create(tenantId, cmd));
 }
 ```
+
+🔴 **이 레포의 `QueueService.createQueue`는 이렇게 하지 않는다.** 잠그지도, 트랜잭션을 열지도
+않는다 — 상한은 상수 `MAX_QUEUES_PER_TENANT = 20`이고 검사는 비잠금 `COUNT`다.
+동시 생성으로 21개가 되는 창을 **의도적으로 받아들인 결정**이며 근거는 그 메서드 주석에 있다.
+따라 쓰기 전에 그 주석을 먼저 읽어라.
 
 ```java
 @Lock(LockModeType.PESSIMISTIC_WRITE)
@@ -186,9 +191,9 @@ Optional<Tenant> findByIdForUpdate(@Param("id") Long id);
 
 | 시나리오 | 권장 방식 | 이유 |
 |---------|---------|------|
-| createQueue (quota 검증) | 비관적 락 | DB만 건드림, 짧은 트랜잭션 |
-| Queue 생성 + Redis/Kafka 초기화 | 분산 락 | 외부 시스템 포함 |
-| ApiKey rotate | 분산 락 | 캐시 무효화 등 외부 영향 |
+| createQueue (개수 상한) | **락 없음** | 비잠금 `COUNT` — 초과 창을 감수한 결정 (`QueueService`) |
+| Queue 생성 + Redis 클러스터 배정 | **락 없음** | `RedisClusterAssigner`가 락 없이 배정한다 |
+| ~~ApiKey rotate~~ | — | **그런 기능이 없다** (grep 0건) |
 | **일별 통계 집계** (`queue_daily_stats`) | **락 없음** | `BillingSnapshotJob`에 얹혀 같은 근거로 산다 (§84·§86). ~~INSERT-only 누적이라 ShedLock 필요~~ → **틀렸다**: `uq_queue_daily_stat (queue_id, stat_date)`가 있어 중복 INSERT는 애초에 ERROR 1062로 막히고, ODKU 덮어쓰기가 멱등을 만든다 |
 | enqueue (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
 | admit (핫패스) | 락 없음 (Lua Script) | 처리량 우선 |
@@ -209,6 +214,11 @@ Optional<Tenant> findByIdForUpdate(@Param("id") Long id);
 ---
 
 ## 4. `@DistributedLock` 사양
+
+> 🔴 **이 절은 결정(§59)이고, 구현이 아니다.** 레포에 `@DistributedLock`도 `DistributedLockAspect`도
+> Redisson 의존성도 **없다**(grep 0건, 2026-09-04). 지금까지 필요한 적이 없었기 때문이다 —
+> 핫패스는 Lua 원자성으로, 콜드패스는 DB 제약으로 해결됐다.
+> **import하려 들지 마라.** 필요해지면 이 절을 사양서로 삼아 그때 만든다.
 
 ### 4.1 모듈 배치
 
@@ -515,10 +525,10 @@ Redis Cluster는 Lua Script 내 여러 key 사용 시 제약 있음.
 > ⚠️ 개정 전 이 문단은 "enqueue.lua는 단일 key만 사용 → CROSSSLOT 이슈 없음"이라고 적혀 있었다.
 > 5-E에서 score 발급을 `INCR seq`로 바꾸며 **Lua가 2-key가 되어 전제가 깨졌다.**
 
-- `enqueue_bulk.lua`는 **키 2개**를 사용 → **해시태그 없이는 CROSSSLOT 발생**
-  - `KEYS[1]` = 대기열 ZSet, `KEYS[2]` = 순번 카운터(`INCR`)
+- `enqueue_bulk.lua`는 **키 3개**를 사용 → **해시태그 없이는 CROSSSLOT 발생**
+  - `KEYS[1]` = 대기열 ZSet, `KEYS[2]` = 순번 카운터(`INCR`), `KEYS[3]` = `tokens` Hash(중복 게이트)
   - seq 키는 제거 불가: `ZCARD+1`은 admit으로 중간이 빠지면 충돌, `currentTimeMillis()`는 동점 발생 → `INCR`만 단조증가·유일 보장
-- **해시태그 적용 완료** (`queue/QueueKeys.java`) → 두 키가 항상 같은 slot
+- **해시태그 적용 완료** (`queue/QueueKeys.java`) → 세 키가 항상 같은 slot
 - 로컬 Cluster A 실측:
   ```
   queue:q_bts:waiting    → slot 7911   → 포트 7002  ┐ 다른 마스터 → CROSSSLOT
@@ -664,10 +674,10 @@ class QueueCreationConcurrencyTest {
 
 **Queue Platform 무변경 자산**:
 - ~~enqueue.lua는 단일 key만 사용 → Cluster 무변경 작동~~
-  → **`enqueue_bulk.lua`는 2-key(waiting + seq)이므로 Hash Tag 필수** (2026-07-15 개정, §70)
+  → **`enqueue_bulk.lua`는 3-key(waiting + seq + tokens)이므로 Hash Tag 필수** (§70)
   → Hash Tag 선제 적용 완료(`queue/QueueKeys.java`) → **이제 Cluster 무변경 작동**
 - `@DistributedLock` key 패턴 (`lock:{domain}:{id}:{action}`) → Cluster 무변경
-- Rate Limiter Lua Script → 단일 key 사용, 무변경 (`rl:tenant:{id}`, `rl:{action}:ip:{ip}`)
+- Rate Limiter Lua Script → 단일 key 사용, 무변경 (`rl:tenant:{id}`, `rl:{action}:ip{ip}:{windowNo}` — `ip` 뒤에 콜론이 없다)
 
 **남은 변경 예상**:
 - ~~Lua Script Hash Tag~~ → **Sprint 5-E에서 도입 완료**

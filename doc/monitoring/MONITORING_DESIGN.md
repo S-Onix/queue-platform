@@ -922,10 +922,10 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
     - 만료/삭제 안 된 Queue 추적 필요
 - 대안
   - Custom 메트릭 작성
-    - queue_created_total{tenant_id}
-    - queue_deleted_total{tenant_id, reason}
+    - queue_created_total{tenant_id}                            ⬜ **미구현** (계측 코드 0건)
+    - queue_deleted_total{tenant_id, reason}                    ⬜ **미구현**
       - reason: manual / expired / tenant_deleted
-    - queue_active_count (Gauge, 현재 활성 Queue 수)
+    - queue_active_count (Gauge, 현재 활성 Queue 수)             ⬜ **미구현**
 - 이슈
   - tenant_id 라벨 Cardinality?
     - 카테고리 1에서 검토한 그대로 (Tenant 수 제한적이므로 OK)
@@ -987,9 +987,9 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
     - 임계치 모니터링 필요
 - 대안
   - Custom 메트릭 작성
-    - queue_token_admit_total{tenant_id, queue_id, result}
+    - queue_token_admit_total{tenant_id, queue_id, result}       ⬜ **미구현** (§80 U9의 queue_admit_requests_total로 대체 예정)
       - result: success / failure
-    - queue_admission_wait_seconds (Histogram)
+    - queue_admission_wait_seconds (Histogram)                  ✅ **구현됨** (2026-09-04, `QueueEngineService.recordAdmissionWait`)
       - 대기 시간 분포
       - 라벨: queue_id
 - 이슈
@@ -1026,11 +1026,12 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
   - 상태 전이 비정상 발생 시
     - 비즈니스 로직 버그
     - 데이터 정합성 깨짐
-  - EXPIRED → WAITING 빈번 발생 시
-    - 사용자가 입장 못 잡음 (UX 저하)
+  - ~~EXPIRED → WAITING 빈번 발생 시~~
+    - 🔴 **이 전이는 없다 (§36 폐기).** admitToken TTL 만료는 **종료**이고 대기열로 복귀하지 않는다.
+      재접속하면 재-enqueue되어 맨 뒤다. 위 Cardinality 계산도 그만큼 과대다
 - 대안
   - Custom 메트릭 작성
-    - queue_token_state_transition_total{from_state, to_state, queue_id}
+    - queue_token_state_transition_total{from_state, to_state, queue_id}   ⬜ **미구현**
 - 이슈
   - 라벨 Cardinality?
     - from_state × to_state × queue_id

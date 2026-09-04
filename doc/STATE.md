@@ -14,7 +14,7 @@ stateDiagram-v2
 
     ADMIT_ISSUED --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\nKafka token-lifecycle 발행 (key=tokenId)
 
-    WAITING --> COMPLETED : POST /tokens/:tokenId/complete\nDB 적재 지연으로 아직 status=0인 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
+    WAITING --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nDB 적재 지연으로 아직 status=0인 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
 
     ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nHDEL tokens (중복 게이트 해제)\n복귀하지 않는다 (§36)\n⚠️ DB status는 1로 남는다\n재접속 → 재-enqueue → 맨 뒤
 
@@ -73,30 +73,41 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | verify | **verify가 완료를 확정한다**(응답 시점에 `COMPLETED` 발행, PR #48). Redis·DB **직접** 쓰기는 0회 — 이벤트만 낸다. ~~상태 변경 없음~~ |
 | complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
 | admitToken 만료 | **복귀하지 않는다 (§36).** `HDEL tokens`로 게이트만 풀고 끝. 재접속 → 재-enqueue → 맨 뒤. ⚠️ **DB `status`는 `1`로 남는다** — `EXPIRED` 가드가 `status = 0` 전용이라 no-op이고, 그것이 `complete`의 300초 창을 살린다 |
-| 이탈 | **전용 API 없음 (§82).** 폴링 중단 → `inactiveTtl` 판정 배치 → EXPIRED(4). `QE_006_INVALID_STATUS`는 쓰이는 곳이 없다 |
+| 이탈 | **전용 API 없음 (§82).** 폴링 중단 → `inactiveTtl` 판정 배치 → EXPIRED(4). `QE_006_INVALID_STATUS`(409)는 큐 상태 전이 위반에 쓰인다(`QueueService`) — 토큰 이탈과는 무관하다 |
 | 세션 관리 | Tenant 책임. Platform 관여 안 함 |
 | complete 순서 | DB 먼저 → ZREM 나중 (잔류가 유실보다 안전) |
-| 복구 | Batch 10초 내 ZREM 재실행 (멱등) |
-| seq 저장 | DB tokens.seq 컬럼 — **Redis 전손 시 DB 재구성**(§71). ~~복귀 시 score 복원~~은 §36이 폐기 |
+| 복구 | **완료 토큰의 ZREM을 재시도하는 코드는 없다.** 잔류분은 `inactiveTtl` 배치가 결국 걷어간다 |
+| seq 저장 | DB `tokens.seq` 컬럼 — **Redis 전손 시 DB 재구성**(§71). ~~복귀 시 score 복원~~은 §36이 폐기 |
 | admit_token 컬럼 | DB 저장 → Redis 미스 시 Fallback용 + verify DB Fallback |
 | Kafka 발행 | **모든 상태 변경**에서 발행 (ENQUEUED/ADMITTED/COMPLETED/EXPIRED). 단일 토픽 `token-lifecycle`, key=`tokenId`. ~~RETURNED~~는 §36이 폐기 |
 
 ### expiredReason
 
-| 값 | 원인 | 대상 | Batch 감지 |
-|----|------|------|------------|
-| `WAITING_TTL` | waitingTtl(7200s) 초과 | WAITING | 🔴 ~~ZRANGEBYSCORE 0 ~ (now_ms - waitingTtl_ms)~~ — `waiting`의 score는 **seq**라 시간축이 아니다. **앞부분 고정량 `ZRANGE` 스캔 + `HGET tokens`의 `issuedAt` 비교**다(`waiting_expire.lua:38,52,59`) |
-| `INACTIVE_TTL` | inactiveTtl(300s) 초과 | WAITING | ZRANGEBYSCORE `queue:{queueId}:last-active` 0 ~ (now_ms - inactiveTtl_ms) — **이탈 회수의 유일한 경로다(§82). ✅ 구현 완료** |
-| `RECONCILE` | complete 창 300초 초과한 `status=1` 잔류 | ADMIT_ISSUED | `ReconcileJob` → `UPDATE ... SET status = 4`(`TokenJpaRepository:114`). **DB만 본다** |
-| ~~`ADMIT_TOKEN_TTL`~~ | 🔴 **성립하지 않는다.** admitToken 만료자는 `status = 1`에 머물러 **`EXPIRED(4)`에 도달하지 않는다**(위 가드 참조). `expiredReason`은 status가 4인 사람의 사유이므로 이 값은 쓰이지 않는다. 만료 자체는 §36대로 `HDEL tokens` 후 종료 | — | `ZRANGEBYSCORE queue:{queueId}:admitted 0 now` — claim-Lua (§80) |
+`ExpiredReason.java`가 정본이다. **코드를 재사용하지 마라** — 지난 파티션에 쓰인 값의 뜻이 바뀌면
+과거 통계 해석이 통째로 틀어진다(`TokenStatus` 3번 결번과 같은 이유).
 
-> 🔴 **admitToken TTL 만료는 복귀하지 않는다 (§36, 2026-08-21).** claim 잡이 `HDEL tokens`로
-> 중복 게이트를 풀고 `EXPIRED`를 발행한다. 유저는 재접속해 새 seq로 맨 뒤에 선다.
-> 발행은 하되 **DB에서는 no-op**이다(위 가드) — 행이 아직 없는 랙 상황에서만 `INSERT`로 작용한다.
->
-> ⚠️ **`expired_reason` 컬럼은 아직 어떤 경로로도 채워지지 않는다.** `TokenJpaAdapter`의
-> `TRANSITION_INSERT` 컬럼 목록에 없다. 위 표는 **Sprint 9 회수 배치의 설계 의도**이고, 실을지
-> 말지는 그때 결정한다 — 만료 배치가 하나뿐이면 구분할 사유가 없어 안 실어도 깨지지 않는다.
+| 코드 | 값 | 원인 | 기록 주체 |
+|---|---|---|---|
+| 1 | `ADMIT_TTL` | admitToken TTL(60초) 만료 — 입장권을 받고 안 씀 | `TokenReclaimJob` → Kafka |
+| 2 | `ADMIT_STALE` | complete 창(300초)이 지나도록 `ADMIT_ISSUED` 잔류 | `ReconcileJob`이 **직접 UPDATE** |
+| 3 | `INACTIVE` | `inactiveTtl`(300초) 초과 — 폴링이 끊김. 이탈이고 정상이다(§82) | `TokenReclaimJob` → Kafka |
+| 4 | `WAITING_TTL` | `waitingTtl`(기본 7200초) 초과 — 기다리고도 못 뽑힘. **용량 부족 신호** | `TokenReclaimJob` → Kafka |
+
+🪤 **`ADMIT_TTL`은 DB에 그 값으로 남지 않는다.** 컨슈머 가드가 `IF(status = 0, 4, status)`라
+`ADMIT_ISSUED(1)`에서 통째로 no-op이고, 그 가드는 늦은 입장(complete 300초 창)을 살리려고 일부러
+넣은 것이다(§36). 같은 사람이 DB에 남는 것은 300초 뒤 `ReconcileJob`이 쓰는 `ADMIT_STALE(2)`다.
+`ADMIT_TTL`은 **이벤트에서 사유를 잃지 않기 위한** 값이다.
+
+감지 방식:
+- `WAITING_TTL` — 🔴 `ZRANGEBYSCORE`가 **아니다.** `waiting`의 score는 seq라 시간축이 아니다.
+  앞부분 고정량 `ZRANGE` 스캔 + `tokens` Hash의 `issuedAt` 비교다(`waiting_expire.lua`).
+- `INACTIVE` — `queue:{queueId}:last-active`를 `ZRANGEBYSCORE 0 (now_ms - inactiveTtl_ms)`.
+  **이탈 회수의 유일한 경로다**(§82).
+- `ADMIT_STALE` — Redis를 안 본다. DB만 본다(`TokenJpaRepository:114`).
+
+`expired_reason` 컬럼은 실제로 채워진다 — `TokenJpaAdapter`의 INSERT 컬럼 목록에 있고,
+`BillingJdbcAdapter`가 읽는다(§86).
+
 
 ---
 

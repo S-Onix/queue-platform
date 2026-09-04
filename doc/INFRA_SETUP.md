@@ -48,7 +48,7 @@ lsb_release -a
 # Release:        22.04 또는 24.04
 
 uname -r
-# Linux kernel 5.x.x WSL2
+# 예: 6.6.114.1-microsoft-standard-WSL2
 ```
 
 ### 패키지 업데이트 (재구축 시 첫 단계)
@@ -263,8 +263,8 @@ SHOW SLAVE STATUS\G
 CREATE DATABASE queue_platform CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE queue_platform;
 
--- 스키마는 docs/schema.sql 참조
-SOURCE /home/sonix/queue-platform/docs/schema.sql;
+-- 스키마는 doc/schema.sql 참조
+SOURCE /home/sonix/projects/queue-platform/doc/schema.sql;
 ```
 
 ---
@@ -878,44 +878,22 @@ Redis는 Single Thread 특성으로 각 Master가 CPU 1개만 사용:
 - 프로덕션 아키텍처 사전 검증
 ```
 
-### 6.5-12. 이중 라우팅 아키텍처 (Sprint 12+)
-
-Cluster + Hash Tag 조합으로 완전한 제어:
+### 6.5-12. 큐 단위 이중 라우팅 (구현 완료, §75)
 
 ```
-[Layer 1 - Cluster Router (애플리케이션)]
-- Tenant Tier 기반
-- 예상 규모 기반
-- Least Load 알고리즘
-- Cluster A 또는 B 선택
+[Layer 1 - Cluster Router (애플리케이션)]  ✅ 구현
+- 큐 생성 시 RedisClusterAssigner가 A/B 중 하나를 고른다
+- 기준은 used_memory ÷ maxmemory 비율(0.5 규칙) — Tenant Tier 아니다
+- 한 큐의 키 4종(waiting/seq/tokens/last-active)은 같은 클러스터에 놓인다 (§75 D26)
 
-[Layer 2 - Hash Tag (Cluster 내)]
-- {shard_X} 문법
-- 부하 기반 Master 선택
-- Cluster 내 4 Master 중 하나 결정
-
-[최종 Key 예시]
-"queue:{shard_A2}:q_bts_002:waiting"
-- Cluster: A (Application 결정)
-- Master: 2 (shard_A2 Hash Tag)
-- Queue: q_bts_002
+[Layer 2 - Hash Tag (Cluster 내)]          ⛔ shard 태그는 기각
+- 해시태그는 부하 분산용이 아니라 CROSSSLOT 방지용이다
+- 태그는 queueId 하나뿐이다: "queue:{q_bts_002}:waiting"
+- 슬롯 배치는 Redis가 CRC16으로 정한다. 애플리케이션이 Master를 고르지 않는다
 ```
 
-**Application 코드 흐름**:
-
-```java
-// Layer 1 - Cluster 선택
-Cluster targetCluster = clusterRouter.selectCluster(tenant, request);
-
-// Layer 2 - Master 선택 (Hash Tag)
-String shard = shardResolver.selectShard(targetCluster);
-
-// 최종 Key 구성
-String redisKey = String.format("queue:{%s}:%s:waiting", shard, queueId);
-
-// Lettuce가 {shard} 부분으로 slot 계산 → 자동 라우팅
-targetCluster.execute(enqueueScript, redisKey, ...);
-```
+🪤 **다른 슬롯이라도 같은 노드에 떨어지면 CROSSSLOT이 안 난다**(실측 25%).
+Cluster에서 초록은 태그가 맞다는 증거가 아니다.
 
 ### 6.5-13. 참고 - 실측 결과
 
@@ -939,12 +917,11 @@ WSL2에서 직접 실행. Spring Boot Actuator의 메트릭을 수집/시각화.
 ### 7-1. 모니터링 아키텍처
 
 ```
-[Windows]
-└── Spring Boot (queue-api, 8080)
-       └── /actuator/prometheus  ← Pull 대상
-
-         ↑ scrape (15초마다)
 [WSL2]
+├── Spring Boot (queue-api 8080, queue-batch 8081, queue-consumer 8082)
+│      └── /actuator/prometheus  ← Pull 대상
+│
+│        ↑ scrape (15초마다)
 ├── Prometheus (9090)
 │     └── 시계열 DB + scrape 관리
 │              ↑ PromQL 쿼리
@@ -955,7 +932,8 @@ WSL2에서 직접 실행. Spring Boot Actuator의 메트릭을 수집/시각화.
 **핵심 결정:**
 - Pull 방식 (Prometheus가 scrape) — 애플리케이션 단순화
 - Micrometer 추상화 — 백엔드 교체 가능
-- WSL ↔ Windows 통신 — Windows host IP 사용
+- **앱도 WSL2 안에서 돈다** — scrape 타깃은 전부 `localhost:PORT`다.
+  Windows host IP를 타깃에 쓰고 있다면 그 자체가 잘못된 설정이다(§11 참조)
 
 ### 7-2. Spring Boot 메트릭 노출 사전 작업
 
@@ -976,6 +954,9 @@ management:
     web:
       exposure:
         include: health, info, prometheus
+  # ⚠️ 프로필이 이 값을 덮는다 — dev는 `health, info, metrics`(prometheus 없음),
+  #    prod는 3개 앱 모두 `health, info`다(§85 — 스크레이퍼 경계가 생길 때까지 닫는다).
+  #    로컬(`application-local.yml`)만 `'*'`다.
   prometheus:
     metrics:
       export:
@@ -991,7 +972,8 @@ management:
 `SecurityConfig.java`에 Actuator 인증 우회 추가:
 
 ```java
-.requestMatchers("/actuator/**").permitAll()
+.requestMatchers("/actuator/health", "/actuator/info", "/actuator/prometheus").permitAll()
+.requestMatchers("/actuator/**").denyAll()   // 그 외는 차단 — env·heapdump가 열린다
 ```
 
 검증:
@@ -1046,7 +1028,7 @@ rm prometheus-3.0.1.linux-amd64.tar.gz
 > ⚠️ 이 플래그는 인증 없는 `/-/reload`·`/-/quit`를 연다. 지금은 로컬 WSL2라 무해하지만
 > 외부에 노출되는 환경으로 옮길 때는 앞단 차단이 선행이다.
 
-실가동 `prometheus.yml` 구조 (2026-08-17 기준, 타깃 27개):
+실가동 `prometheus.yml` 구조 (2026-09-04 기준, 타깃 29개):
 
 ```yaml
 global:
@@ -1054,7 +1036,7 @@ global:
   evaluation_interval: 15s
 
 rule_files:                                                 # 정본은 레포 안 (§7-12)
-  - /home/sonix/projects/queue-platform/doc/monitoring/alerts/*.yml   # 현재 파일 0개 → 규칙 0개
+  - /home/sonix/projects/queue-platform/doc/monitoring/alerts/*.yml   # app 4 · infra 12 · kafka 3 = 19 규칙
 
 # Alertmanager는 의도적으로 미설치 (§7-12). alerting 블록은 주석 처리돼 있다.
 
@@ -1074,6 +1056,17 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:8082']
         labels: { application: 'queue-consumer', env: 'local' }
+
+  - job_name: 'queue-batch'                  # 8081
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['localhost:8081']
+        labels: { application: 'queue-batch', env: 'local' }
+
+  - job_name: 'node'                         # 9100 — node_exporter (§7-11)
+    static_configs:
+      - targets: ['localhost:9100']
+        labels: { env: 'local' }
 
   # 🔧 옛 주석은 "queue-batch는 actuator 의존성이 없어 노출하지 않는다 / job을 넣으면 항상
   #    DOWN이다"였는데 **3중으로 거짓**이었다(2026-09-02 정정) — 의존성이 있고(`6647ca5`),
@@ -1203,9 +1196,9 @@ curl -s localhost:9090/api/v1/targets \
   | python3 -c "import json,sys;[print(t['labels']['job'],t['labels']['instance'],t['health']) \
       for t in json.load(sys.stdin)['data']['activeTargets']]" | sort
 
-# 기대 (2026-08-17 실측, 총 27개):
-#   prometheus 1 / redis 3 / redis-sentinel 3 / redis-cluster 16 / mysql 2  → 전부 up
-#   queue-api(8080), queue-consumer(8082) → 앱이 안 떠 있으면 down (정상)
+# 기대 (2026-09-04 실측, 총 29개):
+#   prometheus 1 / redis 3 / redis-sentinel 3 / redis-cluster 16 / mysql 2 / node 1  → 전부 up
+#   queue-api(8080), queue-consumer(8082), queue-batch(8081) → 앱이 안 떠 있으면 down (정상)
 
 # 3. 인프라 지표가 실제로 들어오는지 (앱과 무관하게 확인 가능)
 curl -sG localhost:9090/api/v1/query --data-urlencode 'query=redis_up'      # → 22 series
@@ -1344,10 +1337,11 @@ GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'localhost';
 | 대기열이 조용히 사라졌나? | `redis_evicted_keys_total`, `redis_memory_max_bytes` |
 | failover 발생? | `redis_instance_info{job="redis"}` 의 `role` 라벨 변화, `redis_sentinel_master_config_epoch` 증가 |
 | Sentinel quorum 성립? | `redis_sentinel_master_ckquorum_status` |
+| 호스트 CPU/디스크 (`node_exporter` 9100, systemd `node-exporter.service`) | `node_filesystem_avail_bytes` — `DiskWillFill` 규칙이 읽는다 |
 | replica 지연 (**DR 유실 구간 전용** — 앱 읽기는 replica로 안 간다) | `mysql_slave_status_seconds_behind_master` |
 
 **미설치 — 안 깔았을 때 안 보이는 것을 답할 수 있을 때만 추가**:
-`node_exporter`(호스트 CPU/디스크), `kafka_exporter`(컨슈머 lag — 단, Spring Kafka가
+`kafka_exporter`(컨슈머 lag — 단, Spring Kafka가
 `/actuator/prometheus`로 `kafka_consumer_fetch_manager_records_lag`를 이미 낸다 → 중복).
 
 ### 7-12. 알람 규칙 + Alertmanager
@@ -1429,8 +1423,13 @@ IntelliJ Settings (Ctrl+Alt+S)
 | 26379 | Redis Sentinel 1 |
 | 26380 | Redis Sentinel 2 |
 | 26381 | Redis Sentinel 3 |
+| 8080 | queue-api |
+| 8081 | queue-batch (actuator 전용, 컨트롤러 0개) |
+| 8082 | queue-consumer (actuator 전용, 컨트롤러 0개) |
+| 8083, 8084 | queue-api 추가 인스턴스 (통합 시나리오는 3대 고정) |
 | 9090 | Prometheus |
 | 3000 | Grafana |
+| 9100 | node_exporter |
 | 9092 | (Sprint 8+) Kafka Broker |
 | 8080 | queue-api Spring Boot |
 
@@ -1453,7 +1452,7 @@ IntelliJ Settings (Ctrl+Alt+S)
 | 9104 | mysqld_exporter → MySQL Master 3306 |
 | 9105 | mysqld_exporter → MySQL Replica 3307 |
 
-미설치 (필요 근거가 생기면 추가): 9100 node_exporter, 9308 kafka_exporter
+미설치 (필요 근거가 생기면 추가): 9308 kafka_exporter
 
 ---
 
@@ -1489,7 +1488,7 @@ ps aux | grep -E "redis|mysql|prometheus|grafana"
 ### 프로젝트 빌드/실행
 
 ```bash
-cd ~/queue-platform   # 또는 본인 프로젝트 위치
+cd /home/sonix/projects/queue-platform
 
 # 빌드
 ./gradlew clean build
@@ -1625,7 +1624,8 @@ Windows 방화벽에서 인바운드 규칙 추가:
 **원인**: SecurityConfig에서 actuator 허용 안 함  
 **해결**: 
 ```java
-.requestMatchers("/actuator/**").permitAll()
+.requestMatchers("/actuator/health", "/actuator/info", "/actuator/prometheus").permitAll()
+.requestMatchers("/actuator/**").denyAll()   // 그 외는 차단 — env·heapdump가 열린다
 ```
 
 ### Grafana 관련
@@ -1721,7 +1721,7 @@ WSL2를 새로 설치하거나 환경 완전 재구축 시:
    systemctl status prometheus grafana-server
 10. Windows IntelliJ + Claude Code 설치 (위 §8)
 11. 프로젝트 빌드 테스트
-    cd ~/queue-platform && ./gradlew build
+    cd /home/sonix/projects/queue-platform && ./gradlew build
 12. Grafana 데이터 소스 + 대시보드 임포트 (위 §7-6)
 ```
 
@@ -1785,11 +1785,11 @@ sudo cp /var/lib/grafana/grafana.db ~/backups/grafana_$(date +%Y%m%d).db
 
 | 문서 | 내용 |
 |------|------|
-| `docs/sprint-5/REDIS_SENTINEL.md` | Sprint 5 Phase 1 Sentinel 학습 노트 |
-| `docs/sprint-5/LUA_SCRIPTS.md` | Sprint 5 Phase 2 Lua Script 분석 |
-| `docs/schema.sql` | MySQL DDL + 파티션 운영 쿼리 |
-| `docs/DECISIONS.md` | §30 Redis Master/Replica Sentinel 설계 결정 |
-| `docs/monitoring/MONITORING_DESIGN.md` | 모니터링 시스템 설계 (5개 카테고리) |
+| `doc/sprint-5/REDIS_SENTINEL.md` | Sprint 5 Phase 1 Sentinel 학습 노트 |
+| `doc/sprint-5/LUA_SCRIPTS.md` | Sprint 5 Phase 2 Lua Script 분석 |
+| `doc/schema.sql` | MySQL DDL + 파티션 운영 쿼리 |
+| `doc/DECISIONS.md` | §30 Redis Master/Replica Sentinel 설계 결정 |
+| `doc/monitoring/MONITORING_DESIGN.md` | 모니터링 시스템 설계 (5개 카테고리) |
 | `CLAUDE.md` | 프로젝트 컨텍스트 (Claude Code 자동 로드) |
 
 ---
@@ -1826,15 +1826,10 @@ sudo cp /var/lib/grafana/grafana.db ~/backups/grafana_$(date +%Y%m%d).db
 # 포트: 9092
 ```
 
-### Sprint 12: Cluster 확장 + Hash Tag
+### ~~Sprint 12: Cluster 확장 + Hash Tag~~ → **§75에서 이미 완료**
 
-```
-[확장 구성]
-- 3 Master → 5-7 Master
-- Hash Tag 정책 도입
-- 부하 기반 Shard 선택 (Layer 2)
-- 이중 라우팅 시작
-```
+Hash Tag·이중 라우팅은 로컬 2 Cluster로 구현·검증이 끝났다(§6.5-12).
+남은 것은 노드 수·메모리 증설뿐이고, 그건 아래 Sprint 15+ 항목이다.
 
 ### Sprint 15+: 4x4x4GB 극대 분산
 
@@ -1856,13 +1851,11 @@ sudo cp /var/lib/grafana/grafana.db ~/backups/grafana_$(date +%Y%m%d).db
 ### Phase 5 (모니터링 확장): 인프라 Exporter
 
 ```bash
-# mysqld_exporter (9104)
-# redis_exporter (9121)
-# kafka_exporter (9308)
-# node_exporter (9100) — 시스템 리소스
-
-# 각 Exporter를 WSL에서 실행 후
-# prometheus.yml에 scrape_configs 추가
+# ✅ 이미 설치·가동 중 (§7-11) — 이 Phase에 남은 일은 없다
+#   mysqld_exporter  9104/9105
+#   redis_exporter   9121  (프로세스 1개가 22개 노드 멀티타깃)
+#   node_exporter    9100  (node-exporter.service)
+# ⛔ kafka_exporter (9308) — 안 만든다. Spring Kafka가 lag을 이미 낸다
 ```
 
 ### Phase 6 (모니터링): AlertManager + 알림
