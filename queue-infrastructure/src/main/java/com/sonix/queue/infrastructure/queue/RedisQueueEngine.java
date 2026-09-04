@@ -258,8 +258,7 @@ public class RedisQueueEngine implements QueueEngine {
      * 붙느냐로 응답이 갈린다.
      *
      * <p>상태가 갈라지지는 않는다 — {@code poll_verify}는 불일치 시 아무것도 쓰지 않는다.
-     * 그리고 이 분기는 <b>cluster2에 큐가 실제로 배정된 뒤에만</b> 발현한다. 동작을 바꿀지는
-     * Sprint 7 admit이 새 읽기 경로를 추가할 때 함께 결정한다.
+     * 그리고 이 분기는 <b>cluster2에 큐가 실제로 배정된 뒤에만</b> 발현한다.
      */
     private StringRedisTemplate routeForRead(String queueId) {
         return route(queueId, () -> null);
@@ -274,6 +273,11 @@ public class RedisQueueEngine implements QueueEngine {
      * <b>그래서 쓰기 경로에만 있다.</b> 쓰기 경로는 호출 전에 큐 존재가 이미 확인된 상태다
      * ({@code QueueEngineService.enqueue} → {@code findQueueAndVerifyOwner},
      * {@code BatchProcessor.getMaxCapacity}).
+     *
+     * <p>🔴 <b>쓰기 계열은 전부 이걸 거쳐야 한다</b>(admit · claim 3종 · cleanup). 템플릿을 직접
+     * 쓰면 cluster2에 배정된 큐의 명령이 cluster1에서 돌아 <b>빈 자료구조를 보고 조용히 0건</b>을
+     * 반환한다. 에러가 없어 만료·이탈자가 영원히 남고, <b>단일 클러스터 로컬에서는 무해해
+     * 테스트로 안 잡힌다.</b>
      */
     private StringRedisTemplate routeForWrite(String queueId) {
         return route(queueId, () -> {
@@ -397,9 +401,7 @@ public class RedisQueueEngine implements QueueEngine {
             args.add(IdGenerator.generate("adm_"));
         }
 
-        // ⚠️ routeForWrite 필수. redisTemplate을 직접 쓰면 cluster2에 배정된 큐의 admit이 cluster1로
-        //    가서 빈 대기열에서 0명을 뽑는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
-        //    쓰기 폴백(DB 배정)을 타는 것도 맞다 — admit은 큐 존재가 이미 확인된 뒤 호출된다.
+        // ⚠️ routeForWrite 필수 (근거는 그 메서드 Javadoc — 오배송은 조용히 0건이 된다).
         @SuppressWarnings("unchecked")
         List<Object> raw = routeForWrite(queueId).execute(
                 admitScript,
@@ -422,14 +424,10 @@ public class RedisQueueEngine implements QueueEngine {
         // 앞에서 세 번만 쪼개고 나머지 전부가 identifier다(limit=4).
         //
         // 🔴 **구 포맷을 필드 개수로 가르면 안 된다.** 구 포맷 "tokenId|identifier"의 identifier에도
-        //    '|'가 들어올 수 있어 조각이 4개가 될 수 있다. 실측으로 확인된 두 갈래:
-        //      "tok_A|user|with|pipes" → 개수만 보면 신 포맷 → 신원이 "pipes"로 잘린다
-        //      "tok_A|12|34|56"        → 숫자라 파싱까지 성공 → issuedAt이 1970년이 되고,
-        //                                멱등 키 (token_id, issued_at)가 어긋나 **중복 행**이
-        //                                INSERT된다. 과금은 행 수라(§82) 그게 곧 중복 청구다
-        //
-        //    그래서 **값의 타당성까지** 본다. issuedAt은 epoch millis이고 시간은 앞으로만 가므로,
-        //    하한보다 작으면 신 포맷일 수 없다. 오분류가 생길 수 없는 기준이다.
+        //    '|'가 들어올 수 있어 조각이 4개가 된다("tok_A|12|34|56"은 숫자 파싱까지 성공한다).
+        //    그러면 issuedAt이 1970년이 되고 멱등 키 (token_id, issued_at)가 어긋나 **중복 행**이
+        //    INSERT된다 — 과금이 행 수라(§82) 곧 중복 청구다.
+        //    그래서 값의 타당성까지 본다: 하한보다 작은 issuedAt은 신 포맷일 수 없다.
         String[] f = raw.split("\\|", 4);
         if (f.length < 2) {
             // "tokenId"만 있던 더 옛날 포맷 — 신원도 모른다. 호출자가 DB 경로로 간다.
@@ -473,11 +471,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     @Override
     public List<ReclaimedToken> claimExpiredAdmits(String queueId, long nowMillis, int limit) {
-        // ⚠️ routeForWrite 필수. 직접 템플릿을 쓰면 cluster2에 배정된 큐의 복귀가 cluster1에서 돌아
-        //    빈 admitted ZSet을 보고 **조용히 0건**을 반환한다. 단일 클러스터 로컬에서는 무해해
-        //    테스트로 안 잡히고, 만료된 토큰은 아무 에러도 없이 영원히 복귀하지 못한다.
-        //    쓰기 폴백(DB 배정 기록)을 타는 것도 맞다 — 큐 목록 자체를 DB에서 읽어왔으므로
-        //    호출 시점에 큐 존재가 이미 확인돼 있다.
+        // ⚠️ routeForWrite 필수 (근거는 그 메서드 Javadoc — 오배송은 조용히 0건이 된다).
         @SuppressWarnings("unchecked")
         List<Object> raw = routeForWrite(queueId).execute(
                 admitExpireScript,
@@ -492,9 +486,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     @Override
     public List<ReclaimedToken> claimInactive(String queueId, long cutoffMillis, int limit) {
-        // ⚠️ routeForWrite 필수 — claimExpiredAdmits와 같은 이유다. 직접 템플릿을 쓰면 cluster2에
-        //    배정된 큐의 회수가 cluster1에서 돌아 **조용히 0건**을 반환하고, 이탈자는 아무 에러도
-        //    없이 영원히 큐에 남는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
+        // ⚠️ routeForWrite 필수 (근거는 그 메서드 Javadoc — 오배송은 조용히 0건이 된다).
         @SuppressWarnings("unchecked")
         List<Object> raw = routeForWrite(queueId).execute(
                 inactiveExpireScript,
@@ -516,9 +508,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     @Override
     public List<ReclaimedToken> claimExpiredWaiting(String queueId, long cutoffMillis, int limit) {
-        // ⚠️ routeForWrite 필수 — claimInactive와 같은 이유다. 직접 템플릿을 쓰면 cluster2에
-        //    배정된 큐의 회수가 cluster1에서 돌아 **조용히 0건**을 반환하고, 그 사람들은 아무
-        //    에러도 없이 영원히 큐에 남는다. 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다.
+        // ⚠️ routeForWrite 필수 (근거는 그 메서드 Javadoc — 오배송은 조용히 0건이 된다).
         @SuppressWarnings("unchecked")
         List<Object> raw = routeForWrite(queueId).execute(
                 waitingExpireScript,

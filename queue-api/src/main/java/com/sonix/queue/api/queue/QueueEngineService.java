@@ -29,24 +29,6 @@ public class QueueEngineService {
      */
     private static final int ADMIT_TTL_SECONDS = 60;
 
-    /**
-     * ⚠️ <b>이 블록은 상수 설명이다. 상수 자체는 {@code Token.COMPLETE_VALID_WINDOW_SECONDS}로
-     * 옮겼고 여기엔 뒤따르는 필드가 없다</b> — 근거를 잃지 않으려고 남겨 둔 기록이다.
-     *
-     * <p>complete를 받아 주는 유효 창(초). <b>admitToken TTL 60초보다 반드시 길다</b> —
-     * Tenant가 이미 유저를 입장시켰는데 통보가 늦은 경우를 덮어야 하기 때문이다
-     * (FRS §6.6이 {@code status IN (0,1)}로 관대한 것과 같은 이유).
-     * (구 서술의 "TTL이 만료돼 WAITING으로 복귀했는데"는 §36이 복귀를 폐기해 거짓이 됐다.)
-     *
-     * <p><b>왜 300인가</b>: 이 값은 "Tenant가 얼마나 늦어도 봐줄 것인가"라는 SLA 판단이라
-     * 시스템 상수에서 유도되지 않는다. 그래서 <b>이미 있는 숫자</b>에 맞췄다 —
-     * {@code RedisQueueEngine.ADMIT_IDEM_TTL_MILLIS}(300_000)가 "Tenant 재시도가 끝났을 시점"으로
-     * 잡은 값이고, 그 창이 닫힌 뒤 도착한 complete는 대응할 admit 재시도가 이미 없다.
-     * 큐 기본 {@code inactiveTtl}(300초)과도 같아 외울 숫자가 하나로 준다.
-     *
-     * <p>60초에 대해 5배 여유 = 늦은 complete 통보에 4분을 준다는 뜻이다.
-     * 늘리는 건 하위호환, 줄이는 건 파괴적 변경이므로 여기서도 "필요를 채우는 최소"를 잡았다.
-     */
 
     private final QueueRepository queueRepository;
     private final TokenRepository tokenRepository;
@@ -142,14 +124,10 @@ public class QueueEngineService {
      * 없다 — publishAdmitted 주석 참조). 기록하면 같은 사람이 두 번 세어지고, 그 두 번째 값은
      * 재시도가 늦은 만큼 부풀어 p95를 위로 끈다.
      *
-     * <p>🪤 <b>큐당 시계열이 늘어난다</b>(버킷 8 + count + sum) 그리고 <b>전역 상한은 없다.</b>
-     * §87의 "테넌트당 20개"는 {@code countByTenantIdAndStatusNot(tenantId, DELETED)}라
-     * <b>삭제된 큐를 안 세고</b>, 테넌트 수 자체도 무제한이다. 즉 생성→삭제를 반복하면
-     * 미터는 계속 쌓인다(Micrometer는 회수하지 않는다 — 재기동 전엔 안 줄어든다).
-     * 그럼에도 라벨을 뗄 수 없다: 알람의 존재 이유가 "<b>어느</b> 테넌트가 마스터를
-     * 독식하는가"라 라벨이 없으면 깨워도 대상을 특정 못 한다. 큐가 수만 개가 되면 재검토.
-     * ({@code TokenReclaimJob}의 gauge가 queueId 태그를 <b>피하는</b> 것과 반대 판단인데, 그쪽은
-     * 큐마다 매 틱 갱신되는 상시 게이지이고 이쪽은 admit이 실제로 일어난 큐에만 생긴다.)
+     * <p>🪤 <b>{@code queue_id} 라벨에 전역 상한이 없다.</b> §87의 "테넌트당 20개"는 삭제된 큐를
+     * 안 세고 테넌트 수도 무제한이라, 생성→삭제 반복이면 미터가 재기동 전까지 쌓인다.
+     * 그래도 라벨은 뗄 수 없다 — 알람이 답해야 하는 것이 "<b>어느</b> 큐인가"다.
+     * 큐가 수만 개가 되면 재검토.
      */
     private void recordAdmissionWait(String queueId, AdmitResult result, Instant admittedAt) {
         if (result.replay()) {
@@ -162,12 +140,9 @@ public class QueueEngineService {
             }
             long waitMillis = admittedAt.toEpochMilli() - record.issuedAt().toEpochMilli();
             if (waitMillis < 0) {
-                // 🔴 **음수는 0으로 눕히지 않는다.** issuedAt·admittedAt은 둘 다 앱 시계고
-                //    API 서버가 N대라 스큐가 그대로 들어온다(queue_daily_stats에 -398초 실측).
-                //    GREATEST(...,0)류의 clamp는 §86에서 이미 기각됐다 — 스큐 신호가 사라진다.
-                //    Timer는 음수를 조용히 버리므로(AbstractTimer) 그냥 record하면 표본만 없어지고
-                //    아무 데도 안 남는다. 그래서 **표본에서 빼되 별도 카운터로 드러낸다** —
-                //    누락 건수를 알아야 남은 분포를 믿을 수 있다.
+                // 🔴 **음수를 0으로 눕히지 않는다.** 두 시각 모두 앱 시계라 N대의 스큐가 그대로
+                //    들어온다(-398초 실측). clamp하면 스큐 신호가 사라지고, 그냥 record하면
+                //    Timer가 음수를 조용히 버려 아무 데도 안 남는다. 빼되 카운터로 드러낸다.
                 Counter.builder("queue.admission.clock.skew")
                         .description("admit 시각이 enqueue 시각보다 앞선 건수 (API 서버 간 시계 스큐)")
                         .tag("queue_id", queueId)
@@ -189,34 +164,26 @@ public class QueueEngineService {
     /**
      * ADMITTED 발행 — <b>실패해도 예외를 올리지 않는다</b> (FRS §6.4).
      *
-     * <p>enqueue와 정반대다. enqueue는 발행 실패에 503을 주는데, 그 시점엔 <b>아직 아무것도
-     * 확정되지 않아</b> 거절이 성립하기 때문이다. admit은 Lua가 이미 커밋됐다 — 대기열에서
-     * 빠졌고 admitToken도 나갔다. 되돌릴 수 없다.
-     *
-     * <p>여기서 5xx를 주면 Tenant 재시도가 {@code admit-idem} REPLAY로 <b>같은 답만</b> 받고
-     * Kafka는 여전히 안 간다. 무한 반복이다. 미반영의 피해는 complete가 {@code status IN (0,1)}로
-     * 관대해 이미 흡수한다.
+     * <p>enqueue는 발행 실패에 503을 준다 — 그 시점엔 아직 아무것도 확정되지 않아 거절이
+     * 성립한다. admit은 반대다. Lua가 이미 커밋됐고(대기열에서 빠졌고 admitToken도 나갔다)
+     * 되돌릴 수 없다. 5xx를 주면 재시도가 {@code admit-idem} REPLAY로 같은 답만 받는 무한
+     * 반복이 된다. 미반영의 피해는 complete가 {@code status IN (0,1)}로 관대해 흡수한다.
      *
      * <p><b>REPLAY도 발행한다.</b> 컨슈머 UPSERT가 멱등이라 중복은 무해한 반면, 첫 호출에서
      * 발행이 실패했을 때 재시도가 그것을 <b>복구</b>할 수 있는 유일한 경로다.
      *
-     * <p>⚠️ <b>REPLAY의 {@code admittedAt}은 첫 admit 시각이 아니라 재시도 시각이다.</b> 멱등
-     * payload에 시각이 없어 알 방법이 없다. 첫 발행이 성공했다면 컨슈머 가드
-     * ({@code IF(status = 0, ...)})가 이미 status 1이라 이 값을 <b>쓰지 않으므로</b> 무해하고,
-     * 첫 발행이 실패한 경우에만 반영되는데 그때는 이 값이 가진 유일한 근거다.
-     * 재시도가 늦은 만큼 유효 창(60초)이 뒤로 밀린다.
+     * <p>⚠️ <b>REPLAY의 {@code admittedAt}은 재시도 시각이다</b>(멱등 payload에 시각이 없다).
+     * 첫 발행이 성공했다면 컨슈머 가드가 status 1이라 이 값을 쓰지 않아 무해하고, 실패했다면
+     * 이 값이 유일한 근거다. 대가는 유효 창(60초)이 재시도가 늦은 만큼 밀리는 것이다.
      *
      * <p>🔴 <b>첫 발행 실패에서 끊는다.</b> 발행은 건별 {@code .get(12초)} 블로킹이라, 브로커가
      * 무응답이면 {@code count=100}짜리 admit 한 건이 <b>최대 20분</b> 동안 요청 스레드를 잡는다.
      * 첫 건이 시한을 다 쓰고 실패했다면 나머지 99건도 같은 브로커를 기다릴 뿐이다.
      *
-     * <p>⚠️ <b>건너뛴 분은 자동으로 복구되지 않는다.</b> admit은 발행이 실패해도 200을 주므로
-     * Tenant에게 재시도할 이유가 없다 — "복구는 REPLAY"는 Tenant가 <b>마침</b> 같은 requestId로
-     * 다시 불렀을 때만 성립하는 <b>가능성</b>이지 경로가 아니다. 그래서 건너뛴 건수와 첫
-     * tokenId를 ERROR로 남긴다(그 로그가 유일한 흔적이다).
-     *
-     * <p>병렬 발행으로는 이 최악을 못 고친다. 메타데이터가 없으면 {@code send()} 자체가
-     * 블로킹이라 스레드만 늘고 벽시계는 그대로다.
+     * <p>⚠️ <b>건너뛴 분은 자동 복구되지 않는다.</b> admit은 발행이 실패해도 200이라 Tenant에게
+     * 재시도할 이유가 없다 — REPLAY 복구는 가능성이지 경로가 아니다. 그래서 건너뛴 건수와 첫
+     * tokenId를 ERROR로 남긴다(유일한 흔적이다). 병렬 발행은 답이 아니다 — 메타데이터가 없으면
+     * {@code send()} 자체가 블로킹이라 스레드만 늘고 벽시계는 그대로다.
      */
     private void publishAdmitted(long tenantId, String queueId, AdmitResult result, Instant admittedAt) {
         List<AdmitResult.AdmitRecord> records = result.records();
@@ -247,20 +214,13 @@ public class QueueEngineService {
      * @return identifier (Tenant가 어느 사용자인지 알아야 하므로)
      * @throws BusinessException 유효하지 않으면 404 {@code INVALID_ADMIT_TOKEN}
      */
-    // 🔴 **트랜잭션을 걸지 않는다.** verify는 이제 Kafka를 동기로 기다리는데(send-timeout 12초),
-    //    트랜잭션 안이면 LazyConnectionDataSourceProxy가 커넥션을 **트랜잭션이 끝날 때까지 쥔다**.
-    //    브로커가 느려지면 Replica 풀이 verify에 12초씩 묶이고, verify는 게이트 개방 순간
-    //    입장자 수만큼 몰리는 엔드포인트라 그게 곧 자해가 된다.
-    //    Redis 히트 경로는 DB를 아예 안 읽는다.
+    // 🔴 **트랜잭션을 걸지 않는다.** verify는 Kafka를 동기로 기다리는데(send-timeout 12초),
+    //    트랜잭션 안이면 커넥션을 그 끝까지 쥔다. verify는 게이트 개방 순간 입장자 수만큼
+    //    몰리는 엔드포인트라 그게 곧 자해다. Redis 히트 경로는 DB를 아예 안 읽는다.
     //
-    //    🪤 **폴백 경로의 단건 조회는 master로 간다.** 구 주석은 "Spring Data 리포지토리가 자체
-    //       readOnly 트랜잭션을 갖고 있어 Replica 라우팅도 그대로"라고 적었는데 **거짓이다**.
-    //       2026-08-27 라우팅 로그 실측: 트랜잭션 없이 부른 파생 쿼리(findByTokenId 등)는
-    //       readOnly 트랜잭션이 **열리지 않아** isCurrentTransactionReadOnly()가 false다 → master.
-    //       같은 findByQueueId도 @Transactional(readOnly=true) 안에서 부르면 replica로 간다
-    //       (QueueService.getQueue로 대조 확인). **갈리는 것은 메서드가 아니라 트랜잭션이다.**
-    //       → 트랜잭션을 안 거는 이 판단 자체는 유지한다. 다만 대가가 "Replica 풀 점유"가
-    //         아니라 **master 풀 점유**라는 것이 정확한 서술이다.
+    //    🪤 **폴백 조회는 master로 간다.** 라우팅을 가르는 것은 메서드가 아니라 **readOnly
+    //       트랜잭션이 열렸는가**다(CLAUDE.md §4-3). 트랜잭션 없이 부른 파생 쿼리는 전부 master다.
+    //       → 안 거는 판단은 유지한다. 대가가 replica 풀이 아니라 **master 풀 점유**일 뿐이다.
     public String verify(long tenantId, String queueId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 
@@ -278,22 +238,13 @@ public class QueueEngineService {
             //    없다 (CLAUDE.md 원칙 1 — Platform은 순서만, Tenant가 입장 제어).
             //    이 전이가 없으면 complete를 안 부르는 Tenant의 행이 status=1로 영원히 남는다.
             //
-            //    🔴 **DB를 직접 쓰지 않고 이벤트만 발행한다.**
-            //
-            //    ⚠️ 구 주석은 근거를 "이 메서드는 @Transactional(readOnly = true)라 Replica로
-            //       라우팅되고 UPDATE가 실패한다"로 적었는데 **그 전제가 거짓이다** — 이 메서드에는
-            //       트랜잭션 어노테이션이 아예 없다(위 주석 참조. Kafka send-timeout 12초를
-            //       커넥션 쥔 채 기다리지 않으려고 일부러 뺐다).
-            //
-            //    진짜 근거는 둘이다: ① 쓰기 트랜잭션을 열면 Redis 히트로 끝나는 정상 경로까지
-            //    Master 커넥션을 잡아 "verify는 DB를 안 읽는다"는 설계(§6.4)가 되돌아간다.
-            //    ② 여기서 UPDATE하면 Kafka 소비 경로와 두 갈래로 갈려 순서 보장이 사라진다.
-            //    🔴 **주석대로 readOnly를 되붙이지 마라** — 그게 F-3(verify가 Kafka 12초 동안
-            //       커넥션 점유) 사고의 재발 경로다.
-            //
-            //    이벤트 경로가 오히려 안전하다 — 파티션 키가 tokenId라
-            //    ENQUEUED → ADMITTED → COMPLETED 순서가 보장되므로, 컨슈머 백로그 구간이어도
-            //    ADMITTED가 먼저 적용된 뒤에 이 전이가 얹힌다.
+            //    🔴 **DB를 직접 쓰지 않고 이벤트만 발행한다.** 근거 둘: ① 쓰기 트랜잭션을 열면
+            //    Redis 히트로 끝나는 정상 경로까지 Master 커넥션을 잡아 "verify는 DB를 안 읽는다"는
+            //    설계(§6.4)가 되돌아간다. ② 여기서 UPDATE하면 Kafka 소비 경로와 두 갈래로 갈려
+            //    순서 보장이 사라진다 — 파티션 키가 tokenId라 이벤트 경로는 컨슈머 백로그
+            //    구간에도 ADMITTED 다음에 이 전이가 얹히는 것이 보장된다.
+            //    🔴 **@Transactional(readOnly)를 붙이지 마라** — verify가 Kafka 12초 동안
+            //       커넥션을 쥐는 재발 경로다.
             publishCompletedOnVerify(tenantId, queueId, admitToken, ref.get());
             return fromRedis.get();
         }
@@ -371,39 +322,27 @@ public class QueueEngineService {
                 return already.get();
             }
 
-            // 🔑 **여기까지 왔다 = DB가 이 토큰을 아직 모른다.**
+            // 🔑 **여기까지 왔다 = DB가 이 토큰을 아직 모른다.** markCompleted가 요구하는
+            //    admit_token·admitted_at은 컨슈머가 ADMITTED를 적재해야 채워진다 —
+            //    랙 구간에서는 정상 입장자도 0행이다.
             //
-            // markCompleted의 술어가 요구하는 admit_token·admitted_at은 ADMITTED 이벤트를
-            // 컨슈머가 적재해야만 채워진다. 즉 **랙 구간에서는 정상 입장자도 0행**이다.
-            // verify가 같은 창에서 멀쩡한 이유는 Redis를 먼저 보기 때문이다(§6.5).
+            // 🔑 **폴백의 근거는 실측이 아니라 불변식이다.** admit-by-admit의 PX 60초 ⊂ DB 창
+            //    300초. 그래서 이 폴백이 통과시키는 요청은 적재만 끝났다면 위 UPDATE도
+            //    통과시켰을 것들뿐이고 자격이 넓어지지 않는다.
+            //    (두 상수가 갈리면 불변식이 깨진다 — Token.COMPLETE_VALID_WINDOW_SECONDS와
+            //     admit TTL을 같이 보고 고쳐라.)
             //
-            // 🔑 **정당화는 실측이 아니라 불변식이다.** admit-by-admit의 PX는 60초이고
-            //    complete의 DB 창은 300초다 — **Redis 히트 창 ⊂ DB 창**. 그러므로 이 폴백이
-            //    통과시키는 요청은 예외 없이 **적재만 끝났다면 위 UPDATE도 통과시켰을 것들**이고,
-            //    자격이 넓어지지 않는다. 부하 수치가 없어도 이 문장은 참이다.
-            //    (두 상수가 갈리면 이 불변식이 깨진다 — Token.COMPLETE_VALID_WINDOW_SECONDS와
-            //     admit TTL을 같이 보고 고쳐라.) §80이 기각한 것은 "Redis 미스면 404"라는
-            // 구 설계이지(FRS §6.6) DB 폴백이 아니다.
-            //
-            // ⚠️ **순서를 뒤집지 마라.** DB를 먼저 치는 덕에 랙이 없는 정상 경로는 변경 전과
-            //    완전히 같다 — status=2가 동기로 확정되고, 재시도는 findCompletedAt이 같은 값을
-            //    돌려주며, 발행이 실패해도 원장은 이미 확정돼 있다. Redis를 먼저 보게 만들면
-            //    그 안전망이 사라져, publishQuietly가 발행을 삼켰을 때 행이 status=1로 남고
-            //    ReconcileJob이 **완료된 토큰을 EXPIRED로 확정**한다(Redis 키는 이미 지워진 뒤라
-            //    복구 경로가 없다).
+            // ⚠️ **순서를 뒤집지 마라.** Redis를 먼저 보게 만들면, publishQuietly가 발행을
+            //    삼켰을 때 행이 status=1로 남고 ReconcileJob이 **완료된 토큰을 EXPIRED로
+            //    확정**한다(Redis 키는 이미 지워진 뒤라 복구 경로가 없다).
             AdmitRef ref = queueEngine.findAdmitRefByAdmitToken(queueId, admitToken)
                     .filter(AdmitRef::complete)
                     .filter(r -> tokenId.equals(r.tokenId()))
                     .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_ADMIT_TOKEN));
 
-            // 🔴 **폴백은 조용히 일어나면 안 된다.**
-            // 이 경로가 도는 동안 원장(tokens)에는 이 완료가 없다. 컨슈머가 잠깐 밀린 것이면
-            // 곧 따라잡지만, **적재가 아예 멈춰도 여기는 계속 200을 준다** — Tenant는 정상이라
-            // 믿고 원장은 비어 있는 상태가 된다(과금 근거도 사라진다).
-            // 전례: 컨슈머가 죽은 판에서 이 경로가 계속 200을 내는 동안 tokens 테이블은
-            // 비어 있었고, 그때 이 로그가 없어 **아무도 몰랐다.**
-            // (그 판의 산출물은 소실됐다 — 건수는 재현 미검증이라 적지 않는다.)
-            // WARN인 이유: 정상 운영에서도 랙이 있으면 나오지만, 지속되면 그 자체가 사고다.
+            // 🔴 **폴백은 조용히 일어나면 안 된다.** 적재가 아예 멈춰도 여기는 계속 200을 준다 —
+            //    Tenant는 정상이라 믿고 원장(tokens)은 비어 간다(과금 근거도 사라진다).
+            //    WARN인 이유: 랙이 있으면 정상 운영에서도 나오지만, 지속되면 그 자체가 사고다.
             log.warn("complete가 Redis 폴백으로 처리됐다 — 컨슈머 적재가 밀려 있다. "
                     + "tokenId={} queueId={} seq={}", tokenId, queueId, ref.seq());
 
@@ -459,13 +398,10 @@ public class QueueEngineService {
      * 그래서 드레인의 용량은 캐시하되({@code BatchProcessor.capacityByQueueId}) 이쪽은 안 한다.
      * {@code BatchProcessor.getMaxCapacity}의 옛 주석이 경고하던 PAUSED 문제의 주소가 여기다.
      *
-     * <p>⚠️ <b>그 결정의 대가:</b> 이 조회는 <b>요청당 1회 DB SELECT</b>로 고정된다.
-     * 2,000 rps면 초당 2,000회이고, 드레인이 캐시로 없앤 양(초당 1,000회)보다 크다.
-     * 줄이려면 캐시가 아니라 <b>{@code status}의 거처를 옮겨야</b> 한다(예: Redis) — 그건
-     * 캐시가 아니라 정본 이동이라 새 키·해시태그·전손 복구 규약이 따라온다. §4 확대 심사 대상.
-     *
-     * <p>🪤 그리고 이 부담이 실제 병목인지는 <b>미측정</b>이다. 드레인은 한 스레드가 직렬로 도는데
-     * 이 경로는 가상 스레드로 병렬이라, 같은 초당 횟수라도 영향이 같지 않다.
+     * <p>⚠️ <b>대가:</b> 요청당 1회 DB SELECT로 고정된다(2,000 rps면 초당 2,000회 —
+     * 드레인이 캐시로 없앤 초당 1,000회보다 크다). 줄이려면 캐시가 아니라 {@code status}의
+     * 거처를 옮겨야 하고, 그건 새 키·해시태그·전손 복구 규약이 따라오는 §4 심사 대상이다.
+     * 🪤 이 부담이 실제 병목인지는 <b>미측정</b>이다.
      */
     private Queue findQueueAndVerifyOwner(Long tenantId, String queueId) {
         Queue queue = queueRepository.findByQueueId(queueId)
@@ -495,13 +431,11 @@ public class QueueEngineService {
      *       생기지만(§80 ⑥), 평범한 {@code GET}은 Lettuce가 슬롯으로 정확히 라우팅한다.</li>
      * </ul>
      *
-     * <p>🔴 <b>admitToken TTL이 만료된 사람은 정확히 이 분기로 와서 404를 받는다. 그게 의도다.</b>
-     * (구 주석은 "복귀 배치가 waiting에 되돌려 놓으므로 이 분기에 오지 않는다"였다 — <b>§36이
-     * 복귀를 폐기</b>해 거짓이 됐다. {@code admit_expire.lua}에 {@code ZADD waiting}이 없다.)
-     *
-     * <p>회수 배치가 {@code admitted}에서 빼고 {@code tokens} Hash를 {@code HDEL}하므로
-     * {@code verifyWaiting}도 {@code findAdmitTokenByTokenId}도 실패한다 → 404가 <b>종료 신호</b>다.
-     * 재접속하면 재-enqueue라 맨 뒤다. <b>이 404를 버그로 보고 고치면 §36 계약이 깨진다.</b>
+     * <p>🔴 <b>admitToken TTL이 만료된 사람은 이 분기로 와서 404를 받는다. 그게 의도다(§36).</b>
+     * 회수 배치가 {@code admitted}에서 빼고 {@code tokens}를 HDEL하므로 두 조회 모두 실패하고,
+     * 그 404가 <b>종료 신호</b>다(재접속하면 재-enqueue라 맨 뒤다). 복귀 경로는 없다 —
+     * {@code admit_expire.lua}에 {@code ZADD waiting}이 없다.
+     * <b>이 404를 버그로 보고 고치면 §36 계약이 깨진다.</b>
      */
     public PollResult poll(String queueId, String tokenId, long seq, boolean keepalive){
         // 존재(seq)만이 아니라 소유권(tokenId)까지 검증한다. seq는 큐별 INCR이라 추측이 자명해서,
@@ -534,12 +468,9 @@ public class QueueEngineService {
      * @throws BusinessException 큐에 enqueue 기록이 없으면 404 {@code QUEUE_NOT_FOUND}
      */
     public QueueBoard status(String queueId) {
-        // 🪤 응답 캐시를 넣었다가 <b>뺐다</b>(2026-09-03). 30만 명이 전원 같은 응답을 받으므로
-        //    캐시가 가능하고, 실측상 Redis MGET이 448배 줄었다(20,000 rps에서 598,528 → 1,337).
-        //    그런데 **Redis가 병목이 아니었다** — 캐시 없이도 20,000 rps에서 p99 18.25ms이고,
-        //    448배를 줄여도 p99는 20%만 좋아진다(지연의 대부분이 앱에 있다).
-        //    §4의 "안 만들면 무엇이 깨지나"에 답이 없어서 뺐다. 근거 실측은 FRS §13에 남아 있다.
-        //    목표 규모(마스터당 2큐 × 30만 ≈ 30,900 rps)를 재고 필요가 확인되면 그때 되살린다.
+        // 🪤 응답 캐시를 넣었다가 뺐다(2026-09-03). MGET은 448배 줄었지만 **Redis가 병목이
+        //    아니라** p99는 20%만 좋아졌다 — §4의 "안 만들면 뭐가 깨지나"에 답이 없다.
+        //    실측은 FRS §13. 목표 규모(≈30,900 rps)를 재고 필요가 확인되면 되살려라.
         return queueEngine.readStatus(queueId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.QUEUE_NOT_FOUND));
     }
