@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>대기열</title>
+<style>
+  body { font: 16px/1.6 system-ui, sans-serif; display: grid; place-items: center; height: 100vh; margin: 0; }
+  main { text-align: center; }
+  #rank { font-size: 4rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #note { color: #666; }
+  #err { color: #c00; }
+</style>
+</head>
+<body>
+<main>
+  <p>내 앞에 남은 사람</p>
+  <div id="rank">—</div>
+  <p id="note">순서를 확인하는 중입니다. 이 창을 닫지 마세요.</p>
+  <p id="err"></p>
+</main>
+
+<script type="module">
+import { createQueueClient } from '../queue-sdk.js';
+
+// 실제 서비스에서는 Tenant 서버가 enqueue 응답(tokenId·seq)을 대기 페이지에 심어 준다.
+// 데모라 쿼리스트링으로 받는다: demo/?queueId=...&tokenId=...&seq=...
+const q = new URLSearchParams(location.search);
+const rank = document.getElementById('rank');
+const note = document.getElementById('note');
+const err = document.getElementById('err');
+
+const client = createQueueClient({
+  baseUrl: q.get('base') || location.origin,
+  queueId: q.get('queueId'),
+  tokenId: q.get('tokenId'),
+  seq: Number(q.get('seq')),
+  onUpdate: (s) => {
+    rank.textContent = s.rank.toLocaleString();
+    if (s.rank === 0) note.textContent = '곧 입장합니다.';
+  },
+  onReady: ({ admitToken }) => {
+    rank.textContent = '입장';
+    // 실제로는 Tenant 서버로 admitToken을 넘겨 검증받고 서비스 페이지로 이동한다.
+    note.textContent = `admitToken = ${admitToken}`;
+  },
+  onError: (e) => { err.textContent = `${e.status ?? ''} ${e.code ?? e.message}`; },
+});
+
+client.start();
+</script>
+</body>
+</html>
