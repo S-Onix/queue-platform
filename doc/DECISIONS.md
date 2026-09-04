@@ -7557,14 +7557,23 @@ robust한 것은 **429 건수(0 → 12,819)와 허용 총량이 이론과 일치
 고정) · Redis 메모리(§87 `maxCapacity`가 막는다) · 가상 스레드 · 드레인 능력(초당 25만).
 
 **비례한다** — Kafka 발행(`QueueEngineService:86`, **토큰마다 1건이고 동기**) ·
-verify·complete(배칭 없음, MySQL master 왕복) · `globalQueue`(**unbounded
-`ConcurrentLinkedQueue`**, `BatchProcessor:281` — Redis가 느려지면 유입 전량이 JVM 힙에 쌓인다).
+verify·complete(배칭 없음, MySQL master 왕복) · `globalQueue` 적체(`RedisQueueEngine:113`).
 
-🔴 **막는 게 없으면 터지는 건 Redis가 아니라 JVM 힙이다.** §87이 Redis 용량을 막지만 힙에는
-대응하는 상한이 없다. capacity를 내리는 것이 지금 그 구멍을 좁히는 유일한 수단이다.
+🔧 **정정 (2026-09-04).** 이 절은 처음에 "`globalQueue`가 unbounded라 유입 전량이 힙에 쌓인다"고
+썼는데 **과장이다.** `enqueue()`는 `offer` 직후 `pending.getFuture().get(30s)`로 **호출 스레드를
+파킹한다**(`RedisQueueEngine:317`). 즉 큐 길이 = **동시 진행 중인 enqueue 요청 수**이고,
+항목은 30초 뒤 타임아웃으로 스스로 빠진다. 자료구조가 unbounded인 것과 실제로 무한히 자라는 것은
+다르다 — 앞을 막는 것은 Tomcat 커넥션이다.
+
+🔴 **그래도 힙은 관측 0이다.** 위험한 쪽은 큐 노드가 아니라 **파킹된 요청 전체**(가상 스레드 +
+Tomcat 요청 버퍼)인데, prod는 actuator prometheus를 껐으므로(§85) `jvm_memory_used_bytes`가
+없다. **버스트 중 힙을 실제로 잰 적이 없다 — 미측정이다.**
 
 ### 남는 것
 
 - **리미터 개입 상태의 피해 테넌트 영향** — 위 ⚠️. 판을 늘려 재측정해야 판정 가능
-- **`globalQueue` 상한** — 없다. 별도 판단 필요
+- **`globalQueue` 상한** — 넣지 않았다. 넣기 전에 **깊이 게이지와 힙 스크레이프가 먼저**다.
+  임계값 근거가 없고(드레인 능력 초당 25만), 거절을 `QE001`로 내면 문서 3곳이 "재시도하라"고
+  쓰고 있어 **재시도가 부하를 더한다**. `ConcurrentLinkedQueue.size()`는 O(n)이라 요청마다
+  못 부르고, `LinkedBlockingQueue`로 바꾸면 종료 경로의 `remove()`가 전체 락이 된다
 - **4,915\~10,000 rps 구간 미측정** — 부하 발생기 한 대로는 못 만든다(하니스가 먼저 굶는다)
