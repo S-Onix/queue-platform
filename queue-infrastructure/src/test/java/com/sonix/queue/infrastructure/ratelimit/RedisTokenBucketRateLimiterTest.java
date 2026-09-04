@@ -112,7 +112,7 @@ class RedisTokenBucketRateLimiterTest {
     }
 
     @Test
-    @DisplayName("키 TTL은 full refill 시간 + 60초 — 폴링(cap5,refill1)=65s, 테넌트(10만/1666.67)=120s")
+    @DisplayName("키 TTL은 full refill 시간 + 60초 — 폴링(cap5,refill1)=65s, 테넌트(5만/833.34)=120s")
     void ttlFollowsFullRefillTime() {
         // 3600 고정이던 시절엔 폴링 키가 토큰 하나당 1시간씩 남았다. 폴링 키는 대기 토큰 수만큼
         // 생기므로 이 상수가 곧 Redis 메모리 상한이다. 파라미터가 달라도 같은 스크립트를
@@ -131,9 +131,9 @@ class RedisTokenBucketRateLimiterTest {
         //    "cap = refill × 60이면 TTL이 120s"라는 스크립트 동작이다(§62 계약).
         //    상수 자체의 비율은 queue-api의 TenantRateLimitConstantsTest가 잠근다.
         String tenantKey = testKey + ":tenant";
-        limiter.tryAcquire(tenantKey, 100_000, 1_666.67);     // RateLimitFilter.TENANT_CAPACITY / TENANT_REFILL_PER_SEC
+        limiter.tryAcquire(tenantKey, 50_000, 833.34);        // RateLimitFilter.TENANT_CAPACITY / TENANT_REFILL_PER_SEC (§89)
         assertThat(redisTemplate.getExpire(tenantKey))
-                .as("테넌트 버킷 TTL = ceil(100000/1666.67) + 60")
+                .as("테넌트 버킷 TTL = ceil(50000/833.34) + 60")
                 .isBetween(119L, 120L);
     }
 
@@ -145,7 +145,7 @@ class RedisTokenBucketRateLimiterTest {
         //   refill 0    → ceil(inf) → EXPIRE 인자 오류로 스크립트 중단.
         //                 HMSET은 이미 실행된 뒤라 TTL=-1(영구) 키가 남았다. 실제 확인함.
         //   refill 0.001 → TTL 100,060초(27.8시간). 줄이려던 메모리가 오히려 늘었다.
-        // 현재 호출자(폴링 1.0, 테넌트 1666.67)는 둘 다 안 밟지만, 포트 시그니처가
+        // 현재 호출자(폴링 1.0, 테넌트 833.34)는 둘 다 안 밟지만, 포트 시그니처가
         // double을 그대로 받으므로 새 호출자가 언제든 밟을 수 있다.
         RateLimiter limiter = new RedisTokenBucketRateLimiter(redisTemplate, tokenBucketScript);
 
