@@ -394,18 +394,20 @@ Redis 오버라이드 값 형식 (사고 중에 사람이 redis-cli로 직접 �
 SDK 계산 (서버는 rank를 계산하지 않는다):
   wm    = max(직전 wm, lastAdmittedSeq)    ← 단조 clamp. 세션 어피니티가 없어 값이 작아질 수 있다
   rank  = max(0, mySeq − wm)               ← 뺄셈 1회
-  간격  = pacing 표 조회 + 지터             ← ⚠️ 지터 규약 미확정. 아래 참조
+  간격  = pacing 표 조회 + 지터             ← 비대칭(하한 위로만). 아래 참조
   rank <= 0 → 그때만 ② 개인 엔드포인트로 admitToken 확인
 ```
 
-> 🔴 **지터 규약이 §79 안에서 갈린다 (미해결 — SDK 착수 전 결론 필요).**
-> §79 본문은 `±20% 지터`(대칭)라고 적었는데, 같은 절의 Consequences는 SDK로 이관되는 불변식을
-> **"지터는 등급 하한 위로만"**(비대칭, `base ~ base+max(1,base/4)`)이라고 적었다. 대칭이면 실효
-> 간격이 등급 하한 아래로 내려간다. 삭제된 서버 구현(`nextPollAfterSec`)은 **비대칭**이었다.
-> 지금은 서버가 간격을 계산하지 않으므로 **어느 쪽이든 서버 코드로 강제할 수단이 없다** —
-> 이 값을 지키는 유일한 장치가 SDK인데 SDK에는 테스트 인프라가 없다.
+> ✅ **지터 규약 확정 — 비대칭(하한 위로만)** `base ~ base + max(1, base/4)`.
+> §79 본문의 `±20% 대칭`은 채택하지 않는다: 대칭이면 실효 간격이 등급 하한 아래로 내려가
+> 폴링 한도(cap 5 / refill 1.0/s)에 더 빨리 닿는다. 삭제된 서버 구현(`nextPollAfterSec`)도
+> 비대칭이었다.
+>
+> 서버는 간격을 계산하지 않으므로 이 값을 강제할 수단이 서버 코드에는 없다. 지키는 장치는
+> **JS SDK**(`sdk/js/queue-sdk.js`의 `withJitter`)이고, 상·하한을 고정하는 단정이
+> `sdk/js/test.mjs`에 있다 — "SDK에 테스트 인프라가 없다"던 서술은 더 이상 사실이 아니다.
 
-**② 개인 상태 — 차례 근처 + keepalive(30~60초 1회)에만 호출**
+**② 개인 상태 — 차례가 가까울 때만 호출 (`rank <= 0`)**
 
 ```
 GET /api/v1/queues/:queueId/tokens/:tokenId?seq={seq}&ka={0|1}
@@ -1045,7 +1047,7 @@ keepalive:
 | 레포 | 모듈 수 | 배포 | 역할 |
 |------|--------|------|------|
 | `queue-platform` | 6개 | Docker | 플랫폼 본체 (API, Batch, **Consumer**, Domain, Infra, Common) |
-| `queue-platform-sdk-js` | 1개 | npm + CDN | 브라우저용 (PollingManager, StateManager) |
+| `queue-platform` 안의 `sdk/js/` | — | 정적 파일(ESM 1개) | 브라우저 폴링 SDK. 별도 레포로 가르지 않는다 — 계약이 이 레포의 문서에 있어 갈라진다 |
 
 > `queue-consumer`는 `token-lifecycle` 소비 전담 독립 앱이다. 분리 근거는 DECISIONS §73 D20.
 
