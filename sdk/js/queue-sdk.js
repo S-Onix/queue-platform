@@ -70,7 +70,9 @@ export function createQueueClient(options) {
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status}`);
       err.status = res.status;
-      err.code = body?.errorResponse?.code;
+      // 🪤 429가 두 군데서 나오고 모양이 다르다. RateLimitFilter는 봉투 없이 {error, message,
+      // retryAfter}를 직접 쓰고(RL001), 애플리케이션 예외는 ApiResponse 봉투를 탄다(Q005).
+      err.code = body?.errorResponse?.code ?? body?.error;
       err.retryAfterMs = Number(res.headers?.get?.('Retry-After') || 0) * 1000;
       throw err;
     }

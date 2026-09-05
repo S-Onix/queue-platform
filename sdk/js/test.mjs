@@ -80,9 +80,10 @@ const scripted = (...responses) => {
 }
 
 // 429는 자리를 잃은 게 아니다 — Retry-After만큼 쉬고 그대로 이어간다
+// 🪤 RateLimitFilter는 봉투 없이 {error:"RL001"}을 쓴다(실측). 봉투만 보면 코드를 놓친다.
 {
   const [, fetchImpl] = scripted(
-    res(429, { errorResponse: { code: 'RL001' } }, { 'Retry-After': '2' }),
+    res(429, { error: 'RL001', retryAfter: 2 }, { 'Retry-After': '2' }),
     res(200, { data: { lastAdmittedSeq: 10, pacing } }),
   );
   const errs = [];
