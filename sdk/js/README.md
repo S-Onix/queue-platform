@@ -44,6 +44,8 @@ Tenant가 직접 짜면 틀리기 쉬운 넷이다.
 | 응답 | 뜻 | SDK 동작 |
 |---|---|---|
 | 429 `RL001` | 너무 자주 물어봤다 (`Retry-After` 있음) | 그만큼 쉬고 그대로 이어간다 |
+
+🪤 429가 두 군데서 나오고 **모양이 다르다**. `RL001`은 필터가 봉투 없이 `{error, message, retryAfter}`를 쓰고, `Q005`는 `ApiResponse` 봉투(`errorResponse.code`)를 탄다. SDK는 둘 다 읽는다.
 | 429 `Q005` | 큐가 꽉 찼다 (`Retry-After` **없음**) | `onError` — 재시도 금지 |
 | 404 `TK001` | 토큰 종료 | `onError` — 재-enqueue하면 맨 뒤 |
 
