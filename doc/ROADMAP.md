@@ -717,21 +717,34 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - verify 순서 등 Workflow를 description에 명시
 - Tenant 구현 가이드라인 (FRS §12.2) → OpenAPI description 반영
 
-**E. JS SDK 구현** (별도 레포 `queue-platform-sdk-js`)
-- 🔴 **착수 전 결정**: `tokenId`·`seq`의 **브라우저 보관처** (`FRS` §6.2 "세션 경계 3종" ②).
-  메모리만 쓰면 브라우저 종료로 폴링이 끊겨 `inactiveTtl` 유예 창을 못 쓴다. `sessionStorage`는
-  새로고침은 견디나 종료는 못 견딘다. `tokenId`가 **자격 증명**(§74)이라 XSS 노출 범위를 함께 본다
-- 🔴 **착수 전 결정**: 지터 규약이 §79 안에서 갈려 있다(대칭 ±20% vs 비대칭) — `FRS` §6.3
-- `PollingManager` (`/status`의 `pacing` 구간표로 간격 계산 + ±20% 지터, setTimeout 관리 — §79)
-  - `rank = mySeq − lastAdmittedSeq`를 **SDK가** 계산한다. 서버는 rank를 계산하지 않는다
-  - `rank <= 0`일 때만 개인 엔드포인트 호출 + 30~60초에 1회 keepalive (`ka` 불필요 — §82 F안)
-- `RetryHandler` (429 응답 시 Retry-After 헤더 활용)
-- `StateManager` (IDLE → WAITING → READY → COMPLETED → EXPIRED)
-- `VisibilityHandler` (visibilitychange → Polling 중단/재개)
-- `NetworkHandler` (offline/online 자동 처리)
-- 데모 HTML 페이지 (간단한 대기열 시각화)
-- npm publish (선택) / CDN 배포 (선택)
-- queue-platform 본체와는 별도 Git 레포로 관리
+**E. JS SDK 구현** — ✅ **완료 (2026-09-05, PR #77·#78)**
+
+**위치는 본 레포 `sdk/js/`다.** "별도 레포 `queue-platform-sdk-js`"는 폐기했다 — 계약이
+`doc/TENANT_INTEGRATION.md`와 `doc/API.md`에 있는데 레포를 가르면 계약이 바뀔 때 갈라진다.
+서버 코드가 아니라 빌드에도 안 들어간다(ESM 한 파일, 의존성 0).
+
+구현한 것 (`sdk/js/queue-sdk.js` · `demo/index.html` · `test.mjs` · `README.md`):
+- 간격 계산 — `/status`의 `pacing` 구간표 + **비대칭 지터**(하한 위로만). 대칭 ±20%는
+  기각했다: 실효 간격이 등급 하한 아래로 내려가 폴링 한도에 더 빨리 닿는다 (`FRS` §6.3 확정)
+- `rank = max(0, mySeq − 단조 clamp한 watermark)`를 **SDK가** 계산한다. 서버는 rank를 안 준다
+- `rank <= 0`일 때만 개인 엔드포인트로 전환하고, **전환 후에는 멈추지 않는다**
+  (`last-active`를 심는 것이 개인 폴링이라 멈추면 `inactiveTtl` 회수 대상 — §82 F안).
+  keepalive 별도 호출은 없다
+- 429 처리 — `Retry-After` 준수. `RL001`(봉투 없음)과 `Q005`(`ApiResponse` 봉투)는 **본문 모양이
+  달라** 둘 다 읽는다(PR #78, 실측으로 잡힌 결함)
+- **리더 탭** — 폴링 버킷 키가 `tokenId` 하나라 탭 2개면 여유가 0이다. Web Locks로 선출(탭이
+  닫히면 브라우저가 락을 자동 해제 → 하트비트 불필요), 나머지 탭은 `BroadcastChannel`로 화면만 받는다.
+  **SDK의 존재 근거가 이것 하나다** — 서버 변경 0으로 막는 유일한 수단이다
+- 서버 쪽 전제 하나를 함께 열었다: 공개 폴링 GET 둘에만 **CORS**(`PublicPollingCorsConfig`, PR #77).
+  없으면 다른 오리진의 대기 페이지가 응답을 못 읽어 "브라우저가 직접 폴링한다"가 성립하지 않는다
+
+만들지 않은 것 (§4 — 안 만들면 무엇이 깨지는지 답이 없다):
+- `StateManager`·`VisibilityHandler`·`NetworkHandler` — 상태는 `onUpdate`/`onReady`/`onError`
+  콜백 셋으로 충분하고, 탭을 숨겨도 **폴링을 멈추면 안 된다**(위 §82 F안). 오프라인은 fetch
+  실패가 `onError`로 나가고 다음 틱이 그대로 재시도한다
+- npm publish / CDN — 배포처가 정해지기 전엔 만들 것이 없다
+- `tokenId`·`seq`의 **브라우저 보관처**는 SDK가 정하지 않는다. 인자로 받는다 — `tokenId`가
+  자격 증명(§74)이라 저장 위치는 Tenant의 XSS 표면에 달렸고, Platform이 대신 정할 문제가 아니다
 
 **F. 성능 튜닝 리포트**
 - JVM GC 튜닝 (G1GC 옵션)
@@ -751,7 +764,9 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 - [ ] **Grafana 대시보드 6개 완성** (JVM / HTTP / HikariCP / Kafka lag / Redis / Rate Limiter)
 - [ ] **k6 실측 중 Grafana 실시간 모니터링 스크린샷 확보** ⭐
 - [ ] Swagger UI 접근 가능 + 모든 API 응답 예시 포함
-- [ ] **JS SDK 데모 HTML로 대기열 참여 → Polling → admitToken 수신 E2E 시나리오 동작**
+- [x] **JS SDK 데모 HTML로 대기열 참여 → Polling → admitToken 수신 E2E 시나리오 동작**
+      (2026-09-05 실증 — Playwright 3탭. API 요청 `3/0/0`, 리더 탭을 닫으면 두 번째가 이어받음.
+       교차 오리진 `:8000`→`:8080`으로 CORS까지 함께 확인)
 - [ ] 성능 튜닝 전/후 비교 리포트 작성
 - [ ] `queue_platform_final.docx` 재생성 + Git 커밋
 

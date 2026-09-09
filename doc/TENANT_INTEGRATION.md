@@ -162,10 +162,10 @@ const waitMs = (base + Math.random() * Math.max(1, base / 4)) * 1000;
 
 > 🪤 **지터를 빼지 마라.** 30만 명이 같은 표를 보고 있어서, 지터가 없으면 전원이 같은 초에 몰린다.
 >
-> ⚠️ **지터 규약은 아직 확정 전이다**(`FRS_final.md` §6.3의 🔴 표시). §79 본문은 `±20% 대칭`,
-> 같은 절 Consequences는 `하한 위로만`(비대칭)이라 서로 다르다. 위 예시는 **비대칭**을 따랐다 —
-> 대칭이면 실효 간격이 등급 하한 아래로 내려가 계약 ③의 한도에 더 빨리 닿기 때문이다.
-> 서버가 간격을 계산하지 않으므로 **어느 쪽도 서버가 강제할 수 없다.**
+>
+> 규약은 **비대칭(하한 위로만)** 으로 확정됐다 — 위 예시가 그것이다. 대칭(±20%)이면 실효 간격이
+> 등급 하한 아래로 내려가 계약 ③의 한도에 더 빨리 닿는다. 서버가 간격을 계산하지 않으므로
+> **서버는 이 값을 강제할 수 없다.** 직접 짜는 대신 아래 SDK를 쓰면 이미 지켜져 있다.
 
 ### ② 개인 폴링 `/tokens/{tokenId}` — **차례가 가까울 때만**
 
@@ -273,9 +273,17 @@ curl -X POST .../api/v1/queues/{queueId}/tokens/{tokenId}/complete \
 헤더가 없다 — **헤더가 없으면 `Q005`다.** 정원이 언제 빌지는 서버도 모르므로 정직한 숫자를
 낼 수 없어서 안 붙인다.
 
+🪤 **두 429는 본문 모양도 다르다**(실측). `RL001`은 Rate Limit 필터가 `ApiResponse` 봉투 없이
+직접 쓰고, `Q005`는 애플리케이션 응답이라 봉투를 탄다. 봉투만 보면 `RL001`을 놓친다.
+
+```
+RL001 : {"error":"RL001","message":"요청 한도를 초과했습니다.","retryAfter":2}
+Q005  : {"data":null, ..., "errorResponse":{"code":"Q005","message":"..."}}
+```
+
 ```js
 if (res.status === 429) {
-  const code = body.errorResponse?.code;
+  const code = body.errorResponse?.code ?? body.error;   // 두 모양을 다 읽는다
   if (code === "Q005") return showFullPage();            // 재시도 금지
   await sleep(res.headers.get("Retry-After") * 1000);    // RL001
   return retry();                                        // identifier가 같으면 중복 안 생긴다
@@ -303,8 +311,13 @@ if (res.status === 429) {
 같은 사용자가 **탭을 두 개 열면 그 둘이 한 버킷을 나눠 쓴다.** 기기가 달라도 마찬가지다 —
 IP가 아니라 `tokenId`가 키이기 때문이다.
 
-**대응**: 탭 하나만 폴링하게 만들어라. `BroadcastChannel`로 리더 탭을 뽑는 것이 표준적인 방법이고,
-서버 변경 없이 클라이언트만으로 된다.
+**대응**: 탭 하나만 폴링하게 만들어라. 서버 변경 없이 클라이언트만으로 된다.
+**`sdk/js/`가 이것 하나 때문에 존재한다** — 직접 짜는 대신 그걸 쓰면 된다(아래 §7).
+
+SDK는 리더 선출에 **Web Locks(`navigator.locks`)** 를 쓴다. 탭이 닫히면 브라우저가 락을 자동으로
+놓아 다음 탭이 이어받으므로, 하트비트도 타임아웃도 필요 없다. 나머지 탭의 화면 갱신에만
+`BroadcastChannel`을 쓴다. 실측: 탭 3개 30초 동안 API 요청이 `3 / 0 / 0`이고, 리더 탭을 닫으면
+두 번째 탭이 이어받는다.
 
 > 이것이 **평상시 폴링을 `/status`로 보내야 하는 이유**다. `/status`는 제한이 없다.
 
@@ -434,6 +447,36 @@ setTimeout(tick, (base + Math.random() * Math.max(1, base / 4)) * 1000);   // �
 > 독식하지 못하게 하는 것. 한도가 모자라면 큐를 쪼개지 말고 문의하라.
 
 
+## 7. 폴링은 SDK를 써도 된다 (`sdk/js/`)
+
+§4의 폴링 로직을 직접 짜지 않아도 된다. 빌드도 의존성도 없는 ESM 한 파일이다.
+
+```html
+<script type="module">
+import { createQueueClient } from '/sdk/js/queue-sdk.js';
+
+createQueueClient({
+  baseUrl: 'https://queue.example.com',
+  queueId: QUEUE.queueId, tokenId: QUEUE.tokenId, seq: QUEUE.seq,   // §3에서 내려보낸 값
+  onUpdate: ({ rank }) => render(rank),
+  onReady:  ({ admitToken }) => goToService(admitToken),
+}).start();
+</script>
+```
+
+**범위는 폴링 GET 둘뿐이다.** `enqueue`·`admit`·`verify`·`complete`는 들어 있지 않다 —
+전부 `X-API-Key`가 필요하고, 그 키는 §1에 따라 Tenant 서버에만 둔다.
+
+SDK가 대신 지켜 주는 것은 **직접 짜면 틀리기 쉬운 넷**이다: 워터마크 단조 clamp(§4),
+비대칭 지터(§4), 리더 탭(계약 ③), 개인 폴링을 시작했으면 멈추지 않기(계약 ⑥).
+두 429의 다른 본문 모양(계약 ②)도 SDK가 흡수한다.
+
+> 대기 페이지가 Platform과 **다른 오리진**이어도 된다. 공개 폴링 GET 둘에만 CORS가 열려 있고,
+> 429의 `Retry-After`도 노출된다. 그 밖의 경로는 닫혀 있다 — 브라우저에서 `enqueue`를 시도할
+> 수 없다는 뜻이기도 하다.
+
+---
+
 ## 에러 코드
 
 | 코드 | HTTP | 뜻 | 대응 |
@@ -470,3 +513,4 @@ setTimeout(tick, (base + Math.random() * Math.max(1, base / 4)) * 1000);   // �
 | [`FLOW.md`](FLOW.md) | Enqueue·Polling·Admit·Complete 흐름도 |
 | [`STATE.md`](STATE.md) | Token 상태 머신 |
 | [`DECISIONS.md`](DECISIONS.md) | §79(폴링 분할) · §80(admit) · §82(이탈 회수) · §84(과금) |
+| [`../sdk/js/README.md`](../sdk/js/README.md) | 폴링 SDK 사용법 · 범위 · 에러 표 |

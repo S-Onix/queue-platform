@@ -104,7 +104,10 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   일부구현 관측 메트릭 — `queue_admission_wait_seconds` ✅(2026-09-04) ·
           `queue_admit_requests_total`/`_tokens_issued_total`은 여전히 계측 0건  (§80 U9)
   폐기    RedisSyncJob + redis_sync_needed — 전제가 성립 불가 (2026-08-27, schema.sql 주석)
-  미착수  JS SDK — 리더 탭(BroadcastChannel) 확정만 되고 코드 0             (§78)
+  구현됨  JS SDK `sdk/js/` — 폴링 전용 + 리더 탭(Web Locks)            (§78 · PR #77·#78)
+          🔑 존재 근거는 리더 탭 하나다 — 폴링 버킷 키가 tokenId 하나라 탭 2개면 여유 0.
+             서버 변경 0으로 막는 유일한 수단. enqueue 계열은 안 넣는다(X-API-Key가 필요하다)
+  구현됨  공개 폴링 GET 둘에만 CORS — PublicPollingCorsConfig          (PR #77)
 
 ⚠️ 중복 게이트는 `tokens` Hash의 **HSETNX**다. `waiting` ZSet이 아니다 —
    admit되면 waiting에서 빠지므로 게이트로 쓰면 재-enqueue가 신규로 판정된다(과금 중복).
