@@ -524,8 +524,9 @@ Kafka 발행 실패: 200을 준다. Lua가 이미 커밋됐고 되돌릴 수 없
   ⚠️ **건너뛴 분은 자동 복구되지 않는다.** admit은 실패해도 200이라 Tenant가 재시도할 이유가 없다 —
      "복구는 REPLAY"는 같은 requestId로 **마침** 다시 불렀을 때만 성립하는 가능성이지 경로가 아니다.
   실패는 로그(건너뛴 건수 + 첫 tokenId)로 남는다.
-     ⬜ `queue_admit_requests_total{result=error}`는 **아직 미구현**이다 — 계측 코드 0건이라
-        현재 유일한 흔적은 그 ERROR 로그다.
+     ✅ `queue_admit_requests_total{queue_id, result=error}` **구현됨**(2026-09-09, §80 U9).
+        알람은 `alerts/app.yml`의 QueueAdmitPublishFailing(0건이 유일한 정상값).
+        ⚠️ 개별 tokenId는 여전히 로그에만 있다 — 메트릭은 "몇 건인가"까지만 답한다.
   🔴 대가: 발행이 실패하면 admitted_at이 NULL로 남아 complete가 영구 404다.
      complete 술어의 admitted_at > UTC_TIMESTAMP(3) - INTERVAL {유효 창} SECOND 가
      NULL을 배제하므로, status IN (0,1)의 관대함이 여기 닿지 못한다 (DECISIONS §80 정정).

@@ -139,6 +139,7 @@ class AdmissionWaitMetricTest {
                 .isEqualTo(1.0);
     }
 
+
     @Test
     @DisplayName("REPLAY는 기록하지 않는다 — 같은 사람이 두 번 세어지고 대기 시간도 재시도 시각으로 부푼다")
     void replayNotRecorded() {

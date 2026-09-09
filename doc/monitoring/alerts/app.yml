@@ -59,7 +59,16 @@
 # 즉 이 규칙이 잡는 것은 "admit이 **느려지는** 테넌트"지 "admit이 **멈춘** 테넌트"가 아니다.
 # 후자는 카운터가 아니라 "대기자가 있는데 admit 관측이 없다"는 결합 조건이 필요하고,
 # 그건 임계값 문제가 아니라 설계 문제다(infra.yml <보류> 절의 B2 항목과 같은 계열).
-# 여기에 규칙을 하나 더 만들어 덮지 않는다 — 대상 메트릭(queue_admit_requests_total)이 아직 없다.
+# 여기에 규칙을 하나 더 만들어 덮지 않는다.
+#
+# 🔴 **정정 (2026-09-09).** 원래 사유는 "대상 메트릭(queue_admit_requests_total)이 아직 없다"였다.
+#    그 메트릭은 이제 있다(§80 U9 구현). **그런데 결론은 그대로다** — 사유가 바뀌었을 뿐이다.
+#    막는 것은 admit 쪽 메트릭이 아니라 **대기자 수를 큐별로 내보내는 시계열이 없다**는 것이다.
+#    그것 없이 큐별 `rate()==0`을 걸면 (a) 과거에 admit이 있던 조용한 큐가 **오발화**하고,
+#    (b) 한 번도 admit이 없던 큐는 **영원히 침묵**한다(없는 시계열의 queue_id는 열거할 수 없다).
+#    (b)가 더 나쁘다 — 그게 바로 이 규칙이 잡고 싶은 대상이다.
+#    사유와 선행 조건 전문은 infra.yml <보류> B절에 있다(비용은 장벽이 아니다 — 순회는 이미 있고
+#    진짜 장벽은 batch gauge에 queue_id 라벨을 달 것인가라는 카디널리티 정책이다).
 # ─────────────────────────────────────────────────────────────────────────────
 
 groups:
@@ -159,7 +168,9 @@ groups:
       #
       # 🔴 **큐별 판정은 불가능하다.** uri 라벨은 `{queueId}`를 **템플릿으로 접는다.**
       #    즉 이 규칙은 "플랫폼 전체에서 15분간 admit이 0건"만 잡는다. "특정 테넌트만 멈췄다"는
-      #    잡지 못한다. 그건 queue_admit_requests_total{queueId}(§80 U9, 미구현)가 선행이다.
+      #    잡지 못한다. 그 선행이던 queue_admit_requests_total{queue_id}는 2026-09-09에 생겼지만,
+      #    큐별 규칙은 여전히 못 만든다 — 사유는 이 파일 상단 "정정 (2026-09-09)" 절을 봐라
+      #    (대기자 수 시계열이 없어 조용한 큐가 전부 발화한다). 라벨 철자도 queue_id다.
       #    큐별로 보이게 하려고 uri 라벨을 풀지 마라 — 큐 수만큼 uri가 생겨 카디널리티가 터진다.
       #
       # severity=info인 이유: 로컬에서 앱을 띄워 두고 부하를 안 주면 상시 firing이다.
@@ -195,11 +206,75 @@ groups:
       #    p95 알람을 믿으려면 이게 0이어야 한다.
       #
       # for: 15m — 스큐는 급한 일이 아니다(NTP 조정으로 끝난다). 다만 조용히 쌓이면 안 된다.
+      # 🪤 두 번째 절의 근거는 아래 QueueAdmitPublishFailing 주석과 같다 — 스큐 카운터도
+      #    지연 등록이라 **첫 스큐 1건이면 시계열이 1로 태어나** increase가 0을 낸다.
       - alert: QueueAdmissionClockSkewDetected
-        expr: sum by (queue_id) (increase(queue_admission_clock_skew_total[1h])) > 0
+        expr: |
+          sum by (queue_id) (increase(queue_admission_clock_skew_total[1h])) > 0
+          or
+          sum by (queue_id) (queue_admission_clock_skew_total
+                             unless queue_admission_clock_skew_total offset 1h) > 0
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "큐 {{ $labels.queue_id }} 에서 음수 대기 {{ $value }}건/1h — API 서버 간 시계 스큐 (p95 표본이 그만큼 빠진다)"
           action: "queue-api 인스턴스 전부에서 `timedatectl status` 의 'System clock synchronized' 확인 → 어긋난 노드에서 `chronyc tracking` 또는 `systemctl status systemd-timesyncd`. ⚠️ **`date -s` 로 손으로 맞추지 마라** — 시간이 뒤로 점프하면 이미 발급된 토큰의 TTL 계산이 어긋난다. NTP가 slew로 서서히 맞추게 둔다."
+
+  # ===========================================================================
+  # admit 커스텀 메트릭 — §80 U9 (2026-09-09 구현). infra.yml <보류> B절에서 승격.
+  # ===========================================================================
+  # 🔴 **라벨은 `queue_id`다** (§80 DECISIONS:5822의 `queueId` 표기가 아니다).
+  #    queue_admission_wait_seconds 와 같은 철자여야 `and on(queue_id)` 조인이 성립한다.
+  #    구현이 손으로 맞춰 놨고(QueueEngineService.recordAdmitRequest), 계약은
+  #    AdmitRequestMetricTest 가 문자열로 건다 — 철자가 갈리면 거기가 빨개진다.
+  # ===========================================================================
+  - name: queue-platform-admit-custom
+    rules:
+
+      # ADMITTED 발행이 실패했다 = Kafka에 안 갔다.
+      #
+      # 🔑 **이 규칙이 존재하는 이유는 "다른 데서는 절대 안 보인다"는 것 하나다.**
+      #    admit은 Lua가 이미 커밋된 뒤라 5xx를 줄 수 없어 **항상 200**이다(FRS §6.4).
+      #    그래서 QueueAdmitErrorRatioHigh(http_server_requests, 5xx)는 이 사건을 못 잡는다.
+      #    구현 전까지 유일한 흔적은 publishAdmitted 의 ERROR 로그 한 줄이었고, 로그는 알람이 아니다.
+      #
+      # 무엇이 깨지나: 발행이 빠진 토큰은 `admitted_at`이 NULL로 남는다. complete 술어의
+      #    `admitted_at > UTC_TIMESTAMP(3) - INTERVAL {유효 창} SECOND`가 NULL을 배제하므로
+      #    **그 사용자는 complete가 영구 404**다. 입장은 했는데 원장에는 영원히 안 남는다.
+      #    Tenant는 200을 받았으니 재시도할 이유가 없다 — 자동 복구 경로가 없다(FRS §6.4).
+      #
+      # 🔴 **임계값 근거: 필요 없다. 0이 유일한 정상값이다.** 비율이 아니라 건수로 본다 —
+      #    발행 실패 1건 = 영구 404 사용자 1명 이상이고, 비율로 누르면 대량 admit 중의
+      #    소수 실패가 임계 아래로 숨는다.
+      #
+      # 🔴 **`increase()` 하나로는 실패 1건을 못 잡는다 — 두 번째 절이 그래서 있다.**
+      #    `increase()`는 구간의 첫 표본을 기준선으로 삼는다. Micrometer는 첫 발생 때 미터를
+      #    만들므로 error 시계열은 **값 1로 태어나고**, 상수 1의 델타는 0이다("0으로 외삽" 보정은
+      #    델타 > 0일 때만 걸린다). 그러면 **영원히 침묵**한다 — 이 규칙의 명분이
+      #    "실패 1건 = 영구 404 사용자 1명 이상"인데 정확히 그 경우가 사각이었다.
+      #    promtool 실측(2026-09-09): 1로 태어나 상수 → 미발화 / 1→2 → 발화 / 0→1 → 발화
+      #
+      #    → 두 번째 절 `unless ... offset 10m`이 **"이번 창에 새로 생긴 시계열"** 을 잡는다.
+      #      `offset 10m` 시점에 없던 계열만 남으므로 갓 태어난 1이 걸리고, 10분 뒤 자동 해소된다.
+      #
+      #    🪤 **앱에서 미터를 미리 등록해 0을 심는 안을 검토했다가 버렸다.** 등록과 증가가 같은
+      #       호출 안이라 **그 큐의 첫 admit이 곧 실패하면 여전히 1로 태어난다**(promtool 재현).
+      #       앱이 반만 보상하고 주석은 다 한다고 말하게 되며 시계열만 큐당 4개로 늘었다.
+      #       🔑 **보정은 한 곳에서만 한다 — 여기다.** 앱 코드에 이 목적의 등록을 다시 넣지 마라.
+      #
+      # 🪤 `$value`는 **요청 건수지 사용자 수가 아니다.** admit 한 번이 count=100이면 실패 1건에
+      #    사용자 100명이 묶인다. 건너뛴 **토큰 수**는 어떤 메트릭에도 없고 로그에만 있다 —
+      #    폭발 반경은 반드시 ①의 로그로 확인해라. (두 번째 절로 발화하면 $value가 없다)
+      - alert: QueueAdmitPublishFailing
+        expr: |
+          sum by (queue_id) (increase(queue_admit_requests_total{result="error"}[10m])) > 0
+          or
+          sum by (queue_id) (queue_admit_requests_total{result="error"}
+                             unless queue_admit_requests_total{result="error"} offset 10m) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "큐 {{ $labels.queue_id }} 에서 ADMITTED 발행 실패 admit {{ $value }}건/10m — 영향 사용자는 그 이상이다(1건에 최대 100명)"
+          action: "① queue-api 로그에서 `ADMITTED 발행 중단` / `ADMITTED 발행 생략` 을 찾아 **첫 tokenId와 건너뛴 건수**를 확보한다(개별 식별 수단은 이 로그뿐이다) → ② 원인 갈래가 둘이다. `발행 중단`이면 Kafka다: `$KAFKA_HOME/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092,localhost:9094,localhost:9096`(3대 전부 찍어라 — 한 대만 찍으면 그 한 대가 죽었을 때 명령 자체가 실패해 오진한다), 그리고 KafkaConsumerStalled(alerts/kafka.yml) firing 여부. `발행 생략`이면 **브로커는 멀쩡하다** — 롤링 배포 중 구 포맷 payload이므로 배포 완료를 기다린다 → ③ 🔴 **복구가 불가능할 수 있다.** complete의 술어는 `admit_token = :admitToken`을 포함하는데(TokenJpaRepository.markCompleted), 그 컬럼의 유일한 기록자가 방금 실패한 ADMITTED 이벤트다. 즉 행에는 NULL이고 **로그에도 admitToken은 안 찍힌다**(Redis 키는 PX 60초라 알람이 뜰 땐 이미 없다). 사본을 가진 곳은 admit 200 응답을 받아 간 **Tenant뿐**이다 — 받아낼 수 있으면 그 값과 `admitted_at = UTC_TIMESTAMP(3)`(300초 창을 새로 연다)을 함께 UPDATE하고, 못 받아내면 그 사용자는 complete 불가로 확정하고 EXPIRED 회수에 맡긴다. ⚠️ **앱을 재시작해도 안 낫는다** — 건너뛴 분은 재발행되지 않는다."

@@ -502,8 +502,11 @@ flowchart TD
   - **큐 목록은 DB `queues`에서 읽는다.** Cluster에서 `SCAN`은 접속한 노드만 훑어 다른 마스터의 큐가
     **조용히 누락**되고, 복귀 안 된 토큰은 에러조차 내지 않는다
 - **`queue-batch`에 actuator + micrometer-prometheus 추가** (claim-Lua 계측. Sprint 9 reconciliation과 **같은 선행 작업**)
-- 관측 메트릭 **2개 + 조건부 1개**: `queue_admit_requests_total{queueId,result}` /
-  `queue_admit_tokens_issued_total{queueId}` / (복귀 구현 시) `queue_admit_returned_to_waiting_total{queueId}`
+- 관측 메트릭 **2개 + 조건부 1개**: `queue_admit_requests_total{queue_id,result}` /
+  `queue_admit_tokens_issued_total{queue_id}` / ~~(복귀 구현 시) `queue_admit_returned_to_waiting_total`~~
+  - ✅ **앞 둘 구현됨**(2026-09-09, `QueueEngineService.recordAdmitRequest`). 라벨은 `queue_id`다
+    (§80의 `queueId` 표기가 아니다 — `queue_admission_wait_seconds`와 조인하려면 철자가 같아야 한다)
+  - 셋째는 **조건부가 아니라 폐기**다 — §36으로 admit 만료 복귀 자체가 없어졌다(발행처가 생길 수 없다)
   - `admit_seconds` 히스토그램은 **넣지 않는다** — `le` 버킷 실측 69개 × 큐 100개 = 6,900 시계열로
     현재 전체(857개)의 8배다
 - **`/status` 엔드포인트 + `pacing` 구간표 (§79 구현)** — Sprint 6이 아니라 여기인 이유: **watermark는 admit이 있어야 존재한다.** admit이 0건이면 `lastAdmittedSeq`가 영원히 0이라 SDK의 `rank = mySeq − lastAdmittedSeq`가 무의미하다

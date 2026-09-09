@@ -445,12 +445,55 @@
       }
     },
     {
+      "id": 15,
+      "title": "admit 판정과 입장 처리량 (§80 U9)",
+      "type": "timeseries",
+      "description": "result=error는 ADMITTED 발행 실패다. admit은 Lua 커밋 뒤라 항상 200이므로 상태 코드 패널에는 절대 안 나온다 — 여기서만 보인다. 발행이 빠진 토큰은 admitted_at이 NULL로 남아 complete가 영구 404가 된다.",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(queue_admit_requests_total[1m]))",
+          "legendFormat": "admit {{result}}/s",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "expr": "sum by (queue_id) (rate(queue_admit_tokens_issued_total[1m]))",
+          "legendFormat": "입장 {{queue_id}}/s",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "reqps"
+        },
+        "overrides": []
+      }
+    },
+    {
       "id": 300,
       "title": "인프라",
       "type": "row",
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 26,
         "w": 24,
         "h": 1
       },
@@ -464,7 +507,7 @@
       "description": "앱 3대를 안 띄우면 25/28이 정상이다. 그보다 낮으면 exporter나 인프라가 죽은 것이다.",
       "gridPos": {
         "x": 0,
-        "y": 21,
+        "y": 27,
         "w": 6,
         "h": 5
       },
@@ -532,7 +575,7 @@
       "description": "@Transactional(readOnly)가 Replica로 라우팅되므로, 이 값이 커지면 읽기가 낡은 데이터를 본다.",
       "gridPos": {
         "x": 6,
-        "y": 21,
+        "y": 27,
         "w": 6,
         "h": 5
       },
@@ -596,7 +639,7 @@
       "description": "Cluster A(7001~) + B(8001~) 각 8노드. 큐 상태 키 4종은 반드시 같은 클러스터에 있어야 한다(§75 D26).",
       "gridPos": {
         "x": 12,
-        "y": 21,
+        "y": 27,
         "w": 6,
         "h": 5
       },
@@ -651,7 +694,7 @@
       "description": "pending이 0이 아니면 풀이 마른 것이다. verify가 Kafka를 기다리며 커넥션을 쥐던 문제(F-3)가 여기 보인다.",
       "gridPos": {
         "x": 18,
-        "y": 21,
+        "y": 27,
         "w": 6,
         "h": 5
       },
@@ -693,7 +736,7 @@
       "description": "maxmemory 1gb / noeviction이다. 차오르면 쓰기가 실패하지 evict되지 않는다.",
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 32,
         "w": 8,
         "h": 6
       },
@@ -727,7 +770,7 @@
       "description": "",
       "gridPos": {
         "x": 8,
-        "y": 26,
+        "y": 32,
         "w": 8,
         "h": 6
       },
@@ -761,7 +804,7 @@
       "description": "prod 풀은 api 50 / consumer 20 / batch 10이다. 앱 대수 × 풀 크기가 max_connections를 넘지 않아야 한다.",
       "gridPos": {
         "x": 16,
-        "y": 26,
+        "y": 32,
         "w": 8,
         "h": 6
       },

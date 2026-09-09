@@ -108,7 +108,8 @@ public class QueueEngineService {
 
         Instant admittedAt = Instant.ofEpochMilli(now);
         recordAdmissionWait(queueId, result, admittedAt);
-        publishAdmitted(tenantId, queueId, result, admittedAt);
+        int skipped = publishAdmitted(tenantId, queueId, result, admittedAt);
+        recordAdmitRequest(queueId, result, skipped);
 
         return result;
     }
@@ -143,6 +144,11 @@ public class QueueEngineService {
                 // 🔴 **음수를 0으로 눕히지 않는다.** 두 시각 모두 앱 시계라 N대의 스큐가 그대로
                 //    들어온다(-398초 실측). clamp하면 스큐 신호가 사라지고, 그냥 record하면
                 //    Timer가 음수를 조용히 버려 아무 데도 안 남는다. 빼되 카운터로 드러낸다.
+                //
+                // 🪤 이 미터는 **첫 스큐 때 만들어져 값 1로 태어난다.** increase()가 상수 1의 델타를
+                //    0으로 내므로 스큐 1건은 그대로 두면 안 잡힌다 — 보정은 앱이 아니라
+                //    alerts/app.yml의 QueueAdmissionClockSkewDetected가 unless...offset 절로 한다
+                //    (recordAdmitRequest javadoc에 같은 판단의 근거가 있다).
                 Counter.builder("queue.admission.clock.skew")
                         .description("admit 시각이 enqueue 시각보다 앞선 건수 (API 서버 간 시계 스큐)")
                         .tag("queue_id", queueId)
@@ -158,6 +164,64 @@ public class QueueEngineService {
                         .register(meterRegistry);
             }
             timer.record(waitMillis, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * admit 요청 1건과 발급된 토큰 수를 센다 — {@code queue_admit_requests_total{queue_id, result}} /
+     * {@code queue_admit_tokens_issued_total{queue_id}} (§80 U9).
+     *
+     * <p><b>라벨은 {@code queue_id}다.</b> §80(DECISIONS:5822)의 {@code queueId} 표기를 따르지
+     * 않는다 — {@code queue_admission_wait_seconds}가 {@code queue_id}를 쓰므로 철자가 갈리면
+     * {@code and on(queue_id)} 조인이 성립하지 않는다. Micrometer는 태그 키를 snake_case로
+     * 바꿔 주지 않는다 (alerts/infra.yml).
+     *
+     * <p><b>{@code result=error}는 발행 실패다</b>, admit 자체의 실패가 아니다. admit은 Lua가
+     * 커밋된 뒤라 5xx를 줄 수 없어 <b>항상 200</b>이고(FRS §6.4), 그래서 HTTP 상태로는 절대
+     * 안 보인다. 지금까지 유일한 흔적이 {@code publishAdmitted}의 ERROR 로그 한 줄이었다.
+     * 발행이 빠진 토큰은 {@code admitted_at}이 NULL로 남아 <b>complete가 영구 404</b>가 된다.
+     *
+     * <p><b>REPLAY는 토큰을 세지 않는다.</b> 재시도는 첫 호출과 같은 records를 돌려줄 뿐 새로
+     * 발급하지 않는다. 세면 같은 토큰이 두 번 잡힌다 (recordAdmissionWait가 REPLAY를 빼는 것과
+     * 같은 이유). 대신 {@code result=replay}로 요청 자체는 남으므로 잃는 정보가 없다.
+     *
+     * <p>🔴 <b>REPLAY가 {@code error}보다 우선한다 — 순서를 뒤집지 마라.</b> {@code issuedAt}이
+     * null이라 발행을 건너뛰는 <b>유일한 실제 경로가 REPLAY다</b>(구 포맷 멱등 payload,
+     * {@code RedisQueueEngine.parseAdmitResult} javadoc). 그 토큰은 <b>첫 호출에서 이미 발행돼</b>
+     * {@code admitted_at}이 차 있으므로 404가 아닌데, error로 접으면 critical 알람이 뜨고 런북이
+     * 멀쩡한 행을 손으로 고치라고 시킨다. 첫 호출의 발행이 진짜로 실패했다면 <b>그때 error로
+     * 이미 세어졌다</b> — 뒤집어도 얻는 것이 없고 {@code replay} 카운트만 영영 0이 된다.
+     *
+     * <p>🪤 <b>미터는 지연 등록된다 — 시계열이 값 1로 태어난다.</b> Micrometer가 첫 호출 때
+     * 미터를 만들기 때문이고, 그러면 {@code increase()}는 구간 첫 표본을 기준선으로 삼아 상수 1의
+     * 델타를 0으로 낸다("0으로 외삽" 보정은 델타 &gt; 0일 때만 걸린다).
+     * <b>이 보정은 앱이 하지 않는다</b> — {@code alerts/app.yml}의 {@code QueueAdmitPublishFailing}이
+     * {@code unless ... offset} 절로 "이번 창에 새로 생긴 시계열"을 함께 잡는다.
+     * <br>여기서 result 4종을 미리 등록해 0을 심는 안을 검토했다가 <b>버렸다</b>:
+     * 등록과 증가가 같은 호출 안이라 <b>그 큐의 첫 admit이 곧 실패하면 여전히 1로 태어난다</b>
+     * (promtool 재현). 앱 코드가 PromQL 특성을 반만 보상하면서 주석은 다 한다고 말하게 되고,
+     * 시계열만 큐당 4개로 는다. <b>보정은 한 곳에서만 한다.</b>
+     *
+     * <p>🪤 {@code queue_id} 카디널리티는 recordAdmissionWait의 주석과 같은 조건이다.
+     */
+    private void recordAdmitRequest(String queueId, AdmitResult result, int skipped) {
+        String outcome = result.replay() ? "replay"
+                : skipped > 0 ? "error"
+                : result.records().isEmpty() ? "empty"
+                : "ok";
+        Counter.builder("queue.admit.requests")
+                .description("admit 요청 건수")
+                .tag("queue_id", queueId)
+                .tag("result", outcome)
+                .register(meterRegistry)
+                .increment();
+
+        if (!result.replay() && !result.records().isEmpty()) {
+            Counter.builder("queue.admit.tokens.issued")
+                    .description("admit이 발급한 admitToken 수")
+                    .tag("queue_id", queueId)
+                    .register(meterRegistry)
+                    .increment(result.records().size());
         }
     }
 
@@ -184,12 +248,17 @@ public class QueueEngineService {
      * 재시도할 이유가 없다 — REPLAY 복구는 가능성이지 경로가 아니다. 그래서 건너뛴 건수와 첫
      * tokenId를 ERROR로 남긴다(유일한 흔적이다). 병렬 발행은 답이 아니다 — 메타데이터가 없으면
      * {@code send()} 자체가 블로킹이라 스레드만 늘고 벽시계는 그대로다.
+     *
+     * @return 발행하지 못한 건수. 0이 아니면 그만큼 {@code admitted_at}이 NULL로 남아
+     *         complete가 영구 404가 되므로, 호출자가 {@code result=error}로 계측한다 (§80 U9).
      */
-    private void publishAdmitted(long tenantId, String queueId, AdmitResult result, Instant admittedAt) {
+    private int publishAdmitted(long tenantId, String queueId, AdmitResult result, Instant admittedAt) {
         List<AdmitResult.AdmitRecord> records = result.records();
+        int skipped = 0;
         for (int i = 0; i < records.size(); i++) {
             AdmitResult.AdmitRecord record = records.get(i);
             if (record.issuedAt() == null) {
+                skipped++;
                 // issuedAt이 없으면 발행할 수 없다. 컨슈머의 멱등 키가 (token_id, issued_at)이라
                 // 아무 값이나 넣으면 같은 토큰의 두 번째 행이 생긴다 — 조용히 틀리느니 빼고 남긴다.
                 // 도달 경로는 롤링 배포 중의 구버전 멱등 payload뿐이다(AdmitRecord.issuedAt 참조).
@@ -201,11 +270,13 @@ public class QueueEngineService {
                     record.tokenId(), queueId, tenantId, record.identifier(), record.seq(),
                     record.issuedAt(), record.admitToken(), admittedAt, null));
             if (!published) {
+                skipped += records.size() - i;
                 log.error("ADMITTED 발행 중단 queueId={} 건너뜀={}건 첫tokenId={}",
                         queueId, records.size() - i, record.tokenId());
                 break;
             }
         }
+        return skipped;
     }
 
     /**
@@ -331,6 +402,33 @@ public class QueueEngineService {
             //    통과시켰을 것들뿐이고 자격이 넓어지지 않는다.
             //    (두 상수가 갈리면 불변식이 깨진다 — Token.COMPLETE_VALID_WINDOW_SECONDS와
             //     admit TTL을 같이 보고 고쳐라.)
+            //
+            // 🔴 **이 불변식에는 상수 말고 전제가 하나 더 있다 — 시계가 맞아야 한다.**
+            //    두 창을 재는 시계가 다르다: 60초는 **Redis**가 PX로 재고(상대 시간이라 시계 오차에
+            //    면역이다), 300초는 **MySQL의 UTC_TIMESTAMP(3)** 가 `admitted_at`과 비교해 잰다.
+            //    그런데 `admitted_at`은 **admit을 처리한 API 서버의 시계**로 찍힌 값이다
+            //    (TokenLifecycleConsumer:278 — payload 값이지 DB의 NOW()가 아니다).
+            //    그 서버가 S초 뒤처지면 **DB 술어의 창**이 `max(300 − S, 0)`으로 줄어든다.
+            //    ⚠️ **엔드포인트의 창과 혼동하지 마라** — 이 폴백이 바닥을 60초로 받쳐서
+            //       사용자 기준 창은 `max(300 − S, 60)`이다. S가 커도 admit 후 60초 안이면 200이다.
+            //    실측(2026-09-09, 실제 markCompleted SQL): S=398이면 admit 0초 뒤에도 UPDATE가 0행.
+            //
+            // 🔴 **S > 240이면 60 ⊄ 300이 되어 폴백이 자격을 넓힌다.** 위 문장이 "넓어지지
+            //    않는다"고 단언한 바로 그 일이다. 그리고 그때 벌어지는 일이 404가 아니라 더 나쁘다:
+            //      ① ReconcileJob.expireStaleAdmitted가 그 행을 status=4로 확정한다
+            //      ② 사용자는 이 폴백으로 **200**을 받고 COMPLETED가 발행된다
+            //      ③ 그런데 컨슈머 가드가 `IF(tokens.status = 1, ...)`라 status=4에서 **no-op**
+            //         (TokenJpaAdapter:91) → 행은 `status=4 / completed_at=NULL`로 **영구 고정**
+            //      ④ 같은 요청의 재시도는 폴백 키가 지워져 404 — **멱등성도 깨진다**
+            //    즉 이건 가용성 문제이자 **원장 무결성 문제**다. Tenant는 200을 받아 알 수단이 없다.
+            //
+            // 🪤 **reconcile이 complete보다 먼저 자르는 것이 아니다.** 둘 다 `admit + (300 − S)`에
+            //    닫힌다 — 어긋난 게 아니라 **같은 잘못된 기준 위에서 일관되게 틀린다.** 원점은
+            //    `admitted_at`이 다른 기계의 시계로 쓰였다는 것이지 batch 시계가 아니다.
+            //    (reconcile cutoff를 SQL로 옮겨도 이 사고는 안 고쳐진다 — 시계 하나가 줄 뿐이다.)
+            //
+            // 🪤 그때 아래 WARN은 "컨슈머 적재가 밀려 있다"라 **오진을 유도한다** — Kafka는 멀쩡하다.
+            //    감시는 alerts/infra.yml의 HostClockNotSynchronized가 한다(사용자가 닿기 전에 뜬다).
             //
             // ⚠️ **순서를 뒤집지 마라.** Redis를 먼저 보게 만들면, publishQuietly가 발행을
             //    삼켰을 때 행이 status=1로 남고 ReconcileJob이 **완료된 토큰을 EXPIRED로

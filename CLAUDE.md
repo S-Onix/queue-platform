@@ -101,8 +101,12 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  큐 상한 둘 — maxCapacity 1~30만(@Max) · 테넌트당 큐 20개(Q006)     (§87)
           🔑 막는 것은 성능이 아니라 Redis 마스터 용량이다. 실측 477 B/명이고,
              상한이 없으면 같은 마스터의 **다른 테넌트** enqueue가 OOM으로 죽는다(재현)
-  일부구현 관측 메트릭 — `queue_admission_wait_seconds` ✅(2026-09-04) ·
-          `queue_admit_requests_total`/`_tokens_issued_total`은 여전히 계측 0건  (§80 U9)
+  구현됨  관측 메트릭 — `queue_admission_wait_seconds` ✅(2026-09-04) ·
+          `queue_admit_requests_total{queue_id,result}`/`_tokens_issued_total{queue_id}` ✅(2026-09-09)
+          🔑 라벨은 `queue_id`다 — §80(DECISIONS:5822)의 `queueId` 표기를 따르지 않는다.
+             `queue_admission_wait_seconds`와 철자가 갈리면 `and on(queue_id)` 조인이 깨진다
+          🔑 `result=error`는 **ADMITTED 발행 실패**다. admit은 Lua 커밋 뒤라 항상 200이라
+             HTTP 지표로는 절대 안 보이고, 발행이 빠진 토큰은 complete가 영구 404다  (§80 U9)
   폐기    RedisSyncJob + redis_sync_needed — 전제가 성립 불가 (2026-08-27, schema.sql 주석)
   구현됨  JS SDK `sdk/js/` — 폴링 전용 + 리더 탭(Web Locks)            (§78 · PR #77·#78)
           🔑 존재 근거는 리더 탭 하나다 — 폴링 버킷 키가 tokenId 하나라 탭 2개면 여유 0.
