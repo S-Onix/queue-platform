@@ -78,10 +78,14 @@ public class TokenJpaAdapter implements TokenRepository {
     private static Map<TokenEventType, String> transitionSql() {
         Map<TokenEventType, String> sql = new EnumMap<>(TokenEventType.class);
         // 🔴 admitted_at은 **이벤트가 실어온 값이 아니라 UTC_TIMESTAMP(3)** 이다 (§90).
-        //    🔑 값을 정하는 곳은 **VALUES 절 하나다**(TRANSITION_INSERT). 여기 `new.admitted_at`은
-        //       그 결과를 가리킬 뿐이라 ODKU 경로와 INSERT 경로가 같은 출처를 쓴다.
-        //       여기에 UTC_TIMESTAMP(3)을 또 쓰면 같은 규칙이 두 곳에 생기고, 실측으로
-        //       **아무 테스트도 지키지 않는 무동작**이었다(결함 주입: SET만 되돌려도 전부 초록).
+        //    🔑 **ADMITTED 경로에서** 값을 정하는 곳은 **VALUES 절 하나다**(TRANSITION_INSERT).
+        //       여기 `new.admitted_at`은 그 결과를 가리킬 뿐이라 ODKU와 INSERT가 같은 출처를 쓴다.
+        //       이 줄에 UTC_TIMESTAMP(3)을 또 쓰면 **무동작**이다(결함 주입 실측: SET만 되돌려도 전부 초록).
+        //    🔧 **"쓰는 곳은 한 곳뿐"이라고 읽지 마라 (§91에서 갈렸다).** COMPLETED ODKU가
+        //       `admitted_at`을 **두 번째로** 쓴다 — 거긴 무동작이 아니라 하중을 받는다.
+        //       COMPLETED가 ADMITTED보다 먼저 도착해 `status=0`에서 완료를 확정하면,
+        //       뒤늦은 ADMITTED가 이 `status = 0` 가드에 걸려 no-op이 되어 **아무도 안 채우기** 때문이다.
+        //       두 경로가 각자 자기 자리를 채우고, 서로 `IS NULL` 조건으로 겹치지 않는다.
         //    이 컬럼은 술어의 좌변이고, 우변은 셋 다 MySQL 시계다
         //    (TokenJpaRepository의 findAdmittedByAdmitToken · markCompleted · expireStaleAdmitted).
         //    좌변을 admit을 처리한 API 서버 시계로 쓰면 **한 창을 두 시계로 재게 된다** —
@@ -115,9 +119,41 @@ public class TokenJpaAdapter implements TokenRepository {
         //
         //    complete API 경로는 영향이 없다 — 동기 UPDATE가 이미 status=2로 만들어 놓아
         //    IF(tokens.status = 1, ...)이 거짓이 되고 자기가 찍은 값이 보존된다.
+        // 🔴 **가드가 `status IN (0, 1)`인 것은 의도다 (§91).** `status = 1`이던 시절, 이 가드는
+        //    "ADMITTED가 먼저 적용됐다"를 전제했는데 **프로듀서가 그 순서를 보장하지 않는다.**
+        //    `admit.lua`가 커밋되면 admitToken이 Redis에 즉시 보이고 폴링은 Redis만 보는데,
+        //    `publishAdmitted`는 그 뒤에 건별 블로킹 `.get()`으로 **직렬** 발행한다(실측 67~128ms).
+        //    사용자가 그 사이에 verify·complete를 끝내면 **COMPLETED가 ADMITTED보다 먼저**
+        //    파티션에 들어가고, 여기서 no-op이 되어 행이 `status=1 / completed_at=NULL`로 고착됐다
+        //    → 300초 뒤 ReconcileJob이 status=4로 확정. **사용자는 200을 받아 알 수단이 없었다.**
+        //    실측(2026-09-09, Kafka 오프셋 전수): stuck 7건 전부 COMPLETED 오프셋 < ADMITTED 오프셋.
+        //    폴백 complete 1,117건 중 **16건(1.43%)**이 원장을 잃었다.
+        //
+        //    🔑 **동기 경로는 진작 `status IN (0,1)`이었다** — `TokenJpaRepository.markCompleted`.
+        //       비동기 경로만 `= 1`로 좁아 **두 코드가 서로 다른 것을 참이라 가정**하고 있었다.
+        //       원래 이 가드가 막으려던 것은 `status=2` 덮어쓰기지 0이 아니다. 2와 4는 여전히 배제된다.
+        //
+        // 🔴 **네 줄 전부 하중을 받는다. 하나도 군더더기가 아니다.**
+        //    `status`/`completed_at`만 넓히면, 뒤늦게 온 ADMITTED가 `IF(tokens.status = 0, ...)`에
+        //    걸려 no-op이 되어 `admit_token`·`admitted_at`이 **영구 NULL**로 남는다. 그 결과는
+        //      ① `SUM(admitted_at IS NOT NULL)`(= 입장권 개수의 유일한 근거)이 **과소 계상**
+        //      ② `findCompletedAt`이 `admit_token = ?`을 요구해 빈 값 → **complete 재시도가 404**
+        //    즉 원장 유실이 과금 누락으로 **모양만 바뀐다.** 3인 검토가 각각 다른 경로로 같은 결론에 왔다.
+        //
+        // 🔴 **`status`는 반드시 마지막 줄이다.** ODKU SET은 좌→우로 평가되고 아래 줄이 위 줄의
+        //    결과를 본다. `status`를 위로 올리면 나머지 셋이 이미 2로 바뀐 값을 봐서 전부 거짓이 되고,
+        //    실측 결과 `admit_token=NULL / admitted_at=NULL / completed_at=NULL`이 된다 —
+        //    **지금 버그보다 나쁘다**(status=2라 ReconcileJob이 손도 못 대고 흔적조차 안 남는다).
+        //
+        // 🪤 `admitted_at`의 대가: 이 경로의 값은 "admit 시각"이 아니라 **"complete 적용 시각"**이 된다.
+        //    §90의 불변식(값이 MySQL 시계에서 나온다)은 그대로 지킨다 — 흐리는 게 아니다.
+        //    대기 시간 집계가 그만큼 짧아지는데, 이 경합에서는 COMPLETED가 ADMITTED보다 **먼저**
+        //    도착하므로 편향은 아래쪽이고 폭은 컨슈머 배치 간격이다(초 단위 집계에서 대개 0).
         sql.put(TokenEventType.COMPLETED, TRANSITION_INSERT + """
-                completed_at = IF(tokens.status = 1, UTC_TIMESTAMP(3), tokens.completed_at),
-                status       = IF(tokens.status = 1, 2, tokens.status)""");
+                admit_token  = IF(tokens.status IN (0, 1) AND tokens.admit_token IS NULL, new.admit_token, tokens.admit_token),
+                admitted_at  = IF(tokens.status IN (0, 1) AND tokens.admitted_at IS NULL, UTC_TIMESTAMP(3), tokens.admitted_at),
+                completed_at = IF(tokens.status IN (0, 1), UTC_TIMESTAMP(3), tokens.completed_at),
+                status       = IF(tokens.status IN (0, 1), 2, tokens.status)""");
         // 🔴 출발이 0뿐인 것은 의도다 (§36). admitToken TTL 만료자는 status = 1이라 여기서
         //    no-op이 되고, 그래야 complete의 status IN (0, 1) + 300초 유효 창이 살아남는다.
         //    IN (0, 1)로 넓히면 늦은 입장이 INVALID_ADMIT_TOKEN이 된다.

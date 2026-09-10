@@ -27,6 +27,12 @@ public interface TokenRepository {
      * <p>🔴 <b>호출자는 같은 타입이 연속하는 구간 단위로 넘긴다.</b> 타입별로 모으면 같은 토큰의
      * {@code ADMITTED}→{@code COMPLETED} 순서가 뒤집혀 그 토큰이 영원히 완료되지 않는다.
      *
+     * <p>🔧 <b>§91에서 갈렸다.</b> 위 문장의 예시({@code ADMITTED}→{@code COMPLETED})는 더 이상
+     * 실패 사례가 아니다 — {@code COMPLETED} 가드가 {@code status IN (0, 1)}로 넓어져
+     * <b>순서에 의존하지 않는다</b>. 다만 <b>구간 단위로 넘기는 규칙 자체는 살아 있다</b>:
+     * {@code ADMITTED}·{@code EXPIRED}는 여전히 {@code status = 0} 출발 가드라
+     * {@code ENQUEUED}보다 앞서면 결과가 달라진다.
+     *
      * @param type {@code ENQUEUED}는 허용하지 않는다 — 그건 {@link #saveAllIfAbsent}의 몫이다
      */
     void applyTransition(TokenEventType type, List<Token> tokens);

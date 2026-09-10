@@ -292,42 +292,55 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
    - 🪤 값의 출처는 **`TRANSITION_INSERT`의 VALUES 절 하나**다. ODKU SET 절에 또 쓰면
      `new.admitted_at`이 그걸 가리키므로 **무동작**이다(결함 주입 실측)
 
-4. **admitToken TTL 60s + DB Fallback**
+4. **비동기 전이 가드는 발행 순서에 기대지 않는다** (§91)
+   - `COMPLETED` 소비 가드는 **`status IN (0, 1)`**이다. `= 1`이면 "ADMITTED가 먼저 적용됐다"를
+     전제하는데 **프로듀서가 그걸 보장하지 않는다** — `admit.lua` 커밋 즉시 admitToken이 Redis에
+     보이고 폴링은 Redis만 보는데, `publishAdmitted`는 그 뒤 **직렬 블로킹 발행**(실측 67~128ms)이다.
+     사용자가 그 사이에 verify·complete를 끝내면 **COMPLETED가 ADMITTED보다 먼저** 파티션에 들어간다
+     (Kafka 오프셋 전수 실측 7/7). 폴백 complete의 **1.43%**가 원장을 잃고 있었다
+   - 🔑 **동기 경로(`markCompleted`)는 진작 `IN (0,1)`이었다** — 비대칭 자체가 결함이었다
+   - 🔴 **SET 절 네 줄이 전부 하중을 받는다**(결함 주입 실측). `admit_token`·`admitted_at`을
+     `IS NULL`일 때 채우지 않으면 **원장 유실이 과금 누락으로 모양만 바뀐다**
+   - 🔴 **`status`는 반드시 마지막 줄** — ODKU는 좌→우 평가라 위로 올리면 나머지가 전부 거짓이 되어
+     세 컬럼이 NULL이 된다(**지금 버그보다 나쁘다**)
+   - ❌ **`status=4`는 넓히지 마라** — 확정된 만료를 완료로 뒤집는 새 결함이 된다
+
+5. **admitToken TTL 60s + DB Fallback**
    - Redis 만료 시 DB에서 admit_token 컬럼으로 복구
    - **복귀하지 않는다(§36).** seq 컬럼은 Redis 전손 시 DB 재구성용(§71)
 
-5. **Status는 TINYINT (0~4)**
+6. **Status는 TINYINT (0~4)**
    - VARCHAR 대비 저장공간·비교 성능 최적화
    - 0=WAITING, 1=ADMIT_ISSUED, 2=COMPLETED, 3=CANCELLED, 4=EXPIRED
    - ⚠️ **3은 결번이다** — Cancel API를 만들지 않아(§82) `TokenStatus.CANCELED` 상수를 삭제했다. 재사용 금지
    - ⚠️ **admitToken TTL 만료자는 4가 아니라 1에 머문다**(§36) — complete의 300초 창을 살리기 위해서다
 
-6. **Kafka 비동기 처리**
+7. **Kafka 비동기 처리**
    - Enqueue: Redis Lua(순번 확정) → **Kafka 발행(동기, ack 대기)** → **200 응답** → Consumer가 DB INSERT (At-Least-Once)
      - ⚠️ 발행이 응답보다 **먼저**다. 실패하면 QE001(503)이고 200이 안 나간다 — "200 먼저, Kafka는 뒤에서"가 아니다
      - 비동기인 것은 **DB 적재뿐**. 발행 대기는 응답 지연에 포함된다
    - 토픽은 **`token-lifecycle` 하나**, 파티션 키는 **`tokenId`** (§73 D16·D18)
      - `queueId` 키는 기각 — 한 큐 30만이면 99%가 한 파티션
 
-7. **tokens 파티셔닝 (Range, 월별)**
+8. **tokens 파티셔닝 (Range, 월별)**
    - `YEAR(issued_at) * 100 + MONTH(issued_at)`
    - 파티션 1달 유예 DROP (월말 걸친 토큰 과금 누락 방지)
 
-8. **RedisKeyFactory: static 메서드 방식**
+9. **RedisKeyFactory: static 메서드 방식**
    - Enum 아님 (가변인수 타입 안전성 위해)
 
-9. **JWT 분리**
+10. **JWT 분리**
    - Access (15분, type=ACCESS, stateless)
    - Refresh (7일, type=REFRESH, DB 저장 + Redis 캐시)
    - Token Rotation + 재사용 감지
 
-10. **동시성 제어 우선순위: DB 제약 > Redis 원자연산 > Kafka 순서 > DB 비관적 락 > 분산 락**
+11. **동시성 제어 우선순위: DB 제약 > Redis 원자연산 > Kafka 순서 > DB 비관적 락 > 분산 락**
    - 핫패스(enqueue/admit): Redis Lua Script로 락 회피
    - 콜드패스(createQueue 등 관리성): DB 비관적 락 또는 `@DistributedLock`
    - 표준 분산 락 어노테이션은 없음 → 사내 `@DistributedLock` (Redisson + AOP)
    - 어노테이션은 `queue-common`, Aspect는 `queue-infrastructure`
 
-11. **Redis 목표 구성: 독립 2 Cluster + 큐 단위 이중 라우팅** (DECISIONS §75, 시점 미정)
+12. **Redis 목표 구성: 독립 2 Cluster + 큐 단위 이중 라우팅** (DECISIONS §75, 시점 미정)
    - 한 큐의 키 4종(`waiting`/`seq`/`tokens`/`last-active`)은 **같은 클러스터**에 놓인다 (§75 D26)
    - 새 큐 상태 키는 반드시 `QueueKeys`를 거칠 것 — 태그 없는 키를 다중 키 Lua의 KEYS에 끼우면
      Cluster에서만 `CROSSSLOT`으로 깨진다. **로컬 Sentinel 테스트로는 안 잡힌다**

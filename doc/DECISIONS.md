@@ -7741,3 +7741,146 @@ lag만큼 물러진다. 정상 L(≪1s)에서 무시할 수준이고 방향도 �
 - `completed_at`이 **여전히 두 시계로 쓰인다**(`QueueEngineService`가 앱, `TokenJpaAdapter`가 MySQL).
   술어로 읽는 코드가 0건이라 무해하고 이번 스코프 밖이다 — 별건으로 남긴다
 
+---
+
+## §91 — `COMPLETED` 가드를 `status IN (0, 1)`로: 발행 순서 의존을 없앤다
+
+**날짜**: 2026-09-10 · **PR**: (미머지, `feat/mysql-ledger-clock`) · **3인 검토 만장일치**: architect · dba · monitoring
+
+### 문제 — 폴백 `complete`의 1.43%가 원장을 잃었다
+
+`COMPLETED` 소비 가드가 `IF(tokens.status = 1, ...)`라 **"ADMITTED가 먼저 적용됐다"를 전제**했는데,
+**프로듀서가 그 순서를 보장하지 않는다.**
+
+```
+admit.lua 커밋 ─┬─→ admitToken이 Redis에 **즉시** 보인다 (폴링은 Redis만 본다)
+                └─→ publishAdmitted: 건별 블로킹 .get()으로 **직렬** 발행 (실측 67~128ms)
+
+그 사이에 사용자: 폴링 → verify → complete
+파티션 순서:  COMPLETED(verify) → COMPLETED(complete 폴백) → ADMITTED  ← 1ms 늦음
+컨슈머: COMPLETED를 status=0 행에 적용 → 가드 거짓 → **조용히 no-op** ×2
+        그 뒤 ADMITTED → status 0→1
+→ status=1 / completed_at=NULL 고착 → 300초 뒤 ReconcileJob이 status=4 / expired_reason=2 확정
+```
+
+**Kafka는 순서를 지켰다. 틀린 순서를 그대로 지킨 것뿐이다.**
+
+**실측**: Kafka 오프셋 전수 대조로 stuck 7건 **전부** `COMPLETED 오프셋 < ADMITTED 오프셋` 확인.
+폴백 1,117건 중 **16건(1.43%)** 유실. 증상은 **k6의 complete 200 개수와 DB `status=2` 개수의 불일치**
+하나뿐이었다(run2 1007 vs 998, run3 1024 vs 1017). **Tenant는 200을 받아 알 수단이 없었다.**
+
+🔑 §90(시계 축)과 **직교**한다. 이건 발행 순서 축이다.
+
+### 결정 — D-13: `COMPLETED` ODKU를 자족하게 만든다 (한 곳, 추가 발행 0)
+
+```sql
+admit_token  = IF(tokens.status IN (0,1) AND tokens.admit_token IS NULL, new.admit_token, tokens.admit_token),
+admitted_at  = IF(tokens.status IN (0,1) AND tokens.admitted_at IS NULL, UTC_TIMESTAMP(3), tokens.admitted_at),
+completed_at = IF(tokens.status IN (0,1), UTC_TIMESTAMP(3), tokens.completed_at),
+status       = IF(tokens.status IN (0,1), 2, tokens.status)   -- 반드시 마지막
+```
+
+🔑 **동기 경로는 진작 `status IN (0,1)`이었다**(`markCompleted`). 비동기 경로만 `= 1`로 좁아
+**두 코드가 서로 다른 것을 참이라 가정**하고 있었다 — §4-2가 말하는 그 모순이고, **비대칭 자체가 결함**이다.
+원래 이 가드가 막으려던 것은 `status=2` 덮어쓰기지 0이 아니다(`TokenJpaAdapter` 주석이 그렇게 말한다).
+2와 4는 여전히 배제된다 — **4를 넓히면 확정된 만료를 완료로 뒤집는 새 결함**이 된다.
+
+### 기각한 대안 — D-1 (폴백·verify에서 `ADMITTED`를 먼저 발행)
+
+효과 자체는 성립한다(키가 `tokenId`, `send().get()` 블로킹, `enable.idempotence=true`).
+그래도 안 택한 이유 셋:
+
+1. **고칠 곳이 셋이다** — `publishCompletedOnVerify` · verify의 DB 폴백 · complete의 Redis 폴백.
+   계약상 verify만 부르는 테넌트가 정상이라 하나만 빠져도 구멍이고, **COMPLETED 생산자가 늘 때마다
+   같은 규칙을 기억해야 한다.** D-13은 모든 호출자가 통과하는 **한 곳**(가드)에 둔다
+2. **핫패스 비용** — verify는 게이트 개방 순간 입장자 수만큼 몰리는데, 블로킹 발행을 **2배**로 만든다
+3. 🔴 **`publishQuietly` 실패에 답이 없다.** 삼키고 COMPLETED만 나가면 **버그 재발**,
+   실패 시 COMPLETED를 생략하면 행이 `status=0`에 남아 waitingTtl 만료 — **200 받은 사용자가
+   원장에서 만료자가 된다.** Redis 키는 `cleanupCompleted`로 이미 지워져 복구 불가.
+   즉 **"브로커가 흔들리면 반드시 원장이 깨지는" 설계**다. 덜 나쁜 쪽이 없다는 것이 답이다
+
+**D-2**(가드만 확대)는 `admitted_at`이 영구 NULL이 되어 과금 근거가 사라져 기각.
+**컨슈머 재정렬 버퍼**는 상태 있는 컨슈머 + N대 리밸런스라 §4 위반.
+
+### 🔴 네 줄이 전부 하중을 받는다 (결함 주입 실측)
+
+| 주입 | 빨개짐 |
+|---|---|
+| 가드를 `= 1`로 되돌림 | ✅ |
+| `admit_token` 줄 제거 | ✅ |
+| `admitted_at` 줄 제거 | ✅ |
+| `status`를 맨 위로 | ✅ |
+
+- `status`/`completed_at`만 넓히면 뒤늦은 ADMITTED가 `status=0` 가드에 걸려 no-op →
+  `admit_token`·`admitted_at`이 **영구 NULL** → ① `SUM(admitted_at IS NOT NULL)`(입장권 개수의
+  유일한 근거) 과소 계상 ② `findCompletedAt`이 빈 값 → **complete 재시도가 404**.
+  **원장 유실이 과금 누락으로 모양만 바뀐다.**
+- `status`를 위로 올리면 ODKU 좌→우 평가로 나머지 셋이 이미 2로 바뀐 값을 봐 전부 거짓 →
+  세 컬럼이 NULL. **지금 버그보다 나쁘다**(status=2라 ReconcileJob이 손도 못 대고 흔적조차 없다)
+
+### 판정 실측 (2026-09-10, 앱 3대 + 컨슈머 + 배치, 빈 큐 40개)
+
+| | §91 이전(run3) | §91 이후 |
+|---|---|---|
+| 폴백을 탄 토큰 | 1,024 | 210 |
+| **그중 `status=2`가 아닌 것** | **7 (0.7%)** | **0** |
+| k6 complete 200 vs DB `status=2` | 1024 vs **1017** | 1031 vs **1031** ✅ |
+
+🔑 **공허한 0이 아니다.** D-13이 발동하면 세 컬럼을 **한 문장에서** 채우므로
+`admitted_at = completed_at`이 **정확히 일치**한다 — 그게 지문이다.
+```
+구조됨(admitted_at = completed_at) : 8      정상 순서 : 1,023
+```
+**경주는 여전히 일어났고(8건 = 0.78%, run3의 0.7%와 같은 비율) 안 깨졌을 뿐이다.**
+ReconcileJob 확정 후 재확인해도 폴백 210건 전부 `status=2`.
+
+최종 정합: `1201 = 완료 1031 + admit_stale 26 + waiting_ttl 144`.
+26·144는 **정상 이탈**이고 이 결함과 무관하다.
+
+### 대가
+
+이 경로의 `admitted_at`이 "admit 시각"이 아니라 **"complete 적용 시각"**이 된다.
+§90의 불변식(값이 MySQL 시계에서 나온다)은 **그대로 지킨다** — 흐리는 게 아니다.
+대기 시간 집계는 이 경합에서 COMPLETED가 ADMITTED보다 **먼저** 도착하므로 편향이 **아래쪽**이고,
+폭은 컨슈머 배치 간격이라 초 단위 집계에서 대개 0이다.
+
+**부수 이득**: ADMITTED 발행이 통째로 실패한 건(`result=error`, §80 U9 → 지금은 complete 영구 404)도
+COMPLETED가 세 컬럼을 채워 **살아난다**.
+
+### 함께 고친 것 (안 고치면 되돌려진다 — §4-2)
+
+- 🔴 **§90에서 내가 쓴 "`admitted_at` 값을 정하는 곳은 VALUES 절 하나다"가 거짓이 됐다.**
+  COMPLETED ODKU가 **두 번째로** 쓴다. 거긴 무동작이 아니라 하중을 받는다 —
+  두 경로가 `IS NULL`로 겹치지 않게 각자 채운다
+- `TokenRepository` · `TokenPersistService` · `TokenLifecycleConsumerTest`의
+  **"ADMITTED→COMPLETED 순서가 뒤집히면 완료되지 않는다"** 3곳 — 예시는 무효가 됐지만
+  **구간 단위 전달 규칙 자체는 살아 있다**(`ADMITTED`·`EXPIRED`는 여전히 `status = 0` 출발 가드)
+- 🔴 **기존 테스트가 옛 계약을 단정하고 있었다** — `"WAITING(0)에 COMPLETED가 와도 0"`.
+  성질(*허용 출발이 아니면 조용히 no-op*)은 살리고 예시를 **`EXPIRED(4) → COMPLETED`**로 옮겼다
+- `TokenUpsertRewriteTest`에 **COMPLETED 케이스 추가**. 그 전까지 **COMPLETED SQL이 재작성 퇴화해도
+  전 스위트가 초록**이었다(기존 테스트는 ADMITTED만 실행한다). §91이 SET 절을 2줄→4줄로 늘리면서
+  이 구멍이 실제 위험이 됐다. 실측: 현행·§91 둘 다 `Com_insert` 델타 **1**, 대조군은 500
+
+### 남는 것
+
+- 🔴 **기존 유실분은 복구 불가.** DB에서 "실제로 200을 받았던 것"과 "입장권만 쥐고 안 들어온 것"이
+  **컬럼 시그니처가 완전히 동일**하다. 유일한 판별자는 Kafka의 COMPLETED 이벤트 존재 여부인데
+  `log.retention.hours=168`(7일)이라 이미 만료 중이다
+- **새 메트릭을 만들지 않았다** — 🔴 **prod·dev에 `/actuator/prometheus`가 아예 없다**
+  (`include: health, info`). 지금 만드는 지표는 local에서만 산다.
+  폴백 카운터는 actuator 경계와 함께 prod 노출을 켤 때 **카운터 1개**로 충분하다
+  (분모는 `http_server_requests_seconds_count`가 이미 준다 — **분모를 새로 만들지 마라**)
+- 🔴 **`expired_reason=2`로는 "급증"을 판정할 수 없다.** 정상 이탈과 이 결함이 섞이고, 배경률이
+  하니스 설정에 따라 하루 사이 **4,948 → 37로 130배** 흔들렸다. 기준선이 없다
+- 🪤 **`alerts/infra.yml`의 `expired_reason=2` 판별식은 시계 알람의 조치문 안에만 있다.**
+  이번 경로는 시계와 무관해 그 알람이 안 뜨고 → **아무도 그 쿼리를 안 친다.** 트리거 없는 탐지다
+- `QueueEngineService`의 `log.warn` 문자열이 아직 "컨슈머 적재가 밀려 있다"로 원인을 단정한다
+  (주석은 §90에서 고쳤지만 문자열은 그대로). 1줄 별건
+- **실측으로 죽은 안**: "컨슈머 no-op 카운터"는 **불가능**하다 — `batchUpdate`가 `-2`
+  (`SUCCESS_NO_INFO`)를 주고, 단건도 `useAffectedRows` 기본값(matched rows)이라 no-op이 1을 낸다
+
+### 🪤 측정 함정
+
+`api-808*.log` 글롭이 **`api-8080.pre91.log`(이전 판 로그)까지 삼켜** "1,327건 중 16건 실패"라는
+가짜 결과가 나왔다. 파일명을 명시해 다시 세니 **210건 중 0건**.
+**판을 나눠 보관할 때 접미사만으론 부족하다 — 글롭이 여전히 매칭한다.**

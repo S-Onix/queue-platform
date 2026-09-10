@@ -257,17 +257,27 @@ class TokenJpaAdapterIntegrationTest {
     /**
      * 허용 출발이 아닌 전이는 <b>조용히 no-op</b>이다 (예외 아님). 예외로 만들면 재전달 한 건이
      * 배치 전체를 DLT로 끌고 간다.
+     *
+     * <p>🔧 <b>예시를 바꿨다 (§91).</b> 예전엔 "WAITING(0)에 COMPLETED가 와도 0"으로 이 성질을
+     * 보였는데, §91이 COMPLETED 가드를 {@code status IN (0, 1)}로 넓히면서 <b>그 전이는 이제
+     * 허용이다</b>(순서 역전이 실재하기 때문 — {@code transition_completedBeforeAdmittedStillCompletes}).
+     * 성질 자체는 그대로라, 여전히 허용 출발이 아닌 {@code EXPIRED(4) → COMPLETED}로 옮겼다.
+     * 🔑 <b>4를 배제하는 것은 의도다</b> — 넓히면 이미 확정된 만료를 완료로 뒤집는 새 결함이 된다.
      */
     @Test
-    @DisplayName("허용 출발이 아니면 상태가 바뀌지 않는다 — WAITING(0)에 COMPLETED가 와도 0")
+    @DisplayName("허용 출발이 아니면 상태가 바뀌지 않는다 — EXPIRED(4)에 COMPLETED가 와도 4")
     void transition_guardBlocksWrongOrigin() {
         String tokenId = "tok_guard_" + UUID.randomUUID();
         adapter.saveAllIfAbsent(List.of(waiting(tokenId, 9)));
+        adapter.applyTransition(TokenEventType.EXPIRED, List.of(
+                expired(tokenId, 9, ExpiredReason.WAITING_TTL)));
+        assertThat(statusOf(tokenId)).isEqualTo(4);
 
         adapter.applyTransition(TokenEventType.COMPLETED, List.of(
                 transition(tokenId, 9, TokenStatus.COMPLETED, "adm_x", null)));
 
-        assertThat(statusOf(tokenId)).as("COMPLETED의 허용 출발은 1뿐").isZero();
+        assertThat(statusOf(tokenId)).as("COMPLETED의 허용 출발은 0·1뿐 — 4는 배제된다").isEqualTo(4);
+        assertThat(completedAtOf(tokenId)).as("no-op이므로 완료 시각도 안 찍힌다").isNull();
     }
 
     /**
@@ -428,6 +438,54 @@ class TokenJpaAdapterIntegrationTest {
                 adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 100));
         assertThat(expired).isEqualTo(1);
         assertThat(statusOf(tokenId)).isEqualTo(4);
+    }
+
+    /**
+     * 🔴 <b>§91 회귀 가드 — 이 테스트가 빨개지면 폴백 complete의 1.43%가 다시 원장을 잃는다.</b>
+     *
+     * <p>실측(2026-09-09, Kafka 오프셋 전수): stuck 7건 <b>전부</b> COMPLETED 오프셋이 ADMITTED보다
+     * 앞이었다. {@code admit.lua}가 커밋되면 admitToken이 Redis에 즉시 보이고 폴링은 Redis만 보는데,
+     * {@code publishAdmitted}는 그 뒤에 건별 블로킹 {@code .get()}으로 <b>직렬</b> 발행한다
+     * (지연 67~128ms). 사용자가 그 사이에 verify·complete를 끝내면 순서가 뒤집힌다.
+     *
+     * <p>예전 가드({@code status = 1})는 여기서 <b>조용히 no-op</b>이 되어 행이
+     * {@code status=1 / completed_at=NULL}로 고착됐고, 300초 뒤 ReconcileJob이 {@code status=4}로
+     * 확정했다. <b>사용자는 200을 받아 알 수단이 없었다.</b>
+     *
+     * <p>🔑 <b>네 컬럼을 다 단정하는 것이 요점이다.</b> {@code status}만 보면
+     * {@code admit_token}·{@code admitted_at}이 NULL로 남는 판(= 원장 유실이 과금 누락으로
+     * 모양만 바뀌는 판)을 통과시킨다 — 3인 검토가 각각 다른 경로로 지목한 지점이다.
+     */
+    @Test
+    @DisplayName("§91: COMPLETED가 ADMITTED보다 먼저 도착해도 완료가 확정되고 네 컬럼이 다 찬다")
+    void transition_completedBeforeAdmittedStillCompletes() {
+        String tokenId = "tok_ord_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(tokenId, 21)));      // ENQUEUED만 적용된 상태
+
+        // 순서 역전: COMPLETED가 먼저 (admittedAt은 null — 실제 발행 지점 전부 그렇다)
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                transition(tokenId, 21, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
+
+        assertThat(statusOf(tokenId)).as("status=1 가드였다면 여기가 0으로 남는다").isEqualTo(2);
+        assertThat(admitTokenOf(tokenId))
+                .as("NULL이면 findCompletedAt이 빈 값을 읽어 complete 재시도가 영구 404가 된다")
+                .isEqualTo(admitTokenFor(tokenId));
+        assertThat(admittedAtOf(tokenId))
+                .as("NULL이면 SUM(admitted_at IS NOT NULL)에서 빠져 입장권이 과소 계상된다")
+                .isNotNull();
+        assertThat(completedAtOf(tokenId)).isNotNull();
+
+        // 뒤늦게 도착한 ADMITTED는 status=0 가드에 걸려 no-op — 값을 덮어쓰지 않아야 한다
+        LocalDateTime admittedAt = admittedAtOf(tokenId);
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(tokenId, 21)));
+
+        assertThat(statusOf(tokenId)).as("늦은 ADMITTED가 완료를 되돌리면 안 된다").isEqualTo(2);
+        assertThat(admittedAtOf(tokenId)).as("no-op이므로 값이 그대로여야 한다").isEqualTo(admittedAt);
+    }
+
+    private LocalDateTime completedAtOf(String tokenId) {
+        return jdbc.queryForObject("SELECT completed_at FROM tokens WHERE token_id = ?",
+                LocalDateTime.class, tokenId);
     }
 
     /** {@code @Modifying} 쿼리는 트랜잭션을 요구하는데, 클래스에 걸면 seed가 flush되지 않아 경로가 갈린다. */
