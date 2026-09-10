@@ -779,7 +779,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 |---|---|---|
 | `ENQUEUED` | (신규) | `ON DUPLICATE KEY UPDATE token_id = token_id` (no-op) |
 | `ADMITTED` | 0 | `IF(status = 0, 1, status)` |
-| `COMPLETED` | 1 | `IF(status = 1, 2, status)` |
+| `COMPLETED` | **0 · 1** | `IF(status IN (0,1), 2, status)` + `admit_token`·`admitted_at`·`completed_at` 보정 (§91) |
 | `EXPIRED` | 0 | `IF(status = 0, 4, status)` |
 
 > 🔴 **순서를 파티션에 기대지 않는다.** 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있고,

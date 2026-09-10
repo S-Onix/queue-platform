@@ -483,6 +483,56 @@ class TokenJpaAdapterIntegrationTest {
         assertThat(admittedAtOf(tokenId)).as("no-op이므로 값이 그대로여야 한다").isEqualTo(admittedAt);
     }
 
+    /**
+     * 🔴 <b>§91 회귀 가드 ②  — `IS NULL` 하위조건과 `status=2` 배제를 지킨다.</b>
+     *
+     * <p>순서 역전 가드({@code transition_completedBeforeAdmittedStillCompletes})가 <b>못 잡는</b>
+     * 두 구멍을 이 테스트가 막는다. 결함 주입으로 확인된 사각지대다 —
+     * {@code admitted_at} 줄의 {@code IS NULL}을 지워도, 가드를 {@code IN (0,1,2)}로 넓혀도
+     * <b>487건이 전부 초록이었다.</b>
+     *
+     * <p>🔑 <b>{@code IS NULL}이 없으면 1.43%가 아니라 완료되는 토큰 100%가 망가진다.</b>
+     * COMPLETED가 정상 순서로 와도 {@code admitted_at}을 자기 시각으로 덮어써서, 그 컬럼이
+     * "admit 시각"이 아니라 "complete 적용 시각"이 된다 →
+     * {@code queue_daily_stats}의 대기 시간이 <b>대기 + 체류 시간</b>이 되고,
+     * §90이 {@code transition_redeliveryDoesNotResurrect}에서 못박은 성질(재기록하면 complete 창이
+     * 연장되고 ReconcileJob 만료가 밀린다)이 COMPLETED 쪽에서 무너진다.
+     *
+     * <p>🪤 <b>{@code transition_redeliveryDoesNotResurrect}는 이걸 구조적으로 못 잡는다</b> —
+     * 비교 기준값을 COMPLETED 적용 <b>뒤에</b> 읽어서, 오염된 값을 기준으로 삼는다.
+     * 그래서 여기서는 <b>ADMITTED 직후에</b> 기준값을 잡는다.
+     */
+    @Test
+    @DisplayName("§91: 정상 순서에서 COMPLETED는 admitted_at을 덮지 않고, status=2 재도착도 no-op이다")
+    void transition_completedDoesNotOverwriteAdmittedAt() {
+        String tokenId = "tok_ovw_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(tokenId, 31)));
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(tokenId, 31)));
+
+        // 🔑 오염 전에 기준값을 잡는다 — 이 한 줄이 J2를 잡는 유일한 이유다
+        LocalDateTime admittedAt = admittedAtOf(tokenId);
+        assertThat(admittedAt).isNotNull();
+
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                transition(tokenId, 31, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
+
+        assertThat(statusOf(tokenId)).isEqualTo(2);
+        assertThat(admittedAtOf(tokenId))
+                .as("IS NULL 조건이 없으면 COMPLETED가 admit 시각을 자기 시각으로 덮는다 (전 토큰 대상)")
+                .isEqualTo(admittedAt);
+        LocalDateTime completedAt = completedAtOf(tokenId);
+        assertThat(completedAt).isNotNull();
+
+        // status=2 배제: 재전달된 COMPLETED가 이미 돌려준 completedAt을 덮으면 안 된다
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                transition(tokenId, 31, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
+
+        assertThat(completedAtOf(tokenId))
+                .as("가드를 IN (0,1,2)로 넓히면 여기가 갈린다 — Tenant에 돌려준 completedAt이 거짓이 된다")
+                .isEqualTo(completedAt);
+        assertThat(admittedAtOf(tokenId)).isEqualTo(admittedAt);
+    }
+
     private LocalDateTime completedAtOf(String tokenId) {
         return jdbc.queryForObject("SELECT completed_at FROM tokens WHERE token_id = ?",
                 LocalDateTime.class, tokenId);

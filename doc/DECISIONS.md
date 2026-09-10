@@ -7802,14 +7802,32 @@ status       = IF(tokens.status IN (0,1), 2, tokens.status)   -- 반드시 마�
 **D-2**(가드만 확대)는 `admitted_at`이 영구 NULL이 되어 과금 근거가 사라져 기각.
 **컨슈머 재정렬 버퍼**는 상태 있는 컨슈머 + N대 리밸런스라 §4 위반.
 
-### 🔴 네 줄이 전부 하중을 받는다 (결함 주입 실측)
+### 🔴 네 줄이 전부 하중을 받는다 (결함 주입 실측 — `tester` 재현 포함)
 
 | 주입 | 빨개짐 |
 |---|---|
-| 가드를 `= 1`로 되돌림 | ✅ |
-| `admit_token` 줄 제거 | ✅ |
-| `admitted_at` 줄 제거 | ✅ |
-| `status`를 맨 위로 | ✅ |
+| 가드를 `= 1`로 되돌림 | ✅ 1건 |
+| `admit_token` 줄 제거 | ✅ 1건 |
+| `admitted_at` 줄 제거 | ✅ 1건 |
+| `status`를 맨 위로 | ✅ **3건**(§91 가드 + `TokenAdmitQuery` 2건 — `completed_at`까지 NULL이 된다) |
+| `IN (0,1)` → `IN (0,1,4)` | ✅ 1건(`guardBlocksWrongOrigin`) |
+| **`admitted_at` 줄의 `IS NULL`만 제거** | 🔴 **처음엔 0건이었다** → 가드 ② 신설로 해소 |
+| **`IN (0,1)` → `IN (0,1,2)`** | 🔴 **처음엔 0건이었다** → 같은 가드가 해소 |
+| `admit_token` 줄의 `IS NULL`만 제거 | ⚪ 0건 — **결함이 아니다**(아래) |
+
+🔧 **"네 줄 전부 하중"은 줄 단위로는 참이지만 `IS NULL` 하위조건 단위로는 갈린다.**
+`admit_token`의 `IS NULL`은 **방어적 잔재**다 — COMPLETED 생산자 4곳이 전부 `admitToken`을
+non-null 필수 파라미터로 넘기고 그 값이 저장된 값과 같아, `new.admit_token`이 NULL이 되는
+경로가 없다. §4 기준으로 테스트를 만들 대상이 아니다.
+
+🔴 **내 첫 결함 주입 4종이 전부 "지우거나 되돌리는" 방향이었다.** `IS NULL`을 떼거나 가드를
+**넓히는** 방향을 안 해봐서 사각지대 둘을 놓쳤다. `IS NULL` 쪽이 특히 나쁘다 —
+**순서 역전 1.43%가 아니라 완료되는 토큰 100%**의 `admitted_at`이 complete 시각으로 밀린다
+(실측: 정상 순서에서 `admitted_at`이 `08:30:58` → `08:31:12`로 이동).
+그러면 `queue_daily_stats`의 대기 시간이 **대기 + 체류 시간**이 되고, §91이 판정 근거로 쓴
+지문(`admitted_at = completed_at`)이 **전 행에서 참**이 되어 지표가 무의미해진다.
+🪤 기존 `transition_redeliveryDoesNotResurrect`가 이걸 **구조적으로 못 잡는다** —
+비교 기준값을 COMPLETED 적용 **뒤에** 읽어 오염된 값을 기준으로 삼는다.
 
 - `status`/`completed_at`만 넓히면 뒤늦은 ADMITTED가 `status=0` 가드에 걸려 no-op →
   `admit_token`·`admitted_at`이 **영구 NULL** → ① `SUM(admitted_at IS NOT NULL)`(입장권 개수의
@@ -7860,6 +7878,21 @@ COMPLETED가 세 컬럼을 채워 **살아난다**.
 - `TokenUpsertRewriteTest`에 **COMPLETED 케이스 추가**. 그 전까지 **COMPLETED SQL이 재작성 퇴화해도
   전 스위트가 초록**이었다(기존 테스트는 ADMITTED만 실행한다). §91이 SET 절을 2줄→4줄로 늘리면서
   이 구멍이 실제 위험이 됐다. 실측: 현행·§91 둘 다 `Com_insert` 델타 **1**, 대조군은 500
+
+### 검토에서 나온 별건 (§91을 막지 않는다)
+
+- 🔴 **`BillingSnapshotIntegrationTest`가 공유 DB에서 재현 불가를 만든다.** `countBillingMismatch`·
+  `countPartitionRows`는 **테넌트 필터가 없는 전역 월 집계**인데 테스트가 **절대값으로** 단정한다
+  (`assertThat(baseline).isZero()` / `isEqualTo(1)`). 정작 같은 테스트의 주석이 *"공유 DB에 남의
+  7월 데이터가 있으면 절대값 단정이 무관한 이유로 깨진다 — baseline 대비 증가분으로 본다"*고
+  적고 있다. **주석과 코드가 서로 반대를 참이라 가정한다**(§4-2 그 자체).
+  실제로 고아 행 3개(`billing_snapshots` 2 + `queue_daily_stats` 1, 참조 대상이 이미 삭제됨)로
+  빨간불이 났다. 삭제 후 3회 연속 초록.
+  🔑 **그래서 "487건 통과"는 DB가 깨끗한 판에서만 참이다.**
+- `RedisTokenBucketRateLimiterTest::pollBucketRefillsFasterThanPollInterval` 벽시계 플레이크
+  (12회 중 1회). §91 무관
+- 🪤 **`-x compileJava`로 주입 검증을 하지 마라** — 주입된 클래스 파일을 재사용해 무수정 트리에서
+  빨간불이 난다(`tester` 실측)
 
 ### 남는 것
 
