@@ -53,3 +53,5 @@ doc/blog/
 # 에이전트 작업용 임시 디렉터리 — 로컬 전용
 .serena/
 scratchpad/
+# graphify 코드 그래프 인덱스 — 로컬 전용, 재생성 가능(graphify update .)
+graphify-out/
