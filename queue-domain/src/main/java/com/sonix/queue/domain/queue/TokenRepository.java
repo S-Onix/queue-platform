@@ -91,13 +91,17 @@ public interface TokenRepository {
      * Redis 전손 시 전원을 오판할 위험도 없다. 큐 단위인 것은 한 큐의 백로그가 {@code limit}을
      * 다 먹어 다른 큐를 굶기지 않게 하기 위해서다.
      *
-     * @param admittedBefore 이 시각 <b>이전</b>에 admit된 것이 대상
-     *                       (= {@code now - }{@link Token#COMPLETE_VALID_WINDOW_SECONDS}).
-     *                       더 일찍 자르면 정상적인 늦은 통보가 404를 받는다
-     * @param limit          한 번에 고칠 최대 행 수. Gap Lock을 피하려면 작게 끊는다
+     * <p>🔴 <b>기준 시각을 호출자가 정하지 않는다</b>(§90). 창의 길이만 넘기고, "지금"은 술어를
+     * 실행하는 DB가 정한다. 호출자(batch)가 자기 시계로 cutoff를 계산해 넘기면 그 시계와
+     * {@code admitted_at}(DB 시계)이 갈려, 아직 완료 가능한 행을 만료로 확정해 원장을 깬다.
+     *
+     * @param validWindowSeconds complete 유효 창의 길이. 이만큼 <b>지난</b> 것이 대상이다
+     *                           (= {@link Token#COMPLETE_VALID_WINDOW_SECONDS}).
+     *                           더 짧게 주면 정상적인 늦은 통보가 404를 받는다
+     * @param limit              한 번에 고칠 최대 행 수. Gap Lock을 피하려면 작게 끊는다
      * @return 실제로 만료 처리된 행 수
      */
-    int expireStaleAdmitted(String queueId, LocalDateTime admittedBefore, int limit);
+    int expireStaleAdmitted(String queueId, int validWindowSeconds, int limit);
 
     /**
      * 대사 기준선 — 이 시각 이전에 발급된 것 중 가장 큰 seq.

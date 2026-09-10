@@ -44,10 +44,20 @@ public class TokenJpaAdapter implements TokenRepository {
      * 값이 필요한 자리는 {@code new.col}로 참조한다. {@code AS} 절은 Connector/J가
      * VALUES 절의 끝으로 인식하므로(같은 클래스의 {@code AS_CLAUSE} 분기) 재작성이 유지된다 —
      * {@code TokenUpsertRewriteTest}가 이 사실을 왕복 횟수로 못박는다.
+     *
+     * <p>🔴 <b>{@code admitted_at} 자리의 {@code IF(? IS NULL, NULL, UTC_TIMESTAMP(3))}</b>는
+     * 충돌이 없어 <b>INSERT로 들어가는 경로</b>(= ENQUEUED가 유실돼 선행 행이 없는 경우)에서도
+     * 값의 출처를 MySQL 시계로 맞추기 위한 것이다(§90). SET 절만 바꾸면 이 경로만 앱 시계로
+     * 남아 <b>"거의 맞는데 가끔 틀리는"</b> 상태가 된다.
+     * {@code ?}를 그대로 두는 것은 <b>null 여부를 보존</b>하기 위해서다 — 이 템플릿은 4종 이벤트가
+     * 공유하므로 무조건 {@code UTC_TIMESTAMP(3)}로 바꾸면 {@code EXPIRED}·{@code COMPLETED}가
+     * 신규 행을 만들 때도 {@code admitted_at}이 찍혀, 입장한 적 없는 토큰을
+     * {@code SUM(admitted_at IS NOT NULL)}(= 입장권 개수의 유일한 근거)이 세어 버린다.
+     * {@code ?}가 <b>VALUES 절 안</b>이라 다중행 재작성은 유지된다.
      */
     private static final String TRANSITION_INSERT = """
             INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at, admit_token, admitted_at, expired_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AS new
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, UTC_TIMESTAMP(3)), ?) AS new
             ON DUPLICATE KEY UPDATE
             """;
 
@@ -67,6 +77,24 @@ public class TokenJpaAdapter implements TokenRepository {
 
     private static Map<TokenEventType, String> transitionSql() {
         Map<TokenEventType, String> sql = new EnumMap<>(TokenEventType.class);
+        // 🔴 admitted_at은 **이벤트가 실어온 값이 아니라 UTC_TIMESTAMP(3)** 이다 (§90).
+        //    🔑 값을 정하는 곳은 **VALUES 절 하나다**(TRANSITION_INSERT). 여기 `new.admitted_at`은
+        //       그 결과를 가리킬 뿐이라 ODKU 경로와 INSERT 경로가 같은 출처를 쓴다.
+        //       여기에 UTC_TIMESTAMP(3)을 또 쓰면 같은 규칙이 두 곳에 생기고, 실측으로
+        //       **아무 테스트도 지키지 않는 무동작**이었다(결함 주입: SET만 되돌려도 전부 초록).
+        //    이 컬럼은 술어의 좌변이고, 우변은 셋 다 MySQL 시계다
+        //    (TokenJpaRepository의 findAdmittedByAdmitToken · markCompleted · expireStaleAdmitted).
+        //    좌변을 admit을 처리한 API 서버 시계로 쓰면 **한 창을 두 시계로 재게 된다** —
+        //    그 서버가 S초 뒤처지면 DB 술어의 창이 max(300 − S, 0)으로 줄고, 실측(2026-09-09)에서
+        //    S = 398이면 admit 0초 뒤 markCompleted가 0행이었다. 결과는 404가 아니라 원장 손상이다
+        //    (QueueEngineService.complete 주석 참조).
+        //    ⚠️ 대가는 이 값이 "admit 시각"이 아니라 **"컨슈머 적용 시각"** 이 되는 것이다.
+        //       issued_at → admitted_at 대기 시간(queue_daily_stats.sum_wait_sec)에 Kafka lag이 섞인다.
+        //       초 단위 집계라 정상 lag(≪1s)에서는 표현되지 않고, 정밀한 값은 앱이 직접 재는
+        //       queue_admission_wait_seconds가 따로 갖고 있다.
+        //    ❌ issued_at은 **같이 옮기지 않는다** — UNIQUE(token_id, issued_at) + 파티션 키 +
+        //       Kafka 재처리 멱등의 절반이라, DB 시계로 만들면 재처리마다 새 행이 생긴다.
+        //       식별자는 발생지 시계, 판정은 판정하는 곳의 시계다.
         sql.put(TokenEventType.ADMITTED, TRANSITION_INSERT + """
                 admit_token = IF(tokens.status = 0, new.admit_token, tokens.admit_token),
                 admitted_at = IF(tokens.status = 0, new.admitted_at, tokens.admitted_at),
@@ -204,8 +232,8 @@ public class TokenJpaAdapter implements TokenRepository {
 
     @Override
     @Transactional
-    public int expireStaleAdmitted(String queueId, LocalDateTime admittedBefore, int limit) {
-        return tokenJpaRepository.expireStaleAdmitted(queueId, admittedBefore, limit);
+    public int expireStaleAdmitted(String queueId, int validWindowSeconds, int limit) {
+        return tokenJpaRepository.expireStaleAdmitted(queueId, validWindowSeconds, limit);
     }
 
     @Override

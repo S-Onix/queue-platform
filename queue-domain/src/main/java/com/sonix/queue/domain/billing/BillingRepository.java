@@ -47,8 +47,16 @@ public interface BillingRepository {
      * <p><b>덮어쓴다.</b> 전월을 그 달 내내 재집계하지 않으면 늦게 admit된 토큰이 통계에서
      * 통째로 빠지는데, 그게 바로 <b>가장 오래 기다린 토큰</b>이라 이 표의 존재 이유다.
      *
-     * <p>🪤 <b>대기 시간 기준은 {@code admitted_at}</b>이다. {@code completed_at}에는 테넌트 내부
-     * 처리 시간과 Kafka lag이 섞인다 — {@code issued_at → admitted_at}만 Platform 단독 책임 구간이다.
+     * <p>🪤 <b>대기 시간 기준은 {@code admitted_at}</b>이다. {@code completed_at}에는 <b>테넌트 내부
+     * 처리 시간</b>이 섞인다 — 우리가 못 재고 우리 책임도 아닌 시간이라 지표가 무의미해진다.
+     *
+     * <p>⚠️ <b>§90 이후 {@code admitted_at}에도 Kafka lag이 섞인다</b>(값을 컨슈머가 적재 시점의
+     * {@code UTC_TIMESTAMP(3)}로 찍는다). 그래도 기준을 옮기지 않는 이유는 위 문장 하나로 충분하기
+     * 때문이다 — lag은 유계이고 상시 감시되며, 이 컬럼은 {@code TIMESTAMPDIFF(SECOND, ...)}라
+     * 정상 구간(≪1s)에서는 아예 표현되지 않는다. lag이 초 단위로 벌어지면 그건 대기 시간이 실제로
+     * 길어진 사건이라 지표가 부풀어 보이는 편이 오히려 옳다.
+     * 실시간 정밀값은 {@code queue_admission_wait_seconds}(앱이 admit 시점에 DB 무접촉으로 계측)가
+     * 따로 갖고 있다 — 이 표는 <b>장기 보존·롤업 대사</b>용이지 SLA 정본이 아니다.
      *
      * <p>🪤 <b>생존 편향</b>: admit까지 간 토큰만 표본이라 <b>대기가 나쁠수록 지표가 좋아 보인다</b>.
      * 같은 행의 {@code total_admit_issued / total_enqueued}(admit률)를 함께 읽어야 해석이 된다.

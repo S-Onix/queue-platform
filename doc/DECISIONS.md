@@ -5401,7 +5401,7 @@ MGET queue:{q}:admit-watermark   queue:{q}:pacing   queue:{q}:seq
 - 키: `queue:{queueId}:admit-watermark` — **해시태그 필수**(§70 D10). 단일 스칼라.
   **`QueueKeys.admitWatermark(queueId)`를 신설해 그것만 쓴다.** 문자열 리터럴로 조립하면
   해시태그가 빠져도 **로컬 Sentinel에서는 절대 안 잡히고 Cluster에서만 `CROSSSLOT`으로 깨진다**
-  (CLAUDE.md 핵심 설계 결정 10)
+  (CLAUDE.md 핵심 설계 결정 — "Redis 목표 구성: 독립 2 Cluster". 🪤번호로 걸지 마라, 재정렬에 깨진다)
 - **admit Lua 안에서 갱신한다.** admit은 이미 원자 연산이어야 하고(ZSet에서 N개 pop + 상태 전이),
   그 스크립트가 방금 뽑은 최대 seq를 알고 있다. **왕복 추가 0회**
 - ⛔ **아래 문단은 이력이다 — §80이 닫았다.** admit 전 구간이 단일 Lua로 원자가 됐다.
@@ -7583,3 +7583,161 @@ Tomcat 요청 버퍼)인데, prod는 actuator prometheus를 껐으므로(§85) `
   쓰고 있어 **재시도가 부하를 더한다**. `ConcurrentLinkedQueue.size()`는 O(n)이라 요청마다
   못 부르고, `LinkedBlockingQueue`로 바꾸면 종료 경로의 `remove()`가 전체 락이 된다
 - **4,915\~10,000 rps 구간 미측정** — 부하 발생기 한 대로는 못 만든다(하니스가 먼저 굶는다)
+
+---
+
+## §90 — 원장 판정 경로의 시계를 MySQL 하나로 (`admitted_at`을 `UTC_TIMESTAMP(3)`가 찍는다)
+
+**날짜**: 2026-09-09 · **PR**: (미머지) · **에이전트 3인 검토**: architect · dba · monitoring
+
+### 문제 — 한 창을 두 시계로 재고 있었다
+
+`admitted_at`은 **술어 세 개의 좌변**이고, 우변은 전부 MySQL 시계였다.
+
+| 술어 | 하는 일 | 창 |
+|---|---|---|
+| `markCompleted` (`TokenJpaRepository:65`) | complete 자격 판정 | 300초 |
+| `findAdmittedByAdmitToken` (`:44`) | verify DB 폴백 신선도 | 60초 |
+| `expireStaleAdmitted` (`:117`) | 만료 판정(reconcile) | 300초 |
+
+그런데 **좌변은 admit을 처리한 API 서버의 시계**로 찍혔다(Kafka payload 값). 비교의 양변이
+다른 기계에서 나온다. 그 서버가 S초 뒤처지면 DB 술어의 창이 `max(300 − S, 0)`으로 줄어든다.
+
+**실측(2026-09-09, 실제 `markCompleted` SQL): S=398이면 admit 0초 뒤에도 UPDATE가 0행.**
+
+증상은 404가 아니라 **원장 손상**이다. S>240이면 `admit-by-admit`의 PX 60초 ⊄ DB 300초가 되어
+complete의 Redis 폴백이 자격을 넓히고, 그때:
+
+1. `ReconcileJob.expireStaleAdmitted`가 그 행을 `status=4`로 확정
+2. 사용자는 폴백으로 **200**을 받고 COMPLETED가 발행됨
+3. 컨슈머 가드가 `IF(tokens.status = 1, ...)`라 `status=4`에서 **no-op** (`TokenJpaAdapter`)
+4. 행은 `status=4 / completed_at=NULL`로 **영구 고정**, 재시도는 404 — **멱등성도 깨진다**
+
+**Tenant는 200을 받아 알 수단이 없고, 수동 SQL 외 복구 경로가 없다.**
+
+### 왜 "감시만"으로는 안 되는가 (monitoring 실측)
+
+`HostClockNotSynchronized`(2026-09-09 신설)로 막으려 했으나 **구조적으로 못 잡는다.**
+
+- `node_timex_sync_status`는 "시계가 맞는가"가 아니라 **"NTP 데몬이 커널을 먹이고 있는가"**
+  (`STA_UNSYNC` 비트)를 잰다. 데몬이 수 시간 죽어 방치돼야 0이 된다.
+  수동 `date -s` · VM 스냅샷 복원 · 절전 복귀 · **NTP 서버가 틀린 시각을 배포** — 넷 다 침묵한다
+- 🔴 **Alertmanager가 없다.** firing은 9090 UI의 한 줄이라 새벽 3시에 아무도 안 깨어난다
+- 🔴 **스크레이프 타깃이 `queue-api` 1대(8080)뿐**인데 통합 시나리오는 3대(8080/8083/8084)다.
+  스큐는 "한 대만 어긋난 상태"라 **탐지 확률 1/3**
+- 결정적: **-398초 실측은 2026-08-26**인데 **node_exporter 설치는 2026-09-04**다.
+  유일하게 실제로 일어난 그 사건 때 이 알람은 존재하지도 않았다
+
+### 결정 — B-full: `admitted_at`을 MySQL이 찍는다
+
+```sql
+-- TRANSITION_INSERT의 VALUES 9번째 칸 (값의 유일한 출처)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, UTC_TIMESTAMP(3)), ?) AS new
+-- expireStaleAdmitted: cutoff를 호출자가 계산하지 않는다
+AND admitted_at < UTC_TIMESTAMP(3) - INTERVAL :validWindowSeconds SECOND
+```
+
+### 경계 규칙 — **식별자·순서는 발생지 시계, 판정은 판정하는 곳의 시계**
+
+"시각 권위 통일"이 **아니다.** 바뀌는 것은 **원장 판정 경로**뿐이다.
+
+| 경로 | 시계 | 이번에 바뀌나 |
+|---|---|---|
+| enqueue `issued_at` | **앱 시계 유지** | ❌ **바꾸면 안 된다** |
+| admit `admitted_at`(DB) | 앱 → **MySQL** | ✅ |
+| admit Redis(`admit.lua` `expiresAt`·`admitted` ZSet score) | 앱 시계 유지 | ❌ |
+| admit Redis PX 60s | 상대 시간 | — 스큐 면역 |
+| verify·complete 술어 | 이미 MySQL | — |
+| reconcile cutoff | batch 앱 → **MySQL** | ✅ |
+| `TokenReclaimJob` | 앱 시계 유지 | ❌ |
+| `queue_admission_wait_seconds`·`_clock_skew_total` | 앱↔앱 유지 | ❌ |
+
+🔑 **`issued_at`을 같이 옮기면 안 된다.** `UNIQUE(token_id, issued_at)` + 월별 파티션 키 +
+Kafka 재처리 멱등의 절반이다. DB 시계로 만들면 **재처리마다 새 행이 생겨** 즉시 깨진다.
+
+🔑 **Redis가 안 따라오는 것도 의도다.** 거기서 어긋나면 회수가 이르거나 늦을 뿐 — **가용성**
+문제고 되돌릴 수 있다. MySQL 쪽만 **원장 무결성**(영구 고정 + 200 응답) 문제라 등급이 다르다.
+
+### 얻는 것 — 불변식이 가정에서 구조적 사실로 승격된다
+
+전에는 "PX 60초 ⊂ DB 300초"가 **시계가 맞아야** 참이었다. 이제 `admitted_at = admit + 컨슈머랙(≥0)`
+이라 DB 창의 **시작점이 Redis 창보다 항상 뒤**고, 종료점은 항상 240초 이상 여유다 —
+**어떤 앱 시계 스큐에서도 포함이 성립한다.**
+
+`ReconcileJob`까지 옮긴 이유가 이것이다. `admitted_at`만 고치면 (MySQL 시계) vs (batch 시계)로
+**비대칭이 남아** 같은 사고가 방향만 반대로 재발한다.
+
+### 대가 — 대기 시간에 Kafka lag이 섞인다
+
+`admitted_at`이 정확히는 **"컨슈머 적용 시각"**이 된다. `queue_daily_stats.sum_wait_sec`/`max_wait_sec`
+(`TIMESTAMPDIFF(SECOND, issued_at, admitted_at)`)에 lag이 양수 방향으로 섞인다.
+
+받아들인 근거:
+- **읽는 코드가 0건이다** — 대시보드 21개 expr 전수·`app.yml` 언급 2건 모두 주석. write-only다
+- **초 단위 집계**라 정상 lag(≪1s)에서는 표현되지 않는다. 초 단위로 벌어지면 그건 대기가 실제로
+  길어진 사건이라 부풀어 보이는 편이 옳다
+- **정밀값은 이미 따로 있다** — `queue_admission_wait_seconds`(앱이 admit 시점에 DB 무접촉 계측)
+- `admitted_at`을 고른 진짜 근거는 **"`completed_at`엔 테넌트 내부 처리 시간이 섞인다"**였고,
+  그건 그대로 유효하다. Kafka lag은 부수적 근거였다
+
+**B-split(판정용/측정용 컬럼 분리)은 기각.** 컬럼+마이그레이션+엔티티+매핑을 늘려서 사는 것이
+"이미 다른 데 있는 값의 장기 보존판 정확도"뿐이다(§4).
+
+### 부수 효과 (보고만, 대응 안 함)
+
+`admitted_at = admit + L`이라 **verify DB 폴백의 60초 창이 L만큼 뒤로 밀린다.** L>0이고 사용자가
+`admit+60 ~ admit+60+L`에 verify하면 Redis TTL은 만료됐는데 DB 폴백이 통과시킨다. §36의 경계가
+lag만큼 물러진다. 정상 L(≪1s)에서 무시할 수준이고 방향도 관대한 쪽이라 지금 뭘 만들지 않는다.
+
+### 실측 — 결함 주입으로 가드 4종 검증
+
+| 주입 | 빨개진 것 | 판정 |
+|---|---|---|
+| VALUES 절 원복(`?`) | ODKU·INSERT §90 가드 + 기존 1건 = **3건** | ✅ 단일 출처가 두 경로를 덮는다 |
+| VALUES를 무조건 `UTC_TIMESTAMP(3)` | EXPIRED NULL 가드 포함 **대량** | ✅ null성 보존이 필요하다 |
+| 만료 술어 창 1000배(`SECOND`→`DAY`) | **4건** | ✅ 만료가 죽지 않는다 |
+| ODKU SET 절만 원복 | **0건** | 🔴 아래 |
+
+🔴 **`admitted_at`을 SET 절에도 `UTC_TIMESTAMP(3)`로 쓴 판은 무동작이었다.** `new.admitted_at`이
+이미 VALUES 절의 표현식을 가리키기 때문이다. 결함 주입이 아니었으면 "두 곳을 고쳤으니 안전하다"고
+믿은 채로 남았을 것이다. **값의 출처는 VALUES 절 하나로 모았다.**
+
+🪤 **`@Transactional`을 테스트에 붙이면 경로가 갈린다.** 붙이면 `saveAllIfAbsent`가 flush되지 않은
+채 `applyTransition`의 raw JDBC가 돌아 **충돌이 없어 INSERT 경로**를 탄다. 운영의 주 경로는 ODKU다 —
+실제로 이 함정 때문에 첫 가드가 **엉뚱한 경로를 지키고 있었고, 결함 주입 전까지 초록이었다.**
+
+- `TokenUpsertRewriteTest` 통과 = **`IF(? IS NULL, ...)`가 배치 재작성을 안 껐다.**
+  `?`가 VALUES 절 **안**이라 Connector/J 8.3.0 `QueryInfo`의 실격 분기 셋(`?`가 VALUES 앞/뒤,
+  `LAST_INSERT_ID`)에 걸리지 않는다
+- 전체 스위트 **485건 / skip 4**. 실패 0이지만 **조건부다** — 전 스위트를 한 번에 돌리면
+  `RedisTokenBucketRateLimiterTest::pollBucketRefillsFasterThanPollInterval`이 간헐 실패한다.
+  **§90 무관**(격리 재실행 3/3 통과, 변경 파일과 ratelimit·Redis 경로의 접점 0). 부하가 걸린
+  머신에서 2초 refill을 벽시계로 재는 테스트다.
+  🔑 **"두 번 돌려 두 번 다 초록"을 "실패 0"으로 단정하면 안 된다** — lead가 세 번째 실행에서
+  잡았다. 타이밍 의존 테스트는 실행 횟수가 곧 신뢰도다
+
+### 함께 고친 것
+
+- `infra.yml`의 `HostClockNotSynchronized` **피해 범위 쿼리가 틀렸다**(§90과 별개로 지금도 거짓).
+  `status=2` 행의 `TIMESTAMPDIFF(admitted_at, completed_at)`을 지목했는데 —
+  ① 손상된 행은 `status=4 / completed_at=NULL`이라 **재려는 대상을 술어가 스스로 배제**하고
+  ② 두 컬럼 다 앱 시계라 앱↔DB 차이도 안 준다. **새벽 3시에 거짓 안심을 준다.**
+  → `expired_reason=2` 기반 판별식으로 교체. 그 알람이 지키는 것도 재서술했다
+  (이제 `issued_at`·Redis TTL·JWT지, 원장이 아니다)
+
+### 남는 것
+
+- **컨슈머 lag 미측정** — B-full의 유일한 실질 대가인데 크기를 안 쟀다
+- **스크레이프 타깃 8083·8084 누락** · **Alertmanager 부재** — 둘 다 별건
+- 🔴 **MySQL failover가 잔여 위험이다.** 권위가 "MySQL"이 아니라 **"그 순간의 master"**다.
+  ROW 복제라(실측 `binlog_format=ROW`) replica는 `UTC_TIMESTAMP(3)`를 재평가하지 않고 master가
+  계산한 값을 그대로 적재하므로 **이미 쓰인 행은 안전**하다. 그러나 승계 후 실행되는 술어는
+  **새 master의 시계**로 평가되므로, 승계 경계에서 `admitted_at`(옛 master 시계)과
+  `UTC_TIMESTAMP(3)`(새 master 시계)가 만난다. 노출 구간은 in-flight 토큰의 300초뿐이고
+  시계가 둘(DB 호스트 2대)이라 §90 이전(앱 서버 N대, 쌍이 N²)보다 훨씬 좁지만 **0은 아니다.**
+  MySQL은 자동 failover 장치가 없고(Redis만 Sentinel/Cluster) 승계가 수동이므로,
+  **승계 절차에 "두 호스트 시계 차 확인"을 넣는 것으로 족하다** — 새 장치를 만들 필요는 없다.
+  🪤 로컬로는 재현 불가다 — 3306·3307이 **같은 호스트**에서 돌아 시계가 물리적으로 동일하다
+- `completed_at`이 **여전히 두 시계로 쓰인다**(`QueueEngineService`가 앱, `TokenJpaAdapter`가 MySQL).
+  술어로 읽는 코드가 0건이라 무해하고 이번 스코프 밖이다 — 별건으로 남긴다
+

@@ -237,8 +237,11 @@ public class QueueEngineService {
      * 발행이 실패했을 때 재시도가 그것을 <b>복구</b>할 수 있는 유일한 경로다.
      *
      * <p>⚠️ <b>REPLAY의 {@code admittedAt}은 재시도 시각이다</b>(멱등 payload에 시각이 없다).
-     * 첫 발행이 성공했다면 컨슈머 가드가 status 1이라 이 값을 쓰지 않아 무해하고, 실패했다면
-     * 이 값이 유일한 근거다. 대가는 유효 창(60초)이 재시도가 늦은 만큼 밀리는 것이다.
+     * <b>§90 이후 이 값 자체는 적재되지 않는다</b> — 컬럼은 {@code UTC_TIMESTAMP(3)}가 찍고 이벤트는
+     * null 여부만 준다. 그래서 "재시도 시각이라 유효 창이 밀린다"는 대가가 <b>없다</b>.
+     * 여기서 non-null을 실어야 하는 이유는 시각이 아니라 <b>"admit이 일어났다"는 표지</b>이기 때문이고,
+     * null을 실으면 첫 발행이 실패했을 때 복구 경로가 {@code admitted_at}을 NULL로 남겨
+     * complete가 영구 404가 된다.
      *
      * <p>🔴 <b>첫 발행 실패에서 끊는다.</b> 발행은 건별 {@code .get(12초)} 블로킹이라, 브로커가
      * 무응답이면 {@code count=100}짜리 admit 한 건이 <b>최대 20분</b> 동안 요청 스레드를 잡는다.
@@ -403,32 +406,51 @@ public class QueueEngineService {
             //    (두 상수가 갈리면 불변식이 깨진다 — Token.COMPLETE_VALID_WINDOW_SECONDS와
             //     admit TTL을 같이 보고 고쳐라.)
             //
-            // 🔴 **이 불변식에는 상수 말고 전제가 하나 더 있다 — 시계가 맞아야 한다.**
-            //    두 창을 재는 시계가 다르다: 60초는 **Redis**가 PX로 재고(상대 시간이라 시계 오차에
-            //    면역이다), 300초는 **MySQL의 UTC_TIMESTAMP(3)** 가 `admitted_at`과 비교해 잰다.
-            //    그런데 `admitted_at`은 **admit을 처리한 API 서버의 시계**로 찍힌 값이다
-            //    (TokenLifecycleConsumer:278 — payload 값이지 DB의 NOW()가 아니다).
-            //    그 서버가 S초 뒤처지면 **DB 술어의 창**이 `max(300 − S, 0)`으로 줄어든다.
-            //    ⚠️ **엔드포인트의 창과 혼동하지 마라** — 이 폴백이 바닥을 60초로 받쳐서
-            //       사용자 기준 창은 `max(300 − S, 60)`이다. S가 커도 admit 후 60초 안이면 200이다.
-            //    실측(2026-09-09, 실제 markCompleted SQL): S=398이면 admit 0초 뒤에도 UPDATE가 0행.
+            // 🔑 **이 불변식은 상수 둘만으로 성립한다 — 시계는 더 이상 전제가 아니다** (§90).
+            //    두 창을 재는 시계: 60초는 **Redis**가 PX로 재고(상대 시간이라 시계 오차에 면역),
+            //    300초는 **MySQL의 UTC_TIMESTAMP(3)** 가 `admitted_at`과 비교해 잰다.
+            //    그리고 그 `admitted_at`도 이제 **MySQL이 찍는다**(TokenJpaAdapter의 ADMITTED ODKU) —
+            //    비교의 양변이 같은 프로세스에서 나오므로 **어떤 앱 시계 스큐에도 창이 300초 그대로**다.
+            //    게다가 `admitted_at = admit + 컨슈머랙(≥0)`이라 DB 창의 시작점이 Redis 창보다
+            //    항상 뒤에 있어, 포함 관계가 **구조적으로** 성립한다.
             //
-            // 🔴 **S > 240이면 60 ⊄ 300이 되어 폴백이 자격을 넓힌다.** 위 문장이 "넓어지지
-            //    않는다"고 단언한 바로 그 일이다. 그리고 그때 벌어지는 일이 404가 아니라 더 나쁘다:
-            //      ① ReconcileJob.expireStaleAdmitted가 그 행을 status=4로 확정한다
-            //      ② 사용자는 이 폴백으로 **200**을 받고 COMPLETED가 발행된다
-            //      ③ 그런데 컨슈머 가드가 `IF(tokens.status = 1, ...)`라 status=4에서 **no-op**
-            //         (TokenJpaAdapter:91) → 행은 `status=4 / completed_at=NULL`로 **영구 고정**
-            //      ④ 같은 요청의 재시도는 폴백 키가 지워져 404 — **멱등성도 깨진다**
-            //    즉 이건 가용성 문제이자 **원장 무결성 문제**다. Tenant는 200을 받아 알 수단이 없다.
+            // 🪤 **예전엔 여기가 원장 손상 경로였다** — `admitted_at`이 admit을 처리한 API 서버
+            //    시계로 찍히던 시절, 그 서버가 S초 뒤처지면 DB 술어의 창이 `max(300 − S, 0)`으로
+            //    줄었다(실측 2026-09-09: S=398이면 admit 0초 뒤에도 markCompleted가 0행).
+            //    S > 240이면 60 ⊄ 300이 되어 이 폴백이 자격을 넓히고, 그 결과가 404보다 나빴다:
+            //      ① ReconcileJob.expireStaleAdmitted가 그 행을 status=4로 확정
+            //      ② 사용자는 이 폴백으로 **200**을 받고 COMPLETED가 발행됨
+            //      ③ 컨슈머 가드가 `IF(tokens.status = 1, ...)`라 status=4에서 **no-op**
+            //         (TokenJpaAdapter) → 행은 `status=4 / completed_at=NULL`로 **영구 고정**
+            //      ④ 재시도는 폴백 키가 지워져 404 — 멱등성까지 깨졌다
+            //    가용성이 아니라 **원장 무결성** 문제였고, Tenant는 200을 받아 알 수단이 없었다.
+            //    🔑 **이 이력을 지우지 마라** — `admitted_at`을 이벤트 payload 값으로 되돌리거나
+            //       reconcile cutoff를 다시 앱에서 계산하면 같은 사고가 그대로 재발한다.
+            //       (batch 시계로 되돌리면 방향만 반대인 같은 사고다.)
             //
-            // 🪤 **reconcile이 complete보다 먼저 자르는 것이 아니다.** 둘 다 `admit + (300 − S)`에
-            //    닫힌다 — 어긋난 게 아니라 **같은 잘못된 기준 위에서 일관되게 틀린다.** 원점은
-            //    `admitted_at`이 다른 기계의 시계로 쓰였다는 것이지 batch 시계가 아니다.
-            //    (reconcile cutoff를 SQL로 옮겨도 이 사고는 안 고쳐진다 — 시계 하나가 줄 뿐이다.)
+            // ⚠️ 남은 앱 시계는 **원장 밖**이다: Redis `admitted` ZSet score와 TokenReclaimJob은
+            //    여전히 앱 시계고, 거기서 어긋나면 회수가 이르거나 늦을 뿐 되돌릴 수 있다.
+            //    issued_at도 앱 시계인데 **그게 맞다** — UNIQUE(token_id, issued_at) + 파티션 키 +
+            //    Kafka 재처리 멱등의 절반이라, DB 시계로 만들면 재처리마다 새 행이 생긴다.
             //
-            // 🪤 그때 아래 WARN은 "컨슈머 적재가 밀려 있다"라 **오진을 유도한다** — Kafka는 멀쩡하다.
-            //    감시는 alerts/infra.yml의 HostClockNotSynchronized가 한다(사용자가 닿기 전에 뜬다).
+            // 🔴 **아래 WARN의 문구를 믿지 마라 — 폴백에 닿는 이유는 최소 둘이다.**
+            //    ① 컨슈머 적재 지연 (WARN이 말하는 그것)
+            //    ② **ADMITTED가 아직 발행조차 안 됐다** — admit.lua가 커밋되면 admitToken이 Redis에
+            //       즉시 보이는데(폴링은 Redis만 본다), publishAdmitted는 그 뒤에 건별 블로킹
+            //       .get()으로 **직렬** 발행한다. 그 사이에 사용자가 폴링 → verify → complete를
+            //       끝내면 COMPLETED가 ADMITTED보다 **먼저** 파티션에 append된다.
+            //    실측(2026-09-09, Kafka 오프셋 전수): stuck 7건 **전부** COMPLETED 오프셋 < ADMITTED
+            //    오프셋이었다. ADMITTED 발행 지연 67~128ms. 폴백 1,117건 중 16건(1.43%)이
+            //    COMPLETED 가드 `IF(tokens.status = 1, ...)`에서 no-op이 되어 status=1로 고착됐고,
+            //    300초 뒤 ReconcileJob이 status=4 / completed_at=NULL로 확정했다.
+            //    🪤 **이 WARN만 보고 Kafka·컨슈머를 조사하면 원인을 영영 못 찾는다** —
+            //       ②의 경우 컨슈머 랙은 0이다. 판별은 그 tokenId의 ADMITTED·COMPLETED
+            //       **오프셋 대소**로 한다. (별건 미해결)
+            //
+            // 🪤 시계 스큐로 여기 오던 경로는 §90으로 닫혔다. 예전 주석이 감시를
+            //    HostClockNotSynchronized에 맡긴다고 적었는데, 그 알람은 `node_timex_sync_status`
+            //    (= NTP 데몬이 커널을 먹이는가)를 볼 뿐이라 수동 `date -s`·스냅샷 복원·절전 복귀·
+            //    NTP가 틀린 시각 배포를 **못 잡는다**. 그 신뢰가 필요 없어진 것이 §90의 요점이다.
             //
             // ⚠️ **순서를 뒤집지 마라.** Redis를 먼저 보게 만들면, publishQuietly가 발행을
             //    삼켰을 때 행이 status=1로 남고 ReconcileJob이 **완료된 토큰을 EXPIRED로

@@ -173,11 +173,16 @@ public class ReconcileJob {
      * {@code markCompleted}가 어차피 0행이라 <b>더 이상 완료가 올 수 없다</b> — 정리해도 되돌릴
      * 것이 없다. 더 일찍(예: admitToken TTL 60초) 자르면 정상적인 늦은 통보가 404를 받는다.
      * 실측으로 확인된 경로다 — admit 후 <b>98초</b>에도 {@code complete}가 200을 돌려준다.
+     *
+     * <p>🔴 <b>cutoff를 여기서 계산하지 않는다</b>(§90). 창의 길이만 넘기고 "지금"은 DB가 정한다 —
+     * {@link #nowUtc()}로 자르면 <b>batch 서버 시계</b>와 {@code admitted_at}(DB 시계)을 비교하게 되고,
+     * batch가 앞서면 아직 완료 가능한 행을 만료로 확정해 {@code status = 4 / completed_at = NULL}로
+     * 영구 고정시킨다. {@code markCompleted}와 <b>같은 시계로 같은 창</b>을 재는 것이 요점이다.
      */
     private int expireStaleAdmitted(Queue queue) {
-        LocalDateTime cutoff = nowUtc().minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
         try {
-            return tokenRepository.expireStaleAdmitted(queue.getQueueId(), cutoff, EXPIRE_LIMIT);
+            return tokenRepository.expireStaleAdmitted(
+                    queue.getQueueId(), Token.COMPLETE_VALID_WINDOW_SECONDS, EXPIRE_LIMIT);
         } catch (RuntimeException e) {
             log.error("ADMIT_ISSUED 잔류 정리 실패 queueId={}", queue.getQueueId(), e);
             return 0;
