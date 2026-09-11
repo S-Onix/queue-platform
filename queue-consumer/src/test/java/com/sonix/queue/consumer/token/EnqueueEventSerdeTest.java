@@ -149,8 +149,15 @@ class EnqueueEventSerdeTest {
     }
 
     /**
-     * ADMITTED만 갖는 두 칸이 왕복에서 살아남는지. {@code admittedAt}은 verify·complete의
-     * 유효 창(60초) 기준이라 밀리초가 뭉개지면 창의 경계가 달라진다.
+     * ADMITTED만 갖는 두 칸이 왕복에서 살아남는지.
+     *
+     * <p>🔧 <b>§90으로 근거가 바뀌었다.</b> 예전엔 "{@code admittedAt}이 유효 창의 기준이라 밀리초가
+     * 뭉개지면 창의 경계가 달라진다"였는데, 이제 컬럼 값은 MySQL의 {@code UTC_TIMESTAMP(3)}가
+     * 찍으므로 <b>창은 안 달라진다</b>. 남은 근거는 둘이다 —
+     * ① {@code admitToken}이 뭉개지면 complete의 {@code admit_token = ?} 술어가 안 맞아 죽는다
+     * ② {@code admittedAt}은 값이 아니라 <b>null 여부</b>가 하중을 받는다(§90). 왕복에서 non-null이
+     *    null로 뒤집히면 {@code admitted_at}이 NULL로 남아 complete가 영구 404가 되고
+     *    {@code SUM(admitted_at IS NOT NULL)}(과금 근거)에서도 빠진다.
      */
     @Test
     @DisplayName("ADMITTED의 admitToken·admittedAt이 왕복 후에도 보존된다")

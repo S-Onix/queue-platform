@@ -383,8 +383,10 @@ class BillingSnapshotIntegrationTest {
     @Test
     @DisplayName("음수 대기를 그대로 보존한다 — GREATEST(...,0)으로 가리면 시계 스큐 신호가 사라진다")
     void preservesNegativeWaitFromClockSkew() {
-        // 🔑 issued_at·admitted_at 둘 다 앱 시계라 API 서버 N대의 스큐만큼 음수가 나온다
-        //    (로컬 실 데이터에 -398초가 실재한다). schema.sql이 "가리지 않는다"를 결정으로
+        // 🔑 §90 이후 축이 바뀌었다 — admitted_at은 **MySQL 시계**(UTC_TIMESTAMP(3))고
+        //    issued_at만 앱 시계다. 그래서 음수 조건이 "임의의 두 API 서버 쌍"에서
+        //    "enqueue를 드레인한 서버 하나가 DB보다 앞섬"으로 좁아졌다 — 좁아졌을 뿐 0은 아니다.
+        //    (-398초 실측은 §90 이전 데이터다.) schema.sql이 "가리지 않는다"를 결정으로
         //    못박았는데 이 테스트가 없으면 누가 GREATEST를 넣어도 아무것도 안 깨진다
         seedAdmitted("tok_d13", ldt(7, 13, 10), ldt(7, 13, 5), 4);
 

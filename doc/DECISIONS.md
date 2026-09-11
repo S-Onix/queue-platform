@@ -5401,7 +5401,7 @@ MGET queue:{q}:admit-watermark   queue:{q}:pacing   queue:{q}:seq
 - 키: `queue:{queueId}:admit-watermark` — **해시태그 필수**(§70 D10). 단일 스칼라.
   **`QueueKeys.admitWatermark(queueId)`를 신설해 그것만 쓴다.** 문자열 리터럴로 조립하면
   해시태그가 빠져도 **로컬 Sentinel에서는 절대 안 잡히고 Cluster에서만 `CROSSSLOT`으로 깨진다**
-  (CLAUDE.md 핵심 설계 결정 10)
+  (CLAUDE.md 핵심 설계 결정 — "Redis 목표 구성: 독립 2 Cluster". 🪤번호로 걸지 마라, 재정렬에 깨진다)
 - **admit Lua 안에서 갱신한다.** admit은 이미 원자 연산이어야 하고(ZSet에서 N개 pop + 상태 전이),
   그 스크립트가 방금 뽑은 최대 seq를 알고 있다. **왕복 추가 0회**
 - ⛔ **아래 문단은 이력이다 — §80이 닫았다.** admit 전 구간이 단일 Lua로 원자가 됐다.
@@ -7583,3 +7583,337 @@ Tomcat 요청 버퍼)인데, prod는 actuator prometheus를 껐으므로(§85) `
   쓰고 있어 **재시도가 부하를 더한다**. `ConcurrentLinkedQueue.size()`는 O(n)이라 요청마다
   못 부르고, `LinkedBlockingQueue`로 바꾸면 종료 경로의 `remove()`가 전체 락이 된다
 - **4,915\~10,000 rps 구간 미측정** — 부하 발생기 한 대로는 못 만든다(하니스가 먼저 굶는다)
+
+---
+
+## §90 — 원장 판정 경로의 시계를 MySQL 하나로 (`admitted_at`을 `UTC_TIMESTAMP(3)`가 찍는다)
+
+**날짜**: 2026-09-09 · **PR**: (미머지) · **에이전트 3인 검토**: architect · dba · monitoring
+
+### 문제 — 한 창을 두 시계로 재고 있었다
+
+`admitted_at`은 **술어 세 개의 좌변**이고, 우변은 전부 MySQL 시계였다.
+
+| 술어 | 하는 일 | 창 |
+|---|---|---|
+| `markCompleted` (`TokenJpaRepository:65`) | complete 자격 판정 | 300초 |
+| `findAdmittedByAdmitToken` (`:44`) | verify DB 폴백 신선도 | 60초 |
+| `expireStaleAdmitted` (`:117`) | 만료 판정(reconcile) | 300초 |
+
+그런데 **좌변은 admit을 처리한 API 서버의 시계**로 찍혔다(Kafka payload 값). 비교의 양변이
+다른 기계에서 나온다. 그 서버가 S초 뒤처지면 DB 술어의 창이 `max(300 − S, 0)`으로 줄어든다.
+
+**실측(2026-09-09, 실제 `markCompleted` SQL): S=398이면 admit 0초 뒤에도 UPDATE가 0행.**
+
+증상은 404가 아니라 **원장 손상**이다. S>240이면 `admit-by-admit`의 PX 60초 ⊄ DB 300초가 되어
+complete의 Redis 폴백이 자격을 넓히고, 그때:
+
+1. `ReconcileJob.expireStaleAdmitted`가 그 행을 `status=4`로 확정
+2. 사용자는 폴백으로 **200**을 받고 COMPLETED가 발행됨
+3. 컨슈머 가드가 `IF(tokens.status = 1, ...)`라 `status=4`에서 **no-op** (`TokenJpaAdapter`)
+4. 행은 `status=4 / completed_at=NULL`로 **영구 고정**, 재시도는 404 — **멱등성도 깨진다**
+
+**Tenant는 200을 받아 알 수단이 없고, 수동 SQL 외 복구 경로가 없다.**
+
+### 왜 "감시만"으로는 안 되는가 (monitoring 실측)
+
+`HostClockNotSynchronized`(2026-09-09 신설)로 막으려 했으나 **구조적으로 못 잡는다.**
+
+- `node_timex_sync_status`는 "시계가 맞는가"가 아니라 **"NTP 데몬이 커널을 먹이고 있는가"**
+  (`STA_UNSYNC` 비트)를 잰다. 데몬이 수 시간 죽어 방치돼야 0이 된다.
+  수동 `date -s` · VM 스냅샷 복원 · 절전 복귀 · **NTP 서버가 틀린 시각을 배포** — 넷 다 침묵한다
+- 🔴 **Alertmanager가 없다.** firing은 9090 UI의 한 줄이라 새벽 3시에 아무도 안 깨어난다
+- 🔴 **스크레이프 타깃이 `queue-api` 1대(8080)뿐**인데 통합 시나리오는 3대(8080/8083/8084)다.
+  스큐는 "한 대만 어긋난 상태"라 **탐지 확률 1/3**
+- 결정적: **-398초 실측은 2026-08-26**인데 **node_exporter 설치는 2026-09-04**다.
+  유일하게 실제로 일어난 그 사건 때 이 알람은 존재하지도 않았다
+
+### 결정 — B-full: `admitted_at`을 MySQL이 찍는다
+
+```sql
+-- TRANSITION_INSERT의 VALUES 9번째 칸 (값의 유일한 출처)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, UTC_TIMESTAMP(3)), ?) AS new
+-- expireStaleAdmitted: cutoff를 호출자가 계산하지 않는다
+AND admitted_at < UTC_TIMESTAMP(3) - INTERVAL :validWindowSeconds SECOND
+```
+
+### 경계 규칙 — **식별자·순서는 발생지 시계, 판정은 판정하는 곳의 시계**
+
+"시각 권위 통일"이 **아니다.** 바뀌는 것은 **원장 판정 경로**뿐이다.
+
+| 경로 | 시계 | 이번에 바뀌나 |
+|---|---|---|
+| enqueue `issued_at` | **앱 시계 유지** | ❌ **바꾸면 안 된다** |
+| admit `admitted_at`(DB) | 앱 → **MySQL** | ✅ |
+| admit Redis(`admit.lua` `expiresAt`·`admitted` ZSet score) | 앱 시계 유지 | ❌ |
+| admit Redis PX 60s | 상대 시간 | — 스큐 면역 |
+| verify·complete 술어 | 이미 MySQL | — |
+| reconcile cutoff | batch 앱 → **MySQL** | ✅ |
+| `TokenReclaimJob` | 앱 시계 유지 | ❌ |
+| `queue_admission_wait_seconds`·`_clock_skew_total` | 앱↔앱 유지 | ❌ |
+
+🔑 **`issued_at`을 같이 옮기면 안 된다.** `UNIQUE(token_id, issued_at)` + 월별 파티션 키 +
+Kafka 재처리 멱등의 절반이다. DB 시계로 만들면 **재처리마다 새 행이 생겨** 즉시 깨진다.
+
+🔑 **Redis가 안 따라오는 것도 의도다.** 거기서 어긋나면 회수가 이르거나 늦을 뿐 — **가용성**
+문제고 되돌릴 수 있다. MySQL 쪽만 **원장 무결성**(영구 고정 + 200 응답) 문제라 등급이 다르다.
+
+### 얻는 것 — 불변식이 가정에서 구조적 사실로 승격된다
+
+전에는 "PX 60초 ⊂ DB 300초"가 **시계가 맞아야** 참이었다. 이제 `admitted_at = admit + 컨슈머랙(≥0)`
+이라 DB 창의 **시작점이 Redis 창보다 항상 뒤**고, 종료점은 항상 240초 이상 여유다 —
+**어떤 앱 시계 스큐에서도 포함이 성립한다.**
+
+`ReconcileJob`까지 옮긴 이유가 이것이다. `admitted_at`만 고치면 (MySQL 시계) vs (batch 시계)로
+**비대칭이 남아** 같은 사고가 방향만 반대로 재발한다.
+
+### 대가 — 대기 시간에 Kafka lag이 섞인다
+
+`admitted_at`이 정확히는 **"컨슈머 적용 시각"**이 된다. `queue_daily_stats.sum_wait_sec`/`max_wait_sec`
+(`TIMESTAMPDIFF(SECOND, issued_at, admitted_at)`)에 lag이 양수 방향으로 섞인다.
+
+받아들인 근거:
+- **읽는 코드가 0건이다** — 대시보드 21개 expr 전수·`app.yml` 언급 2건 모두 주석. write-only다
+- **초 단위 집계**라 정상 lag(≪1s)에서는 표현되지 않는다. 초 단위로 벌어지면 그건 대기가 실제로
+  길어진 사건이라 부풀어 보이는 편이 옳다
+- **정밀값은 이미 따로 있다** — `queue_admission_wait_seconds`(앱이 admit 시점에 DB 무접촉 계측)
+- `admitted_at`을 고른 진짜 근거는 **"`completed_at`엔 테넌트 내부 처리 시간이 섞인다"**였고,
+  그건 그대로 유효하다. Kafka lag은 부수적 근거였다
+
+**B-split(판정용/측정용 컬럼 분리)은 기각.** 컬럼+마이그레이션+엔티티+매핑을 늘려서 사는 것이
+"이미 다른 데 있는 값의 장기 보존판 정확도"뿐이다(§4).
+
+### 부수 효과 (보고만, 대응 안 함)
+
+`admitted_at = admit + L`이라 **verify DB 폴백의 60초 창이 L만큼 뒤로 밀린다.** L>0이고 사용자가
+`admit+60 ~ admit+60+L`에 verify하면 Redis TTL은 만료됐는데 DB 폴백이 통과시킨다. §36의 경계가
+lag만큼 물러진다. 정상 L(≪1s)에서 무시할 수준이고 방향도 관대한 쪽이라 지금 뭘 만들지 않는다.
+
+### 실측 — 결함 주입으로 가드 4종 검증
+
+| 주입 | 빨개진 것 | 판정 |
+|---|---|---|
+| VALUES 절 원복(`?`) | ODKU·INSERT §90 가드 + 기존 1건 = **3건** | ✅ 단일 출처가 두 경로를 덮는다 |
+| VALUES를 무조건 `UTC_TIMESTAMP(3)` | EXPIRED NULL 가드 포함 **대량** | ✅ null성 보존이 필요하다 |
+| 만료 술어 창 1000배(`SECOND`→`DAY`) | **4건** | ✅ 만료가 죽지 않는다 |
+| ODKU SET 절만 원복 | **0건** | 🔴 아래 |
+
+🔴 **`admitted_at`을 SET 절에도 `UTC_TIMESTAMP(3)`로 쓴 판은 무동작이었다.** `new.admitted_at`이
+이미 VALUES 절의 표현식을 가리키기 때문이다. 결함 주입이 아니었으면 "두 곳을 고쳤으니 안전하다"고
+믿은 채로 남았을 것이다. **값의 출처는 VALUES 절 하나로 모았다.**
+
+🪤 **`@Transactional`을 테스트에 붙이면 경로가 갈린다.** 붙이면 `saveAllIfAbsent`가 flush되지 않은
+채 `applyTransition`의 raw JDBC가 돌아 **충돌이 없어 INSERT 경로**를 탄다. 운영의 주 경로는 ODKU다 —
+실제로 이 함정 때문에 첫 가드가 **엉뚱한 경로를 지키고 있었고, 결함 주입 전까지 초록이었다.**
+
+- `TokenUpsertRewriteTest` 통과 = **`IF(? IS NULL, ...)`가 배치 재작성을 안 껐다.**
+  `?`가 VALUES 절 **안**이라 Connector/J 8.3.0 `QueryInfo`의 실격 분기 셋(`?`가 VALUES 앞/뒤,
+  `LAST_INSERT_ID`)에 걸리지 않는다
+- 전체 스위트 **485건 / skip 4**. 실패 0이지만 **조건부다** — 전 스위트를 한 번에 돌리면
+  `RedisTokenBucketRateLimiterTest::pollBucketRefillsFasterThanPollInterval`이 간헐 실패한다.
+  **§90 무관**(격리 재실행 3/3 통과, 변경 파일과 ratelimit·Redis 경로의 접점 0). 부하가 걸린
+  머신에서 2초 refill을 벽시계로 재는 테스트다.
+  🔑 **"두 번 돌려 두 번 다 초록"을 "실패 0"으로 단정하면 안 된다** — lead가 세 번째 실행에서
+  잡았다. 타이밍 의존 테스트는 실행 횟수가 곧 신뢰도다
+
+### 함께 고친 것
+
+- `infra.yml`의 `HostClockNotSynchronized` **피해 범위 쿼리가 틀렸다**(§90과 별개로 지금도 거짓).
+  `status=2` 행의 `TIMESTAMPDIFF(admitted_at, completed_at)`을 지목했는데 —
+  ① 손상된 행은 `status=4 / completed_at=NULL`이라 **재려는 대상을 술어가 스스로 배제**하고
+  ② 두 컬럼 다 앱 시계라 앱↔DB 차이도 안 준다. **새벽 3시에 거짓 안심을 준다.**
+  → `expired_reason=2` 기반 판별식으로 교체. 그 알람이 지키는 것도 재서술했다
+  (이제 `issued_at`·Redis TTL·JWT지, 원장이 아니다)
+
+### 남는 것
+
+- **컨슈머 lag 미측정** — B-full의 유일한 실질 대가인데 크기를 안 쟀다
+- **스크레이프 타깃 8083·8084 누락** · **Alertmanager 부재** — 둘 다 별건
+- 🔴 **MySQL failover가 잔여 위험이다.** 권위가 "MySQL"이 아니라 **"그 순간의 master"**다.
+  ROW 복제라(실측 `binlog_format=ROW`) replica는 `UTC_TIMESTAMP(3)`를 재평가하지 않고 master가
+  계산한 값을 그대로 적재하므로 **이미 쓰인 행은 안전**하다. 그러나 승계 후 실행되는 술어는
+  **새 master의 시계**로 평가되므로, 승계 경계에서 `admitted_at`(옛 master 시계)과
+  `UTC_TIMESTAMP(3)`(새 master 시계)가 만난다. 노출 구간은 in-flight 토큰의 300초뿐이고
+  시계가 둘(DB 호스트 2대)이라 §90 이전(앱 서버 N대, 쌍이 N²)보다 훨씬 좁지만 **0은 아니다.**
+  MySQL은 자동 failover 장치가 없고(Redis만 Sentinel/Cluster) 승계가 수동이므로,
+  **승계 절차에 "두 호스트 시계 차 확인"을 넣는 것으로 족하다** — 새 장치를 만들 필요는 없다.
+  🪤 로컬로는 재현 불가다 — 3306·3307이 **같은 호스트**에서 돌아 시계가 물리적으로 동일하다
+- `completed_at`이 **여전히 두 시계로 쓰인다**(`QueueEngineService`가 앱, `TokenJpaAdapter`가 MySQL).
+  술어로 읽는 코드가 0건이라 무해하고 이번 스코프 밖이다 — 별건으로 남긴다
+
+---
+
+## §91 — `COMPLETED` 가드를 `status IN (0, 1)`로: 발행 순서 의존을 없앤다
+
+**날짜**: 2026-09-10 · **PR**: (미머지, `feat/mysql-ledger-clock`) · **3인 검토 만장일치**: architect · dba · monitoring
+
+### 문제 — 폴백 `complete`의 1.43%가 원장을 잃었다
+
+`COMPLETED` 소비 가드가 `IF(tokens.status = 1, ...)`라 **"ADMITTED가 먼저 적용됐다"를 전제**했는데,
+**프로듀서가 그 순서를 보장하지 않는다.**
+
+```
+admit.lua 커밋 ─┬─→ admitToken이 Redis에 **즉시** 보인다 (폴링은 Redis만 본다)
+                └─→ publishAdmitted: 건별 블로킹 .get()으로 **직렬** 발행 (실측 67~128ms)
+
+그 사이에 사용자: 폴링 → verify → complete
+파티션 순서:  COMPLETED(verify) → COMPLETED(complete 폴백) → ADMITTED  ← 1ms 늦음
+컨슈머: COMPLETED를 status=0 행에 적용 → 가드 거짓 → **조용히 no-op** ×2
+        그 뒤 ADMITTED → status 0→1
+→ status=1 / completed_at=NULL 고착 → 300초 뒤 ReconcileJob이 status=4 / expired_reason=2 확정
+```
+
+**Kafka는 순서를 지켰다. 틀린 순서를 그대로 지킨 것뿐이다.**
+
+**실측**: Kafka 오프셋 전수 대조로 stuck 7건 **전부** `COMPLETED 오프셋 < ADMITTED 오프셋` 확인.
+폴백 1,117건 중 **16건(1.43%)** 유실. 증상은 **k6의 complete 200 개수와 DB `status=2` 개수의 불일치**
+하나뿐이었다(run2 1007 vs 998, run3 1024 vs 1017). **Tenant는 200을 받아 알 수단이 없었다.**
+
+🔑 §90(시계 축)과 **직교**한다. 이건 발행 순서 축이다.
+
+### 결정 — D-13: `COMPLETED` ODKU를 자족하게 만든다 (한 곳, 추가 발행 0)
+
+```sql
+admit_token  = IF(tokens.status IN (0,1) AND tokens.admit_token IS NULL, new.admit_token, tokens.admit_token),
+admitted_at  = IF(tokens.status IN (0,1) AND tokens.admitted_at IS NULL, UTC_TIMESTAMP(3), tokens.admitted_at),
+completed_at = IF(tokens.status IN (0,1), UTC_TIMESTAMP(3), tokens.completed_at),
+status       = IF(tokens.status IN (0,1), 2, tokens.status)   -- 반드시 마지막
+```
+
+🔑 **동기 경로는 진작 `status IN (0,1)`이었다**(`markCompleted`). 비동기 경로만 `= 1`로 좁아
+**두 코드가 서로 다른 것을 참이라 가정**하고 있었다 — §4-2가 말하는 그 모순이고, **비대칭 자체가 결함**이다.
+원래 이 가드가 막으려던 것은 `status=2` 덮어쓰기지 0이 아니다(`TokenJpaAdapter` 주석이 그렇게 말한다).
+2와 4는 여전히 배제된다 — **4를 넓히면 확정된 만료를 완료로 뒤집는 새 결함**이 된다.
+
+### 기각한 대안 — D-1 (폴백·verify에서 `ADMITTED`를 먼저 발행)
+
+효과 자체는 성립한다(키가 `tokenId`, `send().get()` 블로킹, `enable.idempotence=true`).
+그래도 안 택한 이유 셋:
+
+1. **고칠 곳이 셋이다** — `publishCompletedOnVerify` · verify의 DB 폴백 · complete의 Redis 폴백.
+   계약상 verify만 부르는 테넌트가 정상이라 하나만 빠져도 구멍이고, **COMPLETED 생산자가 늘 때마다
+   같은 규칙을 기억해야 한다.** D-13은 모든 호출자가 통과하는 **한 곳**(가드)에 둔다
+2. **핫패스 비용** — verify는 게이트 개방 순간 입장자 수만큼 몰리는데, 블로킹 발행을 **2배**로 만든다
+3. 🔴 **`publishQuietly` 실패에 답이 없다.** 삼키고 COMPLETED만 나가면 **버그 재발**,
+   실패 시 COMPLETED를 생략하면 행이 `status=0`에 남아 waitingTtl 만료 — **200 받은 사용자가
+   원장에서 만료자가 된다.** Redis 키는 `cleanupCompleted`로 이미 지워져 복구 불가.
+   즉 **"브로커가 흔들리면 반드시 원장이 깨지는" 설계**다. 덜 나쁜 쪽이 없다는 것이 답이다
+
+**D-2**(가드만 확대)는 `admitted_at`이 영구 NULL이 되어 과금 근거가 사라져 기각.
+**컨슈머 재정렬 버퍼**는 상태 있는 컨슈머 + N대 리밸런스라 §4 위반.
+
+### 🔴 네 줄이 전부 하중을 받는다 (결함 주입 실측 — `tester` 재현 포함)
+
+| 주입 | 빨개짐 |
+|---|---|
+| 가드를 `= 1`로 되돌림 | ✅ 1건 |
+| `admit_token` 줄 제거 | ✅ 1건 |
+| `admitted_at` 줄 제거 | ✅ 1건 |
+| `status`를 맨 위로 | ✅ **3건**(§91 가드 + `TokenAdmitQuery` 2건 — `completed_at`까지 NULL이 된다) |
+| `IN (0,1)` → `IN (0,1,4)` | ✅ 1건(`guardBlocksWrongOrigin`) |
+| **`admitted_at` 줄의 `IS NULL`만 제거** | 🔴 **처음엔 0건이었다** → 가드 ② 신설로 해소 |
+| **`IN (0,1)` → `IN (0,1,2)`** | 🔴 **처음엔 0건이었다** → 같은 가드가 해소 |
+| `admit_token` 줄의 `IS NULL`만 제거 | ⚪ 0건 — **결함이 아니다**(아래) |
+
+🔧 **"네 줄 전부 하중"은 줄 단위로는 참이지만 `IS NULL` 하위조건 단위로는 갈린다.**
+`admit_token`의 `IS NULL`은 **방어적 잔재**다 — COMPLETED 생산자 4곳이 전부 `admitToken`을
+non-null 필수 파라미터로 넘기고 그 값이 저장된 값과 같아, `new.admit_token`이 NULL이 되는
+경로가 없다. §4 기준으로 테스트를 만들 대상이 아니다.
+
+🔴 **내 첫 결함 주입 4종이 전부 "지우거나 되돌리는" 방향이었다.** `IS NULL`을 떼거나 가드를
+**넓히는** 방향을 안 해봐서 사각지대 둘을 놓쳤다. `IS NULL` 쪽이 특히 나쁘다 —
+**순서 역전 1.43%가 아니라 완료되는 토큰 100%**의 `admitted_at`이 complete 시각으로 밀린다
+(실측: 정상 순서에서 `admitted_at`이 `08:30:58` → `08:31:12`로 이동).
+그러면 `queue_daily_stats`의 대기 시간이 **대기 + 체류 시간**이 되고, §91이 판정 근거로 쓴
+지문(`admitted_at = completed_at`)이 **전 행에서 참**이 되어 지표가 무의미해진다.
+🪤 기존 `transition_redeliveryDoesNotResurrect`가 이걸 **구조적으로 못 잡는다** —
+비교 기준값을 COMPLETED 적용 **뒤에** 읽어 오염된 값을 기준으로 삼는다.
+
+- `status`/`completed_at`만 넓히면 뒤늦은 ADMITTED가 `status=0` 가드에 걸려 no-op →
+  `admit_token`·`admitted_at`이 **영구 NULL** → ① `SUM(admitted_at IS NOT NULL)`(입장권 개수의
+  유일한 근거) 과소 계상 ② `findCompletedAt`이 빈 값 → **complete 재시도가 404**.
+  **원장 유실이 과금 누락으로 모양만 바뀐다.**
+- `status`를 위로 올리면 ODKU 좌→우 평가로 나머지 셋이 이미 2로 바뀐 값을 봐 전부 거짓 →
+  세 컬럼이 NULL. **지금 버그보다 나쁘다**(status=2라 ReconcileJob이 손도 못 대고 흔적조차 없다)
+
+### 판정 실측 (2026-09-10, 앱 3대 + 컨슈머 + 배치, 빈 큐 40개)
+
+| | §91 이전(run3) | §91 이후 |
+|---|---|---|
+| 폴백을 탄 토큰 | 1,024 | 210 |
+| **그중 `status=2`가 아닌 것** | **7 (0.7%)** | **0** |
+| k6 complete 200 vs DB `status=2` | 1024 vs **1017** | 1031 vs **1031** ✅ |
+
+🔑 **공허한 0이 아니다.** D-13이 발동하면 세 컬럼을 **한 문장에서** 채우므로
+`admitted_at = completed_at`이 **정확히 일치**한다 — 그게 지문이다.
+```
+구조됨(admitted_at = completed_at) : 8      정상 순서 : 1,023
+```
+**경주는 여전히 일어났고(8건 = 0.78%, run3의 0.7%와 같은 비율) 안 깨졌을 뿐이다.**
+ReconcileJob 확정 후 재확인해도 폴백 210건 전부 `status=2`.
+
+최종 정합: `1201 = 완료 1031 + admit_stale 26 + waiting_ttl 144`.
+26·144는 **정상 이탈**이고 이 결함과 무관하다.
+
+### 대가
+
+이 경로의 `admitted_at`이 "admit 시각"이 아니라 **"complete 적용 시각"**이 된다.
+§90의 불변식(값이 MySQL 시계에서 나온다)은 **그대로 지킨다** — 흐리는 게 아니다.
+대기 시간 집계는 이 경합에서 COMPLETED가 ADMITTED보다 **먼저** 도착하므로 편향이 **아래쪽**이고,
+폭은 컨슈머 배치 간격이라 초 단위 집계에서 대개 0이다.
+
+**부수 이득**: ADMITTED 발행이 통째로 실패한 건(`result=error`, §80 U9 → 지금은 complete 영구 404)도
+COMPLETED가 세 컬럼을 채워 **살아난다**.
+
+### 함께 고친 것 (안 고치면 되돌려진다 — §4-2)
+
+- 🔴 **§90에서 내가 쓴 "`admitted_at` 값을 정하는 곳은 VALUES 절 하나다"가 거짓이 됐다.**
+  COMPLETED ODKU가 **두 번째로** 쓴다. 거긴 무동작이 아니라 하중을 받는다 —
+  두 경로가 `IS NULL`로 겹치지 않게 각자 채운다
+- `TokenRepository` · `TokenPersistService` · `TokenLifecycleConsumerTest`의
+  **"ADMITTED→COMPLETED 순서가 뒤집히면 완료되지 않는다"** 3곳 — 예시는 무효가 됐지만
+  **구간 단위 전달 규칙 자체는 살아 있다**(`ADMITTED`·`EXPIRED`는 여전히 `status = 0` 출발 가드)
+- 🔴 **기존 테스트가 옛 계약을 단정하고 있었다** — `"WAITING(0)에 COMPLETED가 와도 0"`.
+  성질(*허용 출발이 아니면 조용히 no-op*)은 살리고 예시를 **`EXPIRED(4) → COMPLETED`**로 옮겼다
+- `TokenUpsertRewriteTest`에 **COMPLETED 케이스 추가**. 그 전까지 **COMPLETED SQL이 재작성 퇴화해도
+  전 스위트가 초록**이었다(기존 테스트는 ADMITTED만 실행한다). §91이 SET 절을 2줄→4줄로 늘리면서
+  이 구멍이 실제 위험이 됐다. 실측: 현행·§91 둘 다 `Com_insert` 델타 **1**, 대조군은 500
+
+### 검토에서 나온 별건 (§91을 막지 않는다)
+
+- 🔴 **`BillingSnapshotIntegrationTest`가 공유 DB에서 재현 불가를 만든다.** `countBillingMismatch`·
+  `countPartitionRows`는 **테넌트 필터가 없는 전역 월 집계**인데 테스트가 **절대값으로** 단정한다
+  (`assertThat(baseline).isZero()` / `isEqualTo(1)`). 정작 같은 테스트의 주석이 *"공유 DB에 남의
+  7월 데이터가 있으면 절대값 단정이 무관한 이유로 깨진다 — baseline 대비 증가분으로 본다"*고
+  적고 있다. **주석과 코드가 서로 반대를 참이라 가정한다**(§4-2 그 자체).
+  실제로 고아 행 3개(`billing_snapshots` 2 + `queue_daily_stats` 1, 참조 대상이 이미 삭제됨)로
+  빨간불이 났다. 삭제 후 3회 연속 초록.
+  🔑 **그래서 "487건 통과"는 DB가 깨끗한 판에서만 참이다.**
+- `RedisTokenBucketRateLimiterTest::pollBucketRefillsFasterThanPollInterval` 벽시계 플레이크
+  (12회 중 1회). §91 무관
+- 🪤 **`-x compileJava`로 주입 검증을 하지 마라** — 주입된 클래스 파일을 재사용해 무수정 트리에서
+  빨간불이 난다(`tester` 실측)
+
+### 남는 것
+
+- 🔴 **기존 유실분은 복구 불가.** DB에서 "실제로 200을 받았던 것"과 "입장권만 쥐고 안 들어온 것"이
+  **컬럼 시그니처가 완전히 동일**하다. 유일한 판별자는 Kafka의 COMPLETED 이벤트 존재 여부인데
+  `log.retention.hours=168`(7일)이라 이미 만료 중이다
+- **새 메트릭을 만들지 않았다** — 🔴 **prod·dev에 `/actuator/prometheus`가 아예 없다**
+  (`include: health, info`). 지금 만드는 지표는 local에서만 산다.
+  폴백 카운터는 actuator 경계와 함께 prod 노출을 켤 때 **카운터 1개**로 충분하다
+  (분모는 `http_server_requests_seconds_count`가 이미 준다 — **분모를 새로 만들지 마라**)
+- 🔴 **`expired_reason=2`로는 "급증"을 판정할 수 없다.** 정상 이탈과 이 결함이 섞이고, 배경률이
+  하니스 설정에 따라 하루 사이 **4,948 → 37로 130배** 흔들렸다. 기준선이 없다
+- 🪤 **`alerts/infra.yml`의 `expired_reason=2` 판별식은 시계 알람의 조치문 안에만 있다.**
+  이번 경로는 시계와 무관해 그 알람이 안 뜨고 → **아무도 그 쿼리를 안 친다.** 트리거 없는 탐지다
+- `QueueEngineService`의 `log.warn` 문자열이 아직 "컨슈머 적재가 밀려 있다"로 원인을 단정한다
+  (주석은 §90에서 고쳤지만 문자열은 그대로). 1줄 별건
+- **실측으로 죽은 안**: "컨슈머 no-op 카운터"는 **불가능**하다 — `batchUpdate`가 `-2`
+  (`SUCCESS_NO_INFO`)를 주고, 단건도 `useAffectedRows` 기본값(matched rows)이라 no-op이 1을 낸다
+
+### 🪤 측정 함정
+
+`api-808*.log` 글롭이 **`api-8080.pre91.log`(이전 판 로그)까지 삼켜** "1,327건 중 16건 실패"라는
+가짜 결과가 나왔다. 파일명을 명시해 다시 세니 **210건 중 0건**.
+**판을 나눠 보관할 때 접미사만으론 부족하다 — 글롭이 여전히 매칭한다.**

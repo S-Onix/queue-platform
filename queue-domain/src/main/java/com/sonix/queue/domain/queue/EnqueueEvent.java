@@ -33,8 +33,14 @@ import java.time.Instant;
  *
  * @param eventType {@link TokenEventType} 이름. 아래 정규화 규칙 참조
  * @param admitToken ADMITTED에서 발급된 입장 자격. 그 외 타입은 null일 수 있다
- * @param admittedAt admit 시각(UTC). {@code tokens.admitted_at}에 그대로 적재되며
- *                   verify·complete의 유효 창 기준이다 — {@code issuedAt}("줄 선 시각")이 아니다
+ * @param admittedAt admit 시각(UTC). 🔴 <b>이 값은 {@code tokens.admitted_at}에 적재되지 않는다</b>(§90).
+ *                   적재기가 쓰는 것은 <b>null 여부뿐</b>이고, 값은 MySQL의 {@code UTC_TIMESTAMP(3)}가
+ *                   찍는다 — 그 컬럼은 verify·complete·reconcile 술어의 <b>좌변</b>인데 우변이 전부
+ *                   MySQL 시계라, 앱 시계로 쓰면 한 창을 두 시계로 재게 되기 때문이다.
+ *                   그래서 이 필드는 <b>"admit이 일어났다"는 표지</b>로만 쓰인다 —
+ *                   {@code EXPIRED}·{@code COMPLETED}가 null을 실어 보내면 컬럼도 NULL로 남고,
+ *                   그 NULL 여부가 {@code SUM(admitted_at IS NOT NULL)}(= 입장권 개수의 유일한 근거)을 만든다.
+ *                   🪤 <b>"그대로 적재된다"고 되돌리지 마라</b> — 그 한 문장이 §90을 되돌리게 만든다
  */
 public record EnqueueEvent(
                 String eventType,

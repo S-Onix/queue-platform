@@ -105,6 +105,27 @@ class TokenUpsertRewriteTest {
     }
 
     /**
+     * 🔴 <b>COMPLETED도 재작성돼야 한다 (§91).</b> 이 케이스가 없던 동안 COMPLETED ODKU가
+     * 퇴화해도 <b>전 스위트가 초록이었다</b> — 위 테스트는 ADMITTED만 실행한다.
+     * §91이 COMPLETED SET 절을 2줄에서 4줄로 늘리면서(자족화) 이 구멍이 실제 위험이 됐다.
+     */
+    @Test
+    @DisplayName("🔴 COMPLETED 전이 500건도 INSERT 문장 1개로 합쳐진다 (§91로 SET 절이 4줄이 됐다)")
+    void completedTransitionBatchIsRewrittenIntoOneStatement() {
+        List<Token> tokens = completedTokens(BATCH);
+
+        long before = comInsert();
+        adapter.applyTransition(TokenEventType.COMPLETED, tokens);
+        long executed = comInsert() - before;
+
+        assertThat(executed)
+                .as("COMPLETED SET 절은 new.admit_token·UTC_TIMESTAMP(3)만 쓴다 — 둘 다 ?가 아니라 "
+                        + "재작성이 유지돼야 한다. 500이면 누가 ODKU 절에 ?를 넣은 것이다")
+                .isEqualTo(1);
+        assertThat(countTokens()).as("합쳐졌어도 500행은 그대로 들어간다").isEqualTo(BATCH);
+    }
+
+    /**
      * 대조군 — 위 단언이 "측정이 늘 0"이라서 통과한 것이 아님을 보인다.
      * ODKU에 {@code ?}가 하나 있을 뿐인데 왕복이 500배가 된다.
      */
@@ -139,6 +160,15 @@ class TokenUpsertRewriteTest {
 
     private int countTokens() {
         return jdbc.queryForObject("SELECT COUNT(*) FROM tokens WHERE queue_id = ?", Integer.class, QUEUE_ID);
+    }
+
+    /** COMPLETED 이벤트의 실제 모양 — {@code admittedAt}은 null이다(발행 지점 전부 그렇다). */
+    private List<Token> completedTokens(int count) {
+        String prefix = "tok_rwc_" + UUID.randomUUID() + "_";
+        return IntStream.range(0, count)
+                .mapToObj(i -> Token.transition(TokenStatus.COMPLETED, prefix + i, QUEUE_ID, tenantId,
+                        "user_" + i, i, ISSUED_AT, "adm_" + i, null))
+                .toList();
     }
 
     private List<Token> tokens(int count) {

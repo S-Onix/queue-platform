@@ -15,9 +15,13 @@ import org.junit.jupiter.api.TestInstance;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -26,6 +30,7 @@ import java.util.stream.IntStream;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 
 /**
  * TokenJpaAdapter 통합 테스트 (실제 MySQL, localhost:3306).
@@ -69,6 +74,7 @@ class TokenJpaAdapterIntegrationTest {
 
     @Autowired private TokenJpaAdapter adapter;
     @Autowired private JdbcTemplate jdbc;
+    @Autowired private PlatformTransactionManager txManager;
 
     private long tenantId;
 
@@ -211,7 +217,13 @@ class TokenJpaAdapterIntegrationTest {
         assertThat(statusOf(tokenId)).isEqualTo(1);
         assertThat(admitTokenOf(tokenId)).as("SET 절에서 status를 먼저 쓰면 여기가 NULL이 된다")
                 .isEqualTo(admitTokenFor(tokenId));
-        assertThat(admittedAtOf(tokenId)).isEqualTo(ADMITTED_AT);
+        // 🔴 이벤트가 실어온 ADMITTED_AT이 **아니다** (§90). admitted_at은 술어의 좌변이고
+        //    우변이 전부 MySQL 시계라, 값도 MySQL이 찍는다 — 앱 시계로 쓰면 한 창을 두 시계로 잰다.
+        //    그래서 단정할 수 있는 것은 "이벤트 값과 같다"가 아니라 "지금 근처"다.
+        assertThat(admittedAtOf(tokenId))
+                .as("admitted_at은 UTC_TIMESTAMP(3)이 찍는다 — 이벤트의 %s가 아니다", ADMITTED_AT)
+                .isNotNull()
+                .isCloseTo(LocalDateTime.now(ZoneOffset.UTC), within(1, ChronoUnit.MINUTES));
     }
 
     /**
@@ -228,25 +240,44 @@ class TokenJpaAdapterIntegrationTest {
                 transition(tokenId, 5, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
         assertThat(statusOf(tokenId)).isEqualTo(2);
 
+        // 🔴 §90 이후 **status만 보면 부족하다.** admitted_at 값을 MySQL이 찍으므로,
+        //    status 가드를 잃으면 재전달 시각의 UTC_TIMESTAMP(3)가 새로 박힌다 —
+        //    리밸런스가 200초 뒤 일어나면 complete 창이 **연장되고** ReconcileJob 만료가 밀린다.
+        //    §90 이전엔 payload 값이 같아 무해했던 것이 이제 **원장 시각 변조**다.
+        LocalDateTime before = admittedAtOf(tokenId);
+
         adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(tokenId, 5)));
 
         assertThat(statusOf(tokenId)).as("허용 출발이 0뿐이라 2는 그대로다").isEqualTo(2);
+        assertThat(admittedAtOf(tokenId))
+                .as("재전달이 admitted_at을 다시 찍으면 complete 창이 연장된다 (§90)")
+                .isEqualTo(before);
     }
 
     /**
      * 허용 출발이 아닌 전이는 <b>조용히 no-op</b>이다 (예외 아님). 예외로 만들면 재전달 한 건이
      * 배치 전체를 DLT로 끌고 간다.
+     *
+     * <p>🔧 <b>예시를 바꿨다 (§91).</b> 예전엔 "WAITING(0)에 COMPLETED가 와도 0"으로 이 성질을
+     * 보였는데, §91이 COMPLETED 가드를 {@code status IN (0, 1)}로 넓히면서 <b>그 전이는 이제
+     * 허용이다</b>(순서 역전이 실재하기 때문 — {@code transition_completedBeforeAdmittedStillCompletes}).
+     * 성질 자체는 그대로라, 여전히 허용 출발이 아닌 {@code EXPIRED(4) → COMPLETED}로 옮겼다.
+     * 🔑 <b>4를 배제하는 것은 의도다</b> — 넓히면 이미 확정된 만료를 완료로 뒤집는 새 결함이 된다.
      */
     @Test
-    @DisplayName("허용 출발이 아니면 상태가 바뀌지 않는다 — WAITING(0)에 COMPLETED가 와도 0")
+    @DisplayName("허용 출발이 아니면 상태가 바뀌지 않는다 — EXPIRED(4)에 COMPLETED가 와도 4")
     void transition_guardBlocksWrongOrigin() {
         String tokenId = "tok_guard_" + UUID.randomUUID();
         adapter.saveAllIfAbsent(List.of(waiting(tokenId, 9)));
+        adapter.applyTransition(TokenEventType.EXPIRED, List.of(
+                expired(tokenId, 9, ExpiredReason.WAITING_TTL)));
+        assertThat(statusOf(tokenId)).isEqualTo(4);
 
         adapter.applyTransition(TokenEventType.COMPLETED, List.of(
                 transition(tokenId, 9, TokenStatus.COMPLETED, "adm_x", null)));
 
-        assertThat(statusOf(tokenId)).as("COMPLETED의 허용 출발은 1뿐").isZero();
+        assertThat(statusOf(tokenId)).as("COMPLETED의 허용 출발은 0·1뿐 — 4는 배제된다").isEqualTo(4);
+        assertThat(completedAtOf(tokenId)).as("no-op이므로 완료 시각도 안 찍힌다").isNull();
     }
 
     /**
@@ -314,6 +345,204 @@ class TokenJpaAdapterIntegrationTest {
     // ---------------------------------------------------------------------
 
     /** 실물은 {@code adm_} + UUID(36) = 40자다. 컬럼이 VARCHAR(50)이라 테스트 값도 그 안이어야 한다. */
+    /**
+     * 🔴 <b>§90 회귀 가드 (ODKU 경로) — 이 테스트가 빨개지면 원장이 깨진다.</b>
+     *
+     * <p>실측 재현(2026-09-09): admit을 처리한 API 서버 시계가 <b>398초</b> 뒤처져 있으면 그 서버가
+     * 방금 admit했는데도 {@code admitted_at}에 398초 전 시각이 박혔다. complete 술어는
+     * {@code admitted_at > UTC_TIMESTAMP(3) - INTERVAL 300 SECOND}라 <b>admit 0초 뒤의 complete도
+     * 0행</b>이었고, 그 행은 ReconcileJob이 {@code status = 4}로 확정하는데 사용자는 Redis 폴백으로
+     * 200을 받아 <b>{@code status=4 / completed_at=NULL}로 영구 고정</b>됐다(멱등성까지 깨진다).
+     *
+     * <p>🪤 <b>{@code @Transactional}을 붙이지 마라.</b> 붙이면 {@code saveAllIfAbsent}가 flush되지
+     * 않은 채로 {@code applyTransition}의 raw JDBC가 돌아 <b>충돌이 없어 INSERT 경로</b>를 탄다.
+     * 운영의 주 경로는 ODKU(선행 WAITING 행이 있다)이고, 둘은 값의 출처가 서로 다른 코드다
+     * (SET 절 vs VALUES 절). 실제로 이 함정 때문에 가드가 한동안 엉뚱한 경로를 지키고 있었다.
+     */
+    @Test
+    @DisplayName("§90(ODKU): admit 서버 시계가 398초 뒤처져도 complete 창은 300초 그대로다")
+    void transition_admittedAtIgnoresSkewedEventClock() {
+        String tokenId = "tok_skew_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(tokenId, 7)));   // 커밋된다 → 아래는 ODKU 경로
+
+        // 시계가 398초 뒤처진 API 서버가 만든 payload. 실제 admit은 "지금"이다.
+        LocalDateTime skewed = LocalDateTime.now(ZoneOffset.UTC).minusSeconds(398);
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(
+                transition(tokenId, 7, TokenStatus.ADMIT_ISSUED, admitTokenFor(tokenId), skewed)));
+
+        assertThat(admittedAtOf(tokenId))
+                .as("payload의 뒤처진 시각이 아니라 MySQL 시계가 찍혀야 한다")
+                .isCloseTo(LocalDateTime.now(ZoneOffset.UTC), within(1, ChronoUnit.MINUTES));
+
+        // 🔑 값이 바뀐 것만 재면 "창이 실제로 열렸는지"는 모른다. 그게 이 건의 증상이었다.
+        int rows = txTemplate().execute(tx -> adapter.markCompleted(
+                QUEUE_ID, tenantId, tokenId, admitTokenFor(tokenId),
+                LocalDateTime.now(ZoneOffset.UTC), Token.COMPLETE_VALID_WINDOW_SECONDS));
+        assertThat(rows).as("§90 이전엔 여기가 0행이었다 — 그게 원장 손상의 출발점이다").isEqualTo(1);
+        assertThat(statusOf(tokenId)).isEqualTo(2);
+    }
+
+    /**
+     * 🔴 <b>§90 회귀 가드 (INSERT 경로).</b> 선행 WAITING 행이 없으면(= ENQUEUED 유실) ODKU가 아니라
+     * INSERT로 들어가고, 그때 값을 정하는 것은 SET 절이 아니라 <b>VALUES 절</b>이다.
+     * 한쪽만 고치면 "거의 맞는데 가끔 틀리는" 상태가 되므로 두 경로를 각각 못박는다.
+     */
+    @Test
+    @DisplayName("§90(INSERT): 선행 행이 없어도 admitted_at은 MySQL 시계다")
+    void transition_admittedAtIsDbClockOnInsertPath() {
+        String tokenId = "tok_skew_ins_" + UUID.randomUUID();
+        LocalDateTime skewed = LocalDateTime.now(ZoneOffset.UTC).minusSeconds(398);
+
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(
+                transition(tokenId, 9, TokenStatus.ADMIT_ISSUED, admitTokenFor(tokenId), skewed)));
+
+        assertThat(admittedAtOf(tokenId))
+                .as("VALUES 절이 앱 시계를 그대로 넣으면 여기가 398초 전이 된다")
+                .isCloseTo(LocalDateTime.now(ZoneOffset.UTC), within(1, ChronoUnit.MINUTES));
+    }
+
+    /**
+     * 🔴 <b>null성은 보존돼야 한다.</b> VALUES 절을 무조건 {@code UTC_TIMESTAMP(3)}로 바꾸면
+     * {@code EXPIRED}·{@code COMPLETED}가 신규 행을 만들 때도 {@code admitted_at}이 찍혀,
+     * 입장한 적 없는 토큰을 {@code SUM(admitted_at IS NOT NULL)}(= 입장권 개수의 유일한 근거)이
+     * 세어 버린다. 과금이 부풀어도 아무도 못 본다.
+     */
+    @Test
+    @DisplayName("§90: admit을 거치지 않은 EXPIRED 신규 행의 admitted_at은 NULL이다")
+    void transition_expiredWithoutAdmitLeavesAdmittedAtNull() {
+        String tokenId = "tok_sk_en_" + UUID.randomUUID();
+
+        adapter.applyTransition(TokenEventType.EXPIRED, List.of(
+                expired(tokenId, 10, ExpiredReason.WAITING_TTL)));
+
+        assertThat(admittedAtOf(tokenId))
+                .as("입장한 적 없는 토큰이 SUM(admitted_at IS NOT NULL)에 세어지면 과금이 부푼다")
+                .isNull();
+    }
+
+    /**
+     * 🔴 <b>시계 통일이 만료를 죽이지 않는다.</b> 창 밖(400초)인 행은 여전히 정리 대상이다 —
+     * 반대편을 안 재면 "아무것도 만료 안 되는" SQL로 바꿔도 위 가드들은 초록이다.
+     */
+    @Test
+    @DisplayName("§90: 창 밖 행은 그대로 만료된다 — 시계 통일이 만료를 죽이지 않는다")
+    void expireStaleAdmitted_stillExpiresOutsideWindow() {
+        String tokenId = "tok_skew_exp_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(tokenId, 8)));
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(tokenId, 8)));
+        // MySQL이 찍은 admitted_at을 창 밖으로 직접 민다 (앱 시계를 거치지 않는다)
+        jdbc.update("UPDATE tokens SET admitted_at = UTC_TIMESTAMP(3) - INTERVAL 400 SECOND "
+                + "WHERE token_id = ?", tokenId);
+
+        int expired = txTemplate().execute(tx ->
+                adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 100));
+        assertThat(expired).isEqualTo(1);
+        assertThat(statusOf(tokenId)).isEqualTo(4);
+    }
+
+    /**
+     * 🔴 <b>§91 회귀 가드 — 이 테스트가 빨개지면 폴백 complete의 1.43%가 다시 원장을 잃는다.</b>
+     *
+     * <p>실측(2026-09-09, Kafka 오프셋 전수): stuck 7건 <b>전부</b> COMPLETED 오프셋이 ADMITTED보다
+     * 앞이었다. {@code admit.lua}가 커밋되면 admitToken이 Redis에 즉시 보이고 폴링은 Redis만 보는데,
+     * {@code publishAdmitted}는 그 뒤에 건별 블로킹 {@code .get()}으로 <b>직렬</b> 발행한다
+     * (지연 67~128ms). 사용자가 그 사이에 verify·complete를 끝내면 순서가 뒤집힌다.
+     *
+     * <p>예전 가드({@code status = 1})는 여기서 <b>조용히 no-op</b>이 되어 행이
+     * {@code status=1 / completed_at=NULL}로 고착됐고, 300초 뒤 ReconcileJob이 {@code status=4}로
+     * 확정했다. <b>사용자는 200을 받아 알 수단이 없었다.</b>
+     *
+     * <p>🔑 <b>네 컬럼을 다 단정하는 것이 요점이다.</b> {@code status}만 보면
+     * {@code admit_token}·{@code admitted_at}이 NULL로 남는 판(= 원장 유실이 과금 누락으로
+     * 모양만 바뀌는 판)을 통과시킨다 — 3인 검토가 각각 다른 경로로 지목한 지점이다.
+     */
+    @Test
+    @DisplayName("§91: COMPLETED가 ADMITTED보다 먼저 도착해도 완료가 확정되고 네 컬럼이 다 찬다")
+    void transition_completedBeforeAdmittedStillCompletes() {
+        String tokenId = "tok_ord_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(tokenId, 21)));      // ENQUEUED만 적용된 상태
+
+        // 순서 역전: COMPLETED가 먼저 (admittedAt은 null — 실제 발행 지점 전부 그렇다)
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                transition(tokenId, 21, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
+
+        assertThat(statusOf(tokenId)).as("status=1 가드였다면 여기가 0으로 남는다").isEqualTo(2);
+        assertThat(admitTokenOf(tokenId))
+                .as("NULL이면 findCompletedAt이 빈 값을 읽어 complete 재시도가 영구 404가 된다")
+                .isEqualTo(admitTokenFor(tokenId));
+        assertThat(admittedAtOf(tokenId))
+                .as("NULL이면 SUM(admitted_at IS NOT NULL)에서 빠져 입장권이 과소 계상된다")
+                .isNotNull();
+        assertThat(completedAtOf(tokenId)).isNotNull();
+
+        // 뒤늦게 도착한 ADMITTED는 status=0 가드에 걸려 no-op — 값을 덮어쓰지 않아야 한다
+        LocalDateTime admittedAt = admittedAtOf(tokenId);
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(tokenId, 21)));
+
+        assertThat(statusOf(tokenId)).as("늦은 ADMITTED가 완료를 되돌리면 안 된다").isEqualTo(2);
+        assertThat(admittedAtOf(tokenId)).as("no-op이므로 값이 그대로여야 한다").isEqualTo(admittedAt);
+    }
+
+    /**
+     * 🔴 <b>§91 회귀 가드 ②  — `IS NULL` 하위조건과 `status=2` 배제를 지킨다.</b>
+     *
+     * <p>순서 역전 가드({@code transition_completedBeforeAdmittedStillCompletes})가 <b>못 잡는</b>
+     * 두 구멍을 이 테스트가 막는다. 결함 주입으로 확인된 사각지대다 —
+     * {@code admitted_at} 줄의 {@code IS NULL}을 지워도, 가드를 {@code IN (0,1,2)}로 넓혀도
+     * <b>487건이 전부 초록이었다.</b>
+     *
+     * <p>🔑 <b>{@code IS NULL}이 없으면 1.43%가 아니라 완료되는 토큰 100%가 망가진다.</b>
+     * COMPLETED가 정상 순서로 와도 {@code admitted_at}을 자기 시각으로 덮어써서, 그 컬럼이
+     * "admit 시각"이 아니라 "complete 적용 시각"이 된다 →
+     * {@code queue_daily_stats}의 대기 시간이 <b>대기 + 체류 시간</b>이 되고,
+     * §90이 {@code transition_redeliveryDoesNotResurrect}에서 못박은 성질(재기록하면 complete 창이
+     * 연장되고 ReconcileJob 만료가 밀린다)이 COMPLETED 쪽에서 무너진다.
+     *
+     * <p>🪤 <b>{@code transition_redeliveryDoesNotResurrect}는 이걸 구조적으로 못 잡는다</b> —
+     * 비교 기준값을 COMPLETED 적용 <b>뒤에</b> 읽어서, 오염된 값을 기준으로 삼는다.
+     * 그래서 여기서는 <b>ADMITTED 직후에</b> 기준값을 잡는다.
+     */
+    @Test
+    @DisplayName("§91: 정상 순서에서 COMPLETED는 admitted_at을 덮지 않고, status=2 재도착도 no-op이다")
+    void transition_completedDoesNotOverwriteAdmittedAt() {
+        String tokenId = "tok_ovw_" + UUID.randomUUID();
+        adapter.saveAllIfAbsent(List.of(waiting(tokenId, 31)));
+        adapter.applyTransition(TokenEventType.ADMITTED, List.of(admitted(tokenId, 31)));
+
+        // 🔑 오염 전에 기준값을 잡는다 — 이 한 줄이 J2를 잡는 유일한 이유다
+        LocalDateTime admittedAt = admittedAtOf(tokenId);
+        assertThat(admittedAt).isNotNull();
+
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                transition(tokenId, 31, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
+
+        assertThat(statusOf(tokenId)).isEqualTo(2);
+        assertThat(admittedAtOf(tokenId))
+                .as("IS NULL 조건이 없으면 COMPLETED가 admit 시각을 자기 시각으로 덮는다 (전 토큰 대상)")
+                .isEqualTo(admittedAt);
+        LocalDateTime completedAt = completedAtOf(tokenId);
+        assertThat(completedAt).isNotNull();
+
+        // status=2 배제: 재전달된 COMPLETED가 이미 돌려준 completedAt을 덮으면 안 된다
+        adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                transition(tokenId, 31, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
+
+        assertThat(completedAtOf(tokenId))
+                .as("가드를 IN (0,1,2)로 넓히면 여기가 갈린다 — Tenant에 돌려준 completedAt이 거짓이 된다")
+                .isEqualTo(completedAt);
+        assertThat(admittedAtOf(tokenId)).isEqualTo(admittedAt);
+    }
+
+    private LocalDateTime completedAtOf(String tokenId) {
+        return jdbc.queryForObject("SELECT completed_at FROM tokens WHERE token_id = ?",
+                LocalDateTime.class, tokenId);
+    }
+
+    /** {@code @Modifying} 쿼리는 트랜잭션을 요구하는데, 클래스에 걸면 seed가 flush되지 않아 경로가 갈린다. */
+    private TransactionTemplate txTemplate() {
+        return new TransactionTemplate(txManager);
+    }
+
     private static String admitTokenFor(String tokenId) {
         return "adm_" + tokenId.substring(tokenId.length() - 12);
     }

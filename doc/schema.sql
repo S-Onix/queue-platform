@@ -128,6 +128,10 @@ CREATE TABLE queues (
 -- [seq] Redis 전손 시 DB로 대기열을 재구성하기 위한 값(§71). 복귀 경로는 없다(§36 폐기)
 -- [admit_token] verify DB Fallback + Polling Fallback용
 -- [admitted_at] admit 시각. verify·complete의 유효 창 판정 기준 (DECISIONS §80)
+--      🔴 값을 찍는 것은 앱이 아니라 **MySQL**이다 (UTC_TIMESTAMP(3), §90) — 이 컬럼은 술어의
+--      좌변이고 우변이 전부 MySQL 시계라, 앱 시계로 쓰면 한 창을 두 시계로 재게 된다.
+--      대가로 정확히는 '컨슈머 적용 시각'이다(admit + Kafka lag). 정밀 대기 시간은
+--      queue_admission_wait_seconds(앱 계측)를 봐라.
 --   ⚠️ issued_at을 그 판정에 쓰면 안 된다 — 줄을 선 시각이라 두 시간 전일 수 있다.
 --   ✅ 파티션 테이블 ADD COLUMN에서 ALGORITHM=INSTANT 실증 완료 (2026-08-17 22:26:27 KST, MySQL 8.0.46).
 --      실행문: ALTER TABLE tokens ADD COLUMN admitted_at DATETIME(3) NULL AFTER issued_at, ALGORITHM=INSTANT
@@ -191,7 +195,7 @@ CREATE TABLE tokens (
     --       EXPIRED 소비 가드가 status = IF(status=0, 4, status) 하나뿐이고, ReconcileJob 의
     --       직접 UPDATE 도 SET status = 4 뿐이다. COMPLETED 만 completed_at 을 찍는다.
     issued_at         DATETIME(3)  NOT NULL,
-    admitted_at       DATETIME(3)  NULL,     -- admit 시각 (DECISIONS §80)
+    admitted_at       DATETIME(3)  NULL,     -- admit 시각. MySQL이 찍는다 (UTC_TIMESTAMP(3), §90)
     completed_at      DATETIME(3)  NULL,
     expired_at        DATETIME(3)  NULL,
 
@@ -312,8 +316,12 @@ CREATE TABLE queue_daily_stats (
     -- NULL = admit 0건(표본 없음). 0("즉시 입장")과 다르므로 DEFAULT 0을 주지 마라
     sum_wait_sec      BIGINT      NULL,
     -- MAX는 합산된다(MAX(MAX) = 기간 MAX). 백분위는 안 되므로 p50/p99 컬럼은 두지 않는다
-    -- ⚠️ 음수가 들어올 수 있다. issued_at·admitted_at 둘 다 앱 시계라 API 서버 N대의
-    --    스큐만큼 어긋난다(실측 -398초 1건). GREATEST(...,0)로 가리지 않는다 — 스큐 신호다
+    -- ⚠️ 음수가 들어올 수 있다. 다만 §90 이후로 축이 바뀌었다 — admitted_at은 MySQL 시계
+    --    (UTC_TIMESTAMP(3))고 issued_at만 앱 시계다. 기준점이 하나로 고정돼 음수 조건이
+    --    "임의의 두 API 서버 쌍"에서 "enqueue 서버 하나가 DB보다 앞섬"으로 좁아졌다
+    --    (실측 -398초 1건은 §90 이전 기록이다). GREATEST(...,0)로 가리지 않는다 — 스큐 신호다
+    -- ⚠️ 반대로 admitted_at은 컨슈머 적용 시각이라 Kafka lag이 **양수 방향**으로 섞인다.
+    --    초 단위라 정상 lag(≪1s)에서는 표현되지 않고, 정밀한 값은 queue_admission_wait_seconds가 갖는다
     max_wait_sec      INT         NULL,
     created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
@@ -370,9 +378,12 @@ SELECT a.tenant_id, a.queue_id, a.stat_date, a.enq, a.cmp, a.exp,
                SUM(expired_reason <=> 3)                            AS e_inact,
                SUM(expired_reason <=> 4)                            AS e_wait,
                SUM(admitted_at IS NOT NULL)                       AS adm,
-               -- ⚠️ 기준은 admitted_at이다. completed_at이 아니다 —
-               --    그 구간엔 테넌트 내부 처리 시간과 컨슈머 적용 지연이 섞인다.
-               --    issued_at → admitted_at이 Platform이 단독으로 책임지는 유일한 구간이다.
+               -- ⚠️ 기준은 admitted_at이다. completed_at이 아니다 — 그 구간엔 **테넌트 내부
+               --    처리 시간**이 섞인다. 우리가 못 재고 우리 책임도 아닌 시간이라 지표가 무의미해진다.
+               -- ⚠️ §90 이후 admitted_at은 컨슈머 적용 시각이라 여기에도 Kafka lag이 섞인다.
+               --    그래도 admitted_at인 이유는 위 문장(테넌트 시간 배제) 하나로 충분하다 —
+               --    lag은 유계이고 상시 감시되며 초 단위 집계에는 정상 구간에서 나타나지 않는다.
+               --    실시간 정밀 대기 시간은 queue_admission_wait_seconds(앱 계측)가 따로 갖는다.
                SUM(TIMESTAMPDIFF(SECOND, issued_at, admitted_at)) AS sw,
                MAX(TIMESTAMPDIFF(SECOND, issued_at, admitted_at)) AS mw
           FROM tokens PARTITION (p2026_04)

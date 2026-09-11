@@ -107,6 +107,15 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
      *
      * <p>{@code status = 1} 술어가 멱등성을 만든다 — batch가 N대여도 각 행은 한 번만 전이한다.
      * {@code LIMIT}은 Gap Lock을 피하려고 끊는 것이고, 남은 몫은 다음 주기가 가져간다.
+     *
+     * <p>🔴 <b>cutoff를 파라미터로 받지 않는다</b>(§90). 예전엔 batch가 자기 시계로 계산한
+     * {@code admittedBefore}를 넘겼는데, 그러면 이 UPDATE가 <b>batch 서버 시계 vs
+     * {@code admitted_at}</b>을 비교한다. batch 시계가 앞서면 아직 완료 가능한 행을
+     * {@code status = 4}로 확정해 버리고, 그 행은 컨슈머 {@code COMPLETED} 가드가
+     * {@code status = 1}에서만 도는 탓에 <b>{@code status = 4 / completed_at = NULL}로
+     * 영구 고정</b>된다 — 사용자는 Redis 폴백으로 200을 받아 알 수단이 없다.
+     * {@code admitted_at}까지 MySQL 시계로 옮긴 지금, 이 술어를 SQL 안에 두면 원장 판정
+     * 경로의 시계가 <b>정확히 하나</b>가 된다.
      */
     @Modifying(clearAutomatically = true)
     @Query(value = """
@@ -114,11 +123,11 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
                SET status = 4, expired_reason = 2
              WHERE queue_id = :queueId
                AND status = 1
-               AND admitted_at < :admittedBefore
+               AND admitted_at < UTC_TIMESTAMP(3) - INTERVAL :validWindowSeconds SECOND
              LIMIT :limit
             """, nativeQuery = true)
     int expireStaleAdmitted(@Param("queueId") String queueId,
-                            @Param("admittedBefore") LocalDateTime admittedBefore,
+                            @Param("validWindowSeconds") int validWindowSeconds,
                             @Param("limit") int limit);
 
     /** 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq. 없으면 NULL이라 호출자가 0으로 바꾼다. */

@@ -40,6 +40,9 @@ public class TokenPersistService {
      *               ① 배치에 중복 {@code tokenId}가 없으면 <b>타입별로 모아</b> 한 번에,
      *               ② 있으면 <b>같은 타입이 연속하는 구간</b>씩. ②가 필요한 이유는 같은 토큰의
      *               {@code ADMITTED → COMPLETED} 순서가 뒤집히면 COMPLETED가 먼저 no-op이 되어
+     * 🔧 <b>§91에서 갈렸다.</b> COMPLETED 가드가 {@code status IN (0, 1)}로 넓어져
+     * <b>COMPLETED는 순서에 의존하지 않는다</b>. 이 규칙이 여전히 지키는 것은
+     * {@code ADMITTED}·{@code EXPIRED}의 {@code status = 0} 출발 가드다.
      *               그 토큰이 영원히 완료되지 않기 때문이다. 중복이 없으면 뒤집힐 대상 자체가 없다.
      *               판정은 {@code TokenLifecycleConsumer.canGroupByType}에 있다.
      */

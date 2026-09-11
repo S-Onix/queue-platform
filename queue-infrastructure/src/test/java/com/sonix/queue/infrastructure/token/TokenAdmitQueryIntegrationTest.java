@@ -289,9 +289,7 @@ class TokenAdmitQueryIntegrationTest {
         seedAdmitted("tok_dev_r1", "adm_dev_r1", 400);   // 창 밖 → 대상
         seedAdmitted("tok_dev_r2", "adm_dev_r2", 3);     // 창 안 → 살아야 한다
 
-        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
-                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
-        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isEqualTo(1);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 100)).isEqualTo(1);
 
         assertThat(statusOf("tok_dev_r1")).isEqualTo(4);   // EXPIRED
         assertThat(statusOf("tok_dev_r2")).isEqualTo(1);   // ADMIT_ISSUED 유지
@@ -306,11 +304,9 @@ class TokenAdmitQueryIntegrationTest {
     @DisplayName("expireStaleAdmitted: 두 번째 호출은 0행 — status = 1 술어가 멱등성을 만든다")
     void expireStaleAdmitted_isIdempotent() {
         seedAdmitted("tok_dev_r3", "adm_dev_r3", 400);
-        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
-                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
 
-        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isEqualTo(1);
-        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isZero();
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 100)).isEqualTo(1);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 100)).isZero();
     }
 
     /** {@code LIMIT}이 실제로 걸려야 Gap Lock을 피한다. 남은 몫은 다음 주기가 가져간다. */
@@ -321,11 +317,9 @@ class TokenAdmitQueryIntegrationTest {
         for (int i = 0; i < 3; i++) {
             seedAdmitted("tok_dev_r4_" + i, "adm_dev_r4_" + i, 400);
         }
-        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
-                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
 
-        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 2)).isEqualTo(2);
-        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 2)).isEqualTo(1);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 2)).isEqualTo(2);
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 2)).isEqualTo(1);
     }
 
     /**
@@ -339,9 +333,7 @@ class TokenAdmitQueryIntegrationTest {
         seedAdmitted("tok_dev_r5", "adm_dev_r5", 400);
         jdbc.update("UPDATE tokens SET status = 2 WHERE token_id = ?", "tok_dev_r5");
 
-        LocalDateTime cutoff = LocalDateTime.now(java.time.ZoneOffset.UTC)
-                .minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS);
-        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, cutoff, 100)).isZero();
+        assertThat(adapter.expireStaleAdmitted(QUEUE_ID, Token.COMPLETE_VALID_WINDOW_SECONDS, 100)).isZero();
         assertThat(statusOf("tok_dev_r5")).isEqualTo(2);
     }
 

@@ -987,8 +987,10 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
     - 임계치 모니터링 필요
 - 대안
   - Custom 메트릭 작성
-    - queue_token_admit_total{tenant_id, queue_id, result}       ⬜ **미구현** (§80 U9의 queue_admit_requests_total로 대체 예정)
-      - result: success / failure
+    - queue_token_admit_total{tenant_id, queue_id, result}       ✅ **`queue_admit_requests_total{queue_id, result}`로 대체 구현됨** (2026-09-09, §80 U9)
+      - result: ok / empty / replay / error (설계안의 success/failure보다 갈라 놨다 — 0건 admit과 REPLAY는 실패가 아니고, `error`는 ADMITTED 발행 실패다)
+      - ⚠️ `tenant_id` 라벨은 **빼고 구현했다.** 큐는 테넌트 하나에 속하므로 `queue_id`가 이미 테넌트를 결정한다. 붙이면 시계열만 곱해진다
+    - queue_admit_tokens_issued_total{queue_id}                  ✅ **구현됨** (2026-09-09, REPLAY는 세지 않는다 — 새로 발급한 것이 없다)
     - queue_admission_wait_seconds (Histogram)                  ✅ **구현됨** (2026-09-04, `QueueEngineService.recordAdmissionWait`)
       - 대기 시간 분포
       - 라벨: queue_id

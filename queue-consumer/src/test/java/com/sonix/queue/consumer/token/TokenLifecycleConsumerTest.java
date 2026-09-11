@@ -137,6 +137,9 @@ class TokenLifecycleConsumerTest {
     /**
      * <b>같은 토큰이 한 배치에 두 번 실리면</b> 도착 순서를 그대로 지켜야 한다. 타입별로 모아
      * 넘기면 그 순서가 뒤집혀, 가드({@code status = 1}에서만)가 거짓인 COMPLETED가 먼저
+     * 🔧 <b>§91에서 갈렸다.</b> COMPLETED 가드가 {@code status IN (0, 1)}로 넓어져
+     * <b>COMPLETED는 순서에 의존하지 않는다</b>. 이 규칙이 여전히 지키는 것은
+     * {@code ADMITTED}·{@code EXPIRED}의 {@code status = 0} 출발 가드다.
      * no-op이 되고 그 토큰은 영원히 완료되지 않는다.
      *
      * <p><b>도착 순서를 일부러 전이 순서와 반대로 둔다.</b> 그룹 적재는 {@code EnumMap}의

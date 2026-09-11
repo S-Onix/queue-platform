@@ -113,20 +113,18 @@ class ReconcileJobTest {
      * (admit 후 98초에도 complete가 200을 돌려준다).
      */
     @Test
-    @DisplayName("ADMIT_ISSUED 정리 기준 = now - COMPLETE_VALID_WINDOW_SECONDS (admitTtl이 아니다)")
+    @DisplayName("ADMIT_ISSUED 정리 기준 = COMPLETE_VALID_WINDOW_SECONDS 창 (admitTtl이 아니다)")
     void staleAdmittedCutoffUsesCompleteWindow() {
         when(queueRepository.findAll()).thenReturn(List.of(queue("q_a")));
         when(tokenRepository.findSettledMaxSeq(anyString(), any())).thenReturn(0L);
 
-        LocalDateTime before = LocalDateTime.now(ZoneOffset.UTC);
         job.reconcile();
-        LocalDateTime after = LocalDateTime.now(ZoneOffset.UTC);
 
-        ArgumentCaptor<LocalDateTime> cut = ArgumentCaptor.forClass(LocalDateTime.class);
-        verify(tokenRepository).expireStaleAdmitted(eq("q_a"), cut.capture(), eq(ReconcileJob.EXPIRE_LIMIT));
-        assertThat(cut.getValue())
-                .isBetween(before.minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS),
-                           after.minusSeconds(Token.COMPLETE_VALID_WINDOW_SECONDS));
+        // 🔴 넘기는 것은 **시각이 아니라 창의 길이**다 (§90). 잡이 자기 시계로 cutoff를 만들면
+        //    batch 서버 시계와 admitted_at(DB 시계)이 갈려, 아직 완료 가능한 행을 만료로 확정한다.
+        //    "지금"은 술어를 실행하는 DB가 정한다 — markCompleted와 같은 시계로 같은 창을 잰다.
+        verify(tokenRepository).expireStaleAdmitted(
+                eq("q_a"), eq(Token.COMPLETE_VALID_WINDOW_SECONDS), eq(ReconcileJob.EXPIRE_LIMIT));
     }
 
     /** 정착 구간에 토큰이 없는 큐(새 큐)는 대사 대상이 아니다 — Redis를 부르지도 않는다. */
@@ -159,6 +157,6 @@ class ReconcileJobTest {
         job.reconcile();
 
         assertThat(gauge("queue.reconcile.ghosts")).isEqualTo(7.0);
-        verify(tokenRepository).expireStaleAdmitted(eq("q_ok"), any(), anyInt());
+        verify(tokenRepository).expireStaleAdmitted(eq("q_ok"), anyInt(), anyInt());
     }
 }

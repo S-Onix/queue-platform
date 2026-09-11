@@ -44,7 +44,7 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 |---|---|---|
 | `ENQUEUED` | (신규) | `ON DUPLICATE KEY UPDATE token_id = token_id` (no-op) |
 | `ADMITTED` | 0 WAITING | `IF(status = 0, 1, status)` |
-| `COMPLETED` | 1 ADMIT_ISSUED | `IF(status = 1, 2, status)` |
+| `COMPLETED` | **0 WAITING · 1 ADMIT_ISSUED** | `IF(status IN (0,1), 2, status)` + `admit_token`·`admitted_at`·`completed_at` 보정 (§91) |
 | `EXPIRED` | 0 WAITING | `IF(status = 0, 4, status)` |
 
 > 🔴 **`admitToken` TTL 만료는 `4`에 도달하지 않는다.** 그 사람은 `status = 1`이고 가드가 `0`만
@@ -57,9 +57,17 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 > 특히 `ZADD`(enqueue Lua)가 Kafka 발행보다 먼저라 **`ENQUEUED`보다 `ADMITTED`가 먼저 도착**하는
 > 창이 실재한다. `ENQUEUED`의 no-op upsert가 그 역전을 흡수한다.
 >
-> ℹ️ **`COMPLETED` 가드가 `1`만 허용하는데 complete API는 `status IN (0,1)`을 허용하는 것은 모순이 아니다.**
-> complete는 **동기 UPDATE로 이미 2를 쓰고** 나서 이벤트를 발행하므로, 소비 시점의 행은 이미 `2`다 —
-> 이 가드는 되살아남만 막는 안전장치이고 상태를 만드는 주체가 아니다(권위는 API의 조건부 UPDATE).
+> 🔧 **§91에서 뒤집혔다. 예전 서술을 지운다.**
+> 여기엔 *"`COMPLETED` 가드가 `1`만 허용하는데 complete API가 `IN (0,1)`인 것은 모순이 아니다 —
+> 이 가드는 되살아남만 막는 안전장치이고 **상태를 만드는 주체가 아니다**"* 라고 적혀 있었다.
+> **그 전제가 거짓이었다.** complete가 Redis 폴백으로 200을 주는 경로에서는 동기 UPDATE가 0행이라
+> 행이 아직 `0`이고, 그때 이 가드가 **유일한 기록자**가 된다. 그런데 `= 1`이라 no-op이 되어
+> 행이 `status=1 / completed_at=NULL`로 고착됐다 — 폴백 complete의 **1.43%**가 원장을 잃었다
+> (Kafka 오프셋 전수 실측: COMPLETED가 ADMITTED보다 먼저 도착한다).
+> **지금 이 가드는 상태를 만드는 주체가 맞다.** 그래서 `admit_token`·`admitted_at`도 함께 채운다 —
+> 안 채우면 원장 유실이 과금 누락으로 모양만 바뀐다.
+> ⚠️ **`2`와 `4`는 여전히 배제된다** — `2`를 넣으면 이미 돌려준 `completedAt`이 덮이고,
+> `4`를 넣으면 확정된 만료를 완료로 뒤집는다.
 >
 > ⚠️ **알려진 구멍**: `0 → 1 → (TTL 만료) → 0` 왕복 뒤 **옛 `ADMITTED`가 재전달**되면 낡은 토큰으로
 > 다시 1이 된다. 가드는 `status`만 보고 **세대를 모르기 때문**이다. 60초를 넘긴 재전달이라 희박해
