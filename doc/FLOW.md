@@ -164,7 +164,7 @@ flowchart TD
 
     ARESP --> POLL["유저 다음 Polling 시\nadmitToken 수신"]
     --> USER["유저 → Tenant\nadmitToken 전달"]
-    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인 + COMPLETED 발행 (PR #48)\n※ 이 응답 시점이 완료다\nRedis·DB 직접 쓰기 0회 — 이벤트만 낸다"]
+    --> VERIFY["POST /queues/:queueId/admit-tokens/:admitToken/verify\nTenant → Platform\n유효성 확인 + Redis 회차 키 정리 + COMPLETED 발행 (PR #48 · §92)\n※ 이 응답 시점이 완료다\nDB 직접 쓰기 0회 — 이벤트만 낸다\nRedis: HDEL tokens · ZREM admitted · DEL admit-by-token (cleanupVerified)\n※ admit-by-admit은 남긴다 — verify 재시도·complete 폴백의 근거, PX 60s가 거둔다"]
 
     VERIFY --> VK{"queue:{queueId}:admit-by-admit:{admitToken}\n유효?\n값에 tokenId와 identifier가 함께 들어 있다 (첫 구분자로만 분리)\n→ identifier가 손에 있으므로 DB를 안 읽는다 (§80)"}
     VK -->|"만료 or 무효"| VDB["DB Fallback\nSELECT WHERE admit_token=:admitToken\nAND status=ADMIT_ISSUED\nAND admitted_at > UTC_TIMESTAMP(3) - INTERVAL 60 SECOND\n(issued_at 아님 — 줄 선 시각은 2시간 전일 수 있다. §80)"]

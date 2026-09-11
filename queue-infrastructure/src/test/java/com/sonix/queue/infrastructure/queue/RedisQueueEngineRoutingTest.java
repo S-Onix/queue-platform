@@ -171,6 +171,39 @@ class RedisQueueEngineRoutingTest {
         assertThat(cluster1.hasKey(QueueKeys.lastActive(ON_CLUSTER2))).isFalse();
     }
 
+    /**
+     * §92로 이 EVAL의 호출 빈도가 <b>complete당 1회 → verify당 1회</b>로 올랐다. 그런데 cleanup 계열은
+     * 이 클래스에 한 건도 없었다 — {@code routeForWrite}를 빼도 전 스위트가 초록이었다는 뜻이다.
+     *
+     * <p>🔴 <b>그 회귀의 대가</b>: cluster2 배정 큐의 완료 정리가 cluster1의 빈 키에서 돌아 조용히
+     * {@code -1}로 성공한다. 게이트가 영영 안 풀려 <b>영구 락아웃</b>, admitToken은 60초 더 살아
+     * <b>무료 재입장</b>, {@code admitted} 멤버가 남아 회수 배치가 <b>헛 EXPIRED</b>를 쏜다.
+     * 단일 클러스터 테스트({@code cluster1 == cluster2})로는 원리적으로 못 잡는다.
+     *
+     * <p>{@code waiting} 삭제를 재는 유일한 자리이기도 하다 — {@code AdmitExpiryReclaimTest}의
+     * seed는 {@code waiting}을 심지 않아 그 키를 빼도 빨개지지 않는다.
+     */
+    @Test
+    @DisplayName("쓰기: cleanupVerified(EVAL)도 소유 클러스터에서 실행된다 — cluster1로 가면 조용히 -1이라 게이트가 영영 안 풀린다 (§75·§92)")
+    void cleanupVerified_runsOnOwningCluster() {
+        seedOnCluster2(ON_CLUSTER2);   // seq · waiting(user_1) · tokens(user_1 -> "tok_1|NOW")
+        cluster2.opsForZSet().add(QueueKeys.admitted(ON_CLUSTER2), "1|user_1", NOW + 60_000);
+        cluster2.opsForValue().set(QueueKeys.admitByToken(ON_CLUSTER2, "tok_1"), "adm_1");
+        RedisQueueEngine engine = engine();
+
+        engine.cleanupVerified(ON_CLUSTER2, "user_1", "tok_1", 1L);
+
+        // 넷 다 cluster2에서 사라졌다 = 스크립트가 소유 클러스터에서 돌았다는 직접 증거
+        assertThat(cluster2.opsForHash().hasKey(QueueKeys.tokens(ON_CLUSTER2), "user_1"))
+                .as("중복 게이트").isFalse();
+        assertThat(cluster2.opsForZSet().score(QueueKeys.waiting(ON_CLUSTER2), "user_1"))
+                .as("waiting 잔재").isNull();
+        assertThat(cluster2.opsForZSet().zCard(QueueKeys.admitted(ON_CLUSTER2)))
+                .as("admitted 멤버 — 남으면 회수 배치가 헛 EXPIRED를 쏜다").isZero();
+        assertThat(cluster2.hasKey(QueueKeys.admitByToken(ON_CLUSTER2, "tok_1")))
+                .as("admit-by-token").isFalse();
+    }
+
     @Test
     @DisplayName("쓰기: admit(EVAL)도 소유 클러스터에서 실행된다 — cluster1로 가면 빈 대기열에서 0명을 뽑는다")
     void admit_runsOnOwningCluster() {

@@ -31,8 +31,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ol>
  *
  * <p><b>회수는 {@code tokens} Hash 필드를 지우는 일이다.</b> 그 필드가
- * {@code enqueue_bulk.lua}의 {@code HSETNX} 중복 게이트이고 지우는 경로가
- * {@code cleanupCompleted} 하나뿐이라, 안 지우면 그 사람은 재-enqueue에서
+ * {@code enqueue_bulk.lua}의 {@code HSETNX} 중복 게이트이고 완료 쪽 삭제 경로가
+ * {@code cleanupCompleted}·{@code cleanupVerified}(§92) 둘뿐이라, 안 지우면 그 사람은 재-enqueue에서
  * {@code EXISTS}(rank -1)를 받아 <b>영구 락아웃</b>된다. 회수해도 대기열로 <b>되돌리지 않는다</b>(§36).
  *
  * <p><b>한 잡에 셋을 넣는다.</b> 나누면 {@code queueRepository.findAll()}이 주기마다 그만큼 더

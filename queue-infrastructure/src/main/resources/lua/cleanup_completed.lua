@@ -5,7 +5,16 @@
 -- KEYS[2]: admitted key       (예: queue:{q_bts}:admitted)             — ZSet, member="seq|identifier"
 -- KEYS[3]: tokens key         (예: queue:{q_bts}:tokens)               — Hash, identifier -> "tokenId|issuedAt"
 -- KEYS[4]: admit-by-token key (예: queue:{q_bts}:admit-by-token:tok_x) — String
--- KEYS[5]: admit-by-admit key (예: queue:{q_bts}:admit-by-admit:adm_x) — String
+-- KEYS[5]: admit-by-admit key (예: queue:{q_bts}:admit-by-admit:adm_x) — String  **선택(§92)**
+--   🔴 KEYS[5]는 complete만 넘긴다. verify는 KEYS 4개로 부른다 — admit-by-admit을 **일부러 남긴다**.
+--   그 키 하나가 두 재시도의 근거라서다: ① Tenant가 verify 응답을 못 받고 다시 부르는 verify
+--   (§22가 verify를 비소비로 둔 이유), ② verify → complete를 둘 다 부르는 Tenant의 complete가
+--   컨슈머 백로그·§91 발행 지연 구간에서 DB 0행일 때 타는 Redis 폴백. 지우면 둘 다 404가 되고,
+--   막으려면 §80이 폐기한 verified-token 표식이 다시 필요하다. PX 60s가 알아서 거둔다.
+--   반대로 complete는 자기 재시도가 DB(status=2 + admit_token 대조)로 답하므로 지워도 된다.
+--   나머지 넷은 "이 사람이 아직 회차 안"이라는 뜻이라 완료 경로 둘 다 지운다 — 안 지우면
+--   verify-only 완료자가 60초 동안 옛 토큰으로 무료 재입장하고, 과금이 경로에 따라 1 vs 2로
+--   갈리며, 회수 배치가 완료자를 admit 만료자로 세어 헛 EXPIRED를 발행한다(2026-09-11 실측).
 --   다섯 모두 QueueKeys의 정적 팩토리가 {queueId} 해시태그를 붙인다 = 같은 슬롯.
 --   ⚠️ admit-by-* 를 admit.lua처럼 ARGV 접두사로 받지 않는다. 여기서는 tokenId·admitToken이 둘 다
 --   호출자 손에 있어 **Java가 다섯 키 이름을 실행 전에 전부 안다** — 그러면 KEYS로 선언할 수 있고,
@@ -52,10 +61,13 @@ local tokenId = ARGV[3]
 -- ── 회차 고유 키는 무조건 지운다 ──────────────────────────────────────────────
 -- member에 seq가, 키 뒷조각에 tokenId/admitToken이 박혀 있다. 셋 다 회차마다 유일하므로
 -- (seq=INCR, tokenId·admitToken=UUIDv7) 남의 회차를 지울 수 없다. 대조가 필요 없다.
--- 🔴 반대로 여기에 가드를 걸면 안 된다 — admit-by-admit이 남으면 완료된 admitToken으로
---    verify가 TTL(60초) 동안 계속 통과한다. QueueEngine#findAdmitRefByAdmitToken 참조.
+-- 🔴 반대로 여기에 회차 가드를 걸면 안 된다 — 걸 이유가 없고(남의 회차를 지울 수 없다), 걸면
+--    HGET 미스인 경로에서 이 셋이 남는다. admit-by-admit(KEYS[5])은 verify가 넘기지 않아
+--    verify 뒤 60초 안 같은 admitToken의 verify는 계속 통과한다 — 결함이 아니라 재시도 계약이다
+--    (머리말 KEYS[5] 참조, API.md "admitToken을 소비하지 않는다").
 redis.call('ZREM', KEYS[2], seq .. '|' .. identifier)
-redis.call('DEL', KEYS[4], KEYS[5])
+redis.call('DEL', KEYS[4])
+if KEYS[5] then redis.call('DEL', KEYS[5]) end
 
 -- ── 사람 키는 지금 그 사람이 어느 회차인지 물어본 뒤에 지운다 ─────────────────
 local stored = redis.call('HGET', KEYS[3], identifier)

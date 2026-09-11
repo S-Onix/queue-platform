@@ -487,7 +487,7 @@ flowchart TD
     올리는 건 하위호환이지만 **내리는 건 파괴적 변경**이라 시작값은 "필요를 채우는 최소"다 —
     30만/2h = 42/s인데 cap 100 × 10 rps = 1,000/s로 24배다 (§80 ⑦)
 - `POST /queues/:queueId/admit-tokens/:admitToken/verify` — DB Fallback 술어는 **`admitted_at`** 기준
-  - **Redis·DB 직접 쓰기 0회.** 다만 ~~"상태 변경 없음"~~은 아니다 — **verify가 완료를 확정한다**(응답 시점에 `COMPLETED` 발행, PR #48). Redis·DB **직접** 쓰기는 0회 — 이벤트만 낸다
+  - **DB 직접 쓰기 0회.** 다만 ~~"상태 변경 없음"~~도 ~~"Redis 쓰기 0회"~~도 아니다 — **verify가 완료를 확정하고**(응답 시점에 `COMPLETED` 발행, PR #48) **회차 키 넷을 정리한다**(§92, `admit-by-admit`만 남긴다). DB는 이벤트만 낸다
 - `POST /queues/:queueId/tokens/:tokenId/complete` — **DB 권위** 조건부 UPDATE
   (`admit_token = ?` + `status IN (0,1)` + `admitted_at` 유효 창) → Redis 정리는 나중
 - `queue:{queueId}:admitted` ZSet 신설 (score=만료 epoch ms, member=`"seq|identifier"`) — `QueueKeys` 경유

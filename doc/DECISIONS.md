@@ -1142,6 +1142,10 @@ ADMIT_ISSUED에서 이탈하려면:
 > §80이 verify의 Redis 쓰기를 **0으로** 만들었으므로 "verify는 상태 변경 없음"이 이제
 > **문자 그대로 참**이다(이전에는 `SET verified-token`이라는 쓰기가 있었다).
 > complete의 가드도 바뀐다 — `admit_token` + `status IN (0, 1)` + `admitted_at` 유효 창.
+>
+> ✏️ **§92(2026-09-11)에서 "Redis 쓰기 0"이 다시 깨졌다.** PR #48이 verify를 완료 확정으로 올린
+> 뒤로 verify도 회차 키를 정리한다. 다만 `admit-by-admit`은 남기므로 아래 면접 포인트의
+> "admitToken이 유효한 동안 재시도 가능"은 그대로 참이다 — 그 키가 재시도의 근거라서 남긴 것이다.
 
 ### 결정
 ```
@@ -6140,6 +6144,8 @@ ShedLock이 필요한 잡은 **원자 claim이 불가능한 것들**이다 — �
 - **§13 P1-③** — `verified-token` 도입 결정. **이 결정이 폐기한다**
 - **§22 · §33** (verify / complete 분리) — 분리는 유지. 다만 verify의 Redis 쓰기가 사라져
   "상태 변경 없음"이 문자 그대로 참이 된다
+  > ✏️ **이 줄은 §92(2026-09-11)에서 다시 뒤집혔다.** PR #48이 verify를 완료 확정으로 올린 뒤로
+  > verify도 회차 키를 정리한다(`admit-by-admit` 제외). "Redis 쓰기 0"은 더 이상 참이 아니다.
 - **§35** — "verify 없이 온 complete는 서버가 거절"이라는 괄호 예시를 **철회한다**
 - **§14** (admit 요청 순서 보장 — Kafka) — 명령 토픽 `enqueue-admit`을 **만들지 않는 것으로 닫는다.**
   동기 처리라 전달할 명령이 없다
@@ -7917,3 +7923,80 @@ COMPLETED가 세 컬럼을 채워 **살아난다**.
 `api-808*.log` 글롭이 **`api-8080.pre91.log`(이전 판 로그)까지 삼켜** "1,327건 중 16건 실패"라는
 가짜 결과가 나왔다. 파일명을 명시해 다시 세니 **210건 중 0건**.
 **판을 나눠 보관할 때 접미사만으론 부족하다 — 글롭이 여전히 매칭한다.**
+
+---
+
+## §92 — 완료는 경로 무관 회차 종료: verify도 Redis 회차 키를 정리한다 (`admit-by-admit`만 남긴다)
+
+**날짜**: 2026-09-11 · **Related**: §22 · §36 · §80 ①⑥ · §82 · §84 · PR #48
+
+### 발견 (실측, 깨끗한 DB에서 REST 수동 한 바퀴)
+
+PR #48이 완료 확정 주체를 verify로 옮겼는데 **Redis 정리는 complete에만** 남아 있었다. verify만 부르는
+Tenant의 완료자는 `tokens` 게이트·`admitted` 멤버·`admit-by-*`가 그대로 남아 최대 ~70초
+(admitTtl 60s + 회수 배치 10s) 동안:
+
+| 완료 경로 | 완료 직후 같은 identifier 재-enqueue | 과금(행 수) |
+|---|---|---|
+| `complete` | 새 tokenId · `already=false` · 맨 뒤 | 2 |
+| `verify` | 옛 tokenId · `already=true` · `ready=true` + **같은 admitToken** | 1 |
+
+같은 사용자 행동에 청구가 1 vs 2로 갈렸고, 회수 배치가 완료자를 admit 만료자로 세어 **헛 EXPIRED**를
+발행했다(3/3 실측, 원장은 `status=0` 가드로 무손상). `QueueEngineService.verify()` 주석은 DB를 안 쓰는
+이유만 길게 적고 Redis 정리는 0줄이었다 — **결정의 부재**지 대안 채택이 아니었다.
+
+### 결정
+
+verify 히트 경로(`AdmitRef.complete()`)는 COMPLETED 발행 직전에 회차 키 넷을 정리한다 —
+`HDEL tokens`(게이트) · `ZREM admitted` · `DEL admit-by-token` · `ZREM waiting` 잔재. **`admit-by-admit`은
+남긴다**(PX 60s가 거둔다). 같은 `cleanup_completed.lua`를 KEYS 4개로 부른다(`cleanupVerified`).
+
+### 왜 `admit-by-admit` 하나만 남기나 — 네 안 중 이것뿐이 (e)를 안 깬다
+
+| 안 | 무료 재입장 | 반복 verify | 과금 1 vs 2 | 헛 EXPIRED | **complete 폴백 404** |
+|---|---|---|---|---|---|
+| 현행 | ❌ | ❌ | ❌ | ❌ | ✅ |
+| ① 5키 전부 삭제 | ✅ | ✅ | ✅ | ✅ | **❌** |
+| ② admit-by-admit만 삭제 | ❌ | ✅ | ❌ | ❌ | **❌** |
+| ③ 코드 0줄, 70초 창을 계약으로 | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **④ admit-by-admit만 남김** | ✅ | ❌(계약) | ✅ | ✅ | ✅ |
+
+(e)의 근거: verify → complete를 둘 다 부르는 정상 Tenant는 컨슈머 백로그 + §91 발행 지연(67~128ms)
+구간에서 `markCompleted` 0행 → `findCompletedAt` 0행 → **Redis 폴백 `findAdmitRefByAdmitToken`** 하나에
+기댄다. 그 키를 verify가 지우면 404다. 막으려면 §80이 폐기한 `verified-token`이 다시 필요하다.
+Tenant의 verify 재시도도 같다 — verify DB 폴백은 `status = 1`을 요구하므로 컨슈머가 이미 2로 올린
+뒤엔 Redis 키 없이는 404다(§22가 verify를 비소비로 둔 그 이유가 PR #48 뒤에도 살아 있다).
+
+반복 verify(b)와 폴백 404(e)는 **한 키의 양면**이라 둘 다 가질 수 없다. (b)는 security 판정 ⚪ —
+주체가 큐 소유 Tenant뿐(교차 테넌트 403/404 실증), 세션은 Tenant 소관, 원장은 가드가 막는다.
+`API.md`의 "admitToken을 소비하지 않는다"는 그래서 결함이 아니라 계약이다.
+
+### 이력과의 정합
+
+"완료 후 재입장 = 신규"를 직접 쓴 문장은 0곳이지만 §22(complete = COMPLETED + ZREM) · §36(HDEL 안
+하면 영구 락아웃 / 게이트 우회 = 과금 2건) · §80 ①("빼는 경로는 반드시 HDEL") · §80 ⑥ 표("complete 후
+재-enqueue = 새 tokenId") · §82("두 번 섰으면 두 건 = 의도") · STATE(COMPLETED는 종단) · Lua "회차"
+개념 — 일곱 곳이 같은 방향이고 반대는 0곳. **번복이 아니라 미완의 완성**이다. 번복되는 것은
+§80의 "verify의 Redis 쓰기가 0"뿐이고 §22 배너에 상호 참조를 남겼다.
+
+### 결함 주입
+
+- A: 서비스에서 `cleanupVerified` 호출 제거 → `AdmitApiTest` 1건 빨강 (호출 여부)
+- C: Lua `if KEYS[5]` 가드 제거 → 4키 호출이 nil 에러로 `AdmitExpiryReclaimTest` 1건 빨강 (nil-safe)
+- D: `cleanupVerified`에서 `routeForWrite`를 빼고 `cluster1` 직접 사용 → `RedisQueueEngineRoutingTest`
+  1건 빨강 (§75. cleanup 계열은 **이 검토 전까지 라우팅 커버리지가 0이었다**)
+- ⚠️ **"verify가 `admit-by-admit`을 지우는 방향"을 잡는 것은 단위 테스트 하나뿐이다**
+  (`never().cleanupCompleted(...)`). 통합의 `hasKey(byAdmit).isTrue()`는 **그 회귀를 반증할 수 없다** —
+  `cleanupVerified` 시그니처에 `admitToken`이 없어 어댑터가 그 키 이름을 만들 도리가 없기 때문이다.
+  단정 자체는 값싸서 남기되 **방어 근거로 세지 마라**(tester 지적. §91의 "결함 주입이 한 방향만이라
+  사각지대를 놓쳤다"와 같은 계열의 자기보고 오류다)
+
+### 남는 것
+
+- 구 포맷(`complete()==false`, 롤링 배포 60초)은 seq가 없어 정리를 건너뛴다 → 회수 배치가 ≤70초에 걷는다
+- (e)의 404는 코드 경로 추적이다. 컨슈머 정지 → admit → verify → complete 결함 주입 실측은 **미실행**
+- verify의 **DB 폴백 분기**는 정리하지 않는다(비대칭이지만 결함 아님) — 그 구간의 완료자는 게이트가
+  회수 배치까지 남고, 배치의 `EXPIRED`는 컨슈머 가드(`status = 0`)에 막혀 `status=2` 행에 무동작이다.
+  막아야 할 것이 없어 만들지 않았다(§4)
+- 검토 5인(architect·security·planner → code-reviewer·tester) 보고 원문과 조건 반영 내역:
+  `doc/reviews/2026-09-11-verify-redis-cleanup.md`

@@ -39,9 +39,9 @@ public final class QueueKeys {
      * {@code status=1} 고아 행).
      *
      * <p>🔴 <b>사람을 큐에서 빼는 경로는 반드시 이 필드를 마지막에 {@code HDEL}한다.</b> 현재 넷 —
-     * {@code cleanup_completed}(complete) · {@code admit_expire}(§36) · {@code inactive_expire} ·
-     * {@code waiting_expire}(§82). 안 지우면 영영 재입장 불가, 먼저 지우면 아직 큐에 있는 사람이
-     * 폴링에서 404다.
+     * {@code cleanup_completed}(complete <b>와 verify</b>, §92 — 호출자가 둘이다) · {@code admit_expire}(§36) ·
+     * {@code inactive_expire} · {@code waiting_expire}(§82). 안 지우면 영영 재입장 불가, 먼저 지우면
+     * 아직 큐에 있는 사람이 폴링에서 404다.
      *
      * <p>🔴 <b>키는 identifier(사람)인데 값은 tokenId(회차)라, 지울 때 값을 봐야 한다.</b>
      * identifier는 회차 간 재사용되므로 그것만 보고 지우면 <b>다른 회차의 게이트를 지운다</b>

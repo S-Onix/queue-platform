@@ -78,7 +78,7 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | 항목 | 내용 |
 |------|------|
 | ADMIT_ISSUED | 입장토큰 발급됨. 유저가 Polling으로 admitToken 수신 대기 |
-| verify | **verify가 완료를 확정한다**(응답 시점에 `COMPLETED` 발행, PR #48). Redis·DB **직접** 쓰기는 0회 — 이벤트만 낸다. ~~상태 변경 없음~~ |
+| verify | **verify가 완료를 확정한다**(응답 시점에 `COMPLETED` 발행, PR #48). DB **직접** 쓰기는 0회 — 이벤트만 낸다. Redis는 회차 키 넷을 정리하되 `admit-by-admit`만 남긴다(§92) — 그래서 완료 뒤 재-enqueue는 **신규·맨 뒤**이고, 같은 admitToken의 재-verify는 60초 안 통과한다. ~~상태 변경 없음~~ ~~Redis 쓰기 0회~~ |
 | complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
 | admitToken 만료 | **복귀하지 않는다 (§36).** `HDEL tokens`로 게이트만 풀고 끝. 재접속 → 재-enqueue → 맨 뒤. ⚠️ **DB `status`는 `1`로 남는다** — `EXPIRED` 가드가 `status = 0` 전용이라 no-op이고, 그것이 `complete`의 300초 창을 살린다 |
 | 이탈 | **전용 API 없음 (§82).** 폴링 중단 → `inactiveTtl` 판정 배치 → EXPIRED(4). `QE_006_INVALID_STATUS`(409)는 큐 상태 전이 위반에 쓰인다(`QueueService`) — 토큰 이탈과는 무관하다 |

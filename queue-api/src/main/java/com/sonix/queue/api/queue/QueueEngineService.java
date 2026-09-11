@@ -283,7 +283,9 @@ public class QueueEngineService {
     }
 
     /**
-     * Verify — admitToken이 지금 유효한지만 답한다 (FRS §6.5). <b>Redis 쓰기 0회, DB 쓰기 0회.</b> 다만 <b>부수효과가 0은 아니다</b> — 응답과 함께 {@code COMPLETED}를 발행한다(그 근거는 아래).
+     * Verify — admitToken이 지금 유효한지 답하고, <b>그 응답이 곧 완료다</b> (FRS §6.5 · PR #48).
+     * <b>DB 쓰기 0회.</b> Redis는 회차 키 넷을 정리하되 {@code admit-by-admit}은 남긴다(§92) — 그래서
+     * 같은 admitToken의 verify는 60초 안에 계속 통과한다(재시도 계약). {@code COMPLETED}는 응답과 함께 발행한다.
      *
      * @return identifier (Tenant가 어느 사용자인지 알아야 하므로)
      * @throws BusinessException 유효하지 않으면 404 {@code INVALID_ADMIT_TOKEN}
@@ -319,7 +321,20 @@ public class QueueEngineService {
             //    구간에도 ADMITTED 다음에 이 전이가 얹히는 것이 보장된다.
             //    🔴 **@Transactional(readOnly)를 붙이지 마라** — verify가 Kafka 12초 동안
             //       커넥션을 쥐는 재발 경로다.
-            publishCompletedOnVerify(tenantId, queueId, admitToken, ref.get());
+            //
+            // 🔴 **Redis는 정리한다 — 단 admit-by-admit은 남긴다 (§92).** "verify는 Redis 쓰기 0회"였던
+            //    시절(§80)은 verify가 완료가 아니었다. 완료 확정 주체가 여기로 옮겨온 뒤(PR #48)에도
+            //    정리는 complete에만 있어, verify만 부르는 Tenant의 완료자가 최대 70초 동안 옛 토큰으로
+            //    줄 없이 재입장했고 과금이 경로에 따라 1 vs 2로 갈렸다(2026-09-11 실측).
+            //    admit-by-admit을 남기는 이유는 아래 complete()의 Redis 폴백과 Tenant의 verify 재시도가
+            //    그 키 하나에 기대기 때문이다 — 지우면 둘 다 404. 순서는 complete와 같이 정리 → 발행.
+            //    구 포맷(complete()==false)은 seq가 없어 admitted 멤버를 못 지우므로 건너뛴다 —
+            //    그 잔여는 회수 배치가 ≤70초 안에 걷는다(롤링 배포 60초 구간의 동작).
+            AdmitRef hit = ref.get();
+            if (hit.complete()) {
+                queueEngine.cleanupVerified(queueId, hit.identifier(), hit.tokenId(), hit.seq());
+            }
+            publishCompletedOnVerify(tenantId, queueId, admitToken, hit);
             return fromRedis.get();
         }
 

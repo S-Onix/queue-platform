@@ -567,6 +567,20 @@ public class RedisQueueEngine implements QueueEngine {
 
     @Override
     public void cleanupCompleted(String queueId, String identifier, String tokenId, String admitToken, long seq) {
+        cleanup(queueId, identifier, tokenId, seq,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.admitted(queueId), QueueKeys.tokens(queueId),
+                        QueueKeys.admitByToken(queueId, tokenId), QueueKeys.admitByAdmit(queueId, admitToken)));
+    }
+
+    @Override
+    public void cleanupVerified(String queueId, String identifier, String tokenId, long seq) {
+        // KEYS 4개 — admit-by-admit을 일부러 빼서 남긴다. 이유는 cleanup_completed.lua 머리말 KEYS[5] (§92).
+        cleanup(queueId, identifier, tokenId, seq,
+                List.of(QueueKeys.waiting(queueId), QueueKeys.admitted(queueId), QueueKeys.tokens(queueId),
+                        QueueKeys.admitByToken(queueId, tokenId)));
+    }
+
+    private void cleanup(String queueId, String identifier, String tokenId, long seq, List<String> keys) {
         // ⚠️ routeForWrite 필수. redisTemplate을 직접 쓰면 cluster2에 배정된 큐의 정리가 cluster1로
         //    가서 아무것도 못 지운다 — 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다(§75).
         StringRedisTemplate redis = routeForWrite(queueId);
@@ -579,22 +593,26 @@ public class RedisQueueEngine implements QueueEngine {
         //
         // 🔑 seq는 Long.toString으로 넘긴다. double을 태우면 "42.0"이 되어 admit.lua가 ZADD한
         //    member("42|U")와 어긋나 admitted 멤버가 조용히 안 지워진다.
-        Long cleaned = redis.execute(
-                cleanupCompletedScript,
-                List.of(QueueKeys.waiting(queueId), QueueKeys.admitted(queueId), QueueKeys.tokens(queueId),
-                        QueueKeys.admitByToken(queueId, tokenId), QueueKeys.admitByAdmit(queueId, admitToken)),
-                identifier, Long.toString(seq), tokenId);
+        Long cleaned = redis.execute(cleanupCompletedScript, keys, identifier, Long.toString(seq), tokenId);
 
-        // 🔴 **0은 사고가 아니다 — 가드가 제 일을 한 것이다.** 그래도 로그를 남기는 이유는, 이
-        //    빈도가 §36(admitToken TTL 60초)과 complete 창(300초) 사이의 240초 모순이 실제로
-        //    얼마나 열리는지를 알려주는 **유일한 신호**이기 때문이다. 지금 그 수치는 0건이다.
-        //    complete는 토큰당 1회라 폴링 핫패스(최대 15만/s)와 무관하다.
+        // 🔴 **0은 사고가 아니다 — 가드가 제 일을 한 것이다.** 그래도 로그를 남기는 이유는 이
+        //    빈도가 "옛 회차의 늦은 정리가 새 회차를 만나는" 사건의 유일한 신호이기 때문이다.
+        //    완료 정리는 토큰당 1~2회라 폴링 핫패스(최대 15만/s)와 무관하다.
+        //
+        // ⚠️ **§92로 0의 출처가 둘이 됐다. 240초 모순의 빈도로만 읽지 마라.**
+        //    ① 원래 것 — §36(admitToken TTL 60초)과 complete 창(300초)의 240초 차. 늦은 complete가
+        //       그 사이 재-enqueue한 새 회차를 만난다
+        //    ② §92가 만든 것 — verify가 게이트를 풀어 **완료 직후 재-enqueue가 처음으로 가능해졌다.**
+        //       그 뒤 Tenant가 verify를 재시도하면(admit-by-admit을 60초 남겨둔 게 바로 그 계약이다)
+        //       옛 tokenId로 두 번째 정리가 와서 새 회차를 만난다. 이건 **초 단위** 사건이고 240초와
+        //       무관하다. 둘을 가르려면 호출자 구분이 필요한데, 지금 그걸 만들 근거는 없다(§4)
         //
         // ⚠️ **-1(정리할 게 없었음)에는 찍지 않는다.** 늦은 complete는 -1로도 온다 — TTL 만료로
         //    게이트가 이미 풀렸는데 그 사람이 재-enqueue를 안 한 경우다. 둘을 합쳐 세면 "축출을
         //    막았다"가 아무 일도 없던 경우에까지 찍혀 위 문장이 거짓이 된다. 0만 센다.
         if (cleaned != null && cleaned == 0L) {
-            log.warn("늦은 complete가 다른 회차를 만나 정리를 건너뛰었다 — 재-enqueue 축출을 막았다. "
+            // 문구에서 "complete"를 뺀 것은 §92로 호출자가 둘이 됐기 때문이다 — verify도 여기 온다.
+            log.warn("늦은 완료 정리가 다른 회차를 만나 건너뛰었다 — 재-enqueue 축출을 막았다. "
                     + "tokenId={} queueId={} identifier={} seq={}", tokenId, queueId, identifier, seq);
         }
     }
