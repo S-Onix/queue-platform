@@ -10,7 +10,8 @@
 --   빠지지만(admit.lua의 ZPOPMIN) 아직 큐를 떠난 게 아니므로, waiting 존재 여부로 신규를
 --   판정하면 admit된 사람의 재-enqueue가 새 tokenId·새 seq를 받는다 → 폴링 404, 과금 중복
 --   (billing_snapshots가 tokens 행을 COUNT한다), status=1 고아 행. 그래서 게이트는
---   HSETNX이고, 사람을 큐에서 빼는 경로(cleanupCompleted)가 HDEL로 이 필드를 지운다.
+--   HSETNX이고, 사람을 큐에서 빼는 경로(cleanupCompleted·cleanupVerified — §92로 둘이다)가
+--   HDEL로 이 필드를 지운다.
 -- ARGV[1]: maxCapacity (Queue 최대 인원)
 -- ARGV[2]: requestCount (Bulk 요청 개수)
 -- ARGV[3]: issuedAt (이 청크의 발급 시각, epoch millis 문자열)
@@ -25,8 +26,12 @@
 --   score는 KEYS[2] INCR로 발급 (단조증가, 유일) → Redis 도달 순서 = rank 순서
 --   OK: 정상 추가 (rank 0-based, total 추가 후 크기, issuedAt = ARGV[3])
 --   EXISTS: 이미 존재 (기존 rank + 현재 total, tokenId·issuedAt은 Hash의 최초 값)
---     ※ admit된 사람이 재-enqueue하면 EXISTS이면서 waiting에는 없다 → rank·seq는 -1이다.
---       그 사람은 폴링에서 admit-by-token으로 입장권을 돌려받는다(seq로 찾지 않는다).
+--     ※ admit됐지만 **아직 완료하지 않은** 사람이 재-enqueue하면 EXISTS이면서 waiting에는
+--       없다 → rank·seq는 -1이다. 그 사람은 폴링에서 admit-by-token으로 입장권을 돌려받는다
+--       (seq로 찾지 않는다).
+--       🔑 **완료한 사람은 여기 해당하지 않는다 (§92).** verify든 complete든 완료 시점에
+--       게이트와 admit-by-token이 지워지므로 그 사람의 재-enqueue는 EXISTS가 아니라 OK다
+--       (새 tokenId·맨 뒤·과금 +1). 이 문장을 완료자까지 포함해 읽으면 반대로 구현하게 된다.
 --   FULL: Capacity 초과 (rank -1, 현재 total, tokenId·issuedAt = "")
 --   ※ 빈 문자열은 배열을 자르지 않는다. nil/false만 RESP 변환에서 뒤를 끊으므로
 --     "모름"은 반드시 ""로 표현할 것 (Java의 size() < 7 검사가 이를 전제한다).

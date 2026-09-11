@@ -417,6 +417,10 @@ class AdmitApiTest {
         assertThat(ev.getValue().seq()).isEqualTo(7L);
         assertThat(ev.getValue().issuedAt()).isEqualTo(Instant.ofEpochMilli(1_700_000_000_000L));
 
+        // §92 — 완료면 회차 키를 정리한다. cleanupCompleted(admit-by-admit까지)가 아니라
+        // cleanupVerified(그 키는 남김)여야 한다 — 바뀌면 verify 재시도·complete 폴백이 404다.
+        verify(queueEngine).cleanupVerified(QUEUE_ID, "user-a", "tok_a", 7L);
+        verify(queueEngine, never()).cleanupCompleted(anyString(), anyString(), anyString(), anyString(), anyLong());
         verifyNoInteractions(tokenRepository);
     }
 
@@ -436,6 +440,8 @@ class AdmitApiTest {
 
         verifyNoInteractions(eventPublisher);
         verifyNoInteractions(tokenRepository);
+        // seq가 없으면 admitted 멤버를 못 지운다 — 정리도 건너뛰고 회수 배치에 맡긴다(§92)
+        verify(queueEngine, never()).cleanupVerified(anyString(), anyString(), anyString(), anyLong());
     }
 
     /**

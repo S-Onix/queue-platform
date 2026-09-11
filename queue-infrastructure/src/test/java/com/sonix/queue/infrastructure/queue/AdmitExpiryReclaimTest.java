@@ -80,6 +80,35 @@ class AdmitExpiryReclaimTest {
         redis.opsForHash().put(TOKENS, identifier, "tok_" + seq + "|" + ISSUED_AT);
     }
 
+    /**
+     * §92 — verify가 완료 확정이면 회차 키도 verify가 정리한다. 다만 {@code admit-by-admit}은
+     * <b>남겨야</b> 한다: Tenant의 verify 재시도와 verify→complete 폴백이 그 키 하나에 기댄다.
+     * 이 테스트가 빨개지는 두 방향 — ① 넷 중 하나라도 남으면(완료자 무료 재입장·헛 EXPIRED 재발)
+     * ② admit-by-admit까지 지우면(재시도·폴백 404 재발).
+     */
+    @Test
+    @DisplayName("verify 정리 — 회차 키 넷은 지우고 admit-by-admit은 남긴다 (§92)")
+    void verifyCleanupLeavesAdmitByAdmit() {
+        String byToken = QueueKeys.admitByToken(QUEUE_ID, "tok_7");
+        String byAdmit = QueueKeys.admitByAdmit(QUEUE_ID, "adm_7");
+        seedAdmitted("id-a", 7, NOW + 60_000);
+        redis.opsForValue().set(byToken, "adm_7", java.time.Duration.ofSeconds(60));
+        redis.opsForValue().set(byAdmit, "tok_7|7|" + ISSUED_AT + "|id-a", java.time.Duration.ofSeconds(60));
+        try {
+            engine.cleanupVerified(QUEUE_ID, "id-a", "tok_7", 7);
+
+            assertThat(redis.opsForHash().hasKey(TOKENS, "id-a")).as("게이트").isFalse();
+            assertThat(redis.opsForZSet().zCard(ADMITTED)).as("admitted 멤버").isZero();
+            assertThat(redis.hasKey(byToken)).as("admit-by-token").isFalse();
+            assertThat(redis.hasKey(byAdmit)).as("admit-by-admit은 남는다").isTrue();
+
+            // 회수 배치는 이 완료자를 더 이상 보지 못한다 — 헛 EXPIRED가 안 나간다
+            assertThat(engine.claimExpiredAdmits(QUEUE_ID, NOW + 120_000, 500)).isEmpty();
+        } finally {
+            redis.delete(List.of(byToken, byAdmit));
+        }
+    }
+
     @Test
     @DisplayName("만료분만 admitted에서 빠지고 tokens 게이트가 풀린다 — waiting에는 안 들어간다 (§36)")
     void expiredOnesAreReclaimedWithoutReturningToWaiting() {

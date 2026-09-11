@@ -172,8 +172,8 @@ public interface QueueEngine {
     /**
      * complete: 대기열·admit 흔적 제거(FRS §6.6 ②). 멱등이다.
      *
-     * <p>{@code admit-by-admit}은 TTL 말고 삭제 경로가 여기뿐이라, 안 지우면 완료된 admitToken으로
-     * 최대 60초간 verify가 통과한다. {@code tokens} Hash 필드도 여기서 지운다 — 그 필드의 존재가
+     * <p>{@code admit-by-admit}은 TTL 말고 삭제 경로가 여기뿐이다 — {@link #cleanupVerified}는 일부러
+     * 남긴다. {@code tokens} Hash 필드는 두 완료 경로가 다 지운다 — 그 필드의 존재가
      * enqueue의 중복 게이트(HSETNX)라 남겨두면 완료자가 다시 줄을 못 선다.
      *
      * <p>🔴 <b>{@code identifier}로 지우는 둘({@code waiting}·{@code tokens})은 tokenId가 일치할
@@ -188,4 +188,20 @@ public interface QueueEngine {
      * @param seq     {@code admitted} ZSet 멤버가 {@code "seq|identifier"}라 필요하다
      */
     void cleanupCompleted(String queueId, String identifier, String tokenId, String admitToken, long seq);
+
+    /**
+     * verify: {@link #cleanupCompleted}와 같은 정리를 하되 <b>{@code admit-by-admit}은 남긴다</b> (§92).
+     *
+     * <p>verify가 완료를 확정하므로(PR #48) 회차를 뜻하는 넷({@code tokens} 게이트·{@code admitted}
+     * 멤버·{@code admit-by-token}·{@code waiting} 잔재)은 여기서 지운다. 안 지우면 complete를 안 부르는
+     * Tenant의 완료자가 60초 동안 옛 토큰으로 줄 없이 재입장하고, 과금이 경로에 따라 1 vs 2로 갈린다.
+     *
+     * <p>{@code admit-by-admit}을 남기는 이유는 그 키가 두 재시도의 유일한 근거이기 때문이다 —
+     * Tenant의 verify 재시도(§22)와, verify → complete를 둘 다 부를 때 컨슈머 백로그 구간의
+     * complete Redis 폴백. 지우면 둘 다 404가 된다. PX 60s가 거둔다.
+     *
+     * <p>메서드를 나눈 것은 호출부에서 "admitToken을 소비하지 않는다"가 읽히게 하기 위해서다.
+     * boolean 파라미터로 합치면 그 차이가 인자 하나에 숨는다.
+     */
+    void cleanupVerified(String queueId, String identifier, String tokenId, long seq);
 }

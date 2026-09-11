@@ -65,7 +65,7 @@ Tenant    → 슬롯 관리 + 입장 제어
 | Enqueue | Tenant 서버가 유저 대신 Platform에 대기열 등록 요청 |
 | Polling | 유저가 Platform에 직접 순위 확인 요청 (적응형 간격) |
 | admit | Tenant 서버가 슬롯 여유 생길 때 Platform에 N명 입장토큰 요청 |
-| verify | Tenant가 admitToken 유효성 확인 + **완료 확정**(`COMPLETED` 발행, PR #48). Redis·DB 직접 쓰기만 0회 |
+| verify | Tenant가 admitToken 유효성 확인 + **완료 확정**(`COMPLETED` 발행, PR #48). DB 직접 쓰기 0회. Redis는 회차 키 정리(`admit-by-admit`만 남김, §92) |
 | complete | Tenant가 입장 완료 후 Platform에 통보 → COMPLETED + ZREM |
 | maxCapacity | 대기열 최대 인원 |
 | waitingTtl | 대기 중 절대 만료 시간 (기본 7200s) |
@@ -129,7 +129,7 @@ Redis (QueueKeys — §8 참조):
    ← { ready: true, admitToken: "at_xxx" }
    유저 → Tenant: admitToken 전달
 
-⑦ Tenant → Platform: verify (**이 응답 시점이 완료다** — COMPLETED 발행. Redis·DB 직접 쓰기는 0회)
+⑦ Tenant → Platform: verify (**이 응답 시점이 완료다** — COMPLETED 발행 + Redis 회차 키 정리(§92). DB 직접 쓰기는 0회)
    POST /queues/:queueId/admit-tokens/:admitToken/verify
    ← { valid: true, identifier }
 
@@ -562,7 +562,9 @@ admitToken 생성: tokenId와 동일하게 UUIDv7(랜덤 74비트). 짧은 랜�
 
 > ✏️ **구 제목 "유효성 확인만 — 상태 변경 없음"은 더 이상 사실이 아니다.** verify는 **응답을 주는
 > 시점에 `COMPLETED`를 발행한다**(PR #48). Platform의 책임이 답을 돌려주는 데까지이기 때문이다.
-> 아래 "2. Redis 쓰기 0회, DB 쓰기 0회"는 **여전히 참**이다 — 직접 쓰지 않고 **이벤트만** 낸다
+> 아래 "2. Redis 쓰기 0회, DB 쓰기 0회"는 **§92로 절반만 참**이다 — DB는 직접 쓰지 않고 **이벤트만** 내지만,
+> Redis는 회차 키 넷(`tokens` 게이트·`admitted`·`admit-by-token`·`waiting` 잔재)을 정리한다.
+> `admit-by-admit`만 남긴다 — verify 재시도와 complete Redis 폴백이 그 키에 기댄다
 > (~~`@Transactional(readOnly = true)`라 Replica로 가고~~ — **2026-08-27 정정: 거짓이다.**
 > `verify`에는 트랜잭션 어노테이션이 **아예 없고**(Kafka 12초를 커넥션 쥔 채 기다리지 않으려고
 > 일부러 뺐다), 트랜잭션이 없으면 그 조회는 **master**로 간다. CLAUDE.md §4-3.
@@ -588,7 +590,7 @@ POST /api/v1/queues/:queueId/admit-tokens/:admitToken/verify
      --    아직 +09:00 이라 mysql CLI로 같은 쿼리를 돌리면 NOW()가 KST다.
      --    UTC_TIMESTAMP()는 어느 경로에서도 같은 값이므로 이쪽을 쓴다.
      없으면 → 404 `INVALID_ADMIT_TOKEN` (`TK002`)
-2. 끝. **Redis 쓰기 0회, DB 쓰기 0회.**
+2. `cleanupVerified` — 회차 키 넷 정리, `admit-by-admit`은 남김(§92) → COMPLETED 발행. **DB 쓰기 0회.**
 
 ⚠️ 구 서술의 "2. DB ADMIT_ISSUED 상태 확인"은 **별도 단계가 아니다.** 상태·신선도 술어는 위
    fallback 쿼리 안에 이미 있고(`status = 1` + `admitted_at` 60초), Redis 히트 경로는 **DB를
@@ -598,7 +600,8 @@ Response: { "valid": true, "identifier": "0190e2c1-..." }
 ```
 
 > ✏️ 구 서술 **"\"상태 변경 없음\"이 이제 문자 그대로다"는 §80 시점의 사실**이고 지금은 아니다 —
-> PR #48로 verify가 `COMPLETED`를 발행한다. **Redis·DB 직접 쓰기가 0회**인 것은 여전히 참이다.
+> PR #48로 verify가 `COMPLETED`를 발행한다. **DB 직접 쓰기 0회**는 여전히 참이다. Redis 쓰기 0회는
+> §92에서 깨졌다 — 완료가 된 이상 회차 키를 verify가 정리한다(`admit-by-admit` 제외).
 > 구 설계는 여기서 `SET verified-token:{tokenId} EX 60`을 했는데 **그 키는 폐기됐다.**
 > 존재 이유가 "admit이 verified 토큰을 제외한다"였는데, §80이 admit에서 Redis 밖 조회를
 > 전부 걷어내면서 **읽는 곳이 사라졌다.**
@@ -1214,7 +1217,7 @@ BCrypt → 별도 스케줄러 격리 불필요
 > Platform은 **순서만 관리**한다.
 > 입장 여부는 **Tenant 서버가 결정**한다.
 > 유저는 **Platform에 직접 Polling**한다 (`pacing` 구간표 기반 적응형, §79).
-> verify = **완료 확정**(응답 시점에 COMPLETED 발행, 직접 쓰기 0회). complete = COMPLETED + ZREM + Kafka 발행.
+> verify = **완료 확정**(응답 시점에 COMPLETED 발행 + Redis 회차 키 정리, `admit-by-admit`만 남김 — §92. DB 직접 쓰기 0회). complete = COMPLETED + ZREM + Kafka 발행.
 > **둘 중 하나만 불러도 완료된다.** 둘 다 불러도 멱등이다.
 > DB 먼저, ZREM 나중 — **잔류가 유실보다 안전**하다.
 > seq를 DB에 저장 — **Redis 전손 시 DB 재구성**(§71)이 주 용도다. ~~ADMIT_ISSUED 복귀 시 순위 복원~~은 §36이 폐기.

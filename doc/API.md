@@ -324,8 +324,10 @@ admit(count=100) → 서버가 100명 입장 → 응답 전송 중 네트워크 
 응답 `VerifyResponse`: `valid`(boolean) · `identifier`(string)
 
 - **Redis를 먼저 본다.** 그래서 Kafka 적재 지연과 무관하게 동작한다.
-- **`admitToken`을 소비하지 않는다.** 여러 번 불러도 60초 안이면 계속 `valid: true`.
+- **`admitToken`을 소비하지 않는다.** 여러 번 불러도 60초 안이면 계속 `valid: true` (재시도 계약).
 - 🔑 **verify 응답 시점이 완료 확정이다** (PR #48). 그래서 `complete`는 선택이다.
+- 🔑 **완료면 자리도 반납한다** (§92). 그 뒤 같은 `identifier`의 enqueue는 **신규·맨 뒤**다 —
+  `complete`로 완료했을 때와 같다. `admitToken`만 60초 남는 것이라 재-verify와 재입장은 별개다.
 - 에러: `TK002`(404) — TTL 60초가 지났거나 잘못된 토큰
 
 ### `POST /api/v1/queues/{queueId}/tokens/{tokenId}/complete` — 완료 통보
