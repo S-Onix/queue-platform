@@ -118,3 +118,42 @@ security의 "0줄" 기울기는 위협 관점에 한정된 것이고 일관성 �
 
 **결함 주입 D 실측**: `cleanup()`의 `routeForWrite(queueId)` → `cluster1`로 바꾸니
 `RedisQueueEngineRoutingTest` 12건 중 1건 빨강. 원복 확인.
+
+---
+
+# 실기동 검증 (2026-09-11, 컨테이너 prod 프로필 · api 3대)
+
+이미지 재빌드 후 DB·Redis를 비우고 REST로만. 요청은 인스턴스를 갈아타며 보냈다.
+
+## A. §92 핵심 주장 — 4/4
+
+| 단계 | 결과 |
+|---|---|
+| verify (8080) | 200 |
+| 같은 identifier 재-enqueue (8084) | 200 · `already=false` · **새 tokenId** · `seq=2` |
+| 그 토큰 폴링 (8083) | 200 · `ready=false` — **줄에 다시 섰다** |
+| 같은 admitToken 재-verify (8080) | **200** — 재시도 계약 유지 |
+
+결함 발견 당시(§92 이전)의 같은 시나리오는 `already=true` · 옛 tokenId · `ready=true`였다.
+**교차 인스턴스 미검증 항목도 이걸로 해소된다** — verify·재-enqueue·폴링을 서로 다른 인스턴스가 받았다.
+
+## B. (e) 결함 주입 — "①안이면 백로그 구간 complete가 404"
+
+재빌드 없이 모사했다: verify 직후 `admit-by-admit`을 직접 `DEL`하면 ①안이 만들었을 상태와 같다.
+컨슈머를 멈춰 DB 적재가 없는 구간을 재현했다.
+
+| | verify | DEL | complete |
+|---|---|---|---|
+| B-1 대조군 (현행 ④안) | 200 | — | **200** |
+| B-2 실험군 (①안 모사) | 200 | 1건 | **404 TK002** |
+
+- B-1의 200이 폴백 경로였음을 로그로 확인: `complete가 Redis 폴백으로 처리됐다 — 컨슈머 적재가 밀려 있다`
+- 컨슈머 재기동 후 토큰 3 → 5 → 그 구간에 **DB 행이 실제로 없었다**
+
+**architect의 1-b 판정이 실측으로 확정됐다.** ①안을 골랐다면 verify·complete를 둘 다 부르는
+정상 Tenant가 404를 받는다.
+
+## 남은 미검증
+
+- `admitExpired` 카운트를 읽는 경보 유무 — monitoring 미확인 (§92가 그 카운트를 **줄이는** 방향이라
+  급하지 않다)
