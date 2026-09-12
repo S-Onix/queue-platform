@@ -168,5 +168,55 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://:9292,CONTROLLER://:9293
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${DATA_IP}:9292
 
+  # ── 관측 (data 노드에 얹는다) ─────────────────────────────────────────────
+  # 🔑 왜 data 노드인가: app 은 측정 대상이라 오염시키면 안 되고, worker 는 컨슈머 lag 을
+  #    재려고 일부러 뗀 노드다(2 vCPU 뿐이다). data 는 4 vCPU 중 ~108% 만 쓴다.
+  # 🔑 Grafana 는 SG 에서 안 연다. SSH 터널로 본다:
+  #      ssh -i ~/.ssh/queue-aws -L 3000:localhost:3000 ubuntu@<data 퍼블릭 IP>
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: q-prometheus
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 800m
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/targets:/etc/prometheus/targets:ro   # deploy.sh 가 생성한다
+      - ../../doc/monitoring/alerts:/etc/prometheus/rules:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 세션이 끝나면 destroy 하므로 길게 보관할 이유가 없다.
+      - --storage.tsdb.retention.time=6h
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: q-grafana
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 500m
+    environment:
+      # 터널 안에서만 닿으므로 로그인을 막지 않는다. 익명 뷰어로 바로 보게 한다.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./monitoring/grafana/datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/db.yml:ro
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro   # deploy.sh 가 생성한다
+
+  # 노드별 CPU·메모리·디스크. app·worker 노드에도 같은 것이 뜬다.
+  node-exporter: &nodeexp
+    image: prom/node-exporter:v1.8.2
+    container_name: q-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    mem_limit: 200m
+    command: ['--path.rootfs=/host']
+    volumes: ['/:/host:ro,rslave']
+
 volumes:
   mysql-data:
+  prom-data:

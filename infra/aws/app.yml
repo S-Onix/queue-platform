@@ -60,3 +60,14 @@ services:
     <<: *api
     container_name: q-api-3
     environment: { <<: *env, SERVER_PORT: "8084" }
+
+  # 노드별 CPU·메모리. data 노드의 Prometheus 가 :9100 을 긁는다.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: q-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    mem_limit: 200m
+    command: ['--path.rootfs=/host']
+    volumes: ['/:/host:ro,rslave']

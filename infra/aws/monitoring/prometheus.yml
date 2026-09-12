@@ -1,0 +1,32 @@
+# 부하 실측용 Prometheus. 3노드의 앱·호스트 지표를 긁는다.
+#
+# 🔑 타깃 IP 는 인스턴스마다 바뀌므로 여기 박지 않는다. file_sd 로 빼고
+#    deploy.sh 가 targets/*.json 을 terraform output 으로 생성한다.
+#    (Prometheus 는 설정 파일에서 환경변수를 치환하지 않는다 — 그래서 file_sd 다.)
+global:
+  scrape_interval: 5s      # 60초 측정이라 15s 면 표본이 4개뿐이다
+  evaluation_interval: 15s
+
+rule_files:
+  # 🔑 app.yml(http_server_requests_*)·kafka.yml(kafka_consumer_fetch_manager_*)만 태운다.
+  #    infra.yml 은 redis_exporter(redis_up)·node_timex 를 요구하는데 그 exporter 를 안 돌린다 —
+  #    태우면 영원히 안 뜨는 규칙만 늘어난다.
+  - /etc/prometheus/rules/app.yml
+  - /etc/prometheus/rules/kafka.yml
+
+scrape_configs:
+  - job_name: queue-api
+    metrics_path: /actuator/prometheus
+    file_sd_configs: [{ files: [/etc/prometheus/targets/api.json] }]
+
+  - job_name: queue-worker
+    metrics_path: /actuator/prometheus
+    file_sd_configs: [{ files: [/etc/prometheus/targets/worker.json] }]
+
+  # 노드별 CPU·메모리·디스크. 1차 실측 이후 핵심 질문이 "api 가 코어를 몇 개 쓰는가"라
+  # 이게 없으면 ssh + top 으로 훑는 수밖에 없다.
+  - job_name: node
+    file_sd_configs: [{ files: [/etc/prometheus/targets/node.json] }]
+
+  - job_name: prometheus
+    static_configs: [{ targets: ['localhost:9090'] }]
