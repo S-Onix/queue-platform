@@ -28,10 +28,10 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      MYSQL_ROOT_PASSWORD: rootpw1234
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 필요 — .env 를 만들어라}
       MYSQL_DATABASE: queue_platform
       MYSQL_USER: queueapp
-      MYSQL_PASSWORD: queueapp1234
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD 필요 — .env 를 만들어라}
     # 🔑 max_connections: api 3대(50+50) + batch 15 + consumer 25 = 340 이 한 서버로 몰린다.
     #    replica URL 도 이 서버를 가리키므로(앱의 replica 읽기가 0인 걸 실측했다 — PR #63)
     #    두 풀이 같은 곳에 붙는다. 기본값 151 이면 부하 중 "Too many connections" 로 터진다.
@@ -52,7 +52,7 @@ services:
       - mysql-data:/var/lib/mysql
     mem_limit: 4g
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-prootpw1234"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
       timeout: 3s
       retries: 30

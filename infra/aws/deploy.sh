@@ -25,6 +25,19 @@ APP_IP=$(privip app); WORKER_IP=$(privip worker)
 MYSQL_IP=$(privip mysql); KAFKA_IP=$(privip kafka); REDIS_IP=$(privip redis)
 # 앱 컨테이너가 볼 주소. 셋을 한 덩어리로 넘긴다.
 DATAENV="MYSQL_IP=$MYSQL_IP KAFKA_IP=$KAFKA_IP REDIS_IP=$REDIS_IP"
+
+# 🔑 자격증명은 커밋하지 않는다. 레포 루트 .env(.gitignore 대상)에서 읽어 ssh 로 인라인 전달한다.
+#    ⚠️ rsync 로 올리지 않는다 — 원격 디스크에 남을 이유가 없다(아래 --exclude).
+#    compose 는 파일 전체를 파싱 시점에 치환하므로, 그 노드가 안 띄우는 서비스의 변수도 필요하다.
+#    그래서 IP 와 함께 모든 compose 호출에 붙인다.
+[ -f .env ] || { echo "레포 루트에 .env 가 없다. .env.example 을 복사해서 값을 채워라."; exit 1; }
+set -a; . ./.env; set +a
+: "${MYSQL_ROOT_PASSWORD:?.env 에 MYSQL_ROOT_PASSWORD 가 없다}"
+: "${DB_PASSWORD:?.env 에 DB_PASSWORD 가 없다}"
+: "${JWT_SECRET_CURRENT:?.env 에 JWT_SECRET_CURRENT 가 없다}"
+SEC="MYSQL_ROOT_PASSWORD=$(printf %q "$MYSQL_ROOT_PASSWORD")"
+SEC="$SEC DB_PASSWORD=$(printf %q "$DB_PASSWORD")"
+SEC="$SEC JWT_SECRET_CURRENT=$(printf %q "$JWT_SECRET_CURRENT")"
 echo "app=$APP  worker=$WORKER  mysql=$MYSQL  kafka=$KAFKA  redis=$REDIS"
 echo "  사설: app=$APP_IP worker=$WORKER_IP mysql=$MYSQL_IP kafka=$KAFKA_IP redis=$REDIS_IP"
 
@@ -32,6 +45,7 @@ on() { ssh $SSHOPT "ubuntu@$1" "${@:2}"; }
 push() {
   rsync -az --delete -e "ssh $SSHOPT" --exclude '.git' --exclude 'build' \
     --exclude '.gradle' --exclude 'node_modules' --exclude 'infra/aws/.terraform' \
+    --exclude '.env' \
     ./ "ubuntu@$1:~/queue-platform/"
 }
 
@@ -78,10 +92,10 @@ for h in $ALL; do push "$h" & done; wait
 echo "[3/5] 데이터 계층 기동 (redis·kafka 병렬 → mysql)"
 # ⚠️ DATA_IP 는 각 노드가 자기 사설 IP 를 넣는다. announce-ip / advertised.listeners 가
 #    이 값이라 다른 노드 IP 를 넣으면 클라이언트가 엉뚱한 곳으로 리다이렉트된다.
-on "$REDIS" "cd ~/queue-platform && DATA_IP=$REDIS_IP docker compose -f infra/aws/data.yml up -d \
+on "$REDIS" "cd ~/queue-platform && DATA_IP=$REDIS_IP $SEC docker compose -f infra/aws/data.yml up -d \
   redis-a-1 redis-a-2 redis-a-3 redis-b-1 redis-b-2 redis-b-3 node-exporter &&
   REDIS_IP=$REDIS_IP ./infra/aws/init.sh redis" &
-on "$KAFKA" "cd ~/queue-platform && DATA_IP=$KAFKA_IP docker compose -f infra/aws/data.yml up -d \
+on "$KAFKA" "cd ~/queue-platform && DATA_IP=$KAFKA_IP $SEC docker compose -f infra/aws/data.yml up -d \
   kafka-1 kafka-2 kafka-3 node-exporter &&
   until docker exec q-kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server $KAFKA_IP:9092 --list >/dev/null 2>&1; do sleep 3; done &&
   KAFKA_IP=$KAFKA_IP ./infra/aws/init.sh kafka" &
@@ -89,18 +103,18 @@ wait
 # 🔑 Prometheus·Grafana·redis-exporter 는 mysql 노드에 얹는다. 셋 중 가장 한가하고
 #    (0.83코어), redis-exporter 는 multi-target 이라 Redis 와 같은 노드일 필요가 없다.
 #    다만 prometheus.yml 이 익스포터를 localhost:9121 로 부르므로 **둘은 같은 노드여야 한다.**
-on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP docker compose -f infra/aws/data.yml up -d \
+on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f infra/aws/data.yml up -d \
   mysql prometheus grafana redis-exporter node-exporter &&
-  until docker exec q-mysql mysqladmin ping -h127.0.0.1 -prootpw1234 >/dev/null 2>&1; do sleep 3; done"
+  until docker exec q-mysql mysqladmin ping -h127.0.0.1 -p$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do sleep 3; done"
 
 echo "[4/5] 이미지 빌드 (app·worker 병렬. 최초 5~10분)"
-on "$APP"    "cd ~/queue-platform && $DATAENV docker compose -f infra/aws/app.yml build" &
-on "$WORKER" "cd ~/queue-platform && $DATAENV docker compose -f infra/aws/worker.yml build" &
+on "$APP"    "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
+on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/worker.yml build" &
 wait
 
 echo "[5/5] 앱 기동"
-on "$WORKER" "cd ~/queue-platform && $DATAENV docker compose -f infra/aws/worker.yml up -d"
-on "$APP" "cd ~/queue-platform && $DATAENV docker compose -f infra/aws/app.yml up -d &&
+on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/worker.yml up -d"
+on "$APP" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
   for p in 8080 8083 8084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done"
 
 cat <<EOF

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 전 구간 1건 + 시간 데이터 검증. **data 노드 위에서** 돈다(MySQL 을 docker exec 로 본다).
-#   ssh ubuntu@<data> 'cd ~/queue-platform && APP_IP=<app 사설 IP> ./infra/aws/smoke.sh'
+#   ssh ubuntu@<data> "cd ~/queue-platform && APP_IP=<app 사설 IP> DB_PASSWORD=<...> ./infra/aws/smoke.sh"
 set -euo pipefail
 B=http://${APP_IP:?APP_IP 필요}:8080
 E="smoke-$(date +%s)@test.com"
-MY="docker exec q-mysql mysql -uqueueapp -pqueueapp1234 queue_platform -N -B"
+MY="docker exec q-mysql mysql -uqueueapp -p${DB_PASSWORD:?DB_PASSWORD 필요} queue_platform -N -B"
 pick() { python3 -c "import sys,json;print(json.load(sys.stdin)['data']['$1'])"; }
 fail() { echo "  ❌ $1"; FAILED=1; }
 FAILED=0

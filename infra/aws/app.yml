@@ -24,7 +24,7 @@ x-api: &api
     DB_REPLICA_HOST: ${MYSQL_IP}
     DB_REPLICA_PORT: "3306"
     DB_USERNAME: queueapp
-    DB_PASSWORD: queueapp1234
+    DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD 필요 — .env 를 만들어라}
     REDIS_CLUSTER1_NODES: ${REDIS_IP:?REDIS_IP 필요}:7001,${REDIS_IP}:7002,${REDIS_IP}:7003
     REDIS_CLUSTER2_NODES: ${REDIS_IP:?REDIS_IP 필요}:8001,${REDIS_IP}:8002,${REDIS_IP}:8003
     KAFKA_BOOTSTRAP: ${KAFKA_IP:?KAFKA_IP 필요}:9092,${KAFKA_IP}:9192,${KAFKA_IP}:9292
@@ -37,7 +37,7 @@ x-api: &api
     MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,prometheus
     # prod 프로필이 요구한다. 실측용 값이며 운영 시크릿이 아니다.
     JWT_ACTIVE_KID: key-loadtest-01
-    JWT_SECRET_CURRENT: queue-platform-LOADTEST-current-secret-must-be-32-bytes-or-more
+    JWT_SECRET_CURRENT: ${JWT_SECRET_CURRENT:?JWT_SECRET_CURRENT 필요 — .env 를 만들어라}
 
 services:
   # 🔑 build 는 1호에만 둔다. 같은 태그(queue-api:local)를 빌더 3개가 동시에 구우면
