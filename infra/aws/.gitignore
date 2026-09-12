@@ -4,3 +4,4 @@
 *.tfstate.*
 monitoring/targets/
 monitoring/dashboards/
+tfplan

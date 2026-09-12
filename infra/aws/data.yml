@@ -206,6 +206,19 @@ services:
       - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/db.yml:ro
       - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro   # deploy.sh 가 생성한다
 
+  # 🔑 Redis 는 CPU 가 2% 라 병목이 아니지만, Redis 에서 중요한 축은 CPU 가 아니라 메모리다.
+  #    §87 의 큐 상한 근거가 "Redis 마스터 용량"이고 실측 477 B/명이다. noeviction 이라
+  #    maxmemory 에 닿으면 enqueue 가 503 으로 죽는다 — 그 여유를 볼 수단이 이것뿐이다.
+  # 🔑 노드마다 하나씩 띄우지 않는다. multi-target 모드로 하나가 6노드를 긁는다
+  #    (Prometheus 가 /scrape?target=redis://... 로 호출한다).
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: q-redis-exporter
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 200m
+    command: ['--redis.addr=', '--web.listen-address=:9121']
+
   # 노드별 CPU·메모리·디스크. app·worker 노드에도 같은 것이 뜬다.
   node-exporter: &nodeexp
     image: prom/node-exporter:v1.8.2

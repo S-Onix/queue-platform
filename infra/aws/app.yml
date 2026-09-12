@@ -1,6 +1,6 @@
 # app 노드 — queue-api 3대. 이 노드가 측정 대상이다.
 #
-#   DATA_IP=<data 프라이빗 IP> docker compose -f infra/aws/app.yml up -d
+#   MYSQL_IP=.. KAFKA_IP=.. REDIS_IP=.. docker compose -f infra/aws/app.yml up -d
 #
 # 1차(단일 인스턴스)에서 api 3대가 ~250%/400% 를 썼는데 **그건 포화 상태에서 "쓴 양"이지
 # "필요한 양"이 아니다**. 이 노드를 따로 떼는 목적이 그 진짜 수요를 얻는 것이다.
@@ -18,16 +18,16 @@ x-api: &api
   mem_limit: 1g
   environment: &env
     SPRING_PROFILES_ACTIVE: prod
-    DB_MASTER_HOST: ${DATA_IP:?DATA_IP 필요}
+    DB_MASTER_HOST: ${MYSQL_IP:?MYSQL_IP 필요}
     DB_MASTER_PORT: "3306"
     # replica URL 이 master 를 가리킨다 — 앱의 replica 읽기가 0인 걸 실측했다(PR #63).
-    DB_REPLICA_HOST: ${DATA_IP}
+    DB_REPLICA_HOST: ${MYSQL_IP}
     DB_REPLICA_PORT: "3306"
     DB_USERNAME: queueapp
     DB_PASSWORD: queueapp1234
-    REDIS_CLUSTER1_NODES: ${DATA_IP}:7001,${DATA_IP}:7002,${DATA_IP}:7003
-    REDIS_CLUSTER2_NODES: ${DATA_IP}:8001,${DATA_IP}:8002,${DATA_IP}:8003
-    KAFKA_BOOTSTRAP: ${DATA_IP}:9092,${DATA_IP}:9192,${DATA_IP}:9292
+    REDIS_CLUSTER1_NODES: ${REDIS_IP:?REDIS_IP 필요}:7001,${REDIS_IP}:7002,${REDIS_IP}:7003
+    REDIS_CLUSTER2_NODES: ${REDIS_IP:?REDIS_IP 필요}:8001,${REDIS_IP}:8002,${REDIS_IP}:8003
+    KAFKA_BOOTSTRAP: ${KAFKA_IP:?KAFKA_IP 필요}:9092,${KAFKA_IP}:9192,${KAFKA_IP}:9292
     JAVA_TOOL_OPTIONS: -Xmx512m
     # 🔑 prod 기본값은 health,info 뿐이라 부하 중 앱 메트릭이 0 이 된다
     #    (tail_probe.sh 가 /actuator/prometheus 를 직접 긁는다).

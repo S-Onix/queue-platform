@@ -28,5 +28,18 @@ scrape_configs:
   - job_name: node
     file_sd_configs: [{ files: [/etc/prometheus/targets/node.json] }]
 
+  # multi-target: 타깃 목록의 각 항목을 __param_target 으로 넘기고, 실제 접속은 익스포터로 한다.
+  # 그래서 instance 라벨은 Redis 주소가, 스크레이프 대상은 익스포터가 된다.
+  - job_name: redis
+    metrics_path: /scrape
+    file_sd_configs: [{ files: [/etc/prometheus/targets/redis.json] }]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: localhost:9121   # host 네트워크라 Prometheus 와 같은 호스트다
+
   - job_name: prometheus
     static_configs: [{ targets: ['localhost:9090'] }]
