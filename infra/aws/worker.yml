@@ -1,0 +1,52 @@
+# worker 노드 — queue-batch + queue-consumer.
+#
+#   DATA_IP=<data 프라이빗 IP> docker compose -f infra/aws/worker.yml up -d
+#
+# 🔑 따로 떼는 이유는 무게가 아니라 **측정**이다. 1차 실측에서 consumer 19% · batch <12% 로
+#    둘을 합쳐도 31% 밖에 안 된다. 그런데도 나누는 것은, "컨슈머가 실시간으로 못 따라간다
+#    (종료 후 lag 0 까지 4분)"가 CPU 부족 때문인지 설계 때문인지 지금까지 구분할 수
+#    없었기 때문이다. 전용 코어를 주면 그게 갈린다.
+# 🔑 batch 와 consumer 를 합치지 않는다(§73 D20) — 소비는 파티션 수만큼 늘리고 스케줄
+#    작업은 늘릴수록 중복 실행 방지가 필요하다. 확장 방향이 반대다. 같은 노드에 둘 뿐이다.
+name: queue-worker
+
+x-app: &app
+  restart: unless-stopped
+  network_mode: host
+  mem_limit: 800m
+  environment: &env
+    SPRING_PROFILES_ACTIVE: prod
+    DB_MASTER_HOST: ${DATA_IP:?DATA_IP 필요}
+    DB_MASTER_PORT: "3306"
+    DB_REPLICA_HOST: ${DATA_IP}
+    DB_REPLICA_PORT: "3306"
+    DB_USERNAME: queueapp
+    DB_PASSWORD: queueapp1234
+    REDIS_CLUSTER1_NODES: ${DATA_IP}:7001,${DATA_IP}:7002,${DATA_IP}:7003
+    REDIS_CLUSTER2_NODES: ${DATA_IP}:8001,${DATA_IP}:8002,${DATA_IP}:8003
+    KAFKA_BOOTSTRAP: ${DATA_IP}:9092,${DATA_IP}:9192,${DATA_IP}:9292
+    JAVA_TOOL_OPTIONS: -Xmx512m
+    MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,prometheus
+    JWT_ACTIVE_KID: key-loadtest-01
+    JWT_SECRET_CURRENT: queue-platform-LOADTEST-current-secret-must-be-32-bytes-or-more
+
+services:
+  queue-batch:
+    <<: *app
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args: { MODULE: queue-batch, APP_PORT: "8081" }
+    image: queue-batch:local
+    container_name: q-batch
+    environment: { <<: *env, SERVER_PORT: "8081" }
+
+  queue-consumer:
+    <<: *app
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args: { MODULE: queue-consumer, APP_PORT: "8082" }
+    image: queue-consumer:local
+    container_name: q-consumer
+    environment: { <<: *env, SERVER_PORT: "8082" }
