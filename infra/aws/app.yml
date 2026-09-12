@@ -1,0 +1,73 @@
+# app 노드 — queue-api 3대. 이 노드가 측정 대상이다.
+#
+#   MYSQL_IP=.. KAFKA_IP=.. REDIS_IP=.. docker compose -f infra/aws/app.yml up -d
+#
+# 1차(단일 인스턴스)에서 api 3대가 ~250%/400% 를 썼는데 **그건 포화 상태에서 "쓴 양"이지
+# "필요한 양"이 아니다**. 이 노드를 따로 떼는 목적이 그 진짜 수요를 얻는 것이다.
+#
+# 🔑 network_mode: host — data 노드와 통신하므로 브리지 published port 를 거칠 이유가 없다.
+#    덤으로 k6 의 source IP 가 그대로 보인다(브리지였다면 게이트웨이 IP 로 뭉개진다).
+# 🔑 3대인 이유는 성능이 아니다. 한 대에서는 ownerByQueueId·캐시가 갈라질 기회가 없어
+#    "한 대에서만 맞는" 결함을 구조적으로 못 잡는다.
+name: queue-app
+
+x-api: &api
+  image: queue-api:local
+  restart: unless-stopped
+  network_mode: host
+  mem_limit: 1g
+  environment: &env
+    SPRING_PROFILES_ACTIVE: prod
+    DB_MASTER_HOST: ${MYSQL_IP:?MYSQL_IP 필요}
+    DB_MASTER_PORT: "3306"
+    # replica URL 이 master 를 가리킨다 — 앱의 replica 읽기가 0인 걸 실측했다(PR #63).
+    DB_REPLICA_HOST: ${MYSQL_IP}
+    DB_REPLICA_PORT: "3306"
+    DB_USERNAME: queueapp
+    DB_PASSWORD: queueapp1234
+    REDIS_CLUSTER1_NODES: ${REDIS_IP:?REDIS_IP 필요}:7001,${REDIS_IP}:7002,${REDIS_IP}:7003
+    REDIS_CLUSTER2_NODES: ${REDIS_IP:?REDIS_IP 필요}:8001,${REDIS_IP}:8002,${REDIS_IP}:8003
+    KAFKA_BOOTSTRAP: ${KAFKA_IP:?KAFKA_IP 필요}:9092,${KAFKA_IP}:9192,${KAFKA_IP}:9292
+    JAVA_TOOL_OPTIONS: -Xmx512m
+    # 🔑 prod 기본값은 health,info 뿐이라 부하 중 앱 메트릭이 0 이 된다
+    #    (tail_probe.sh 가 /actuator/prometheus 를 직접 긁는다).
+    #    application-prod.yml 이 막아둔 이유는 "스크레이퍼 전용 ACL 없이는 켜지 마라"였고,
+    #    여기서는 보안 그룹이 그 ACL 이다 — 인터넷에 열린 것은 내 IP 의 SSH 하나뿐이다.
+    #    application-prod.yml 자체는 건드리지 않는다.
+    MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,prometheus
+    # prod 프로필이 요구한다. 실측용 값이며 운영 시크릿이 아니다.
+    JWT_ACTIVE_KID: key-loadtest-01
+    JWT_SECRET_CURRENT: queue-platform-LOADTEST-current-secret-must-be-32-bytes-or-more
+
+services:
+  # 🔑 build 는 1호에만 둔다. 같은 태그(queue-api:local)를 빌더 3개가 동시에 구우면
+  #    낭비이고 경합한다. 2·3호는 만들어진 이미지를 쓴다.
+  queue-api-1:
+    <<: *api
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args: { MODULE: queue-api, APP_PORT: "8080" }
+    container_name: q-api-1
+    environment: { <<: *env, SERVER_PORT: "8080" }
+
+  queue-api-2:
+    <<: *api
+    container_name: q-api-2
+    environment: { <<: *env, SERVER_PORT: "8083" }
+
+  queue-api-3:
+    <<: *api
+    container_name: q-api-3
+    environment: { <<: *env, SERVER_PORT: "8084" }
+
+  # 노드별 CPU·메모리. data 노드의 Prometheus 가 :9100 을 긁는다.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: q-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    mem_limit: 200m
+    command: ['--path.rootfs=/host']
+    volumes: ['/:/host:ro,rslave']

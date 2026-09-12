@@ -1,0 +1,235 @@
+# data 노드 — MySQL 1 + Kafka 3 + Redis 6. 실측 부하 ~108%(4 vCPU 중 1개분).
+#
+#   DATA_IP=<data 프라이빗 IP> docker compose -f infra/aws/data.yml up -d
+#
+# 🔑 network_mode: host 인 이유
+#   호스트가 갈리면 컨테이너는 **다른 인스턴스에서 닿는 주소**를 광고해야 한다.
+#   Redis 의 cluster-announce-ip 는 IP 만 받고(호스트명 불가), 클라이언트는 MOVED 응답에
+#   담긴 그 문자열로 직접 접속한다. host 네트워크면 그 값이 인스턴스 프라이빗 IP 하나로
+#   끝나고, 실제 도달 경로와 광고 주소가 어긋날 여지가 없다.
+#   대신 포트가 호스트에서 유일해야 한다 → 노드마다 다른 포트를 준다.
+#
+# 포트 배치 (로컬 학습 환경과 같은 번호)
+#   Redis A 7001-7003 (bus 17001-17003) · Redis B 8001-8003 (bus 18001-18003)
+#   Kafka   9092/9192/9292 (controller 9093/9193/9293) · MySQL 3306
+name: queue-data
+
+x-redis: &redis
+  image: redis:7-alpine
+  restart: unless-stopped
+  network_mode: host
+  # appendonly/noeviction 은 호스트 판과 같은 값이다 — 되돌리지 말 것(유실 감지 전제).
+  # maxmemory 는 상한이지 할당이 아니다.
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: q-mysql
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw1234
+      MYSQL_DATABASE: queue_platform
+      MYSQL_USER: queueapp
+      MYSQL_PASSWORD: queueapp1234
+    # 🔑 max_connections: api 3대(50+50) + batch 15 + consumer 25 = 340 이 한 서버로 몰린다.
+    #    replica URL 도 이 서버를 가리키므로(앱의 replica 읽기가 0인 걸 실측했다 — PR #63)
+    #    두 풀이 같은 곳에 붙는다. 기본값 151 이면 부하 중 "Too many connections" 로 터진다.
+    # 🔑 서버 TZ 를 +09:00 으로 **명시** 고정한다. 컨테이너 기본값은 UTC 인데, UTC 로 두면
+    #    실수로 쓴 NOW() 가 UTC_TIMESTAMP() 와 같은 값이라 **결함이 숨는다**. +09:00 이면
+    #    9시간 틀어져 즉시 드러난다. 판정 술어는 UTC_TIMESTAMP(3) 라 TZ 무관이고(§90),
+    #    DEFAULT CURRENT_TIMESTAMP(3) 은 앱 세션 TZ(=UTC)를 따른다. smoke.sh 가 둘 다 검증한다.
+    #    ⚠️ CLI 로 볼 때는 SET time_zone='+00:00' 또는 UTC_* 함수를 써라 (doc/schema.sql:118).
+    command: >
+      --max_connections=500
+      --innodb_buffer_pool_size=2G
+      --innodb_flush_log_at_trx_commit=1
+      --default-time-zone=+09:00
+    volumes:
+      - ../../doc/schema.sql:/schema/schema.sql:ro
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+      # 이름 있는 볼륨. down 은 데이터 유지(3일치 누적용), down -v 는 전부 삭제(빈 DB 시작).
+      - mysql-data:/var/lib/mysql
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-prootpw1234"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis-a-1:
+    <<: *redis
+    container_name: q-redis-a-1
+    command: >
+      redis-server --port 7001 --cluster-enabled yes --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000 --cluster-require-full-coverage yes
+      --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
+      --cluster-announce-port 7001 --cluster-announce-bus-port 17001
+      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+
+  redis-a-2:
+    <<: *redis
+    container_name: q-redis-a-2
+    command: >
+      redis-server --port 7002 --cluster-enabled yes --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000 --cluster-require-full-coverage yes
+      --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
+      --cluster-announce-port 7002 --cluster-announce-bus-port 17002
+      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+
+  redis-a-3:
+    <<: *redis
+    container_name: q-redis-a-3
+    command: >
+      redis-server --port 7003 --cluster-enabled yes --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000 --cluster-require-full-coverage yes
+      --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
+      --cluster-announce-port 7003 --cluster-announce-bus-port 17003
+      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+
+  # Cluster B — A 와 완전 독립, 슬롯 공유 없음 (§75)
+  redis-b-1:
+    <<: *redis
+    container_name: q-redis-b-1
+    command: >
+      redis-server --port 8001 --cluster-enabled yes --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000 --cluster-require-full-coverage yes
+      --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
+      --cluster-announce-port 8001 --cluster-announce-bus-port 18001
+      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+
+  redis-b-2:
+    <<: *redis
+    container_name: q-redis-b-2
+    command: >
+      redis-server --port 8002 --cluster-enabled yes --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000 --cluster-require-full-coverage yes
+      --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
+      --cluster-announce-port 8002 --cluster-announce-bus-port 18002
+      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+
+  redis-b-3:
+    <<: *redis
+    container_name: q-redis-b-3
+    command: >
+      redis-server --port 8003 --cluster-enabled yes --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000 --cluster-require-full-coverage yes
+      --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
+      --cluster-announce-port 8003 --cluster-announce-bus-port 18003
+      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+
+  # ── Kafka 3 브로커 (KRaft) ────────────────────────────────────────────────
+  # 🔑 CLUSTER_ID 를 고정한다. 안 주면 각 브로커가 제 멋대로 포맷해 쿼럼이 영원히 안 선다.
+  # 🔑 RF=3 + min.insync=2 는 일부러다. enqueue 는 acks=all 동기 발행이라 복제 대기가
+  #    응답 지연에 포함된다 — RF=1 은 그 비용을 숨겨 측정을 낙관적으로 만든다.
+  kafka-1:
+    image: apache/kafka:4.0.0
+    container_name: q-kafka-1
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 1500m
+    environment: &kafka
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@${DATA_IP:?DATA_IP 필요}:9093,2@${DATA_IP}:9193,3@${DATA_IP}:9293
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_MIN_INSYNC_REPLICAS: "2"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_HEAP_OPTS: -Xmx768m -Xms256m
+      KAFKA_NODE_ID: "1"
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${DATA_IP}:9092
+
+  kafka-2:
+    image: apache/kafka:4.0.0
+    container_name: q-kafka-2
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 1500m
+    environment:
+      <<: *kafka
+      KAFKA_NODE_ID: "2"
+      KAFKA_LISTENERS: PLAINTEXT://:9192,CONTROLLER://:9193
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${DATA_IP}:9192
+
+  kafka-3:
+    image: apache/kafka:4.0.0
+    container_name: q-kafka-3
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 1500m
+    environment:
+      <<: *kafka
+      KAFKA_NODE_ID: "3"
+      KAFKA_LISTENERS: PLAINTEXT://:9292,CONTROLLER://:9293
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${DATA_IP}:9292
+
+  # ── 관측 (data 노드에 얹는다) ─────────────────────────────────────────────
+  # 🔑 왜 data 노드인가: app 은 측정 대상이라 오염시키면 안 되고, worker 는 컨슈머 lag 을
+  #    재려고 일부러 뗀 노드다(2 vCPU 뿐이다). data 는 4 vCPU 중 ~108% 만 쓴다.
+  # 🔑 Grafana 는 SG 에서 안 연다. SSH 터널로 본다:
+  #      ssh -i ~/.ssh/queue-aws -L 3000:localhost:3000 ubuntu@<data 퍼블릭 IP>
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: q-prometheus
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 800m
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/targets:/etc/prometheus/targets:ro   # deploy.sh 가 생성한다
+      - ../../doc/monitoring/alerts:/etc/prometheus/rules:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 세션이 끝나면 destroy 하므로 길게 보관할 이유가 없다.
+      - --storage.tsdb.retention.time=6h
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: q-grafana
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 500m
+    environment:
+      # 터널 안에서만 닿으므로 로그인을 막지 않는다. 익명 뷰어로 바로 보게 한다.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./monitoring/grafana/datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/db.yml:ro
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards:ro   # deploy.sh 가 생성한다
+
+  # 🔑 Redis 는 CPU 가 2% 라 병목이 아니지만, Redis 에서 중요한 축은 CPU 가 아니라 메모리다.
+  #    §87 의 큐 상한 근거가 "Redis 마스터 용량"이고 실측 477 B/명이다. noeviction 이라
+  #    maxmemory 에 닿으면 enqueue 가 503 으로 죽는다 — 그 여유를 볼 수단이 이것뿐이다.
+  # 🔑 노드마다 하나씩 띄우지 않는다. multi-target 모드로 하나가 6노드를 긁는다
+  #    (Prometheus 가 /scrape?target=redis://... 로 호출한다).
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: q-redis-exporter
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 200m
+    command: ['--redis.addr=', '--web.listen-address=:9121']
+
+  # 노드별 CPU·메모리·디스크. app·worker 노드에도 같은 것이 뜬다.
+  node-exporter: &nodeexp
+    image: prom/node-exporter:v1.8.2
+    container_name: q-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    mem_limit: 200m
+    command: ['--path.rootfs=/host']
+    volumes: ['/:/host:ro,rslave']
+
+volumes:
+  mysql-data:
+  prom-data:

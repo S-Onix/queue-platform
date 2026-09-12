@@ -1,0 +1,7 @@
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+monitoring/targets/
+monitoring/dashboards/
+tfplan
