@@ -24,8 +24,12 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.MySQLDialect
         jdbc:
-          batch_size: 500          # ⚠️ kafka max-poll-records와 같은 값을 유지할 것.
-                                   #    어긋나면 JDBC 배치가 중간에 쪼개져 왕복이 늘어난다
+          # 🔧 2026-09-14 이후 이 값이 지배하는 적재 경로가 없다. tokens 쓰기는 네 종류 전부
+          #    JdbcTemplate(raw JDBC)로 나가고, 배치 크기는 리스너가 넘기는 목록 크기가 정한다.
+          #    ⚠️ 예전 주석이 "kafka max-poll-records와 반드시 같은 값을 유지할 것"이라고 못박고
+          #       있었는데, 그 불변식은 이제 성립하지 않는다 — 지키려 애쓰지 마라.
+          #    남겨 둔 것은 앞으로 이 앱에 JPA 쓰기가 생길 때의 기본값으로서다. 제거는 별도 판단.
+          batch_size: 500
         order_inserts: true
 
   kafka:
@@ -36,7 +40,7 @@ spring:
       # 그 시점 이전 이벤트가 조용히 사라진다.
       auto-offset-reset: earliest
       enable-auto-commit: false    # DB 커밋 성공 후 수동 ack
-      max-poll-records: 500        # hibernate batch_size와 일치
+      max-poll-records: 500        # 한 번에 가져올 이벤트 수 = 한 트랜잭션의 상한
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       # 역직렬화 실패 1건이 배치 전체를 영원히 막지 않도록 래핑한다.
       # 래핑하지 않으면 그 한 건이 poll될 때마다 예외가 나고 offset이 전진하지 못한다.

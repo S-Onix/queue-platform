@@ -55,6 +55,9 @@ class TokenLifecycleConsumerTest {
     @Test
     @DisplayName("범인을 특정하지 못하면(재시도 중 전 건 적재) 예외 없이 ack 한다")
     void 범인을_특정하지_못하면_예외_없이_반환한다() {
+        // 구간 일괄 적재가 실패해야 구간별 독립 트랜잭션으로 내려간다
+        doThrow(new DataIntegrityViolationException("일시적"))
+                .when(persistService).persistAll(anyList());
         // 첫 시도만 실패하고 이후 시도는 성공 = 일시적 원인이 해소된 상황
         doThrow(new DataIntegrityViolationException("일시적"))
                 .doNothing()
@@ -163,10 +166,10 @@ class TokenLifecycleConsumerTest {
 
         consumer.consume(events);
 
-        InOrder order = inOrder(persistService);
-        order.verify(persistService).persist(eq(TokenEventType.COMPLETED), anyList());
-        order.verify(persistService).persist(eq(TokenEventType.ADMITTED), anyList());
-        order.verifyNoMoreInteractions();
+        // 🔑 순서는 구간 **목록의 순서**로 보존된다. 한 트랜잭션에 담기더라도 문장은 이 순서로 나간다.
+        assertThat(capturedSegments()).extracting(TokenPersistService.Segment::type)
+                .containsExactly(TokenEventType.COMPLETED, TokenEventType.ADMITTED);
+        verify(persistService, org.mockito.Mockito.never()).persist(any(), anyList());
     }
 
     /**
@@ -227,14 +230,14 @@ class TokenLifecycleConsumerTest {
 
         assertThatCode(() -> consumer.consume(events)).doesNotThrowAnyException();
 
-        // 같은 인자의 검증이 연속하므로 calls(1)을 쓴다. 기본 times(1)은 InOrder에서 탐욕적이라
-        // 연속한 동일 호출을 한 번에 삼켜 "3번 불렸다"로 실패한다.
         InOrder order = inOrder(persistService);
         order.verify(persistService, calls(1)).persist(eq(TokenEventType.ENQUEUED), anyList()); // 실패한 그룹
-        order.verify(persistService, calls(1)).persist(eq(TokenEventType.ENQUEUED), anyList()); // 구간 1
-        order.verify(persistService, calls(1)).persist(eq(TokenEventType.ADMITTED), anyList()); // 구간 2
-        order.verify(persistService, calls(1)).persist(eq(TokenEventType.ENQUEUED), anyList()); // 구간 3
+        order.verify(persistService, calls(1)).persistAll(anyList());                           // 구간 일괄 재실행
         order.verifyNoMoreInteractions();
+
+        // 구간 3개가 도착 순서 그대로 넘어가야 한다 — 그룹 경로가 실패했으니 정렬되면 안 된다
+        assertThat(capturedSegments()).extracting(TokenPersistService.Segment::type)
+                .containsExactly(TokenEventType.ENQUEUED, TokenEventType.ADMITTED, TokenEventType.ENQUEUED);
     }
 
     /**
@@ -254,10 +257,10 @@ class TokenLifecycleConsumerTest {
 
         consumer.consume(events);
 
-        @SuppressWarnings("unchecked")
-        ArgumentCaptor<List<Token>> captor = ArgumentCaptor.forClass(List.class);
-        verify(persistService).persist(eq(TokenEventType.ADMITTED), captor.capture());
-        assertThat(captor.getValue()).hasSize(2);
+        assertThat(capturedSegments())
+                .filteredOn(seg -> seg.type() == TokenEventType.ADMITTED)
+                .singleElement()
+                .satisfies(seg -> assertThat(seg.tokens()).hasSize(2));
     }
 
     /** ADMITTED는 상태와 두 칸을 실어 넘어가야 한다 — 빠지면 complete의 술어가 영원히 안 맞는다. */
@@ -296,14 +299,14 @@ class TokenLifecycleConsumerTest {
                 .isEqualTo(2);
 
         // 앞쪽 2건은 적재하고 던진다. 던진 뒤에 적재하면 인덱스 앞이 "성공"으로 커밋돼 사라진다.
-        @SuppressWarnings("unchecked")
-        ArgumentCaptor<List<Token>> captor = ArgumentCaptor.forClass(List.class);
-        verify(persistService).persist(eq(TokenEventType.ENQUEUED), captor.capture());
-        assertThat(captor.getValue()).hasSize(2);
+        assertThat(capturedSegments()).singleElement().satisfies(seg -> {
+            assertThat(seg.type()).isEqualTo(TokenEventType.ENQUEUED);
+            assertThat(seg.tokens()).hasSize(2);
+        });
 
         // 모르는 타입이 하나라도 있으면 그룹 경로를 타면 안 된다. 탔다면 뒤쪽 ENQUEUED까지
         // 함께 적재되어(또는 null 키로 터져) 격리 인덱스를 잃는다.
-        verify(persistService, org.mockito.Mockito.times(1)).persist(any(), anyList());
+        verify(persistService, org.mockito.Mockito.never()).persist(any(), anyList());
     }
 
     /** 첫 건이 모르는 타입이면 적재할 앞 구간이 없다. */
@@ -318,11 +321,23 @@ class TokenLifecycleConsumerTest {
                 .isEqualTo(0);
 
         verify(persistService, org.mockito.Mockito.never()).persist(any(), anyList());
+        // 구간이 하나도 없으니 빈 트랜잭션조차 열면 안 된다
+        verify(persistService, org.mockito.Mockito.never()).persistAll(anyList());
     }
 
     // ---------------------------------------------------------------------
 
-    /** 지정한 tokenId가 묶음에 들어 있으면 언제나 실패한다 = 절대 적재 불가 항목. */
+    /**
+     * 지정한 tokenId가 묶음에 들어 있으면 언제나 실패한다 = 절대 적재 불가 항목.
+     *
+     * <p><b>{@code persistAll}도 같이 막아야 한다.</b> 분할 경로는 구간 일괄 적재를 먼저 치고,
+     * 거기서 실패해야 비로소 구간별 독립 트랜잭션(= 격리 탐색이 가능한 경로)으로 내려간다.
+     * 한쪽만 막으면 격리가 아예 일어나지 않는다.
+     *
+     * <p>🔧 <b>여기 원래 "그런데 테스트는 초록이 된다"고 적혀 있었는데 거짓이다</b>(반사실 실측:
+     * {@code persistAll} stub만 빼면 격리 테스트 2건이 <b>빨개진다</b> — {@code assertThatThrownBy}가
+     * 받을 예외가 없어서다). 둘 다 막아야 한다는 판단은 맞고 <b>이유가 틀렸다.</b>
+     */
     private void failOn(String offenderTokenId) {
         doAnswer(invocation -> {
             List<Token> tokens = invocation.getArgument(1);
@@ -331,6 +346,23 @@ class TokenLifecycleConsumerTest {
             }
             return null;
         }).when(persistService).persist(any(), anyList());
+
+        doAnswer(invocation -> {
+            List<TokenPersistService.Segment> segments = invocation.getArgument(0);
+            if (segments.stream().flatMap(seg -> seg.tokens().stream())
+                    .anyMatch(t -> t.getTokenId().equals(offenderTokenId))) {
+                throw new DataIntegrityViolationException("적재 불가");
+            }
+            return null;
+        }).when(persistService).persistAll(anyList());
+    }
+
+    /** 분할 경로가 넘긴 구간 목록. */
+    @SuppressWarnings("unchecked")
+    private List<TokenPersistService.Segment> capturedSegments() {
+        ArgumentCaptor<List<TokenPersistService.Segment>> captor = ArgumentCaptor.forClass(List.class);
+        verify(persistService).persistAll(captor.capture());
+        return captor.getValue();
     }
 
     /**

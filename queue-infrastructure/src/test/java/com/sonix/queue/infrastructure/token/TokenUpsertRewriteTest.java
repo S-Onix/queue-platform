@@ -49,6 +49,10 @@ import static org.assertj.core.api.Assertions.assertThat;
         "spring.datasource.replica.username=queueapp",
         "spring.datasource.replica.password=queueapp1234",
         "spring.jpa.hibernate.ddl-auto=none",
+        // 🔧 여기에 hibernate batch_size·order_inserts를 넣어야 하던 시절이 있었다 — ENQUEUED가
+        //    JPA saveAll이던 동안엔 그게 없으면 왕복이 500으로 나왔다(실측으로 한 번 밟았다).
+        //    2026-09-14에 saveAllIfAbsent가 raw JDBC로 옮겨가(실행 순서 보존) **이 경로는 더 이상
+        //    Hibernate를 타지 않는다.** 설정이 없는데도 ENQUEUED 왕복이 1인 것이 그 사실의 증거다.
         "spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.MySQLDialect"
 })
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -126,6 +130,30 @@ class TokenUpsertRewriteTest {
     }
 
     /**
+     * 🔴 <b>ENQUEUED만 다른 길로 간다.</b> 나머지 셋은 {@code applyTransition}(JdbcTemplate)이지만
+     * 이건 {@code saveAllIfAbsent} → JPA {@code saveAll} → {@code @SQLInsert}다. 위 두 테스트는
+     * 이 경로를 <b>한 번도 지나지 않는다</b> — COMPLETED가 그랬듯 여기가 퇴화해도 전 스위트가 초록이다.
+     *
+     * <p>그런데 ENQUEUED는 토큰마다 반드시 한 번 발행되므로 <b>네 타입 중 가장 흔하다</b>.
+     * 여기가 건별 왕복이면 컨슈머 드레인이 통째로 그 속도에 묶인다.
+     */
+    @Test
+    @DisplayName("🔴 ENQUEUED 500건도 INSERT 문장 1개로 합쳐진다 (JPA saveAll + @SQLInsert 경로)")
+    void enqueueBatchIsRewrittenIntoOneStatement() {
+        List<Token> tokens = enqueuedTokens(BATCH);
+
+        long before = comInsert();
+        adapter.saveAllIfAbsent(tokens);
+        long executed = comInsert() - before;
+
+        assertThat(executed)
+                .as("Hibernate가 @SQLInsert 엔티티를 JDBC 배치로 묶고 드라이버가 다중행으로 합쳐야 한다. "
+                        + "500이면 배치가 아니라 건별 왕복이다 — 예외도 로그도 없이 그렇게 된다")
+                .isEqualTo(1);
+        assertThat(countTokens()).as("합쳐졌어도 500행은 그대로 들어간다").isEqualTo(BATCH);
+    }
+
+    /**
      * 대조군 — 위 단언이 "측정이 늘 0"이라서 통과한 것이 아님을 보인다.
      * ODKU에 {@code ?}가 하나 있을 뿐인데 왕복이 500배가 된다.
      */
@@ -168,6 +196,15 @@ class TokenUpsertRewriteTest {
         return IntStream.range(0, count)
                 .mapToObj(i -> Token.transition(TokenStatus.COMPLETED, prefix + i, QUEUE_ID, tenantId,
                         "user_" + i, i, ISSUED_AT, "adm_" + i, null))
+                .toList();
+    }
+
+    /** ENQUEUED 이벤트의 실제 모양 — admitToken·admittedAt 둘 다 null이다. */
+    private List<Token> enqueuedTokens(int count) {
+        String prefix = "tok_rwe_" + UUID.randomUUID() + "_";
+        return IntStream.range(0, count)
+                .mapToObj(i -> Token.transition(TokenStatus.WAITING, prefix + i, QUEUE_ID, tenantId,
+                        "user_" + i, i, ISSUED_AT, null, null))
                 .toList();
     }
 

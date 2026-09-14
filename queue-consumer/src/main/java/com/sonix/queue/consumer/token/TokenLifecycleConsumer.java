@@ -47,6 +47,10 @@ public class TokenLifecycleConsumer {
     /**
      * 한 번의 poll로 받은 배치를 <b>같은 타입이 연속하는 구간(run)</b>씩 적재한다.
      *
+     * <p><b>구간은 문장을 가르지 트랜잭션을 가르지 않는다.</b> 도착 순서를 지켜야 하는 것은
+     * 문장의 실행 순서이므로, 구간을 순서대로 <b>한 트랜잭션</b>에 넣으면 순서는 그대로면서
+     * 커밋만 1회가 된다. 구간마다 커밋하던 때는 500건 배치가 265~322 커밋이었다(실측).
+     *
      * <p>배치 안에는 여러 파티션의 레코드가 섞여 오지만 문제되지 않는다. 파티션 사이의
      * 순서는 의미가 없고(서로 다른 토큰이므로), 같은 파티션 안의 상대 순서는 리스트에
      * 그대로 유지된다.
@@ -65,9 +69,13 @@ public class TokenLifecycleConsumer {
      */
     @KafkaListener(topics = "${queue.consumer.topic:token-lifecycle}")
     public void consume(List<EnqueueEvent> events) {
-        // 왜 모으는가: 구간 분할은 타입이 바뀔 때마다 트랜잭션을 연다. 타입이 섞인 배치는
-        // 구간이 잘게 부서져 커밋이 폭주하고, 그 랙이 complete를 죽였다. 타입은 4종뿐이라
-        // 모으면 배치당 최대 4회다. 절감 83.0%(실측) — 표·측정 함정은 doc/perf/CONSUMER_BATCHING.md.
+        // 왜 모으는가: 타입별로 모으면 문장이 타입당 하나(다중행)가 된다. 구간 분할은 타입이
+        // 바뀔 때마다 문장을 여니 500건이 265~322 문장으로 부서지고, 배치 크기 500이
+        // **실효 1.82행**이 된다(2026-09-14 로컬 100rps 실측, 가득 찬 배치 67/67이 분할 경로).
+        // 🔧 **커밋 수는 더 이상 이 분기에서 갈리지 않는다.** 분할 경로도 한 트랜잭션으로
+        //    적재하도록 바꿨다(아래 persistAll). doc/perf/CONSUMER_BATCHING.md의 "커밋 절감
+        //    83.0%"는 **그 변경 이전의 수치**다 — 지금 이 분기가 버는 것은 커밋이 아니라
+        //    **문장 수와 행/문장**이다.
         // 🪤 이득은 **파티션당 유입률의 함수**라 저부하에서는 정확히 0이다. 저부하 벤치로
         //    "효과 없다"고 판단해 지우지 마라.
         // ⚠️ 이건 위 금지의 예외가 아니라 **그 금지가 필요 없는 배치만 우회**하는 것이다.
@@ -90,13 +98,18 @@ public class TokenLifecycleConsumer {
             }
         }
 
+        // 구간을 먼저 모으고 한 트랜잭션으로 적재한다. 지켜야 하는 것은 **문장 순서**이지
+        // 트랜잭션 경계가 아니다 — 구간마다 커밋하면 500건 배치가 265~322 커밋이 된다(실측).
+        // 모르는 타입에서 멈추는 것은 그대로다: 그 앞까지 적재한 **뒤에** 던져야 한다.
+        List<TokenPersistService.Segment> segments = new ArrayList<>();
+        int unknownAt = -1;
         int start = 0;
-        int segments = 0;
 
         while (start < events.size()) {
             TokenEventType type = TokenEventType.from(events.get(start).eventType());
             if (type == null) {
-                throw unknownType(events.get(start), start);   // 앞 구간은 이미 적재된 뒤다
+                unknownAt = start;
+                break;
             }
 
             int end = start + 1;
@@ -104,27 +117,54 @@ public class TokenLifecycleConsumer {
                 end++;
             }
 
-            List<Token> tokens = events.subList(start, end).stream()
-                    .map(TokenLifecycleConsumer::toToken)
-                    .toList();
-            try {
-                tokenPersistService.persist(type, tokens);
-            } catch (DataIntegrityViolationException e) {
-                quarantineOffender(type, tokens, start, e);   // 던지거나(인덱스 포함), 전 건 적재됐으면 반환
-            }
-
+            segments.add(new TokenPersistService.Segment(type,
+                    events.subList(start, end).stream().map(TokenLifecycleConsumer::toToken).toList(),
+                    start));
             start = end;
-            segments++;
         }
 
-        log.debug("token-lifecycle 적재 완료: path=split events={} tx={} splitTx={}", events.size(), segments, segments);
+        if (!segments.isEmpty()) {
+            try {
+                tokenPersistService.persistAll(segments);
+                // 🪤 tx는 1이고 splitTx가 구간 수다. 둘을 비교하는 것이 이 변경의 값을 재는 유일한 직접 근거다.
+                log.debug("token-lifecycle 적재 완료: path=split events={} tx=1 splitTx={}",
+                        events.size(), segments.size());
+            } catch (DataIntegrityViolationException e) {
+                // 격리의 이분 탐색은 시도마다 독립 트랜잭션이어야 한다 — 실패 경로에서만 필요한 성질이라
+                // 여기서 비로소 구간별로 나눈다. 적재가 멱등이라(ODKU) 다시 태워도 결과가 같다.
+                log.warn("구간 일괄 적재가 제약 위반으로 실패했다({}구간) — 구간별 독립 트랜잭션으로 재시도한다",
+                        segments.size());
+                persistSegmentsIndividually(segments);
+                log.debug("token-lifecycle 적재 완료: path=split-fallback events={} tx={} splitTx={}",
+                        events.size(), segments.size(), segments.size());
+            }
+        }
+
+        if (unknownAt >= 0) {
+            throw unknownType(events.get(unknownAt), unknownAt);   // 앞 구간은 이미 적재된 뒤다
+        }
+    }
+
+    /** 구간마다 독립 트랜잭션으로 적재한다. 제약 위반이 난 구간에서 범인을 찾아 한 건만 격리한다. */
+    private void persistSegmentsIndividually(List<TokenPersistService.Segment> segments) {
+        for (TokenPersistService.Segment segment : segments) {
+            try {
+                tokenPersistService.persist(segment.type(), segment.tokens());
+            } catch (DataIntegrityViolationException e) {
+                // 던지거나(인덱스 포함), 전 건 적재됐으면 반환
+                quarantineOffender(segment.type(), segment.tokens(), segment.offset(), e);
+            }
+        }
     }
 
     /**
-     * 같은 타입이 연속하는 <b>구간의 개수</b> — 분할 경로가 여는 트랜잭션 수와 같다.
+     * 같은 타입이 연속하는 <b>구간의 개수</b> — 분할 경로가 여는 <b>문장 수</b>와 같다.
+     *
+     * <p>🔧 예전엔 트랜잭션 수와도 같았다. 분할 경로가 한 트랜잭션으로 바뀐 뒤로는
+     * 문장 수만 가리킨다.
      *
      * <p>그룹 경로에서 <b>반사실</b>로만 쓴다. 이 값이 실제 타입 수와 같으면 그룹 적재가
-     * 줄인 커밋이 0이라는 뜻이다.
+     * 줄인 문장이 0이라는 뜻이다.
      */
     private static int countSegments(List<EnqueueEvent> events) {
         int segments = 0;

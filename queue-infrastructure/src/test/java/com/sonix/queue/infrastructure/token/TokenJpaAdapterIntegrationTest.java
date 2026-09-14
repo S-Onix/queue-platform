@@ -533,6 +533,49 @@ class TokenJpaAdapterIntegrationTest {
         assertThat(admittedAtOf(tokenId)).isEqualTo(admittedAt);
     }
 
+    /**
+     * 🔴 <b>회귀 가드 — 한 트랜잭션 안에서 ENQUEUED와 전이의 <u>실행 순서</u>가 호출 순서와 같은가.</b>
+     *
+     * <p>실측으로 깨졌던 것이다(2026-09-14). {@code saveAllIfAbsent}가 JPA {@code saveAll}이던 동안에는
+     * {@code persist}가 INSERT를 <b>플러시까지 미루고</b> {@code applyTransition}의 raw JDBC는
+     * <b>즉시 실행</b>했다. 그래서 한 트랜잭션에 둘을 넣으면 COMPLETED가 먼저 돌아 선행 행이 없고,
+     * ODKU가 아니라 <b>INSERT 경로</b>를 탔다. 그 경로의 VALUES에는 {@code completed_at}이 없고
+     * COMPLETED 이벤트는 {@code admittedAt = null}을 싣는다 → <b>{@code status=2}인데 두 칸이 NULL</b>.
+     *
+     * <p>그 상태의 피해는 이 파일이 이미 다른 테스트로 적어 둔 것과 같다 — complete 재시도가 영구 404,
+     * {@code SUM(admitted_at IS NOT NULL)}(입장권 개수의 유일한 근거) 과소 계상 = <b>과금 누락</b>.
+     *
+     * <p>🪤 <b>{@code status}만 보면 안 잡힌다.</b> 깨진 경로도 {@code status = 2}로 끝난다.
+     * 실제로 검토에서 한 에이전트가 status만 대조하고 "무해"로 판정했다가 뒤집혔다.
+     * <b>반드시 {@code completed_at}·{@code admitted_at}을 단정해라.</b>
+     *
+     * <p>🪤 <b>{@code TransactionTemplate}이 이 테스트의 핵심이다.</b> 트랜잭션 없이 부르면 두 호출이
+     * 각자 커밋돼 순서가 저절로 맞는다 — 결함이 있어도 초록이다. 컨슈머의 {@code persistAll}이
+     * 바로 이 "한 트랜잭션" 모양이므로 여기서도 그렇게 태워야 한다.
+     */
+    @Test
+    @DisplayName("🔴 한 트랜잭션에서 ENQUEUED→COMPLETED→ADMITTED를 태워도 원장 두 칸이 채워진다")
+    void oneTransaction_enqueueThenTransitions_fillsLedgerColumns() {
+        String tokenId = "tok_ord_" + UUID.randomUUID();
+
+        // 컨슈머 persistAll 과 같은 모양: 한 트랜잭션 안에서 도착 순서대로 구간을 친다.
+        txTemplate().executeWithoutResult(status -> {
+            adapter.saveAllIfAbsent(List.of(waiting(tokenId, 41)));
+            adapter.applyTransition(TokenEventType.COMPLETED, List.of(
+                    transition(tokenId, 41, TokenStatus.COMPLETED, admitTokenFor(tokenId), null)));
+            adapter.applyTransition(TokenEventType.ADMITTED, List.of(
+                    transition(tokenId, 41, TokenStatus.ADMIT_ISSUED, admitTokenFor(tokenId), ADMITTED_AT)));
+        });
+
+        assertThat(statusOf(tokenId)).as("완료로 끝나야 한다").isEqualTo(TokenStatus.COMPLETED.getStatusCode());
+        assertThat(completedAtOf(tokenId))
+                .as("ENQUEUED가 전이보다 늦게 실행되면 COMPLETED가 INSERT 경로를 타고 이 칸이 NULL로 굳는다")
+                .isNotNull();
+        assertThat(admittedAtOf(tokenId))
+                .as("여기가 NULL이면 입장권 개수 집계에서 빠져 과금이 누락된다 (§91 SET 절이 안 돈 것)")
+                .isNotNull();
+    }
+
     private LocalDateTime completedAtOf(String tokenId) {
         return jdbc.queryForObject("SELECT completed_at FROM tokens WHERE token_id = ?",
                 LocalDateTime.class, tokenId);
