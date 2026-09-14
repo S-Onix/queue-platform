@@ -48,10 +48,45 @@ public class TokenPersistService {
      */
     @Transactional
     public void persist(TokenEventType type, List<Token> tokens) {
+        apply(type, tokens);
+    }
+
+    /**
+     * 여러 구간을 <b>받은 순서 그대로, 한 트랜잭션으로</b> 적재한다.
+     *
+     * <p>구간 분할 경로가 지켜야 하는 것은 <b>문장의 실행 순서</b>이지 트랜잭션 경계가 아니다.
+     * 구간마다 트랜잭션을 열면 순서는 같은데 <b>커밋만 구간 수만큼</b> 늘어난다 — 부하 중
+     * 실측(2026-09-14, 로컬 100rps)에서 500건 배치가 265~322개 트랜잭션으로 쪼개졌고,
+     * 가득 찬 배치 67회가 예외 없이 그랬다. {@code max-poll-records}·{@code batch_size}를
+     * 500으로 맞춰 둔 의미가 그 층에서 사라진다(실효 배치 <b>1.82건</b>).
+     *
+     * <p><b>실패하면 호출자가 구간별로 다시 태운다.</b> 격리(이분 탐색)는 시도마다 독립
+     * 트랜잭션이어야 하는데, 그건 <b>실패 경로에서만</b> 필요한 성질이다. 적재가 멱등이라
+     * (ODKU) 다시 태워도 결과가 같다 — 그룹 경로가 분할 경로로 되돌아가는 것과 같은 구조다.
+     *
+     * @param segments 도착 순서대로 정렬된 구간들. 순서를 바꾸면 {@code ADMITTED}·{@code EXPIRED}의
+     *                 {@code status = 0} 출발 가드가 다른 결과를 낸다
+     */
+    @Transactional
+    public void persistAll(List<Segment> segments) {
+        for (Segment segment : segments) {
+            apply(segment.type(), segment.tokens());
+        }
+    }
+
+    private void apply(TokenEventType type, List<Token> tokens) {
         if (type == TokenEventType.ENQUEUED) {
             tokenRepository.saveAllIfAbsent(tokens);
         } else {
             tokenRepository.applyTransition(type, tokens);
         }
+    }
+
+    /**
+     * 같은 타입이 연속하는 구간 하나.
+     *
+     * @param offset 이 구간이 배치에서 시작하는 위치. 격리 인덱스는 <b>배치 전체 기준</b>이어야 한다
+     */
+    public record Segment(TokenEventType type, List<Token> tokens, int offset) {
     }
 }

@@ -12,7 +12,14 @@ import org.springframework.lang.Nullable;
 import java.time.LocalDateTime;
 
 /**
- * ⚠️ 아래 {@code @SQLInsert}는 §80 가드 표의 <b>{@code ENQUEUED} 한 줄</b>이다(허용 출발: 신규,
+ * 🔴 <b>2026-09-14 기준 아래 {@code @SQLInsert}를 타는 코드가 0건이다.</b> 유일한 호출자였던
+ * {@code TokenJpaAdapter.saveAllIfAbsent}가 raw JDBC로 옮겨갔다 — JPA의 지연 플러시가 한
+ * 트랜잭션 안에서 전이와 실행 순서를 뒤집었기 때문이다(그쪽 주석 참조). SQL 원문은
+ * {@code TokenJpaAdapter.ENQUEUE_INSERT}로 <b>그대로</b> 옮겨갔다.
+ * <b>지우지 않고 남겨둔 것은 아래 {@code insertable = false} 셋과 묶여 있어서다</b> — 푸는 순간
+ * 고정 컬럼 수와 어긋나 11건이 깨진 전례가 있다. 제거는 별도 판단 대상이다.
+ *
+ * ⚠️ 아래 {@code @SQLInsert}는 §80 가드 표의 <b>{@code ENQUEUED} 한 줄</b>이었다(허용 출발: 신규,
  * 충돌 시 no-op). 나머지 다섯 줄은 이벤트마다 SQL이 달라 여기 담을 수 없어
  * {@code TokenJpaAdapter.applyTransition}에 있다 — {@code @SQLInsert}는 엔티티당 한 문장뿐이다.
  *

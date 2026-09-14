@@ -26,8 +26,9 @@ public class TokenJpaAdapter implements TokenRepository {
 
     /**
      * 상태 전이 UPSERT의 INSERT 부분. <b>ENQUEUED만은 이 경로를 쓰지 않는다</b> —
-     * 그건 {@code TokenEntity.@SQLInsert}가 이미 같은 모양으로 처리하고 있고, 초당 수만 건이
-     * 흐르는 경로라 손대는 이득이 없다.
+     * 그건 가드가 필요 없는 no-op UPSERT라 {@link #ENQUEUE_INSERT}가 따로 갖는다.
+     * 🔧 2026-09-14까지는 {@code TokenEntity.@SQLInsert}가 그 일을 했는데, JPA 지연 플러시가
+     * 같은 트랜잭션 안에서 실행 순서를 뒤집어 raw JDBC로 옮겼다({@code saveAllIfAbsent} 주석).
      *
      * <p><b>🔴 {@code AS new} 별칭을 쓰는 이유 (MySQL 8.0.19+):</b> 같은 뜻의 {@code VALUES(col)}은
      * 8.0.20부터 deprecated라 서버(8.0.46)가 <b>사용 1회마다 경고 1287</b>을 돌려준다(실측:
@@ -55,6 +56,19 @@ public class TokenJpaAdapter implements TokenRepository {
      * {@code SUM(admitted_at IS NOT NULL)}(= 입장권 개수의 유일한 근거)이 세어 버린다.
      * {@code ?}가 <b>VALUES 절 안</b>이라 다중행 재작성은 유지된다.
      */
+    /**
+     * 신규 적재(ENQUEUED) SQL. {@code TokenEntity.@SQLInsert}의 원문을 그대로 옮긴 것이다 —
+     * <b>컬럼 순서까지 같아야 한다</b>({@code saveAllIfAbsent}의 파라미터 인덱스가 이 순서에 붙어 있다).
+     *
+     * <p>ODKU가 {@code token_id = token_id}(완전 no-op)인 것이 핵심이다. 뒤늦게 온 ENQUEUED가
+     * 이미 전이된 행을 <b>되돌리지 않는다</b>는 보장이 여기서 나온다.
+     * 🪤 SET 절에 {@code ?}를 쓰면 다중행 재작성이 조용히 꺼진다(TRANSITION_INSERT 주석 참조).
+     */
+    private static final String ENQUEUE_INSERT =
+            "INSERT INTO tokens (queue_id, seq, status, tenant_id, user_id, issued_at, token_id) "
+            + "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            + "ON DUPLICATE KEY UPDATE token_id = token_id";
+
     private static final String TRANSITION_INSERT = """
             INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at, admit_token, admitted_at, expired_reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, UTC_TIMESTAMP(3)), ?) AS new
@@ -70,8 +84,8 @@ public class TokenJpaAdapter implements TokenRepository {
      * {@code admit_token}이 영원히 NULL로 남는다. 그러면 complete의 {@code admit_token = ?}
      * 술어가 절대 맞지 않아 complete 전체가 죽는다. 줄 순서를 바꾸지 말 것.
      *
-     * <p>{@code ENQUEUED}가 없는 것은 의도다 — no-op UPSERT는 {@code TokenEntity.@SQLInsert}에
-     * 이미 있다. 여기 넣으면 같은 규칙이 두 곳에 생긴다.
+     * <p>{@code ENQUEUED}가 없는 것은 의도다 — no-op UPSERT는 {@link #ENQUEUE_INSERT}가 갖는다.
+     * 여기 넣으면 같은 규칙이 두 곳에 생긴다. (🔧 그 자리는 원래 {@code TokenEntity.@SQLInsert}였다)
      */
     private static final Map<TokenEventType, String> TRANSITION_SQL = transitionSql();
 
@@ -180,17 +194,60 @@ public class TokenJpaAdapter implements TokenRepository {
     }
 
 
+    /**
+     * 신규 적재(ENQUEUED). 충돌하면 no-op이다.
+     *
+     * <p><b>🔴 JPA가 아니라 JdbcTemplate인 이유 — 같은 트랜잭션 안에서 실행 시점을 맞추기 위해서다.</b>
+     * 예전에는 {@code tokenJpaRepository.saveAll}이었는데, JPA {@code persist}는 <b>플러시까지
+     * INSERT를 미루고</b> {@code applyTransition}의 raw JDBC는 <b>즉시 실행</b>한다. 두 경로가 한
+     * 트랜잭션에 섞이면 <b>호출 순서와 실행 순서가 갈린다</b>.
+     *
+     * <p>그 결과를 실측했다(2026-09-14). 한 배치에 같은 토큰의 {@code ENQUEUED}·{@code COMPLETED}가
+     * 있으면 COMPLETED가 먼저 실행돼 <b>선행 행이 없으니 ODKU가 아니라 INSERT 경로</b>를 탄다.
+     * {@code TRANSITION_INSERT}의 VALUES에는 {@code completed_at}이 <b>없고</b> COMPLETED 이벤트는
+     * {@code admittedAt = null}을 싣는다 → 그 행은 {@code status=2}인데
+     * <b>{@code completed_at = NULL}, {@code admitted_at = NULL}</b>로 굳는다.
+     * §91이 SET 절 네 줄로 채우려던 칸이 그 경로에서만 통째로 비는 것이다 —
+     * complete 재시도가 영구 404가 되고, 입장권 개수({@code SUM(admitted_at IS NOT NULL)})가
+     * 과소 계상돼 <b>과금이 누락</b>된다.
+     *
+     * <p>🔑 <b>두 경로를 같은 계층으로 맞추면 그 함정 자체가 사라진다.</b> 한쪽에 플러시를 강제하는
+     * 방법도 있지만, 그건 "왜 여기 플러시가 있는가"를 주석으로 지켜야 한다 — 이 레포는 실제로
+     * 그 주석이 전파되지 않아 같은 함정을 두 번 밟았다
+     * ({@code TokenJpaAdapterIntegrationTest}의 {@code @Transactional} 경고 참조).
+     *
+     * <p>SQL은 {@code TokenEntity.@SQLInsert}에 있던 것을 <b>그대로</b> 옮겼다. 컬럼 7개와
+     * {@code ON DUPLICATE KEY UPDATE token_id = token_id}(완전 no-op)가 같아야 동작이 보존된다.
+     */
     @Override
     public void saveAllIfAbsent(List<Token> tokens) {
-        if(tokens.isEmpty()) return;
+        if (tokens.isEmpty()) return;
 
-        Map<TokenEntityId, TokenEntity> deduped = new LinkedHashMap<>();
-        for(Token token : tokens) {
-            TokenEntity entity = TokenEntity.fromDomain(token);
-            deduped.putIfAbsent(entity.getId(), entity);
+        // 같은 (tokenId, issuedAt)이 한 배치에 두 번 오면 앞의 것만 남긴다 — 기존 동작 보존.
+        Map<TokenEntityId, Token> deduped = new LinkedHashMap<>();
+        for (Token token : tokens) {
+            deduped.putIfAbsent(new TokenEntityId(token.getTokenId(), token.getIssuedAt()), token);
         }
+        List<Token> rows = List.copyOf(deduped.values());
 
-        tokenJpaRepository.saveAll(deduped.values());
+        jdbcTemplate.batchUpdate(ENQUEUE_INSERT, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                Token token = rows.get(i);
+                ps.setString(1, token.getQueueId());
+                ps.setLong(2, token.getSeq());
+                ps.setInt(3, token.getStatus().getStatusCode());
+                ps.setLong(4, token.getTenantId());
+                ps.setString(5, token.getUserId());
+                ps.setObject(6, token.getIssuedAt());
+                ps.setString(7, token.getTokenId());
+            }
+
+            @Override
+            public int getBatchSize() {
+                return rows.size();
+            }
+        });
     }
 
     /**
