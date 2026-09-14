@@ -148,10 +148,36 @@ GET /api/v1/queues/{queueId}/status        인증 없음 · Rate Limit 없음
 
 **응답이 30만 명 전원에게 동일하다.** 개인화가 없어서 캐시가 가능하고, 그래서 제한도 없다.
 
+#### 🔴 `enqueue`가 **한 번도 없었던 큐**는 `404 Q001`이다
+
+큐를 정상적으로 만들었어도, **첫 `enqueue` 전까지는** 이 엔드포인트가 `404 Q001`
+("대기열을 찾을 수 없습니다")을 준다. **없는 `queueId`와 응답이 같아서 구분할 수 없다.**
+
+| 시점 | `/status` |
+|---|---|
+| 큐 생성 직후 (`enqueue` 0회) | **404 `Q001`** |
+| 누가 한 명이라도 선 뒤 | 200 |
+| 전원 `admit`돼 줄이 빈 뒤 | 200 (되돌아가지 않는다) |
+
+즉 **오픈 직전에만** 나는데, 하필 그때가 "곧 오픈합니다 / 현재 대기 0명" 페이지를 띄우는 시점이다.
+아래 예제들이 `.data`를 바로 펼치므로 **방어하지 않으면 `TypeError`로 죽는다**(실측).
+
+```js
+async function getStatus() {
+  const res = await fetch(`${P}/api/v1/queues/${queueId}/status`);
+  if (res.status === 404) return null;      // 아직 아무도 안 섰다 = 오픈 전. 오류가 아니다
+  if (!res.ok) return null;                 // 그 밖의 실패도 다음 주기에 다시 물어본다
+  return (await res.json()).data;
+}
+```
+
 - **내 순위** = `mySeq - watermark` (직접 계산한다. 서버는 rank를 주지 않는다)
 - **다음 호출 간격** = `pacing`에서 **내 순위 이하인 첫 구간**의 초 + **지터**
 
 ```js
+const status = await getStatus();                   // 위 §4① — 오픈 전이면 null이다
+if (!status) return setTimeout(tick, 2000);         // 오류가 아니다. 다음 주기에 다시 묻는다
+
 // 🔴 lastAdmittedSeq를 그대로 쓰지 마라 — 단조 clamp가 필요하다
 wm = Math.max(wm, status.lastAdmittedSeq);          // wm은 호출 간에 유지한다
 const rank = Math.max(0, QUEUE.seq - wm);
@@ -370,8 +396,9 @@ poll(tokenId, seq);                       // 버킷 5칸 중 1칸 소모, 얻는
 
 // ✅ 첫 호출부터 pacing 간격으로 예약한다
 const { tokenId, seq, rank } = enq.data;
-const { pacing } = (await getStatus()).data;              // /status는 한도가 없다
-const base = pacing.find(([max]) => max === null || rank <= max)[1];
+const s = await getStatus();                              // /status는 한도가 없다
+// 🔴 오픈 전이면 null이다(§4①의 404 Q001). 그때는 기본 간격으로 예약하고 다음 주기에 다시 묻는다
+const base = s ? s.pacing.find(([max]) => max === null || rank <= max)[1] : 2;
 setTimeout(tick, (base + Math.random() * Math.max(1, base / 4)) * 1000);   // 지터 필수
 ```
 
@@ -486,6 +513,7 @@ SDK가 대신 지켜 주는 것은 **직접 짜면 틀리기 쉬운 넷**이다:
 | 코드 | HTTP | 뜻 | 대응 |
 |---|---|---|---|
 | `RL001` | 429 | 요청 한도 초과 | `Retry-After`만큼 대기 후 재시도 |
+| `Q001` | 404 | 대기열 없음 — **또는 아직 아무도 안 선 큐**(§4①) | `/status`면 오류가 아니다(오픈 전). 그 밖이면 `queueId`를 확인하라 |
 | `Q005` | 429 | **대기열 정원이 참** (`maxCapacity` 도달) | 🔴 **재시도 금지.** 마감 페이지. `Retry-After` 없음 — 계약 ②·⑦ |
 | `Q006` | 409 | 테넌트당 큐 개수 상한(20) 초과 | 안 쓰는 큐를 지우고 다시 만들어라. 계약 ⑦ |
 | `QE001` | 503 | 대기열 처리 일시 오류 | 재시도. `enqueue`면 같은 `identifier`로 안전하다 |
