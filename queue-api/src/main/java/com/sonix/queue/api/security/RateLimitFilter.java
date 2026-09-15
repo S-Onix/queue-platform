@@ -132,7 +132,13 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        //Polling의 경우 API-KEY로 인증하지 않기 떄문에 선처리하여 확인한다.
+        // 폴링은 인증이 없어 여기서 **선처리**한다.
+        //
+        // 🔴 뒤로 미루면 "늦게 걸리는" 게 아니라 **한도가 통째로 사라진다**. 폴링은 인증이 안 되니
+        //    아래 3)에서 auth == null → checkPublicRateLimit → resolvePublicEndpoint(path)가 null
+        //    (signup/login/refresh가 아니다) → **return true 로 그냥 통과**한다.
+        // 🔑 버킷을 테넌트 것과 따로 두는 이유는 다르다 — 합치면 대기자들의 폴링이 그 테넌트의
+        //    enqueue·admit 예산을 다 먹는다. 순서(여기)와 키 분리(아래)는 별개의 결정이다.
         if (isPollPath(request.getMethod(), path)) {
             if (!checkPollRateLimit(path, response)) {
                 return;   // 429로 종료
@@ -181,6 +187,15 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
     /**
      * tokenId 기준 Token Bucket.
+     *
+     * <p>🪤 <b>키가 tokenId 하나라 존재하지 않는 tokenId도 버킷을 만든다.</b> 인증이 없으니
+     * 무작위 tokenId를 쏘면 한도에 걸리는 대신 <b>요청 1건 = 새 키 1개</b>다(실측 200건 → +200).
+     * 무한 누적은 아니다 — {@code token-bucket.lua}가 {@code ceil(capacity/refill)+60 = 65초}
+     * TTL을 걸어 정상상태 키 수는 <b>유입률 × 65초</b>다(10,000 rps면 65만 개 상주).
+     * 🔴 종착점이 "느려진다"가 아니다. maxmemory 1GB + {@code noeviction}이라 한계에 닿으면
+     * <b>쓰기가 거부</b>되고, {@code rl:} 키엔 해시태그가 없어 마스터 전역에 퍼지므로
+     * <b>같은 마스터에 얹힌 다른 테넌트의 enqueue가 503</b>이 된다 — §87과 같은 종류의 위험이다
+     * (내 요청이 남의 테넌트를 죽인다). 상한은 아직 없다.
      *
      * <p>⚠️ 버킷 키가 되는 tokenId는 <b>정규화된 경로</b>에서 뽑아야 한다. 원문에서 뽑으면
      * 인코딩 변형마다 다른 키가 나와 버킷이 무한정 새로 생긴다(위 PATH_HELPER 주석의 실측 참조).

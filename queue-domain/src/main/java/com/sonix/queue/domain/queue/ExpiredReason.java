@@ -38,6 +38,12 @@ public enum ExpiredReason {
      *
      * <p>{@link #ADMIT_TTL}과 뿌리가 같다(둘 다 입장권을 쥐고 안 들어옴). 다만 <b>기록 주체가
      * 다르고 판정 기준 시각도 다르므로</b>(60초 vs 300초) 구분해 둔다.
+     *
+     * <p>🪤 <b>이 상수를 참조하는 코드는 없다</b>(2026-09-15 전수). 실제 기록은
+     * {@code TokenJpaRepository}의 {@code SET status = 4, expired_reason = 2} <b>리터럴</b>이
+     * 하고 {@code ReconcileJob}은 그 {@code @Query}를 부를 뿐이다. 즉 <b>여기 값을 바꿔도 SQL은
+     * 따라오지 않는다</b> — 고칠 일이 생기면 두 곳을 같이 고쳐라. (바꿀 일이 없어야 정상이다:
+     * 이미 지난 파티션에 쓰인 값이라 뜻이 바뀌면 과거 통계 해석이 통째로 틀어진다)
      */
     ADMIT_STALE(2),
 

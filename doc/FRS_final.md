@@ -922,7 +922,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | `QUEUE_NOT_FOUND` | `Q001` | 404 | 큐 없음 |
 | `QUEUE_NOT_OWNED` | `Q002` | 403 | 본인 큐 아님 |
 | `DUPLICATE_QUEUE_NAME` | `Q003` | 409 | 큐 이름 중복 |
-| `QUEUE_NOT_ACTIVE` | `Q004` | 503 | 큐 PAUSED / DRAINING |
+| `QUEUE_NOT_ACTIVE` | `Q004` | 503 | 큐 PAUSED / DELETED |
 | `QUEUE_FULL` | `Q005` | 429 | maxCapacity 초과. **신규 진입자만 받는다** — 기존자는 EXISTS |
 | `QUEUE_LIMIT_EXCEEDED` | `Q006` | 409 | 테넌트당 큐 개수 상한(20) 초과 |
 | `QUEUE_ENGINE_UNAVAILABLE` | `QE001` | 503 | 대기열 처리 일시 오류 |

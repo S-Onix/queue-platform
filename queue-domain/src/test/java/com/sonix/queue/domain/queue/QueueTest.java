@@ -77,22 +77,6 @@ public class QueueTest {
     }
 
     @Test
-    @DisplayName("drain 성공")
-    void drain_success() {
-        Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
-        queue.drain();
-        assertEquals(QueueStatus.DRAINING, queue.getStatus());
-    }
-
-    @Test
-    @DisplayName("delete - DRAINING에서 예외")
-    void delete_from_draining_throws() {
-        Queue queue = Queue.create(1L, "test", 100000, null, null);
-        queue.drain();
-        assertThrows(IllegalStateException.class, () -> queue.delete());
-    }
-
-    @Test
     @DisplayName("delete - PAUSED에서 성공")
     void delete_from_paused() {
         Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
@@ -150,30 +134,6 @@ public class QueueTest {
     }
 
     @Test
-    @DisplayName("DRAINING에서 pause 불가")
-    void draining_cannot_pause() {
-        Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
-        queue.drain();
-        assertThrows(IllegalStateException.class, () -> queue.pause());
-    }
-
-    @Test
-    @DisplayName("DRAINING에서 resume 불가")
-    void draining_cannot_resume() {
-        Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
-        queue.drain();
-        assertThrows(IllegalStateException.class, () -> queue.resume());
-    }
-
-    @Test
-    @DisplayName("DRAINING에서 drain 중복 불가")
-    void draining_cannot_drain_again() {
-        Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
-        queue.drain();
-        assertThrows(IllegalStateException.class, () -> queue.drain());
-    }
-
-    @Test
     @DisplayName("DELETED에서 모든 전환 불가")
     void deleted_cannot_do_anything() {
         Queue queue = Queue.create(1L, "test-queue", 100000, null, null);
@@ -182,7 +142,6 @@ public class QueueTest {
 
         assertThrows(IllegalStateException.class, () -> queue.pause());
         assertThrows(IllegalStateException.class, () -> queue.resume());
-        assertThrows(IllegalStateException.class, () -> queue.drain());
         assertThrows(IllegalStateException.class, () -> queue.delete());
     }
 
@@ -198,14 +157,6 @@ public class QueueTest {
     void isCapacityExceeded_zero() {
         Queue queue = Queue.create(1L, "test", 100, null, null);
         assertFalse(queue.isCapacityExceeded(0));
-    }
-
-    @Test
-    @DisplayName("isEnqueueable - DRAINING이면 false")
-    void isEnqueueable_draining() {
-        Queue queue = Queue.create(1L, "test", 100000, null, null);
-        queue.drain();
-        assertFalse(queue.isEnqueueable());
     }
 
     @Test

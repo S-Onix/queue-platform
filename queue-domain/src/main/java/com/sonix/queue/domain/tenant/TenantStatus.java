@@ -1,7 +1,10 @@
 package com.sonix.queue.domain.tenant;
 
 public enum TenantStatus {
+    /** 정상. 로그인·API Key 인증이 통과하는 유일한 상태다. */
       ACTIVE(0)
+
+    /** 비활성. {@code Tenant.deactivate()}로만 진입하고 <b>되돌리는 전이는 없다</b>(단방향). */
     , DEACTIVATED(1);
 
 
