@@ -15,7 +15,11 @@ x-api: &api
   image: queue-api:local
   restart: unless-stopped
   network_mode: host
-  mem_limit: 1g
+  # 🔴 1g 에서 **cgroup OOM 으로 죽었다**(2026-09-15, 100만 투입 중 app1 컨테이너 3개가
+  #    RestartCount=3, 연결 거부 17,085건). 힙은 -Xmx512m 인데 anon-rss 가 1,038MB 였다 —
+  #    넘긴 것은 힙이 아니라 **비힙**(메타스페이스·코드캐시·가상스레드 스택·다이렉트 버퍼)이다.
+  #    🪤 "컨테이너 한도 = 힙 × 2" 어림이 부하에서 깨진다. 기능 테스트로는 안 나온다.
+  mem_limit: 2g
   environment: &env
     SPRING_PROFILES_ACTIVE: prod
     DB_MASTER_HOST: ${MYSQL_IP:?MYSQL_IP 필요}

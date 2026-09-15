@@ -19,9 +19,9 @@ TF="terraform -chdir=infra/aws"
 pubip()  { $TF output -json public_ip  | python3 -c "import sys,json;print(json.load(sys.stdin)['$1'])"; }
 privip() { $TF output -json private_ip | python3 -c "import sys,json;print(json.load(sys.stdin)['$1'])"; }
 
-APP=$(pubip app); WORKER=$(pubip worker)
+APP=$(pubip app); APP2=$(pubip app2); WORKER=$(pubip worker)
 MYSQL=$(pubip mysql); KAFKA=$(pubip kafka); REDIS=$(pubip redis)
-APP_IP=$(privip app); WORKER_IP=$(privip worker)
+APP_IP=$(privip app); APP2_IP=$(privip app2); WORKER_IP=$(privip worker)
 MYSQL_IP=$(privip mysql); KAFKA_IP=$(privip kafka); REDIS_IP=$(privip redis)
 # 앱 컨테이너가 볼 주소. 셋을 한 덩어리로 넘긴다.
 DATAENV="MYSQL_IP=$MYSQL_IP KAFKA_IP=$KAFKA_IP REDIS_IP=$REDIS_IP"
@@ -49,7 +49,7 @@ push() {
     ./ "ubuntu@$1:~/queue-platform/"
 }
 
-ALL="$MYSQL $KAFKA $REDIS $APP $WORKER"
+ALL="$MYSQL $KAFKA $REDIS $APP $APP2 $WORKER"
 
 echo "[0/5] 인스턴스 준비 대기 (user_data 설치 완료까지)"
 for h in $ALL; do
@@ -61,11 +61,11 @@ done
 #    여기서 만든다. rsync 전에 만들어야 그대로 실려 간다.
 echo "[1/5] 관측 설정 생성 (타깃 + 대시보드)"
 mkdir -p infra/aws/monitoring/targets infra/aws/monitoring/dashboards
-python3 - "$APP_IP" "$WORKER_IP" "$MYSQL_IP" "$KAFKA_IP" "$REDIS_IP" <<'PYEOF'
+python3 - "$APP_IP" "$APP2_IP" "$WORKER_IP" "$MYSQL_IP" "$KAFKA_IP" "$REDIS_IP" <<'PYEOF'
 import json, sys
-app, worker, mysql, kafka, redis = sys.argv[1:6]
+app, app2, worker, mysql, kafka, redis = sys.argv[1:7]
 d = "infra/aws/monitoring/targets"
-json.dump([{"targets": [f"{app}:{p}" for p in (8080, 8083, 8084)]}], open(f"{d}/api.json", "w"))
+json.dump([{"targets": [f"{h}:{p}" for h in (app, app2) for p in (8080, 8083, 8084)]}], open(f"{d}/api.json", "w"))
 json.dump([{"targets": [f"{worker}:8081"], "labels": {"app": "batch"}},
            {"targets": [f"{worker}:8082"], "labels": {"app": "consumer"}}], open(f"{d}/worker.json", "w"))
 json.dump([{"targets": [f"redis://{redis}:{p}"], "labels": {"cluster": c}}
@@ -73,7 +73,7 @@ json.dump([{"targets": [f"redis://{redis}:{p}"], "labels": {"cluster": c}}
           open(f"{d}/redis.json", "w"))
 # 🔑 노드가 5개다. 어느 계층이 먼저 포화하는지가 이 환경의 존재 이유라 하나도 빠뜨리면 안 된다.
 json.dump([{"targets": [f"{ip}:9100"], "labels": {"node": n}}
-           for n, ip in (("app", app), ("worker", worker), ("mysql", mysql),
+           for n, ip in (("app", app), ("app2", app2), ("worker", worker), ("mysql", mysql),
                          ("kafka", kafka), ("redis", redis))], open(f"{d}/node.json", "w"))
 
 # 대시보드는 ${DS_PROMETHEUS} 를 쓰는 export 판이다. 프로비저닝에는 실제 uid 가 필요하므로
@@ -109,18 +109,21 @@ on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f inf
 
 echo "[4/5] 이미지 빌드 (app·worker 병렬. 최초 5~10분)"
 on "$APP"    "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
+on "$APP2"   "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
 on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/worker.yml build" &
 wait
 
 echo "[5/5] 앱 기동"
 on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/worker.yml up -d"
-on "$APP" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
-  for p in 8080 8083 8084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done"
+for H in "$APP" "$APP2"; do
+  on "$H" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
+    for p in 8080 8083 8084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done"
+done
 
 cat <<EOF
 
 완료.
-  k6 대상    : $APP_IP (포트 8080 · 8083 · 8084)
+  k6 대상    : $APP_IP · $APP2_IP (각 포트 8080 · 8083 · 8084 = api 6대)
   Grafana    : ssh -i ~/.ssh/queue-aws -L 3000:localhost:3000 ubuntu@$MYSQL
                열고 http://localhost:3000 (익명 Admin, 로그인 없음)
   Prometheus : 같은 방식으로 -L 9090:localhost:9090

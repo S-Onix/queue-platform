@@ -64,16 +64,23 @@ locals {
   #
   # 시간당 합계 약 $0.169 (m7g.xlarge ×1 + c7g.xlarge ×1 + m7g.large ×2 + c7g.large ×2)
   nodes = {
-    app    = "m7g.xlarge" # queue-api ×3 — 여기가 피크 92%, 여전히 가장 먼저 포화한다
+    app    = "m7g.2xlarge" # queue-api ×3 — 4차 f500 에서 CPU 90.1%. 5차에서 증설해 잰다
+    # 🔑 5차: app 노드를 둘로 나눠 **수평 확장 전제를 실증한다**(CLAUDE.md "N대 Stateless").
+    #    같은 노드에 컨테이너만 늘리는 것은 무의미하다 — 폴링 10,000 rps 에서 노드 CPU 가
+    #    94.86% 로 이미 포화였다. 늘려야 하는 것은 프로세스가 아니라 **노드(=vCPU)** 다.
+    #    🪤 스팟 쿼터가 32 vCPU 다. data 10 + app 8 + k6 8 = 26 이라 여유가 6 뿐이라 xlarge(4)다.
+    app2   = "m7g.xlarge"  # queue-api ×3 (2번째 노드)
     mysql  = "m7g.large"  # mysql (0.83코어) + prometheus·grafana·redis-exporter
     kafka  = "c7g.xlarge" # kafka ×3 (1.09코어) — RF=3 복제가 네트워크로 나간다
     redis  = "m7g.large"  # redis ×6 (0.34코어) — 싱글스레드라 코어 수보다 코어 성능이다
     worker = "c7g.large"  # queue-batch + queue-consumer (3.4% — 남아돈다)
-    k6     = "c7g.large"  # 부하 드라이버
+    # 🔴 5차에서 c7g.large(2 vCPU) → c7g.2xlarge(8 vCPU). 폴링 목표 25,448 rps 를 재려면
+    #    드라이버부터 커야 한다 — 로컬 6코어 천장이 15,500 이었다(그때도 천장은 Platform 이 아니라 CPU).
+    k6     = "c7g.2xlarge" # 부하 드라이버
   }
 
   # 루트 볼륨. mysql 은 데이터 + 파티션, kafka 는 로그 세그먼트, app 은 Gradle 빌드 + 이미지.
-  disk = { app = 40, mysql = 40, kafka = 40, redis = 20, worker = 20, k6 = 20 }
+  disk = { app = 40, app2 = 40, mysql = 40, kafka = 40, redis = 20, worker = 20, k6 = 20 }
 }
 
 data "aws_subnet" "this" {
