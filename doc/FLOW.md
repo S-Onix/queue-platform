@@ -41,7 +41,7 @@ flowchart TD
     FILTER -->|"Rate 초과"| E429(["429 RL_001 + Retry-After"])
     SERV -->|"큐 없음"| E404(["404 Q001 QUEUE_NOT_FOUND"])
     SERV -->|"소유권 불일치"| E403(["403 Q002 QUEUE_NOT_OWNED"])
-    SERV -->|"PAUSED/DRAINING"| E503(["503 Q004 QUEUE_NOT_ACTIVE"])
+    SERV -->|"PAUSED/DELETED"| E503(["503 Q004 QUEUE_NOT_ACTIVE"])
 ```
 
 **처리량 상한**: 인스턴스당 `MAX_DRAIN / 주기` = **250,000 req/s** (5,000건 / 20ms).

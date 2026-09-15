@@ -185,7 +185,7 @@ flowchart TD
 - `queue-domain` 모듈에 Rich Domain Model (순수 Java, Spring 의존성 없음)
   - `Tenant`: create(), deactivate(), changePassword(), isActive(), reconstruct()
   - `ApiKey`: create(), revoke(), isActive(), matchesHash(), reconstruct()
-  - `Queue`: create(), pause(), resume(), drain(), delete(), update(), isEnqueueable(), isCapacityExceeded()
+  - `Queue`: create(), pause(), resume(), delete(), update(), isEnqueueable(), isCapacityExceeded()
 - Port 인터페이스: `TenantRepository`, `ApiKeyRepository`, `QueueRepository`, `PasswordHasher`
 - JPA Entity (`toDomain()`, `fromDomain()`) + JpaAdapter (Port 구현체)
 - `BcryptPasswordHasher`: PasswordHasher Port 구현체 (infrastructure)

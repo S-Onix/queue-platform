@@ -7,7 +7,7 @@ import java.util.List;
  * <b>30만 명 전원에게 같은 값</b>이다.
  *
  * <p>이름이 {@code QueueStatus}가 아닌 이유는 그 이름이 이미 큐의 <b>생명주기 상태</b>
- * (ACTIVE/PAUSED/DRAINING/DELETED)에 쓰이고 있어서다. 이쪽은 상태가 아니라 대기자에게 보여주는
+ * (ACTIVE/PAUSED/DELETED)에 쓰이고 있어서다. 이쪽은 상태가 아니라 대기자에게 보여주는
  * 전광판 값이다.
  *
  * <p>구 {@code QueueSnapshot}(frontSeq/total)을 대체한다. 바뀐 것은 필드 이름이 아니라 성질이다:

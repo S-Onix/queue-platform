@@ -18,6 +18,7 @@ CREATE TABLE tenants (
     email         VARCHAR(255) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     name          VARCHAR(100) NOT NULL,
+    -- TenantStatus: 0 ACTIVE / 1 DEACTIVATED. 단방향이다(되살리는 전이 없음).
     status        TINYINT      NOT NULL DEFAULT 0,
     -- ⚠️ 읽는 코드가 0이다 (§88 — Plan 등급제 제거). 의도적으로 남긴 §4-1 예외다.
     --    엔티티(TenantEntity)가 매핑하지 않으므로 INSERT에 안 실리고 DEFAULT가 채운다.
@@ -45,6 +46,7 @@ CREATE TABLE api_keys (
     api_key_id  VARCHAR(50) NOT NULL,
     tenant_id   BIGINT      NOT NULL,
     key_hash    VARCHAR(64) NOT NULL,
+    -- ApiKeyStatus: 0 ACTIVE / 1 REVOKED. 단방향이다 — 되쓰려면 새 키를 발급한다.
     status      TINYINT     NOT NULL DEFAULT 0,
     created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     revoked_at  DATETIME(3) NULL,
@@ -67,6 +69,11 @@ CREATE TABLE queues (
     max_capacity INT          NOT NULL,
     waiting_ttl  INT          NOT NULL DEFAULT 7200,
     inactive_ttl INT          NOT NULL DEFAULT 300,
+    -- QueueStatus: 0 ACTIVE / 1 PAUSED / 3 DELETED.
+    -- 🔴 2는 결번이다 DRAINING (2026-09-15 삭제). 도달도 탈출도 불가능한 상태였다 —
+    --    drain() 호출자 0건, delete()는 PAUSED만 받았다. 순차 배출은 PAUSED가 이미 한다.
+    --    **2를 다른 의미로 재사용하지 마라.** QueueStatus.java 주석과 짝이다.
+    -- 🪤 DELETED여도 조회는 된다(findByQueueId가 안 거른다) → enqueue는 404가 아니라 503 Q004.
     status       TINYINT      NOT NULL DEFAULT 0,
     created_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     deleted_at   DATETIME(3)  NULL,

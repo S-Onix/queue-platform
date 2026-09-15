@@ -130,11 +130,6 @@ stateDiagram-v2
 
     PAUSED --> DELETED : DELETE /queues
 
-    %% 🔴 DRAINING은 도달도 탈출도 불가능하다 (2026-08-26 실측)
-    %%   drain()은 ACTIVE만 받는데 프로덕션 호출이 0건이고,
-    %%   delete()는 PAUSED만 받는다 (Queue.java:100-112). DRAINING → DELETED 배치도 없다.
-    ACTIVE --> DRAINING : drain() — 호출자 0건
-
     DELETED --> [*]
 ```
 
@@ -142,9 +137,34 @@ stateDiagram-v2
 |------|---------|------------|
 | ACTIVE | ✅ | 유지 |
 | PAUSED | ❌ 503 | 유지 |
-| DRAINING | ❌ 503 | 순차 만료 |
 | DELETED | ❌ **503 Q004** | 없음 |
   ※ ~~404~~가 아니다 — 조회는 되고(`findByQueueId`가 삭제를 안 거른다) `isEnqueueable()`이 `ACTIVE`만 봐서 `QUEUE_NOT_ACTIVE`다
+
+> 🔴 **`status = 2`는 결번이다 (2026-09-15).** `DRAINING`이 있었으나 **도달도 탈출도 불가능**했다 —
+> `drain()`은 `ACTIVE`만 받는데 프로덕션 호출이 0건이었고, `delete()`는 `PAUSED`만 받아 빠져나올
+> 수도 없었다. `DRAINING → DELETED` 배치도 없었다. 상수·메서드·테스트 6건을 삭제했다.
+> **"순차 배출"이 필요해지면 `PAUSED`가 이미 그 일을 한다** — 신규만 막고 기존 대기자는 흘린다.
+> `2`를 다른 의미로 재사용하지 마라(`queues.status`는 TINYINT다). `TokenStatus` 3번과 같은 처리다.
+
+---
+
+## Tenant 상태 머신
+
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE : POST /tenants/signup
+
+    ACTIVE --> DEACTIVATED : Tenant.deactivate()
+```
+
+| 상태 | 값 | 로그인 | API Key 인증 |
+|------|---|--------|--------------|
+| ACTIVE | 0 | ✅ | ✅ |
+| DEACTIVATED | 1 | ❌ | ❌ |
+
+> **단방향이다** — 되살리는 전이가 없다(`Tenant.java`에 `activate()`가 없다).
+> ⚠️ `deactivate()`를 부르는 **API는 아직 없다**(도메인 메서드만 있다). `DRAINING`과 다른 점은
+> **탈출 불가 상태가 아니라는 것**뿐이다 — 필요해지면 엔드포인트만 붙이면 된다.
 
 ---
 

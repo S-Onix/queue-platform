@@ -11,6 +11,20 @@ package com.sonix.queue.infrastructure.queue;
  * {@code CROSSSLOT} 에러가 난다. 중괄호 안쪽만 슬롯 계산에 쓰이므로 queueId가 같으면
  * 같은 마스터가 수학적으로 보장된다.
  *
+ * <p>🔑 <b>거부 기준이 둘이고, 시끄러운 쪽과 조용한 쪽이 갈린다</b>(2026-09-15 실측, 로컬 Cluster A):
+ * <pre>
+ *   EVAL ... 2 foo bar        → CROSSSLOT Keys in request don't hash to the same slot   (슬롯 기준)
+ *   EVAL ... 1 foo, 스크립트가 bar 를 만짐 → ERR Script attempted to access non local key (노드 기준)
+ *   EVAL ... 1 foo, 스크립트가 undeclared_key_x 를 만짐 → OK   ← 슬롯 11481 vs 12182 로 <b>다른데 통과</b>
+ * </pre>
+ * 즉 {@code KEYS[]}에 <b>선언한</b> 키는 슬롯이 갈리면 즉시 거부되지만(실패가 시끄럽다),
+ * <b>선언하지 않은</b> 키는 "이 노드가 소유하는가"만 보므로 <b>슬롯이 달라도 우연히 같은 노드면
+ * 조용히 성공</b>한다(마스터 4대 ≈ 25%). 초록은 안전의 증거가 아니다 —
+ * 자세한 사례는 {@link #admitByTokenPrefix(String)} 참조.
+ *
+ * <p>🪤 <b>로컬 Sentinel로는 원리적으로 못 잡는다</b> — Sentinel에는 슬롯 개념 자체가 없다.
+ * {@code RedisConfig}에서 Sentinel 분기를 코드에서 지운 이유가 이것이다(§75 D28).
+ *
  * <p>🔴 <b>태그를 shard 단위로 옮기지 마라</b>(§75에서 기각된 안). {@code RedisQueueEngine.route}는
  * 소유자를 모를 때 {@code EXISTS queue:&#123;queueId&#125;:seq}를 양쪽 클러스터에 물어 판정하는데,
  * 키 이름에 shard가 들어가면 <b>질문을 만들려면 답을 이미 알아야</b> 한다. queueId는 테넌트에

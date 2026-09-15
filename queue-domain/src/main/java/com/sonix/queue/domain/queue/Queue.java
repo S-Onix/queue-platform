@@ -103,13 +103,6 @@ public class Queue {
         this.status = QueueStatus.ACTIVE;
     }
 
-    public void drain(){
-        if(this.status != QueueStatus.ACTIVE) {
-            throw new IllegalStateException("The queue is not ACTIVE");
-        }
-        this.status = QueueStatus.DRAINING;
-    }
-
     public void delete(){
         if(this.status != QueueStatus.PAUSED) {
             throw new IllegalStateException("The queue is not PAUSED");
