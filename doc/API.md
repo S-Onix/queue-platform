@@ -106,6 +106,71 @@ GET  /actuator/{health,info,prometheus}
 
 ---
 
+## 0-1. HTTP 상태 코드 — 엔드포인트별 전수
+
+> 코드에서 추출했다(2026-09-15). 서비스가 던지는 `BusinessException`, 필터가 직접 쓰는 429,
+> Security·검증이 만드는 상태까지 포함한다.
+
+### 🔑 성공은 **전부 200**이다
+
+**`201 Created`도 `204 No Content`도 쓰지 않는다.** 생성 계열(`POST /queues`,
+`POST /tokens`, `POST /me/api-keys`)도 200이고, 삭제 계열(`DELETE`)도 200이다.
+`QueueEngineController`는 `ResponseEntity.ok(...)`, 나머지 컨트롤러는 `ApiResponse<T>`를
+그대로 반환(기본 200)하며 **`@ResponseStatus`를 쓰는 곳이 한 곳도 없다**.
+
+🪤 그래서 **HTTP 상태만 보고 "만들어졌는지"를 판정하지 마라.** 판정은 봉투의 `success`와
+`data`로 한다. 예: enqueue는 이미 줄 서 있던 사람도 200이고 `already: true`로 갈린다.
+
+### 상태가 만들어지는 경로는 넷이고, **봉투 모양이 다르다**
+
+| 경로 | 나오는 상태 | 봉투 |
+|---|---|---|
+| 컨트롤러 정상 반환 | 200 | ✅ `{data, success:true, errorResponse:null}` |
+| `GlobalExceptionHandler` (`BusinessException`) | 400·401·403·404·409·429·500·503 | ✅ `{data:null, success:false, errorResponse:{code,message}}` |
+| `RateLimitFilter` (필터라 핸들러 이전) | **429 `RL001`** | 🔴 **없음** — `{error, message, retryAfter}` |
+| Security·검증 → `/error` 디스패치 | **401**·**400** | 🔴 **없음** — Boot 표준 에러 본문, `message`도 빠진다 |
+
+🔴 **429가 두 모양이다.** `Q005`(정원 참)는 봉투가 있고 **`Retry-After`가 없다**(재시도 금지).
+`RL001`(요청 한도)은 봉투가 없고 **`Retry-After`가 있다**(재시도 대상). `errorCode`로 갈라라.
+
+### 엔드포인트별
+
+`AK001`(401 인증 필요)·`RL001`(429 한도)·`I004`(500)는 **인증이 필요한 전 엔드포인트 공통**이라
+아래 표에서 생략한다. 공개 엔드포인트 둘은 그 자리에 따로 적었다.
+
+| # | 엔드포인트 | 인증 | 성공 | 에러 |
+|---|---|---|---|---|
+| 1 | `POST /tenants/signup` | 없음 | 200 | **409** `T001` · **400** 검증 · **429** `RL001`(IP 5/분) |
+| 2 | `POST /tenants/login` | 없음 | 200 | **401** `T003` · **400** 검증 · **429** `RL001`(IP 10/분) |
+| 3 | `POST /tenants/refresh` | 없음 | 200 | **401** `T004` · **404** `T002` · **429** `RL001`(IP 30/분) |
+| 4 | `POST /tenants/logout` | JWT | 200 | — |
+| 5 | `POST /tenants/me/api-keys` | JWT | 200 | — |
+| 6 | `DELETE /tenants/me/api-keys/{apiKeyId}` | JWT | 200 | **404** `A001` · **403** `A002` |
+| 7 | `POST /queues` | JWT | 200 | **409** `Q003`(이름 중복) · **409** `Q006`(테넌트당 20개 초과) · **400** 검증 |
+| 8 | `GET /queues/{queueId}` | JWT | 200 | **404** `Q001` · **403** `Q002` |
+| 9 | `PATCH /queues/{queueId}` | JWT | 200 | **404** `Q001` · **403** `Q002` · **409** `QE006` · **400** 검증 |
+| 10 | `POST /queues/{queueId}/pause` | JWT | 200 | **404** `Q001` · **403** `Q002` · **409** `QE006` |
+| 11 | `POST /queues/{queueId}/resume` | JWT | 200 | 〃 |
+| 12 | `DELETE /queues/{queueId}` | JWT | 200 | 〃 |
+| 13 | `POST /queues/{queueId}/tokens` (enqueue) | API Key<br>(JWT도 통과) | 200 | **404** `Q001` · **403** `Q002` · **429** `Q005`(정원 참, **Retry-After 없음**) · **503** `Q004`(PAUSED/DELETED) · **503** `QE001`(Redis·Kafka 실패, **재시도 가능**) · **400** 검증 |
+| 14 | `POST /queues/{queueId}/admit` | API Key<br>(JWT도 통과) | 200 | **404** `Q001` · **403** `Q002` |
+| 15 | `POST /queues/{queueId}/admit-tokens/{admitToken}/verify` | API Key<br>(JWT도 통과) | 200 | **404** `TK002` · **404** `Q001` · **403** `Q002` |
+| 16 | `POST /queues/{queueId}/tokens/{tokenId}/complete` | API Key<br>(JWT도 통과) | 200 | **404** `TK002` · **404** `Q001` · **403** `Q002` |
+| 17 | `GET /queues/{queueId}/status` | **없음**(permitAll) | 200 | **404** `Q001` — 🔴 **첫 enqueue 전에도 404다**(큐는 있는데 Redis 키가 없다) |
+| 18 | `GET /queues/{queueId}/tokens/{tokenId}` (폴링) | **없음**(permitAll) | 200 | **404** `TK001` · **429** `RL001`(tokenId 버킷, `Retry-After: 2`) |
+
+### 주의할 조합
+
+- **404가 두 뜻이다** — `Q001`(큐 없음)과 `TK001`/`TK002`(토큰·입장권 없음). ⑰은 **큐가 멀쩡해도**
+  `Q001`이 나올 수 있다(Redis 키 미생성). `errorCode`로 갈라라
+- **503도 두 뜻이다** — `Q004`는 **재시도해도 소용없다**(큐가 멈췄다), `QE001`은 **재시도 대상**이다
+- **13의 429(`Q005`)에 `Retry-After`를 기대하지 마라.** 정원이 찬 것은 시간이 해결하지 않는다
+- **17·18은 인증이 없다.** 소유권 검사도 없으므로 `Q002`(403)가 나올 수 없다
+- **admit(⑭)은 Lua 커밋 뒤라 사실상 항상 200이다** — 발행 실패도 200으로 나간다.
+  그래서 실패는 HTTP가 아니라 `queue_admit_requests_total{result="error"}`로만 보인다(§80 U9)
+
+---
+
 ## 1. 테넌트
 
 ### `POST /api/v1/tenants/signup` — 가입
