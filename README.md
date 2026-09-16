@@ -7,7 +7,7 @@
 [![Redis](https://img.shields.io/badge/Redis-Cluster_x2-DC382D?logo=redis)](https://redis.io/)
 [![Kafka](https://img.shields.io/badge/Kafka-Spring_Kafka-231F20?logo=apachekafka)](https://kafka.apache.org/)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql)](https://www.mysql.com/)
-[![Tests](https://img.shields.io/badge/Tests-495-success)](#-테스트-전략)
+[![Tests](https://img.shields.io/badge/Tests-520-success)](#-테스트-전략)
 
 > 개인 사이드 프로젝트입니다. **운영 중이 아닙니다.**
 > 이 문서의 수치는 전부 실측이며, 측정 환경(로컬 / AWS)을 항상 같이 적었습니다.
@@ -308,7 +308,7 @@
 
 ## 🧪 테스트 전략
 
-**495건**(전체, 벤치마크 4건 skip) / **307건**(단위 레인). 가르는 기준은 모듈이 아니라 **`@Tag`**다 — 실 MySQL·Redis
+**520건**(전체, 벤치마크 4건 skip) / **332건**(단위 레인). 가르는 기준은 모듈이 아니라 **`@Tag`**다 — 실 MySQL·Redis
 Cluster·Kafka를 쓰는 테스트에만 태그를 붙이고, CI 단위 레인은 그것만 제외한다.
 
 - 🔴 **모듈 단위로 가르다가 384건 중 104건만 돌고 있던 적이 있다.** 그래서 태그다
