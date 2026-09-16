@@ -115,10 +115,15 @@ wait
 
 echo "[5/5] 앱 기동"
 on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/worker.yml up -d"
+# 🔴 **병렬로 띄운다.** 순차면 app 의 health 대기에서 시간을 다 쓰고 app2 차례가 오지 않는다 —
+#    2026-09-16 에 실제로 그랬다. 새 이미지는 구워졌는데 컨테이너는 옛 것으로 남았고,
+#    겉보기엔 "배포 성공"이었다(앱이 떠 있으니 health 도 200 이다).
+#    🪤 이 종류의 결함은 **초록으로 보인다** — 두 노드의 컨테이너 생성 시각을 비교해야 드러난다.
 for H in "$APP" "$APP2"; do
   on "$H" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
-    for p in 8080 8083 8084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done"
+    for p in 8080 8083 8084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done" &
 done
+wait
 
 cat <<EOF
 
