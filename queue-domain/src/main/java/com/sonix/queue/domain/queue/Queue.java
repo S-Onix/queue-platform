@@ -65,6 +65,27 @@ public class Queue {
         return this.status == QueueStatus.ACTIVE;
     }
 
+    /**
+     * PAUSED는 <b>입구만 잠근다</b> — 이미 줄에 선 사람의 재진입(새로고침)까지 막지 않는다.
+     *
+     * <p>{@code DRAINING}을 지우면서 남긴 문장("신규만 막고 기존은 흘린다")이 PAUSED의 정의인데,
+     * 코드는 {@link #isEnqueueable()} 하나로 둘을 같이 막고 있었다. 새로고침 한 번에 자리를 잃는다.
+     *
+     * <p>🔑 <b>여기서 "기존"인지는 판정하지 않는다.</b> 그건 Redis의 중복 게이트가 안다
+     * ({@code QueueEngine.hasToken}). 이 메서드는 <b>물어볼 가치가 있는 상태인가</b>만 답한다.
+     */
+    public boolean allowsRejoin(){
+        return this.status == QueueStatus.PAUSED;
+    }
+
+    /**
+     * 삭제된 큐인가. 소프트 삭제라 행은 남으므로 <b>존재 확인만으로는 걸러지지 않는다</b> —
+     * 실제로 지운 큐에서 {@code admit}이 200을 내고 있었다.
+     */
+    public boolean isDeleted(){
+        return this.status == QueueStatus.DELETED;
+    }
+
     public boolean isCapacityExceeded(int currentCount) {
         return currentCount >= maxCapacity;
     }

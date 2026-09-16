@@ -6,12 +6,14 @@ import com.sonix.queue.api.queue.dto.QueueUpdateRequest;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.Queue;
+import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.QueueStatus;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -30,6 +32,10 @@ class QueueServiceTest {
 
     @Mock
     private QueueRepository queueRepository;
+
+    /** 삭제 시 Redis 대기 줄을 지운다(2026-09-16). 목이 없으면 {@code deleteQueue}가 NPE로 죽는다. */
+    @Mock
+    private QueueEngine queueEngine;
 
     @InjectMocks
     private QueueService queueService;
@@ -311,6 +317,23 @@ class QueueServiceTest {
 
         // then
         assertEquals(QueueStatus.DELETED, response.getStatus());
+
+        // 🔑 상태만 바꾸고 끝내면 Redis 대기 줄이 영구 점유된다. 순서도 중요하다 —
+        //    저장보다 먼저 지우면 저장 실패 시 살아 있는 큐의 대기자만 날아간다.
+        InOrder inOrder = inOrder(queueRepository, queueEngine);
+        inOrder.verify(queueRepository).save(any(Queue.class));
+        inOrder.verify(queueEngine).purgeDeleted("q_test1234");
+    }
+
+    @Test
+    @DisplayName("Queue 삭제 실패(ACTIVE)면 Redis 정리도 하지 않는다")
+    void deleteQueue_fromActive_doesNotPurge() {
+        Queue queue = Queue.create(1L, "이벤트 대기열", 100000, null, null);
+        when(queueRepository.findByQueueId("q_test1234")).thenReturn(Optional.of(queue));
+
+        assertThrows(BusinessException.class, () -> queueService.deleteQueue(1L, "q_test1234"));
+
+        verifyNoInteractions(queueEngine);
     }
 
     @Test

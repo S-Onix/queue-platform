@@ -6,6 +6,7 @@ import com.sonix.queue.api.queue.dto.QueueUpdateRequest;
 import com.sonix.queue.common.exception.BusinessException;
 import com.sonix.queue.common.exception.ErrorCode;
 import com.sonix.queue.domain.queue.Queue;
+import com.sonix.queue.domain.queue.QueueEngine;
 import com.sonix.queue.domain.queue.QueueRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,9 +33,11 @@ public class QueueService {
     static final int MAX_QUEUES_PER_TENANT = 20;
 
     private final QueueRepository queueRepository;
+    private final QueueEngine queueEngine;
 
-    public QueueService(QueueRepository queueRepository) {
+    public QueueService(QueueRepository queueRepository, QueueEngine queueEngine) {
         this.queueRepository = queueRepository;
+        this.queueEngine = queueEngine;
     }
 
     /**
@@ -144,11 +147,24 @@ public class QueueService {
     }
 
     @Transactional
+    /**
+     * 큐 삭제. <b>되돌릴 수 없다</b>(DELETED에서 나가는 전이가 없다).
+     *
+     * <p>🔑 <b>DB는 소프트 삭제, Redis는 실제로 지운다.</b> 원장(tokens)은 남겨야 한다 —
+     * 이미 발급된 토큰은 청구 대상이라 지우면 과금 근거가 사라진다. 반면 Redis의 대기 줄은
+     * 지운다. "큐를 지우면 줄도 사라진다"가 계약이고, 안 지우면 그 메모리를 영구 점유한다.
+     *
+     * <p>🪤 <b>정리를 저장보다 뒤에 둔다.</b> 먼저 지우면 저장이 실패했을 때 살아 있는 큐의
+     * 대기자만 날아간다. 반대로 정리가 실패하면 상태만 DELETED로 남는데, 그건 회수 배치가
+     * 훑어서 걷는다(그러려고 배치가 상태로 거르지 않는다).
+     */
     public QueueResponse deleteQueue(Long tenantId, String queueId) {
         Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
 
         guardTransition(() -> queue.delete());
         queueRepository.save(queue);
+
+        queueEngine.purgeDeleted(queueId);
 
         return QueueResponse.from(queue);
     }

@@ -76,6 +76,12 @@ public class RedisQueueEngine implements QueueEngine {
     /** admit.lua에서 admitToken 후보가 시작되는 ARGV 위치 직전까지의 고정 인자 수. */
     private static final int ADMIT_TOKEN_OFFSET = 7;
 
+    /**
+     * 삭제된 큐에서 {@code tokens}·{@code admitted}를 남겨두는 시간. <b>complete 의 유효 창과 같다</b> —
+     * 이보다 짧으면 이미 나간 입장권의 완료가 Redis 폴백에서 404가 되고, 길면 메모리만 더 잡는다.
+     */
+    private static final long PURGE_GRACE_SECONDS = 300L;
+
     private final StringRedisTemplate cluster1;
     private final StringRedisTemplate cluster2;
 
@@ -578,6 +584,47 @@ public class RedisQueueEngine implements QueueEngine {
         cleanup(queueId, identifier, tokenId, seq,
                 List.of(QueueKeys.waiting(queueId), QueueKeys.admitted(queueId), QueueKeys.tokens(queueId),
                         QueueKeys.admitByToken(queueId, tokenId)));
+    }
+
+    /**
+     * PAUSED 큐의 재진입 판정. 중복 게이트인 {@code tokens} Hash에 {@code identifier}가 있으면
+     * <b>이미 줄에 선 사람</b>이다.
+     *
+     * <p>🔑 게이트가 {@code waiting} ZSet이 아니라 {@code tokens} Hash인 이유는 원래 결정 그대로다 —
+     * admit되면 {@code waiting}에서 빠지므로 ZSet으로 보면 <b>입장한 사람이 신규로 판정</b>된다.
+     *
+     * <p>⚠️ {@code routeForRead}를 쓴다. 이 시점에 큐는 이미 DB에서 확인된 뒤라 소유 클러스터를 안다.
+     */
+    @Override
+    public boolean hasToken(String queueId, String identifier) {
+        return Boolean.TRUE.equals(
+                routeForRead(queueId).opsForHash().hasKey(QueueKeys.tokens(queueId), identifier));
+    }
+
+    /**
+     * 삭제된 큐의 Redis 상태 정리. 근거는 포트 주석에 있다.
+     *
+     * <p>🪤 <b>{@code tokens}·{@code admitted}를 즉시 지우면 안 된다.</b> 삭제 시점에 입장권을 들고
+     * 있던 사람의 {@code complete}가 Redis 폴백을 타는데, 그 폴백이 이 키들에 기댄다. 대신 완료 창
+     * (300초)만큼만 살려두고 만료시킨다 — 그 뒤엔 어차피 DB 술어가 거부한다.
+     */
+    @Override
+    public void purgeDeleted(String queueId) {
+        StringRedisTemplate redis = routeForWrite(queueId);
+
+        redis.delete(List.of(
+                QueueKeys.waiting(queueId),
+                QueueKeys.lastActive(queueId),
+                QueueKeys.seq(queueId),
+                QueueKeys.admitWatermark(queueId),
+                QueueKeys.pacing(queueId)));
+
+        for (String key : List.of(QueueKeys.tokens(queueId), QueueKeys.admitted(queueId))) {
+            redis.expire(key, PURGE_GRACE_SECONDS, TimeUnit.SECONDS);
+        }
+
+        log.info("삭제된 큐의 Redis 상태 정리 queueId={} (tokens·admitted 는 {}초 뒤 만료)",
+                queueId, PURGE_GRACE_SECONDS);
     }
 
     private void cleanup(String queueId, String identifier, String tokenId, long seq, List<String> keys) {
