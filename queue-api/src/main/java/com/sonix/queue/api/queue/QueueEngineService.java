@@ -73,7 +73,13 @@ public class QueueEngineService {
     public EnqueueResult enqueue(long tenantId, String queueId, String identifier) {
         Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
 
-        if (!queue.isEnqueueable()) {
+        // 🔑 PAUSED는 **입구만** 잠근다. 이미 줄에 선 사람의 재-enqueue(=새로고침)는 통과시킨다 —
+        //    막으면 화면을 새로고침한 것만으로 자리를 잃는다(2026-09-15 실증).
+        //    🪤 신규/기존 판정은 원래 enqueue_bulk.lua의 HSETNX가 한다. 그런데 이 가드가 Lua보다
+        //       **앞**에 있어 물어보기도 전에 막고 있었다. 그래서 여기서 한 번 물어본다.
+        //    🔑 ACTIVE는 첫 조건에서 끝나므로 **핫패스에 왕복이 붙지 않는다**.
+        if (!queue.isEnqueueable()
+                && !(queue.allowsRejoin() && queueEngine.hasToken(queueId, identifier))) {
             throw new BusinessException(ErrorCode.QUEUE_NOT_ACTIVE);
         }
 
@@ -101,7 +107,16 @@ public class QueueEngineService {
      * (최대 {@code send-timeout}까지 블록)이 통째로 커넥션을 잡는다.
      */
     public AdmitResult admit(long tenantId, String queueId, int count, String requestId) {
-        findQueueAndVerifyOwner(tenantId, queueId);
+        Queue queue = findQueueAndVerifyOwner(tenantId, queueId);
+
+        // 🔴 삭제된 큐에서 **새 입장권을 더 내주지 않는다.** 소프트 삭제라 행이 남아 있어
+        //    존재·소유 확인만으로는 통과했고, 지운 큐에서 admit이 계속 200이었다.
+        //    🔑 verify·complete는 **막지 않는다** — 삭제 시점에 이미 입장권을 들고 좌석으로
+        //       가던 사람까지 자르면 "돈은 받고 입장은 못 시킨" 사용자가 생긴다. 그쪽은
+        //       admitToken TTL 60초와 완료 창 300초로 이미 유계다.
+        if (queue.isDeleted()) {
+            throw new BusinessException(ErrorCode.QUEUE_NOT_FOUND);
+        }
 
         long now = clock.millis();
         AdmitResult result = queueEngine.admit(queueId, requestId, count, now);

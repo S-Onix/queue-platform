@@ -26,6 +26,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 import javax.sql.DataSource;
@@ -430,6 +431,122 @@ class QueueLifecycleContractTest {
     }
 
     // ── ④ 테넌트당 큐 개수 상한이 세는 방식 ──────────────────────────────────
+
+    @Nested
+    @DisplayName("⑤ PAUSED·DELETED 에서 실제로 무엇이 막히나")
+    class PausedAndDeletedBehaviour {
+
+        /** ACTIVE 큐 하나를 API로 만들고 API Key 를 발급해 둔다. */
+        private String[] activeQueueWithKey(String label) throws Exception {
+            MvcResult created = mockMvc.perform(post("/api/v1/queues").with(auth())
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {"name":"%s","maxCapacity":1000}
+                                    """.formatted(uniqueName(label))))
+                    .andExpect(status().isOk())
+                    .andReturn();
+            String queueId = json(created).path("data").path("queueId").asText();
+            createdQueueIds.add(queueId);
+
+            MvcResult issued = mockMvc.perform(post("/api/v1/tenants/me/api-keys").with(auth()))
+                    .andExpect(status().isOk())
+                    .andReturn();
+            return new String[]{queueId, json(issued).path("data").path("rawKey").asText()};
+        }
+
+        private ResultActions enqueue(String queueId, String rawKey, String identifier) throws Exception {
+            return mockMvc.perform(post("/api/v1/queues/" + queueId + "/tokens")
+                    .with(FROM_TEST_IP)
+                    .header("X-API-Key", rawKey)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("""
+                            {"identifier":"%s"}
+                            """.formatted(identifier)));
+        }
+
+        @Test
+        @DisplayName("PAUSED 큐에서 **신규** enqueue 는 503 Q004 로 막힌다 — 입구는 잠긴다")
+        void pausedRejectsNewcomer() throws Exception {
+            String[] q = activeQueueWithKey("paused-new");
+
+            mockMvc.perform(post("/api/v1/queues/" + q[0] + "/pause").with(auth()))
+                    .andExpect(status().isOk());
+
+            enqueue(q[0], q[1], NS + "newcomer")
+                    .andExpect(status().isServiceUnavailable())
+                    .andExpect(jsonPath("$.errorResponse.code").value("Q004"));
+        }
+
+        @Test
+        @DisplayName("🔴 PAUSED 큐에서 **기존 대기자**의 재-enqueue 는 통과하고 자리가 유지된다")
+        void pausedKeepsExistingWaiterOnRefresh() throws Exception {
+            String[] q = activeQueueWithKey("paused-rejoin");
+            String identifier = NS + "already_waiting";
+
+            MvcResult first = enqueue(q[0], q[1], identifier)
+                    .andExpect(status().isOk())
+                    .andReturn();
+            long seqBefore = json(first).path("data").path("seq").asLong();
+            String tokenBefore = json(first).path("data").path("tokenId").asText();
+
+            mockMvc.perform(post("/api/v1/queues/" + q[0] + "/pause").with(auth()))
+                    .andExpect(status().isOk());
+
+            // 🔑 이게 이 수정의 전부다. 막으면 새로고침 한 번에 자리를 잃는다.
+            MvcResult again = enqueue(q[0], q[1], identifier)
+                    .andExpect(status().isOk())
+                    .andReturn();
+
+            assertThat(json(again).path("data").path("seq").asLong()).isEqualTo(seqBefore);
+            assertThat(json(again).path("data").path("tokenId").asText()).isEqualTo(tokenBefore);
+        }
+
+        @Test
+        @DisplayName("🔴 DELETED 큐의 admit 은 404 Q001 — 지운 큐에서 입장권이 더 나가지 않는다")
+        void deletedQueueIssuesNoMoreAdmits() throws Exception {
+            String[] q = activeQueueWithKey("deleted-admit");
+            enqueue(q[0], q[1], NS + "waiter_before_delete").andExpect(status().isOk());
+
+            mockMvc.perform(post("/api/v1/queues/" + q[0] + "/pause").with(auth()))
+                    .andExpect(status().isOk());
+            mockMvc.perform(delete("/api/v1/queues/" + q[0]).with(auth()))
+                    .andExpect(status().isOk());
+
+            mockMvc.perform(post("/api/v1/queues/" + q[0] + "/admit")
+                            .with(FROM_TEST_IP)
+                            .header("X-API-Key", q[1])
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {"count":1,"requestId":"%sreq_after_delete"}
+                                    """.formatted(NS)))
+                    .andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.errorResponse.code").value("Q001"));
+        }
+
+        @Test
+        @DisplayName("🔴 큐를 지우면 Redis 의 대기 줄도 사라진다 — 안 지우면 영구 점유였다")
+        void deleteAlsoClearsWaitingLine() throws Exception {
+            String[] q = activeQueueWithKey("deleted-purge");
+            enqueue(q[0], q[1], NS + "waiter_to_be_purged").andExpect(status().isOk());
+            assertThat(waitingSize(q[0])).isOne();
+
+            mockMvc.perform(post("/api/v1/queues/" + q[0] + "/pause").with(auth()))
+                    .andExpect(status().isOk());
+            mockMvc.perform(delete("/api/v1/queues/" + q[0]).with(auth()))
+                    .andExpect(status().isOk());
+
+            assertThat(waitingSize(q[0])).isZero();
+        }
+
+        private long waitingSize(String queueId) {
+            for (StringRedisTemplate redis : List.of(cluster1, cluster2)) {
+                Long size = redis.opsForZSet().zCard(QueueKeys.waiting(queueId));
+                if (size != null && size > 0) return size;
+            }
+            return 0L;
+        }
+    }
+
 
     @Nested
     @DisplayName("④ countActiveByTenantId")

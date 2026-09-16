@@ -16,8 +16,19 @@ public interface QueueRepository {
      * <b>접속한 노드만</b> 훑기 때문이다. 마스터마다 따로 돌리지 않으면 다른 노드에 사는 큐가
      * 조용히 누락되고, 누락된 큐의 토큰은 아무 에러도 없이 복귀되지 않는다 (§80 ⑧).
      *
-     * <p>상태로 거르지 않는다 — {@code DELETED}는 소프트 삭제라 Redis 키가 남아 있고,
-     * 순회 대상에서 빼면 그 큐의 {@code admitted} ZSet이 영영 비워지지 않는다.
+     * <p>상태로 거르지 않는다. 다만 <b>이유가 2026-09-16에 바뀌었다.</b>
+     *
+     * <p>원래 근거는 "{@code DELETED}는 소프트 삭제라 Redis 키가 남아 있고, 순회 대상에서 빼면
+     * 그 큐의 {@code admitted} ZSet이 영영 비워지지 않는다"였다. <b>그 전제가 사라졌다</b> —
+     * 이제 삭제 시점에 지운다({@code QueueEngine.purgeDeleted}). 남기는 {@code tokens}·
+     * {@code admitted}도 완료 창(300초) 뒤 만료되므로 영구 점유가 아니다.
+     *
+     * <p>그래도 거르지 않는 이유는 <b>거를 실익이 없어서다</b> — 지워진 큐의 순회는 빈 키 조회라
+     * 무동작이고, 조건을 넣으면 "정리가 실패해 상태만 DELETED인 큐"가 영영 방치된다.
+     *
+     * <p>🪤 <b>PAUSED를 거르는 것은 특히 금지다.</b> PAUSED는 입구만 잠글 뿐 시간은 흐른다.
+     * 회수가 멈추면 멈춰둔 큐가 Redis 마스터를 무기한 점유하고, 같은 마스터의 <b>다른 테넌트</b>가
+     * OOM으로 죽는다(§87에서 재현된 그 경로다).
      */
     List<Queue> findAll();
     boolean existsByTenantIdAndName(Long tenantId, String name);

@@ -204,4 +204,32 @@ public interface QueueEngine {
      * boolean 파라미터로 합치면 그 차이가 인자 하나에 숨는다.
      */
     void cleanupVerified(String queueId, String identifier, String tokenId, long seq);
+
+    /**
+     * 이 큐에 {@code identifier}로 발급된 토큰이 이미 있는지.
+     *
+     * <p><b>PAUSED 큐의 재진입 판정 전용이다.</b> PAUSED는 입구만 잠그므로, 이미 줄에 선 사람의
+     * 새로고침(재-enqueue)까지 막으면 자리를 잃는다. 신규와 기존을 가르는 것은 원래
+     * {@code enqueue_bulk.lua}의 {@code HSETNX}인데, 상태 가드가 그보다 <b>앞</b>에 있어
+     * 물어보기도 전에 막고 있었다.
+     *
+     * <p>🔑 <b>ACTIVE 경로에서는 호출되지 않는다</b> — 핫패스에 왕복이 붙지 않는다.
+     */
+    boolean hasToken(String queueId, String identifier);
+
+    /**
+     * 삭제된 큐의 Redis 상태를 정리한다. <b>DB 원장은 건드리지 않는다</b>(발급된 토큰은 청구 대상).
+     *
+     * <p>둘로 나뉜다.
+     * <ul>
+     *   <li><b>즉시 삭제</b> — 대기 줄({@code waiting}·{@code last-active})과 순번·전광판.
+     *       큐를 지우면 대기자도 사라진다는 것이 계약이다.</li>
+     *   <li><b>유예 후 만료</b> — {@code tokens}·{@code admitted}. 삭제 시점에 이미 입장권을
+     *       들고 좌석으로 가는 중인 사람이 있고, 그 사람의 {@code verify}·{@code complete}는
+     *       <b>끝까지 받아준다</b>(막으면 돈은 받고 입장은 못 시킨 사용자가 생긴다).</li>
+     * </ul>
+     *
+     * <p>🪤 개별 입장권 키({@code admit-by-*})는 이미 TTL이 있어 손대지 않는다.
+     */
+    void purgeDeleted(String queueId);
 }
