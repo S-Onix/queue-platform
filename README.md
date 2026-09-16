@@ -1,455 +1,394 @@
-# 🚀 Queue Platform
+# Queue Platform
 
-> 대규모 트래픽 상황에서 서버 부하를 제어하기 위해  
-> 대기열을 외부 플랫폼으로 분리한 Queue-as-a-Service
+> B2B Queue-as-a-Service. **난이도는 처리량이 아니라, 동시성과 장애 속에서 원장을 안 틀리는 것이다.**
 
 [![Java](https://img.shields.io/badge/Java-21-007396?logo=java)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring_Boot-3.3.4-6DB33F?logo=springboot)](https://spring.io/projects/spring-boot)
 [![Redis](https://img.shields.io/badge/Redis-Cluster_x2-DC382D?logo=redis)](https://redis.io/)
 [![Kafka](https://img.shields.io/badge/Kafka-Spring_Kafka-231F20?logo=apachekafka)](https://kafka.apache.org/)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql)](https://www.mysql.com/)
+[![Tests](https://img.shields.io/badge/Tests-490-success)](#-테스트-전략)
+
+> 개인 사이드 프로젝트입니다. **운영 중이 아닙니다.**
+> 이 문서의 수치는 전부 실측이며, 측정 환경(로컬 / AWS)을 항상 같이 적었습니다.
 
 ---
 
-## 🔥 TL;DR
+## 30초 요약
 
-- 대기열을 서비스 서버에서 분리 → **트래픽 제어를 플랫폼화**
-- **Platform(순서 관리)** vs **Tenant(슬롯·입장 제어)** 책임 분리
-- **유저가 Platform에 직접 Polling** — `/status` 전광판 + `pacing` 구간표 (전원 동일 응답 → 캐시)
-- **Backpressure Pull** — Tenant가 소화 가능한 인원만 admit 요청
-- **admitToken TTL 60초** → verify(유효성 확인) → complete(COMPLETED+ZREM)
-- **admitToken 만료 시 종료** — 복귀하지 않는다(§36). 재접속 → 재-enqueue → 맨 뒤
-- **Kafka 버퍼** — Enqueue는 순번 확정 → Kafka 발행(동기) → 200 응답. **DB INSERT만 비동기**
-- **Virtual Thread** — Spring MVC + JPA blocking I/O를 OS Thread 고갈 없이 처리
-- **SDK 제공** — JS SDK(폴링·대기 UI 전용)만. Tenant 서버는 REST 직접 호출 (DECISIONS §35 · §78)
+- **50만 명을 전 구간 완주**시켰다 — Redis 대기 0 · Kafka 이벤트 103만 · 잔여 lag 0 · DB 50만 (로컬)
+- **원장을 깨뜨리는 결함 2건을 실측으로 잡았다** — 둘 다 전 테스트가 초록인 상태에서 숨어 있었다
+- **컨슈머 적재를 132 → 1,400~1,800건/s**로 올렸다. 원인은 배치 크기가 아니라 트랜잭션 경계였다
+- **추론이 실측에 계속 졌다.** 에이전트 3인이 합의한 불변식이 10분 만에 반증된 기록이 있다
 
 ---
 
-## 📌 문제 정의
+## 📌 문제 정의 — 난이도는 어디에 있나
 
-트래픽이 몰릴 때 서버가 대기열을 직접 관리하면:
-- 동시 접속 폭증 → 서버 자원 고갈
-- 대기열 로직과 비즈니스 로직 강결합 → 복잡도 증가
-- 순서 꼬임, Race Condition
+대기열은 "줄 세우기"처럼 보이지만, 돈이 걸리면 어려운 지점이 셋이다.
+
+**① 중복은 곧 중복 청구다.** 과금 단위가 **토큰 1장 = 청구 1건**이라, 새로고침 한 번이 청구 2건이
+되면 안 된다. 그래서 중복 게이트는 `tokens` Hash의 **`HSETNX`**다 — `waiting` ZSet이 아니다.
+입장하면 ZSet에서 빠지므로, ZSet을 게이트로 쓰면 **재-enqueue가 신규로 판정되어 두 번 청구된다.**
+
+**② 자리는 enqueue 시점에 확정되고, 그 뒤로 바뀌지 않는다.** 여기서 값이 둘로 갈린다 —
+**`seq`(발급 번호)는 줄 선 순간 박히고 영원히 안 바뀌고**, 화면에 보이는 **대기 순위는 앞이
+빠질수록 줄어든다**. 순위는 "나보다 `seq`가 작은 사람 중 아직 남은 수"일 뿐이라, **바뀌는 건
+순위지 자리가 아니다.** 그래서 `seq`는 `INCR`(단조증가·유일) 하나로만 만들고, 발급은 Redis Lua
+안에서 원자적으로 끝낸다.
+
+> 🪤 순위는 앱이 N대라 **역행해 보일 수 있다**(요청마다 다른 서버가 다른 순간을 본다).
+> 그래서 화면에는 단조 감소만 하도록 클라이언트가 clamp한다 — **`seq`가 불변이라 이게 가능하다.**
+
+**③ 즉시 응답과 비동기 적재 사이에 창(window)이 있다.** 사용자는 자기 자리를 즉시 받아야 하고,
+원장은 MySQL에 있다. 그 사이를 Kafka가 잇는다. **이 창에서 시계가 갈리거나 순서가 뒤집히면
+원장이 조용히 틀린다.** 실제로 그 두 가지가 다 일어났다 (아래).
 
 ---
 
-## 💡 핵심 설계 원칙
+## 🔀 누가 무엇을 책임지나
 
-### 1. Platform은 순서만 관리한다
+**Platform은 순서만 관리하고, 슬롯과 입장은 Tenant가 정한다.**
+
+**사용자(브라우저)가 하는 것 — 하나뿐이다**
+
+| | |
+|---|---|
+| **폴링** | *"내 차례인가?"*를 Platform에 **직접** 묻는다. Tenant 서버를 거치지 않는다 |
+
+**Tenant 서버가 하는 것 — 나머지 전부**
+
+| | |
+|---|---|
+| `enqueue` | 사용자를 줄에 세우고 **자리(순번)**를 받아 온다 |
+| `admit` | **소화할 수 있는 만큼만 당겨간다** — Backpressure Pull |
+| `verify` / `complete` | 입장권을 확인하고, 좌석을 확정한다 |
+
+🔑 갈리는 기준은 **열쇠(API Key)**다. 브라우저에는 열쇠를 줄 수 없으므로 **읽기만** 하고,
+줄을 세우거나 입장을 결정하는 일은 전부 Tenant 서버가 한다.
+
+입장권 TTL은 **60초**이고, **만료되면 복귀하지 않는다** — 재접속하면 맨 뒤다.
+붙잡아두면 그 자리가 비어 있는 동안 뒤가 못 들어오기 때문이다.
+
+---
+
+## 🧾 원장 정합성 — 틀린 것 2건, 막아둔 것 1건
+
+**원장 = MySQL `tokens` 테이블이고, 행 하나가 곧 청구 1건이다.** 그런데 사용자에게는 즉시 답해야 해서
+원장에 바로 쓸 수 없다 — 순서는 Redis가 정하고, Kafka를 건너, 컨슈머가 MySQL에 적는다.
+**응답은 이미 나갔는데 원장은 수십 ms 뒤에 쓰인다.** 그 구간이 위에서 말한 "창"이고,
+거기서 틀어지는 방식이 딱 둘이었다. **둘 다 실제로 났다.**
+
+### ① 시간을 재는 시계를 하나로
+
+**원설계** — 입장 시각은 **애플리케이션 서버가 찍어서** 기록에 담아 보냈다. 일이 일어난 곳이
+거기니 자연스러운 선택이었다.
+
+**문제** — 방금 입장한 사람의 완료 처리가 **한 건도 반영되지 않았다.** 그 토큰은 "만료됨"인데
+완료 시각은 비어 있는 채로 영구히 굳었고, **그런데도 사용자에게는 정상이라고 답했다.**
+아무도 오류를 볼 수 없었다.
+
+**원인** — 플랫폼은 시간으로 판정을 한다. *"입장한 지 60초 안인가?"*(입장권 확인),
+*"5분 안인가?"*(완료 처리). 이런 판정에는 **입장한 시각**과 **지금 시각** 두 값이 필요한데,
+**"지금"은 원장이 있는 데이터베이스 시계로 읽고, "입장 시각"은 앱 서버 시계로 찍고** 있었다.
+**출발은 손목시계로 재고 도착은 경기장 벽시계로 재는 것과 같다.** 실제로 두 시계가 **0.4초**
+어긋나 있었고, 데이터베이스가 보기에 그 사람은 아직 입장하지 않은 셈이었다.
+
+**해결** — 입장 시각도 **데이터베이스가 직접 찍게** 했다. 판정에 쓰는 두 값이 같은 시계에서
+나오므로, 서버 시계가 얼마나 어긋나든 판정은 틀리지 않는다.
+
+> 🔑 **줄 선 시각은 옮기지 않았다.** 그 값은 "몇 초 전인가"를 계산하는 데 쓰이지 않고,
+> **같은 토큰인지 판별하는 데**만 쓰인다. 다시 처리해도 **똑같이 재현되는 것**이 그 값의 임무라
+> (뒤의 ③이 여기 기댄다), 기록되는 시점이 아니라 **일이 일어난 시점**에 확정돼야 한다.
+> 한 줄로: **"지금"과 비교되는 시각만 데이터베이스가 찍는다.**
+
+### ② 소식이 거꾸로 도착해도 견디게
+
+원장에는 토큰의 상태가 숫자로 남는다 — **0 = 줄 서는 중, 1 = 입장권 받음, 2 = 완료.**
+
+**원설계** — 완료 소식은 **"상태가 1일 때만"**, 즉 *입장 기록이 이미 적혀 있을 때만* 반영하도록
+했다. 입장이 먼저 일어나니 당연해 보였다.
+
+**문제** — 이 경로로 들어온 완료의 **1.43%**가 원장에서 사라지고 있었다.
+
+**원인** — 입장과 완료는 **각각 따로 전달되는 소식**이다. 입장권은 만들어지는 즉시 사용자에게
+보이지만, 그 사실을 원장 쪽에 알리는 소식은 **그 뒤에 따로** 보낸다(실측 67~128ms).
+사용자가 그 사이에 입장까지 끝내버리면 **"완료" 소식이 "입장" 소식보다 먼저 도착한다.**
+그러면 상태가 아직 0(줄 서는 중)이라 조건에 걸리지 않고, **완료 기록이 조용히 버려진다.**
+
+**해결** — **아직 끝나지 않은 상태(0 또는 1)면 완료로 받는다.** 무조건 완료로 만드는 것이 아니다.
+**이미 완료(2)이거나 만료로 확정(4)된 토큰은 건드리지 않는다** — 거기까지 넓히면 "시간이 지나
+끝난 것"을 뒤늦게 완료로 뒤집는 **새로운 결함**이 된다. 넓힌 것은 딱 **"입장 기록이 아직 안
+적힌 경우"** 하나다.
+
+> 🔑 메시지 큐는 보낸 순서를 지켜준다. 하지만 **보낸 순서 자체가 틀렸다면, 틀린 순서를 그대로
+> 지켜준다.** "순서 보장"은 보내는 쪽이 옳게 보냈을 때만 쓸모가 있다.
+
+### ③ 재처리로 안 깨지게
+
+적재는 At-Least-Once다. 중복 소비를 `UNIQUE(token_id, issued_at)` + 상태 전이 가드 UPSERT로 흡수한다.
+전이는 **한 방향으로만** 진행하므로, 같은 이벤트를 몇 번 먹어도 결과가 같다.
+
+근거와 번복 이력은 [`doc/DECISIONS.md`](doc/DECISIONS.md) §90 · §91.
+
+---
+
+## 📐 규모 — 어디까지 확인했나
+
+### 50만 명 전 구간 (로컬, 실제 Tenant 서버 + 브라우저)
+
 ```
-Tenant가 슬롯 여유 감지 → POST /admit 호출
-Platform은 순번 관리만. 세션 관리는 Tenant 책임
+투입 500,000  →  Redis 대기 0  ·  Kafka 이벤트 1,030,040 (밀린 것 0)  ·  DB 원장 500,016
 ```
 
-### 2. 유저가 Platform에 직접 Polling (적응형 간격 — DECISIONS §79)
-```
-GET /queues/:queueId/status  → { lastAdmittedSeq, pacing }   ← 전원 동일. 캐시 가능
-  rank = mySeq − lastAdmittedSeq        ← SDK가 뺄셈 (서버는 rank를 계산하지 않는다)
+세 곳의 숫자가 맞아떨어진다는 뜻이다. **"밀린 것 0"**은 대기열에서 일어난 일이 원장에 **전부
+반영됐다**는 의미다 — 적재는 비동기라 일이 밀릴 수 있는데, 50만 명이 몰린 뒤에도 남은 게 없었다.
 
-pacing 기본 구간표 (Redis 키로 오버라이드 가능):
-  rank ≤ 50     → 2s (곧 입장)
-  rank ≤ 1000   → 5s
-  rank ≤ 5000   → 10s
-  rank ≤ 10000  → 15s
-  그 이상        → 20s (서버 부하 절약)
+| | 실측 |
+|---|---|
+| enqueue | 717/s (5만 명 69.7초, 실패 0) |
+| admit — 직렬 1워커 | **110/s** |
+| admit — 병렬 6워커 | **800/s** (피크 1,200/s) |
+| 입장권 수령 지연 | 2.2~3.6초 = TTL 60초의 4~6% |
 
-JS SDK: setTimeout(poll, 간격 × 1000 + ±20% 지터) 자동 적용
-탭 비활성화 → Polling 자동 중단
-rank ≤ 0 일 때만 개인 엔드포인트로 admitToken 확인
-```
+🔑 **줄이 빠지는 속도는 Platform이 아니라 Tenant가 정한다.** admit이 110/s에 머문 건 데모 Tenant가
+입장 요청을 하나씩 순서대로 보내고 있었기 때문이고, 6개를 동시에 보내자 800/s가 됐다.
+**그동안 Platform은 줄 세우기를 717/s로 계속 받아내고 있었다.** 느린 쪽이 전체 속도를 정한 게
+아니라, **애초에 Tenant가 정하도록 설계된 것**이다 — Backpressure Pull이 말이 아니라 숫자로
+보인 지점이다.
 
-### 3. Backpressure Pull
-```
-Tenant가 소화 가능한 만큼만 admit { count: N }
-Platform과 커플링 없음
-```
+🔑 **입장권을 뿌린다고 사람이 들어오는 게 아니다.** 이 판에서 입장권 500,012장이 나갔는데
+실제로 입장까지 간 건 **4명**이다. 나머지는 60초 뒤 그대로 만료됐다.
 
-### 4. admitToken TTL 만료 → 종료 (복귀하지 않는다)
-```
-TTL 60초 초과 → claim 잡이 HGET → HDEL tokens (중복 게이트 해제) + EXPIRED 발행
-→ 유저는 404를 받고 재접속 → Tenant가 재-enqueue → 새 seq, 맨 뒤
+⚠️ 이 숫자는 **데모라서 과장된 것**이다 — 실제 브라우저는 몇 대뿐이었고 나머지 50만은 줄만 서
+있는 가상 대기자라 입장권을 받아 갈 주체가 없었다. 그래도 **구조는 실제와 같다**: 입장권이
+쓰일지 안 쓰일지는 Platform이 알 수 없고, 60초가 지나면 사라지며, **청구는 발급 기준으로 된다.**
+현실에서도 그 사이에 사람은 창을 닫는다.
 
-왜: Platform은 만료 원인(유저/불가항력/Tenant/Platform)을 구분할 수 없다.
-    Platform 귀책분(폴링 수령 지연)은 실측상 이미 60초 예산 안이므로 봐줄 이유가 없다.
+### AWS 실측 (서버 6대)
 
-이유: 네트워크 지연 등 유저 귀책 아닐 수 있음
-     EXPIRED 처리 시 유저가 맨 뒤로 → 불공평
-```
+**부하의 대부분은 줄 세우기가 아니라 "내 차례인가?"를 묻는 데서 나온다.**
+줄을 서는 건 한 사람당 한 번이지만, 기다리는 동안에는 계속 물어야 하기 때문이다.
+순위가 멀수록 뜸하게 묻도록 간격을 벌려두는데(앞쪽 2초, 뒤쪽 20초), 그래도 50만 명이 기다리면
+**초당 약 25,000번**의 질문이 된다. 그중 **96%가 뒤쪽 사람들**이 만든다 — 한 명씩 보면 20초에
+한 번뿐이지만 수가 49만이다. **간격을 벌려도 총량은 사람 수가 정한다.**
 
-### 5. Virtual Thread + Spring MVC
-```
-spring.threads.virtual.enabled=true 한 줄로 적용
-Tomcat의 모든 요청이 Virtual Thread에서 처리
-JPA blocking → OS Thread 점유 없이 대기
-@Transactional + ThreadLocal → Virtual Thread 정상 동작
-→ Polling 2,000 rps + JPA 동시에 가능
-```
+그래서 측정도 여기에 맞췄다.
 
-### 6. Kafka Enqueue 버퍼
-```
-Redis Lua 처리 → Kafka 발행(동기) → 200 응답 (seq·rank 확정)
-Kafka token-lifecycle (key=tokenId) → DB INSERT (At-Least-Once)
-→ Enqueue p99 50ms 이하 달성
-```
+| | 결과 |
+|---|---|
+| 100만 명 투입 | **999,422명 처리 · 오류 0 · 거절 0 · 원장 반영도 밀리지 않고 따라옴** |
+| 묻기 — 서버 1대(8코어) | 초당 **10,000번** 처리 · 응답 **1.80ms** |
+| 묻기 — 서버 2대(12코어) | 초당 **18,000번** 처리 · 응답 **6.34ms** · 실패 0 |
+| 줄 세우기 — 초당 200명 | 응답 **27.54ms** |
+
+> 📏 여기 적은 응답 시간은 **p95**다 — 100번 중 95번은 이 시간 안에 답했다는 뜻이다.
+> 평균은 느린 소수를 가려버리기 때문에, 가장 느린 쪽을 기준으로 본 값이다.
+
+🔑 **수용 인원이 늘면 서버를 늘려야 한다.** 8코어 한 대로 초당 1만 번, 12코어 두 대로 1만 8천 번.
+**코어를 1.5배로 늘리자 처리량도 1.8배가 됐다** — 서버를 늘리면 그만큼 늘어나는 구조라는 것을
+이번에 처음 확인했다.
+
+🪤 **단, 서버 크기가 서로 다르면 그냥 반씩 나눠 보내면 안 된다.** 8코어와 4코어에 절반씩 보냈더니
+작은 쪽이 먼저 포화돼(96% vs 50%) 처리량이 20%밖에 안 늘었다. 용량 비율대로 보내자 **같은
+하드웨어에서 응답이 506ms → 1.12ms**가 됐다 — 고친 것은 코드가 아니라 분배 비율 하나다.
+**로드밸런서는 각 서버가 얼마나 감당할 수 있는지 모른다.**
+
+🔴 **그래도 50만 명분(초당 2만 5천)에는 못 미친다.** 검증된 건 1만 8천까지고, 계산상 **24코어쯤**
+필요하다. 즉 이 규모를 받으려면 **서버를 더 붙여야 한다**는 것이 지금 답이다.
+
+🔧 **부하가 터졌을 때 제일 먼저 돌릴 손잡이는 증설이 아니라 "묻는 간격"이다.** 간격표는 순위
+구간별로 정해져 있고(앞쪽 2초 … 뒤쪽 20초), **큐마다 Redis 키 하나로 덮어쓴다 — 코드 변경도
+배포도 없다.** 총량의 **96%를 뒤쪽 구간이 만들기 때문에**, 손대야 할 값도 사실상 그 하나다.
+
+> 🪤 대신 두 가지가 걸린다. **간격을 2초 밑으로 내리면** 폴링 한도(초당 1회 회복)에 닿아
+> 새로고침 한 번에 거절당하고, **뒤쪽 간격을 늘리면** 자는 사이에 자기 차례가 지나갈 수 있다 —
+> 입장권은 60초면 사라지는데 본인은 다음에 물을 때까지 모른다. 그래서 뒤쪽 간격을 늘릴수록
+> **그 구간의 시작 순위도 함께 뒤로 밀어야 한다**(줄이 빠지는 속도 × 간격만큼).
+
+🔑 **폴링 부하는 "몇 명이 동시에 기다리느냐"로 정해진다.** 줄이 빨리 빠지면 서버를 안 늘려도
+부하가 준다 — 실제로 한 번에 내보내는 인원을 20 → 100으로 올리자 폴링 응답이 **65% 빨라졌다**
+(서버는 그대로 두고). ⚠️ 단, **앉힐 자리가 있을 때만**이다. 자리가 없는데 많이 내보내면
+**대기자가 만료자로 바뀔 뿐이고 청구는 그대로** 나간다.
+
+🪤 **앞서 로컬에서 "초당 1만 5천에서 막힌다"는 천장을 만났는데, 그건 서비스의 한계가 아니었다** —
+부하를 만드는 프로그램이 같은 컴퓨터에서 돌면서 CPU를 나눠 쓰고 있었다.
+**천장의 정체가 측정 장비였다.** 부하 생성기를 별도 서버로 떼고 나서야 진짜 숫자가 나왔다.
+
+---
+
+## ⚡ 성능 개선 2건 — 원인을 틀렸다가 고친 기록
+
+### ① enqueue 드레인 주기 1,000ms → 20ms
+
+**원설계** — 줄 세우기 요청을 한 건씩 Redis로 보내면 왕복이 너무 많다. 그래서 일단 모았다가
+**정해진 주기마다 한 번씩** 몰아서 보내도록 만들었다.
+
+**문제** — 응답이 목표(50ms)를 한참 넘겼다. 거의 **1초**가 걸렸다.
+
+**원인** — 보내는 일 자체는 몇 ms면 끝난다. 나머지는 전부 **다음 차례를 기다리는 시간**이었다.
+주기가 1초였으니, 방금 한 묶음이 나간 직후에 도착한 사람은 꼬박 1초를 기다린 것이다.
+측정값도 그대로 따라왔다 — **응답 시간 ≈ 주기 × 0.99.** 주기가 곧 지연이라는 뜻이다.
+
+**해결** — 주기를 1,000ms에서 **20ms**로 줄였다. 목표 부하(초당 200명)에서 **32.32ms**로,
+목표치 안에 들어왔다.
+
+🔴 **처음엔 30ms로 정했다가 뒤집혔다.** 버스트를 20ms 설정 위에서 재놓고 30ms의 수치라고 보고했다.
+🔴 **"몇 rps에서 몇 ms"는 큐 수 없이는 의미가 없다** — 같은 2,000rps에서 큐 10개 46.6ms, 큐 40개 149.5ms.
+
+### ② 컨슈머 적재 132 → 1,400~1,800건/s
+
+**원설계** — 원장에 한 건씩 쓰면 왕복이 너무 많다. 그래서 **500건씩 모아 한 번에** 쓰도록 만들었다.
+
+**문제** — 그런데 실제로는 **초당 132건**밖에 못 넣었다. 부하가 몰리면 밀린 일이 계속 쌓였고,
+대기열에서 일어난 일이 원장에 반영되기까지 점점 늦어졌다.
+
+**원인** — 한 번에 쓰인 건수를 재봤더니 **평균 1.82건**이었다. 500건을 모아놓고도, 일의 종류
+(줄 섬 · 입장 · 완료)가 바뀔 때마다 저장을 끊고 있었다. *"순서대로 적용해야 한다"*는 요구를
+*"종류마다 따로 저장해야 한다"*로 구현해 둔 것이었는데, **순서는 쓰는 순서만 지키면 되지
+저장을 끊을 이유가 없었다.**
+
+**해결** — 저장 경계를 하나로 합쳤다. 초당 **1,400~1,800건**(10배 이상). 줄 세우기 응답도
+312ms → **45.7ms**로 같이 내려갔다 — 밀린 적재가 앞단까지 붙잡고 있었기 때문이다.
+
+🔴 **첫 수정이 오히려 원장을 깼다.** 저장 경계를 합치고 보니, 그 안에 **쓰는 방식이 서로 다른
+두 코드**가 섞여 있었다. 한쪽은 곧바로 쓰고, 다른 쪽은 **마지막에 몰아서** 썼다. 그래서 먼저
+일어난 일이 나중에 기록되는 **순서 뒤바뀜**이 생겼고, 앞의 ②에서 본 것과 똑같은 이유로
+일부 기록이 조용히 사라졌다. 결국 양쪽을 같은 방식으로 통일하고 나서야 맞았다.
 
 ---
 
 ## 🏗 아키텍처
 
-```mermaid
-flowchart TD
-    User["👤 유저\n브라우저/앱"]
-    Tenant["🖥 Tenant 서버"]
-    API["⚡ Queue Platform API\nSpring MVC · Tomcat · Virtual Thread"]
-    Batch["⏱ Batch Server\n@Scheduled Jobs"]
-    Consumer["📥 queue-consumer\nKafka 소비 전담"]
-    Kafka["📨 Kafka\ntoken-lifecycle (key=tokenId)"]
-    Redis["🔴 Redis 독립 2 Cluster\nA(7001-7008) · B(8001-8008)\n큐 단위 라우팅 (§75)"]
-    DB_M["🗄 MySQL Master"]
-    DB_R["🗄 MySQL Read Replica"]
+요청 하나가 어디를 거쳐 원장까지 가는지, 그리고 **어디서 시간이 벌어지는지**.
 
-    User -->|"④ Polling (적응형 간격)"| API
-    User -->|"⑥ admitToken"| Tenant
-    Tenant -->|"③ Enqueue → 200"| API
-    Tenant -->|"⑤ admit"| API
-    Tenant -->|"⑦ verify"| API
-    Tenant -->|"⑨ complete"| API
-    API -->|"Lua Script\n(ZADD, ZREM 등)"| Redis
-    API -->|"이벤트 발행\n(produce)"| Kafka
-    Kafka -->|"지속 구독\n(consume)"| Consumer
-    Consumer -->|"DB INSERT (tokens)\n배치 · 멱등"| DB_M
-    Batch -->|"@Scheduled\n회수 3경로 · 대사 · 과금\n(락 없음 — EVAL이 claim)"| Redis
-    Batch -->|"DB UPDATE (expire)\n@Transactional"| DB_M
-    API -->|"SELECT\n@Transactional(readOnly)"| DB_R
-    API -->|"UPDATE\n(complete)\n@Transactional"| DB_M
-    DB_M -->|"복제"| DB_R
 ```
+   [사용자 브라우저]                      [Tenant 서버]
+         │                                     │
+         │ 폴링 — "내 차례인가?"                 │ enqueue · admit · verify · complete
+         │ (공개, 열쇠 없이 조회만)              │ (API Key 필요)
+         ▼                                     ▼
+   ┌─────────────────────────────────────────────────────┐
+   │            queue-api   (N대 · 상태 없음)             │
+   └──────────────────────────┬──────────────────────────┘
+                              │
+                   ① 순번·입장을 원자적으로 확정
+                              ▼
+                   Redis Cluster × 2  ◄── 회수·대사 ── queue-batch
+                              │
+                   ② 일어난 일을 발행                   ┐
+                      (동기 — 확인하고 나서 응답)         │
+                              ▼                       │  이 구간이 "창"
+                   Kafka   token-lifecycle             │  응답은 이미 나갔는데
+                              │                       │  원장은 아직 안 적혔다
+                   ③ 원장에 적재 (비동기)                │
+                              ▼                       │
+                   queue-consumer  →  MySQL (원장)     ┘
+```
+
+**쓰는 요청은 종류를 가리지 않고 전부 이 길을 지난다.** 줄 세우기든 입장이든, ①에서 Redis로 확정되고
+②로 알려진 뒤 ③에서 원장에 적힌다. **사용자 응답은 ②까지만 확인하고 곧바로 나간다** — 그래서 빠르다.
+(②는 건너뛰지 않는다. 발행에 실패하면 응답도 실패한다.)
+
+바로 그 **③이 늦게 도착하는 구간**이 "창"이고, 앞의 *원장 정합성* 두 항목이 지키는 곳이다.
+
+🔑 브라우저는 **읽기만** 한다. 줄을 세우는 것도, 입장을 결정하는 것도 Tenant 서버다 —
+브라우저에 열쇠(API Key)를 줄 수 없기 때문이다.
+
+| 모듈 | 책임 |
+|---|---|
+| `queue-common` | ErrorCode · 예외 · ID 생성 · AOP 어노테이션 |
+| `queue-domain` | Rich Domain Model + Port. **Spring 의존성 0** (순수 Java) |
+| `queue-infrastructure` | JPA · Redis · Kafka 어댑터 |
+| `queue-api` | REST + Security(JWT / API Key) |
+| `queue-batch` | 회수 · 대사 · 과금 스냅샷 |
+| `queue-consumer` | Kafka 소비 전담 독립 앱 (확장 방향이 batch와 반대라 분리) |
 
 ---
 
-## 📦 모듈 구조
+## 🧪 테스트 전략
 
-```mermaid
-flowchart LR
-    subgraph IN["Adapter In"]
-        api["queue-api\nMVC Controller"]
-        batch["queue-batch\n@Scheduled Jobs"]
-        consumer["queue-consumer\nKafka 소비 전담 (독립 앱)\ntoken-lifecycle → DB 적재"]
-    end
+**490건**(전체, 벤치마크 4건 skip) / **306건**(단위 레인). 가르는 기준은 모듈이 아니라 **`@Tag`**다 — 실 MySQL·Redis
+Cluster·Kafka를 쓰는 테스트에만 태그를 붙이고, CI 단위 레인은 그것만 제외한다.
 
-    subgraph DOMAIN["Domain"]
-        domain["queue-domain\nEntity · UseCase · Port\nRich Domain Model"]
-    end
-
-    subgraph OUT["Adapter Out"]
-        infra["queue-infrastructure\nQueueKeys · RedisKeyFactory\nJPA Repository\nKafka Producer"]
-    end
-
-    common["queue-common\nErrorCode · BusinessException\nIdGenerator · RawKeyGenerator"]
-
-    api --> domain & infra & common
-    batch --> domain & infra & common
-    consumer --> domain & infra & common
-    infra --> domain & common
-    domain --> common
-```
-
-```
-의존성 원칙:
-  queue-common  ← 모든 모듈이 직접 의존 (명시적 선언)
-  queue-domain  ← queue-api, queue-batch, queue-consumer, queue-infrastructure
-  queue-domain은 Spring 의존 없음 (순수 Java)
-  queue-infrastructure는 queue-api/batch/consumer를 절대 모름
-  queue-consumer는 아무도 참조하지 않는다 (최말단)
-```
-
-> **`queue-consumer`를 `queue-batch`와 합치지 않는 이유**: 확장 방향이 반대다. 소비는 파티션 수만큼
-> 늘려야 하고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요해진다 ([DECISIONS §73](doc/DECISIONS.md) D20).
-> actuator + micrometer-prometheus를 갖는다 — 없으면 `/actuator/prometheus`가 아예 생기지 않아
-> **컨슈머 lag을 PromQL로 볼 수단이 사라진다**.
+- 🔴 **모듈 단위로 가르다가 384건 중 104건만 돌고 있던 적이 있다.** 그래서 태그다
+- 🔴 **CI 배지를 달지 않았다.** 0건이 실행돼도 초록이라, 배지는 "다 돌았다"로 오독된다.
+  대신 건수를 본다
+- 🔴 **테스트가 결함을 잡는지를 따로 확인한다.** 큐 상한 작업에서 결함 주입 6종 중 **셋이 안 잡혔다** —
+  어댑터가 항상 0을 반환해(= 상한 무동작) 전 스위트가 초록이었다
+- 통합 테스트는 **api 3대 고정**이다. 1대로는 "한 대에서만 맞는" 결함을 구조적으로 못 잡는다
+- 동시성 테스트는 Virtual Thread로 돈다(고정 풀은 출발 신호에서 교착한다)
 
 ---
 
-## 🧠 Token 상태 머신
+## 🤖 AI 협업 방식
 
-```mermaid
-stateDiagram-v2
-    [*] --> WAITING : POST /tokens\nEnqueue
-    WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
-    ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka 발행
-    ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\n종료 — 복귀 없음 (§36)\n재접속하면 맨 뒤
-    WAITING --> EXPIRED : Batch TTL 만료\n(waitingTtl · inactiveTtl)
-    COMPLETED --> [*]
-    EXPIRED --> [*]
-```
+이 프로젝트는 Claude Code와 **역할별 에이전트 14종**으로 만들었다. 자산은 코드 생산 속도가 아니라
+**AI 출력을 불신하는 절차** 쪽에 있다.
 
-> 🔴 **취소 전용 엔드포인트는 없다 (DECISIONS §82).** 유저가 취소 버튼을 누르든 탭을 닫든
-> 신호는 **"폴링이 멈춘다"** 하나이고, `inactiveTtl` 판정 배치가 EXPIRED(4)로 보낸다.
-> `inactiveTtl`은 **"몇 초까지 자리를 지켜줄 것인가"** 라는 유예 창이라, 그 안에 돌아오면
-> 같은 identifier로 재-enqueue해 **원래 순번이 복원**된다(창을 되살리는 신호는 **개인 폴링 재개**다 — `ka` 여부와 무관, §82 F안).
+- **어떤 에이전트도 단독으로 결론을 확정하지 않는다.** 최소 1인의 교차 검토가 필요하고,
+  최종 판정은 사람이 한다. 총괄은 보고서를 믿지 않고 `git diff`로 직접 대조한다
+- **보고 형식을 강제한다** — 목적 → 대안 → 선택 이유 → **검증 결과**.
+  안 돌린 명령은 "미검증"이라고 쓴다
+- **늘리는 제안은 "안 만들면 무엇이 깨지는가"를 같이 낸다.** 안 깨지면 만들지 않는다
 
----
+실제로 이 절차가 잡아낸 것들:
 
-## 🔄 전체 흐름 (9단계)
+| | |
+|---|---|
+| 🔴 합의가 실측에 졌다 | 에이전트 3인이 동의한 불변식이 10분 만에 반증됐다(오탐 15,144건). **합의는 실측을 대체하지 못한다** |
+| 🔴 메커니즘 추론이 틀렸다 | 둘이 독립적으로 "이 쿼리는 replica로 간다"고 추론했고 **둘 다 틀렸다**. 라우팅 로그로 확인해야 했다 |
+| 🔴 절차 자체의 결함 | 파일을 수정하는 에이전트와 읽기 전용 검토자를 병렬로 돌렸더니, **diff에 없는 코드를 근거로 결함을 보고**했다 |
 
-```mermaid
-flowchart TD
-    A["① Queue 생성"]
-    --> B["② 유저 접속\nTenant 슬롯 확인"]
-    --> C["③ Enqueue\n순번 확정 → Kafka 발행(동기)\n→ 200 응답. DB INSERT만 비동기"]
-    --> D["④ Polling\n유저 → Platform 직접\n/status 전광판 + pacing 구간표"]
-
-    D --> E{"status?"}
-    E -- "WAITING" --> D
-    E -- "ADMIT_ISSUED\nadmitToken 포함" --> F
-
-    F["⑥ 유저 → Tenant\nadmitToken 전달"]
-    --> G["⑦ verify\n유효성 확인 + COMPLETED 발행\n(이 시점이 완료다)"]
-    --> H["⑧ Tenant → 유저 입장 허용"]
-    --> I["⑨ complete\nCOMPLETED + ZREM + Kafka"]
-
-    J["Tenant 슬롯 여유"]
-    --> K["⑤ admit\nadmitToken TTL 60초"]
-    --> D
-```
+교차 검토가 결론을 뒤집은 원문은 [`doc/reviews/`](doc/reviews/)에 있다.
+(에이전트 정의 파일 자체는 `.gitignore` 대상이라 레포에 없다.)
 
 ---
 
-## 🗂 Redis Key 구조
+## ⚠️ 한계와 다음
 
-```
-큐 상태 키: queue-infrastructure/.../queue/QueueKeys.java   ← 해시태그 {queueId} 필수
-캐시성 키: queue-infrastructure/.../cache/RedisKeyFactory.java (static 메서드, Enum X)
-```
+**먼저 밝힌다. 이 프로젝트는 운영 경험을 증명하지 못한다.**
 
-| Key | 자료구조 | TTL | 역할 |
-|-----|-----|-----|------|
-| `queue:{queueId}:waiting` | ZSet | 없음 | 대기열. member=`identifier`, score=`seq` |
-| `queue:{queueId}:seq` | String | 없음 | `INCR`로 score 발급 |
-| `queue:{queueId}:tokens` | Hash | 없음 | `identifier` → `tokenId\|issuedAt` (중복 방지 + 소유권 대조) |
-| `queue:{queueId}:last-active` | ZSet | 없음 | keepalive. member=`seq`, score=ms |
-| ~~`queue-meta:{t}:{q}`~~ | — | — | 🔴 **구현된 적 없다**(전 코드 0건) |
-| ~~`token-info:{tokenId}`~~ | — | — | 🔴 **구현된 적 없다**(전 코드 0건) |
-| `queue:{queueId}:admit-by-token:{tokenId}` | 60s | Polling 응답용 |
-| `queue:{queueId}:admit-by-admit:{admitToken}` | 60s | verify/complete용 |
-| `queue:{queueId}:admit-watermark` | 없음 | 마지막 admit seq (`/status` 전광판) |
-| `queue:{queueId}:pacing` | 없음 | 폴링 간격 구간표 오버라이드 (없으면 코드 상수) |
-| `queue:{queueId}:admit-idem:{requestId}` | 300s | admit 멱등성 (requestId는 Tenant 지정값 → 큐 스코프) |
-| `queue:{queueId}:admitted` | 없음 | admit된 토큰의 만료 시각 ZSet. TTL 복귀 claim 대상 ([§80](doc/DECISIONS.md)) |
-| ~~`batch-lock:{t}:{q}`~~ | — | 🔴 **구현된 적 없다**(전 코드 0건). 배치는 락을 안 쓴다(§80) |
-| `apikey:{keyHash}` | 60s | API Key 캐시 |
+**① 운영 배선이 없다**
+- Alertmanager **0건** — 경보 규칙 21개가 갈 데가 없다
+- prod 프로필 actuator는 `health,info`뿐 (스크레이퍼 경계가 없어 일부러 닫아뒀다)
+- 배포는 compose뿐. 롤백 절차 없음
 
----
+> 근거: AWS 부하 중 컨테이너 메모리 한도(1g)를 넘겨 **커널 OOM Kill**이 났는데,
+> **앱 로그는 0건**이었다. 커널이 죽이는 거라 앱이 남길 틈이 없다.
+> 발견 경로는 부하 클라이언트의 `connection refused` 17,085건뿐이었다. **알림이 없으면 못 본다.**
 
-## 🗄 MySQL R/W 분리 + 파티셔닝
+**② 미달·미측정**
+- 입장 처리(admit) 응답이 **116~143ms**로 목표(100ms)에 **미달**이다. 한 번에 내보내는 인원을
+  20 → 100으로 바꿔도 거의 그대로였다
+- 🔑 **서버를 늘려도 안 줄어든다.** 이 지연은 CPU 경쟁이 아니라 **한 번의 왕복**에 묶여 있다 —
+  입장 사실을 Kafka에 보내고 응답을 기다리는 구간(67~128ms)이 유력한데, **아직 분해 측정을
+  안 했다.** 원인을 모르는 채로 고치지 않는다는 뜻이기도 하다
+- 줄 세우기(enqueue)는 **가장 느린 1%를 못 쟀다** — 부하 도구 요약에 그 값이 없다.
+  그래서 "목표 충족"이라고 쓰지 않았다
 
-```
-Write → Master / Read → Replica
-@Transactional(readOnly) → Replica 자동 라우팅
+**③ 알려진 결함 3건 (미조치)**
+- 큐가 PAUSED일 때 **기존 대기자의 재-enqueue가 503** — 새로고침하면 자리를 잃는다
+- 멈춰둬도 **회수 배치는 계속 돈다** → 대기자가 조용히 만료되고, 재개하면 줄이 비어 있다
+- **지운 큐에서 입장·검증·완료가 200**을 반환한다
 
-tokens 테이블:
-  Range 파티션 (issued_at 월별)
-  월말 배치: queue_daily_stats 집계 → DROP PARTITION
-  → 파티션 DROP 후에도 과금 근거 영구 보존
+**④ 연동사가 만료 사유를 볼 수 없다**
+입장권을 60초 안에 쓰지 않으면 토큰은 `EXPIRED`가 되고 **과금은 된다.** 그런데 연동사에게 가는
+신호는 `TK002`(404) 하나뿐이라 **"내가 늦었다"와 "없는 토큰이다"가 구분되지 않고**, verify를
+아예 안 부르면 신호가 **0개**다. 만료 사유(`expired_reason`)와 만료율은 Platform 안에만 있다.
 
-status: TINYINT (0~4) — VARCHAR 대비 저장공간·비교 성능 최적화
-admit_token: DB 저장 → Redis 미스 시 Fallback
-```
-
----
-
-## 🔴 Redis — 독립 2 Cluster + 큐 단위 라우팅
-
-> **전환 완료**(§75). `RedisConfig`는 **Cluster 전용**이고 Sentinel 분기는 코드에서 제거했다 —
-> 프로파일로 나누면 해시태그 누락처럼 "Cluster에서만 터지는" 결함이 Sentinel 경로로 숨는다.
-> Sentinel은 폐기가 아니라 **학습·로컬 자산**으로 남긴다(§75 D28). 앱은 붙지 않는다.
-
-```
-Cluster A (7001-7008) · Cluster B (8001-8008)     각 4 Master + 4 Replica
-큐 하나 → 둘 중 하나에 배정 (RedisClusterAssigner — **queueId 해시가 아니다**)
-  └ 기준은 생성 시점 cluster1의 used_memory/maxmemory >= 0.5. 결과는 queues.redis_cluster_no에 기록
-한 큐의 키 4종(waiting/seq/tokens/last-active)은 반드시 같은 클러스터
-  └ 해시태그는 한 클러스터 안의 슬롯만 정렬한다. 경계는 못 넘는다
-큐 상태가 아닌 키(rl:*, apikey:*)는 전부 cluster1 (@Primary)
-```
-
-> 🪤 **키를 새로 만들면 반드시 `QueueKeys`를 거칠 것.** 해시태그 없는 키를 다중 키 Lua의
-> `KEYS`에 끼우면 Cluster에서만 `CROSSSLOT`으로 깨진다 — **로컬 Sentinel로는 안 잡힌다.**
-
----
-
-## 📨 Kafka
-
-| 토픽 | 파티션 키 | 생산 | 소비 |
-|------|------|------|------|
-| `token-lifecycle` (18 파티션) | **`tokenId`** | Enqueue · admit · verify/complete · 회수 배치 | `queue-consumer`의 `TokenLifecycleConsumer` → tokens 적재 |
-
-> **단일 토픽 + `tokenId` 키**인 이유: 순서 보장은 같은 토픽의 같은 파티션 안에서만 성립하고,
-> `queueId`로 잡으면 한 큐 30만 명이 통째로 한 파티션에 몰린다 ([DECISIONS §73](doc/DECISIONS.md) D16·D18).
-> ✏️ 구 서술 "admit 요청 전달 수단은 **미판정**(Sprint 7)"은 **§80이 닫았다** — admit은 **동기 Lua**라
-> 전달할 명령이 없다. 명령 토픽(`enqueue-admit`)은 **만들지 않는다.**
-
----
-
-## 🔧 SDK + API
-
-### REST API (Tenant 서버용)
-
-> Java SDK 제거 — Tenant 서버 언어가 다양해 SDK 커스터마이징이 비현실적.
-> REST API 명세 (OpenAPI 3.0) 제공으로 대체.
-
-```
-관리 API (JWT 인증):
-  POST   /api/v1/tenants/signup          → 회원가입
-  POST   /api/v1/tenants/login           → 로그인 (JWT 발급)
-  POST   /api/v1/tenants/refresh         → 토큰 갱신
-  POST   /api/v1/tenants/me/api-keys     → API Key 발급
-  DELETE /api/v1/tenants/me/api-keys/:id → API Key 폐기
-  POST   /api/v1/queues                  → 대기열 생성
-  GET    /api/v1/queues/:queueId         → 대기열 조회
-  PATCH  /api/v1/queues/:queueId         → 대기열 이름 변경
-  POST   /api/v1/queues/:queueId/pause   → 대기열 정지
-  POST   /api/v1/queues/:queueId/resume  → 대기열 재개
-  DELETE /api/v1/queues/:queueId         → 대기열 삭제
-
-Queue Engine API (API Key 인증, Sprint 6~7):
-  POST   /api/v1/queues/:queueId/tokens  → Enqueue (200, 순번 확정 후 응답)
-  GET    /api/v1/queues/:queueId/status  → Polling ① 전광판 (인증 없음, 전원 동일)
-  GET    /api/v1/queues/:queueId/tokens/:tokenId?seq=&ka=  → Polling ② 개인 (tokenId 소유)
-  POST   /api/v1/queues/:queueId/admit   → Admit
-  POST   /api/v1/queues/:queueId/admit-tokens/:admitToken/verify → Verify
-  POST   /api/v1/queues/:queueId/tokens/:tokenId/complete → Complete
-```
-
-### JS SDK (브라우저용) — ⬜ **설계만. 코드 0줄이다**
-
-> 🔴 **아래는 목표 인터페이스이지 동작하는 API가 아니다.** SDK는 아직 한 줄도 없다.
-> 지금 브라우저를 붙이려면 **REST를 직접 호출**해야 한다 → [`doc/TENANT_INTEGRATION.md`](doc/TENANT_INTEGRATION.md)
->
-> 착수 전에 **지터 규약을 먼저 확정**해야 한다 — §79 본문(±20% 대칭)과 같은 절 Consequences
-> (하한 위로만, 비대칭)가 서로 다르다. 서버가 간격을 계산하지 않으므로 **SDK가 그 값을 지키는
-> 유일한 장치**다. 리더 탭(`BroadcastChannel`)도 확정만 되고 코드가 없다.
-
-```javascript
-const queue = QueueSDK.init({
-    baseUrl: 'https://api.queue-platform.com',
-    queueId: queueId,  // Tenant 서버에서 받은 값
-    tokenId: tokenId,  // Tenant 서버에서 받은 값
-    seq: seq           // Tenant 서버에서 받은 값
-});
-
-queue.startPolling({
-    onWaiting: ({ rank }) => {
-        updateUI(rank);
-        // rank = seq − lastAdmittedSeq, 간격은 pacing 표로 SDK가 계산 (§79)
-    },
-    onReady: ({ admitToken }) => {
-        sendToTenantServer(admitToken);
-    },
-    onExpired: () => showExpiredMessage()
-});
-// 탭 비활성화 → 자동 중단 / 복귀 → 즉시 재개
-// 네트워크 offline/online 자동 처리
-```
-
-### 클라이언트 전체 흐름
-
-```
-유저 → Tenant 서버      : 서비스 접속
-Tenant (REST API)       : POST /tokens → 대기토큰 발급
-Tenant → 유저           : tokenId, queueId, **seq** 전달   ← seq를 빼면 폴링이 아예 안 된다
-유저 (JS SDK)           : startPolling() → Platform 직접 Polling
-JS SDK → onReady        : admitToken 수신
-유저 → Tenant 서버      : admitToken 전달
-Tenant (REST API)       : POST /verify → POST /complete
-```
-
----
-
-## ⚡ 성능
-
-| API | p99 | TPS |
-|-----|-----|-----|
-| Enqueue | < 50ms | 200 rps (급증 → Kafka) |
-| Polling | < 50ms | 2,000 rps |
-| admit/complete | < 100ms | - |
-
----
-
-## ⚖️ 트레이드오프
-
-| 선택 | 장점 | 단점 | 근거 |
-|------|------|------|------|
-| Spring MVC + Virtual Thread | 친숙한 생태계, 코드 단순 | blocking → VT 필요 | spring.threads.virtual.enabled=true 한 줄 적용 |
-| JPA + Virtual Thread | @Transactional 자연스러움 | blocking I/O | VT가 OS Thread 고갈 없이 처리 |
-| admitToken 만료 → **종료**(§36) | 좀비가 admit 슬롯을 재순환 점유하지 않는다 | 60초를 놓치면 맨 뒤 | Platform 귀책분(폴링 지연)이 이미 예산 안이라 봐줄 근거가 없다 |
-| Kafka Enqueue 버퍼 | DB 적재를 비동기로 흡수 | Eventually Consistent | At-Least-Once 보장 |
-| ~~Kafka admit 처리~~ | — | — | 🔴 **§80이 폐기.** admit은 **동기 Lua**다. 멱등은 Redis `admit-idem` 키(PX 300s) |
-| status TINYINT | 저장공간·비교 성능 | 가독성 (상수로 보완) | 대량 tokens 테이블 최적화 |
-| admit_token 컬럼 | Redis 미스 시 DB Fallback | 컬럼 추가 | verify 안정성 향상 |
-| queue_daily_stats | 파티션 DROP 후 과금 근거 보존 | 배치 필요 | 감사/청구 불변 기록 |
-| billing_snapshots 직접 집계 | tokens 원본 → 중복 방지 불필요 | 집계 쿼리 필요 | billing_events 테이블 제거 |
-| 파티션 1달 유예 DROP | 월말 걸친 토큰 과금 누락 방지 | 스토리지 2배 | B2B 과금 정확도 우선 |
-| ZCARD Pipeline | queue-count 관리 불필요 | N번 ZCARD | 카운터 불일치 위험 제거 |
-| `pacing` 구간표 | 서버 부하 절약 + 장애 시 서버가 전원 간격 조정 | SDK 구현 필요 | 순위 높을수록 Polling 드물게 (§79) |
-| Redis R/W 분리 미적용 | 설계 단순 | - | Lua 원자성. In-Memory 충분 |
-| MySQL R/W 분리 | SELECT 2,000 rps 분산 | Replica lag | ~~token-info 캐시~~ — 그 키는 구현된 적 없다. 폴링은 Redis만 본다 |
-| tokens 파티셔닝 | 월별 DROP 빠른 정리 | PK에 파티션 키 + **범위 조건 프루닝 안 됨**(§83) | 집계는 `PARTITION` 절로 지목 |
-| RedisKeyFactory | 컴파일 타임 검사 | - | Enum: 가변인수 타입 안전성 없음 |
-
----
-
-## 🛠 기술 스택
-
-| 영역 | 기술 | 근거 |
-|------|------|------|
-| Language | Java 21 | Virtual Thread, Record, LTS |
-| API Server | Spring MVC + Tomcat | Virtual Thread로 2,000 rps 달성 |
-| ORM | JPA (Hibernate) | @Transactional 자연스러움, 풍부한 생태계 |
-| DB 연결 | JDBC + Virtual Thread | blocking → spring.threads.virtual.enabled=true |
-| Messaging | Spring Kafka | Enqueue 버퍼 + 상태 이벤트 |
-| Batch | Spring MVC + Tomcat | @Scheduled + Spring Kafka Consumer |
-| Cache · Queue 상태 | **독립 2 Cluster + 큐 단위 라우팅** (§75, 구현 완료. ~~Sentinel~~은 학습 자산) | FIFO Sorted Set + Lua 원자 · 큐 단위 이중 라우팅 ([DECISIONS §75](doc/DECISIONS.md)) |
-| DB | MySQL 8.0 | Range 파티셔닝 + Replica |
-| Architecture | Hexagonal + DDD | 도메인 단위 테스트 |
-| Build | Gradle 멀티모듈 6개 | 의존성 명확 분리 |
+> 여기까지 테스트는 **전부 토큰 생애주기**였다. 대기자가 있는 채로 큐를 멈추고·방치하고·지워본 적이
+> 없었다. 셋 다 "멈춤이 무엇을 멈추는가"를 먼저 정해야 해서, 기록만 남기고 조치하지 않았다.
 
 ---
 
 ## 📎 문서
 
-| 문서 | 설명 |
-|------|------|
-| [FRS v1.16](doc/FRS_final.md) | API · Redis · Kafka · SDK · Batch |
-| [STATE](doc/STATE.md) | Token · Queue · ApiKey 상태 머신 |
-| [FLOW](doc/FLOW.md) | Enqueue · Polling · Admit · Complete · Batch |
-| [DECISIONS](doc/DECISIONS.md) | 84개 설계 결정 + 근거 + 면접 포인트 |
-| [ROADMAP](doc/ROADMAP.md) | 11개 Sprint DoD + 진행 현황 |
-| [CONCURRENCY](doc/CONCURRENCY.md) | 동시성 제어 우선순위 · `@DistributedLock` |
-
----
-
-## 📊 프로젝트 진행 현황
-
-```
-✅ Sprint 1:  멀티모듈 스켈레톤 + Virtual Thread
-✅ Sprint 2:  JPA + MySQL Master/Replica R/W 분리
-✅ Sprint 3:  관리 도메인 (Tenant + ApiKey + Queue) 헥사고날 구현
-✅ Sprint 4:  JWT 인증 + 관리 API 12개 + Service/Controller 테스트
-🔄 Sprint 5:  Redis + Lua Script + Sentinel + Rate Limit
-✅ Sprint 6:  Token 도메인 + Queue Engine API  (Enqueue·Polling 구현 / Cancel은 §82로 폐기)
-⬜ Sprint 7:  Admit → Verify → Complete
-🔄 Sprint 8:  Kafka KRaft 연동  (token-lifecycle 적재 경로 구현)
-⬜ Sprint 9:  Batch 모듈
-⬜ Sprint 10: 통합 테스트 + k6 + Grafana + JS SDK + OpenAPI
-⬜ Sprint 11: Docker + AWS 배포 + 대용량 실측
-```
-
-> 일정·DoD의 정본은 [ROADMAP](doc/ROADMAP.md)이다.
-
----
-
-<p align="center">
-  <sub>Queue Platform · Java 21 · Spring Boot 3.3.4 · Redis · Kafka · MySQL 8.0</sub>
-</p>
+| | |
+|---|---|
+| [`doc/DECISIONS.md`](doc/DECISIONS.md) | 설계 결정 92건 — 근거와 **번복 이력** 포함 |
+| [`doc/reviews/`](doc/reviews/) | 교차 검토가 결론을 뒤집은 기록 |
+| [`doc/API.md`](doc/API.md) | 엔드포인트 18개 필드 단위 명세 |
+| [`doc/TENANT_INTEGRATION.md`](doc/TENANT_INTEGRATION.md) | 연동사가 읽는 계약 7건 |
+| [`doc/CONCURRENCY.md`](doc/CONCURRENCY.md) | 동시성 제어 우선순위와 분산 전제 |
+| [`doc/monitoring/`](doc/monitoring/) | 운영 런북 + PromQL |
