@@ -79,6 +79,45 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * 120초 → 121초로 어긋난다. 비율 단정({@code within(1)})은 둘 다 통과하므로
      * <b>테스트가 이 어긋남을 안 잡는다</b>. 나눗셈이 정확히 60 이하로 떨어지는 값을 써야 한다.
      */
+    /**
+     * 큐 상태 제어와 API Key 관리의 한도. <b>분당 60회</b>다.
+     *
+     * <p>큐를 멈추고 재개하는 일은 하루에 몇 번이다. 실사용에는 사실상 무제한이고, 남용은 여전히
+     * 막힌다. 🔑 중요한 건 숫자가 아니라 <b>데이터 평면과 지갑이 다르다는 사실</b>이다 —
+     * enqueue 가 아무리 몰려도 이 버킷은 줄지 않는다.
+     */
+    static final int CONTROL_CAPACITY = 60;
+    static final double CONTROL_REFILL_PER_SEC = 1.0;
+
+    /**
+     * 제어 평면 경로. <b>명시적으로 열거한 것만</b> 제어로 본다.
+     *
+     * <p>🔴 반대로(데이터 평면을 열거하고 나머지를 제어로) 짜면 안 된다 — 빠뜨린 핫패스가
+     * 60/분에 걸려 <b>플랫폼이 죽는다</b>. 이쪽으로 짜면 빠뜨려도 오늘 동작 그대로다.
+     *
+     * <p>🪤 {@code /api/v1/queues/{id}/tokens}(enqueue)·{@code /admit} 은 같은 접두사를 갖는다.
+     * 그래서 접두사 검사가 아니라 <b>경로 전체 모양</b>으로 가른다.
+     */
+    private static final java.util.regex.Pattern CONTROL_PLANE = java.util.regex.Pattern.compile(
+            "^/api/v1/(queues(/[^/]+(/(pause|resume))?)?|tenants/me/api-keys(/[^/]+)?)$");
+
+    static boolean isControlPlane(String path) {
+        return path != null && CONTROL_PLANE.matcher(path).matches();
+    }
+
+    /**
+     * 배출 평면 경로 — {@code admit} · {@code verify} · {@code complete}.
+     *
+     * <p>🪤 {@code /tokens} 로 끝나면 enqueue(유입)이고, {@code /tokens/&#123;id&#125;/complete} 는
+     * 배출이다. 접미사가 아니라 <b>모양 전체</b>로 갈라야 한다.
+     */
+    private static final java.util.regex.Pattern DRAIN_PLANE = java.util.regex.Pattern.compile(
+            "^/api/v1/queues/[^/]+/(admit|admit-tokens/[^/]+/verify|tokens/[^/]+/complete)$");
+
+    static boolean isDrainPlane(String path) {
+        return path != null && DRAIN_PLANE.matcher(path).matches();
+    }
+
     static final int TENANT_CAPACITY = 50_000;
     static final double TENANT_REFILL_PER_SEC = 833.34;
 
@@ -166,7 +205,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
         if (auth != null && auth.getPrincipal() instanceof TenantAuth tenantAuth) {
             // 인증된 요청 → Token Bucket (테넌트 단위, 한도는 상수)
-            if (!checkAuthenticatedRateLimit(tenantAuth, response)) {
+            if (!checkAuthenticatedRateLimit(tenantAuth, path, response)) {
                 return;  // 429 응답으로 종료
             }
         } else {
@@ -232,7 +271,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * @return true=통과, false=거부 (429 응답 완료)
      */
     private boolean checkAuthenticatedRateLimit(
-            TenantAuth tenantAuth, HttpServletResponse response) throws IOException {
+            TenantAuth tenantAuth, String path, HttpServletResponse response) throws IOException {
 
         // PK로 조회한다. TenantAuth.tenantId(String)는 API-Key 인증 경로에서 null이라
         // 그것으로 조회하면 항상 미스가 나고, 아래 분기가 모든 요청을 통과시켜
@@ -246,14 +285,35 @@ public class RateLimitFilter extends OncePerRequestFilter {
         }
 
         Tenant tenant = tenantOpt.get();
-        String key = RateLimitKeys.tenant(tenant.getTenantId());
 
-        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, TENANT_CAPACITY, TENANT_REFILL_PER_SEC);
+        // 🔑 제어 평면은 **지갑을 따로 쓴다.** 같은 키를 쓰면 enqueue 가 한도를 다 쓴 순간
+        //    pause 가 429 가 되는데, 멈춰야 하는 순간이 곧 부하가 몰린 순간이라
+        //    비상 스위치가 정확히 필요할 때 안 눌린다(2026-09-16 AWS 실측).
+        String key;
+        int capacity;
+        double refill;
+        if (isControlPlane(path)) {
+            key = RateLimitKeys.tenantControl(tenant.getTenantId());
+            capacity = CONTROL_CAPACITY;
+            refill = CONTROL_REFILL_PER_SEC;
+        } else if (isDrainPlane(path)) {
+            // 🔑 배출(admit·verify·complete)은 유입과 지갑을 나눈다. 같이 쓰면 유입이 한도를
+            //    비운 순간 줄이 안 빠지고, 안 빠지면 더 쌓이는 악순환이 된다.
+            key = RateLimitKeys.tenantDrain(tenant.getTenantId());
+            capacity = TENANT_CAPACITY;
+            refill = TENANT_REFILL_PER_SEC;
+        } else {
+            key = RateLimitKeys.tenant(tenant.getTenantId());
+            capacity = TENANT_CAPACITY;
+            refill = TENANT_REFILL_PER_SEC;
+        }
+
+        boolean allowed = tokenBucketRateLimiter.tryAcquire(key, capacity, refill);
 
         if (!allowed) {
             log.debug("Token Bucket rate limit exceeded: key={}", key);
             // Retry-After: refill 기반 (1 토큰 회복 시간)
-            long retryAfter = Math.max(1, (long) Math.ceil(1.0 / TENANT_REFILL_PER_SEC));
+            long retryAfter = Math.max(1, (long) Math.ceil(1.0 / refill));
             writeTooManyRequests(response, retryAfter);
             return false;
         }

@@ -27,6 +27,12 @@ provider "aws" {
 }
 
 # 2026-09-12 spot 최저가 AZ. AZ 마다 재고가 달라 값이 갈린다(같은 날 2a 는 m7g 가 1.5배였다).
+variable "use_spot" {
+  description = "스팟으로 띄울지. 측정 판은 false(온디맨드) — 스팟은 측정 중 회수당한다."
+  type        = bool
+  default     = false
+}
+
 locals {
   az = "ap-northeast-2d"
 
@@ -64,12 +70,14 @@ locals {
   #
   # 시간당 합계 약 $0.169 (m7g.xlarge ×1 + c7g.xlarge ×1 + m7g.large ×2 + c7g.large ×2)
   nodes = {
-    app    = "m7g.2xlarge" # queue-api ×3 — 4차 f500 에서 CPU 90.1%. 5차에서 증설해 잰다
+    # 🔴 6차(2026-09-16): 200만 전 구간 + 생애주기 판. 쿼터가 64 로 올라 16 vCPU ×2 가 된다
+    #    (app 32 + data 10 + k6 8 = 50). 5차는 쿼터 32 가 벽이라 8+4 로 갈 수밖에 없었다.
+    app    = "m7g.4xlarge" # queue-api ×3 — 4차 f500 에서 CPU 90.1%. 5차에서 증설해 잰다
     # 🔑 5차: app 노드를 둘로 나눠 **수평 확장 전제를 실증한다**(CLAUDE.md "N대 Stateless").
     #    같은 노드에 컨테이너만 늘리는 것은 무의미하다 — 폴링 10,000 rps 에서 노드 CPU 가
     #    94.86% 로 이미 포화였다. 늘려야 하는 것은 프로세스가 아니라 **노드(=vCPU)** 다.
     #    🪤 스팟 쿼터가 32 vCPU 다. data 10 + app 8 + k6 8 = 26 이라 여유가 6 뿐이라 xlarge(4)다.
-    app2   = "m7g.xlarge"  # queue-api ×3 (2번째 노드)
+    app2   = "m7g.4xlarge"  # queue-api ×3 (2번째 노드)
     mysql  = "m7g.large"  # mysql (0.83코어) + prometheus·grafana·redis-exporter
     kafka  = "c7g.xlarge" # kafka ×3 (1.09코어) — RF=3 복제가 네트워크로 나간다
     redis  = "m7g.large"  # redis ×6 (0.34코어) — 싱글스레드라 코어 수보다 코어 성능이다
@@ -144,10 +152,16 @@ resource "aws_instance" "node" {
   associate_public_ip_address = true
   user_data                   = file("${path.module}/user_data_${each.key == "k6" ? "k6" : "docker"}.sh")
 
-  instance_market_options {
-    market_type = "spot"
+  # 🔴 6차부터 온디맨드다. 스팟은 측정 중에 회수당한다 — 5차에서 실제로 k6 노드가
+  #    회수됐고(Service initiated), 그때 측정 중이었으면 판을 통째로 버려야 했다.
+  #    200만 판은 한 시간 넘게 돈다. use_spot=true 로 되돌릴 수 있게만 남긴다.
+  dynamic "instance_market_options" {
+    for_each = var.use_spot ? [1] : []
+    content {
+      market_type = "spot"
     # 정지(stop)가 아니라 종료(terminate). 정지만 해도 EBS 요금이 계속 나간다.
-    spot_options { instance_interruption_behavior = "terminate" }
+      spot_options { instance_interruption_behavior = "terminate" }
+    }
   }
 
   root_block_device {
