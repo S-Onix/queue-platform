@@ -73,10 +73,31 @@ receivers:
         #    그러면 브라우저에 로컬 Grafana 가 떠서 그걸 AWS 로 착각한다(4차 실측에서 실제로
         #    당했다). 판별은 버전이다 — `/api/health` 가 13.x 면 로컬, 11.3.1 이면 AWS.
         title_link: 'http://localhost:9090/alerts'
+        # 🔑 **새벽에 받은 사람이 읽을 수 있어야 한다.** 한 문단에 뭉쳐 두면 아무도 안 읽는다.
+        #    셋으로 나눈다 — 무슨 일이 났나 / 두면 뭐가 깨지나 / 뭘 하나.
+        #    🪤 조치문은 규칙 파일에 `① … → ② …` 한 줄로 적혀 있다. 그걸 여기서 줄바꿈으로
+        #       편다(reReplaceAll) — 규칙 23개를 다시 쓰지 않고 읽기만 고치는 방법이다.
+        #    🪤 **Slack 은 마크다운이 아니라 mrkdwn 이다.** 굵게가 `**x**` 가 아니라 `*x*` 하나라
+        #       규칙 파일에 쓴 마크다운이 별표 그대로 찍힌다. 여기서 변환한다 — 규칙 23개를
+        #       Slack 전용으로 다시 쓰면 문서·Grafana·런북에서 그 표기가 깨진다.
+        # 🔑 **한 통에 같은 알람 여러 건이 묶인다**(group_by: alertname). 그래서 상황은
+        #    건별로 나열하고, 영향·조치는 **한 번만** 쓴다 — 큐 3개면 조치문이 3번 반복돼
+        #    화면을 덮는다(2026-09-17 실제 화면에서 확인).
+        #
+        # 🪤 **문장 속 굵게는 포기한다.** Slack mrkdwn 은 `*x*` 인데 문장 중간에서는 렌더가
+        #    들쭉날쭉해 별표가 글자로 찍힌다. 규칙 파일의 `**…**` 는 여기서 **지운다**
+        #    (변환하지 않는다). 섹션 제목의 굵게는 정상 동작하므로 그것만 쓴다.
         text: |-
-          {{ range .Alerts }}*{{ .Labels.severity | toUpper }}* {{ .Annotations.summary }}
-          {{ if .Annotations.action }}*조치*: {{ .Annotations.action }}
-          {{ end }}{{ end }}
+          {{ define "plain" }}{{ . | reReplaceAll "\\*\\*" "" }}{{ end }}
+          *상황*{{ if gt (len .Alerts) 1 }} ({{ len .Alerts }}건){{ end }}
+          {{ range .Alerts }}• {{ template "plain" .Annotations.summary }}
+          {{ end }}{{ with (index .Alerts 0).Annotations.impact }}
+          *이대로 두면*
+          {{ template "plain" . }}
+          {{ end }}{{ with (index .Alerts 0).Annotations.action }}
+          *조치*
+          {{ template "plain" (. | reReplaceAll " ?→ ?(②|③|④|⑤|⑥)" "\n$1" | reReplaceAll " (②|③|④|⑤|⑥) " "\n$1 " | reReplaceAll " ?(①)" "\n$1") }}
+          {{ end }}
         # 🔑 버튼 셋. 알람을 받은 사람이 **다음에 눌러야 할 것**을 고르게 한다 —
         #    주소를 기억해 두는 곳을 런북 하나로 줄인다.
         actions:

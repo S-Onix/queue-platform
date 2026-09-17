@@ -126,7 +126,7 @@ class AdmissionWaitMetricTest {
     }
 
     @Test
-    @DisplayName("음수(시계 스큐)는 Timer 표본에서 빼고 별도 카운터로 드러낸다 — 0으로 눕히지 않는다")
+    @DisplayName("음수(시계 스큐)는 대기 표본에서 빼고 별도 Timer 로 건수·크기를 드러낸다 — 0으로 눕히지 않는다")
     void skewGoesToCounterNotClampedToZero() {
         givenAdmit(false, record("skewed", -398), record("normal", 10));
 
@@ -135,8 +135,11 @@ class AdmissionWaitMetricTest {
         Timer timer = waitTimer();
         assertThat(timer.count()).isEqualTo(1);                          // 스큐 건은 표본에 없다
         assertThat(timer.totalTime(TimeUnit.SECONDS)).isEqualTo(10.0);   // 0으로 눕혔다면 여기가 10 그대로여도 count가 2다
-        assertThat(registry.get("queue.admission.clock.skew").tag("queue_id", QUEUE_ID).counter().count())
-                .isEqualTo(1.0);
+        // 🔑 **건수만 보면 안 된다.** 크기를 안 재면 "마이크로초 잡음"과 "분 단위 시계 고장"이
+        //    같은 알람으로 보이고, 받은 사람이 판별할 수 없다(2026-09-17 AWS 실측에서 실제로 막혔다).
+        Timer skew = registry.get("queue.admission.clock.skew").tag("queue_id", QUEUE_ID).timer();
+        assertThat(skew.count()).isEqualTo(1);
+        assertThat(skew.max(TimeUnit.SECONDS)).isEqualTo(398.0);
     }
 
 

@@ -70,13 +70,14 @@ groups:
       # ⚠️ 다만 prod 프로필은 prometheus를 노출하지 않는다(경계가 없는 동안은 열지 않는다,
       #    2026-09-02). prod job을 추가할 때는 노출을 다시 켜는 것이 선행이다.
       - alert: AppInstanceDown
-        expr: up{job=~"queue-api|queue-batch|queue-consumer"} == 0
+        expr: up{job=~"queue-.*"} == 0
         for: 2m
         labels:
           severity: info
         annotations:
           summary: "{{ $labels.job }} ({{ $labels.instance }}) 스크레이프 실패 2분"
-          action: "로컬이면 앱 미기동이 원인이다. 기동 여부만 확인하고 끝낸다: `ss -lntp | grep 8080`"
+          impact: "그 인스턴스로 가던 요청이 전부 실패한다. 남은 인스턴스가 부하를 나눠 받으므로 **다음 인스턴스가 연쇄로 넘어질 수 있다.**"
+          action: "로컬이면 앱 미기동이 원인이다. 기동 여부만 확인하고 끝낸다: `ss -lnt | grep -E ':808[0-2]'`"
 
       # Redis 인스턴스가 죽었다.
       #
@@ -91,13 +92,14 @@ groups:
       # for: 1m — Sentinel failover 실측이 5~10초다(doc/INFRA_SETUP.md). 1분이면 failover
       #           과정은 안 걸리고 진짜 다운만 걸린다.
       - alert: RedisInstanceDown
-        expr: redis_up{job="redis-cluster"} == 0
+        expr: redis_up{job=~"redis|redis-cluster"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Redis {{ $labels.instance }} ({{ $labels.job }}) 응답 없음 1분"
-          action: "⚠️ 이 규칙은 **Cluster**(job=redis-cluster)를 본다. Sentinel 명령을 치지 마라. `systemctl status redis-cluster-a-{1..8}` / `redis-cluster-b-{1..8}` 로 확인 → 죽었으면 해당 유닛만 `systemctl start`. 마스터였으면 Cluster가 스스로 replica를 승격했어야 한다 — `redis-cli -c -p 7001 cluster nodes` 로 승격 여부와 `cluster_state`를 먼저 본다."
+          impact: "그 마스터에 걸린 큐 전체가 멈춘다 — 한 큐의 키 4종은 한 마스터에 고정된다(§75 D26). **다른 마스터의 큐는 멀쩡해서 '일부만 죽은' 상태가 된다.**"
+          action: "⚠️ 이 규칙은 **Cluster**(job=redis-cluster)를 본다. Sentinel 명령을 치지 마라. `docker ps --filter name=q-redis` / `redis-cluster-b-{1..8}` 로 확인 → 죽었으면 해당 유닛만 `systemctl start`. 마스터였으면 Cluster가 스스로 replica를 승격했어야 한다 — `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster nodes` 로 승격 여부와 `cluster_state`를 먼저 본다."
 
       # 익스포터 자체가 죽었다 = 위 RedisInstanceDown 규칙이 침묵한다.
       #
@@ -112,12 +114,13 @@ groups:
       #    시계 알람을 새로 넣으면서 그 알람이 딛고 선 익스포터가 무감시라는 것이 드러났다.
       #    ⚠️ 감시 대상을 늘릴 때는 **그 신호의 공급자도 이 정규식에 있는지** 함께 확인해라.
       - alert: ExporterDown
-        expr: up{job=~"redis-cluster|mysql|node"} == 0
+        expr: up{job=~"redis|redis-cluster|mysql|node"} == 0
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: "익스포터 응답 없음 — {{ $labels.job }} {{ $labels.instance }} (해당 인프라 지표 전체 소실)"
+          impact: "해당 인프라 지표가 통째로 빈다. 그러면 그 위의 알람들이 **전부 조용해지는데, 그 침묵이 정상과 구분되지 않는다.**"
           action: "익스포터 프로세스 확인. 이게 firing인 동안 같은 대상의 다른 규칙은 전부 침묵 중이라고 봐야 한다."
 
       # mysqld_exporter는 살아 있는데 MySQL에 붙지 못한다.
@@ -135,6 +138,7 @@ groups:
           severity: warning
         annotations:
           summary: "mysqld_exporter가 {{ $labels.application }}에 접속 못 함 — MySQL 지표 전체가 비어 있다"
+          impact: "MySQL 지표가 전부 빈다 — 복제 정지·지연 알람이 **영원히 안 뜬다.** 서비스는 멀쩡해 보인다."
           action: "모니터링 전용 계정(PROCESS, REPLICATION CLIENT, SELECT) 생성 여부부터 확인. 계정이 생기기 전까지 복제 지연은 관측 불가다."
 
   # ===========================================================================
@@ -147,13 +151,14 @@ groups:
       # 이 상태에서 failover가 나면 승격된 노드가 오래된 데이터를 갖는다 = 대기열 유실.
       # 값이 0/1뿐이라 임계값 개념이 없다.
       - alert: RedisReplicationBroken
-        expr: redis_master_link_up{job="redis-cluster"} == 0
+        expr: redis_master_link_up{job=~"redis|redis-cluster"} == 0
         for: 1m
         labels:
           severity: warning
         annotations:
           summary: "Redis 복제 끊김 — {{ $labels.instance }} → master {{ $labels.master_host }}:{{ $labels.master_port }}"
-          action: "`redis-cli -p <slave> INFO replication` 의 master_link_status 확인. 이 상태에서 master를 강제 failover 시키지 마라 — 유실된다."
+          impact: "복제본이 뒤처진 채 멈춘다. 마스터가 죽으면 그 시점까지의 대기열만 남는다 — **failover 해도 줄이 옛날 상태다.**"
+          action: "`docker exec q-redis-a-1 redis-cli -c -p 7001 cluster nodes (해당 노드 줄 끝이 connected 로 돌아왔으면 해소된 것이다)` 의 master_link_status 확인. 이 상태에서 master를 강제 failover 시키지 마라 — 유실된다."
 
       # Sentinel quorum이 깨졌다 = master가 죽어도 승격이 불가능하다.
       # "지금 서비스는 멀쩡한데 다음 장애를 복구할 수단이 사라진" 전형적 critical이다.
@@ -167,7 +172,8 @@ groups:
           severity: critical
         annotations:
           summary: "Sentinel quorum 실패 — {{ $labels.instance }} / master={{ $labels.master_name }}"
-          action: "Sentinel 3대 생존 확인(`redis_status`). quorum이 없으면 master 장애 시 자동 승격이 안 된다. 복구 전까지 master 재기동·강제 종료 금지."
+          impact: "자동 failover 가 불가능해진다. 마스터가 죽어도 **아무도 승격시키지 못해** 그 큐들이 복구되지 않는다."
+          action: "Sentinel 3대 생존 확인(`docker ps --filter name=q-redis` (로컬이면 `redis-cli -p 26379 sentinel masters`)). quorum이 없으면 master 장애 시 자동 승격이 안 된다. 복구 전까지 master 재기동·강제 종료 금지."
 
       # master가 둘 이상이다 = split-brain 또는 구성 사고.
       # 앱이 어느 쪽에 쓰느냐에 따라 대기열이 조용히 갈린다. 조용한 실패라 규칙으로만 잡힌다.
@@ -181,8 +187,8 @@ groups:
       #    Sentinel은 마스터가 하나뿐이라 2개 이상이 split-brain이었지만, Cluster는 **4 마스터가 정상**이다.
       #    같은 사고(슬롯을 아무도 담당 못 함)를 Cluster에서 보는 지표는 cluster_state / slots_fail 이다.
       - alert: RedisClusterDegraded
-        expr: min(redis_cluster_state{job="redis-cluster"}) != 1
-              or max(redis_cluster_slots_fail{job="redis-cluster"}) > 0
+        expr: min(redis_cluster_state{job=~"redis|redis-cluster"}) != 1
+              or max(redis_cluster_slots_fail{job=~"redis|redis-cluster"}) > 0
         for: 2m
         labels:
           severity: critical
@@ -192,7 +198,8 @@ groups:
           #    그대로 두면 새벽에 Cluster 노드에 SLAVEOF 를 치게 된다. 커밋 de24048이 다른 알람의
           #    $value 를 고칠 때 이 건이 빠져 있었다.
           summary: "Redis Cluster가 온전하지 않다 — cluster_state={{ $value }} (정상 1) 또는 slots_fail>0 ({{ $labels.instance }})"
-          action: "⚠️ **Sentinel 명령을 치지 마라.** `redis-cli -c -p 7001 cluster info` 로 cluster_state·slots_assigned·slots_fail 확인 → `cluster nodes` 로 fail 표시된 노드 특정 → 그 유닛만 `systemctl start redis-cluster-{a|b}-N`. 슬롯 담당이 사라진 것이면 승격 대상 replica가 살아 있는지부터 본다. 앱 재시작보다 이게 먼저다."
+          impact: "일부 슬롯이 주인을 잃는다. 그 슬롯의 큐는 enqueue·폴링·admit 이 전부 실패하고, **나머지 큐는 정상이라 전체 장애로 보이지 않는다.**"
+          action: "⚠️ **Sentinel 명령을 치지 마라.** `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster info` 로 cluster_state·slots_assigned·slots_fail 확인 → `cluster nodes` 로 fail 표시된 노드 특정 → 그 유닛만 `docker start q-redis-a-N (N 은 포트 끝자리 — 7003 이면 a-3, 8003 이면 b-3)`. 슬롯 담당이 사라진 것이면 승격 대상 replica가 살아 있는지부터 본다. 앱 재시작보다 이게 먼저다."
 
   # ===========================================================================
   # 2-b. MySQL 복제 (2026-09-04 <보류>에서 승격 — 사용자 결정)
@@ -223,7 +230,8 @@ groups:
           severity: critical
         annotations:
           summary: "MySQL 복제 정지 — {{ $labels.instance }} (IO 또는 SQL 스레드 중단)"
-          action: "`mysql -h127.0.0.1 -P3307 -uroot -p -e 'SHOW REPLICA STATUS\\G'` 로 Last_IO_Error / Last_SQL_Error 를 먼저 읽는다. ⚠️ **오류를 읽기 전에 `SET GLOBAL SQL_SLAVE_SKIP_COUNTER`나 GTID 건너뛰기를 하지 마라** — 건너뛴 트랜잭션은 영원히 사라지고 그 사실이 어디에도 안 남는다. 되돌리기: 원인 해소 후 `START REPLICA`."
+          impact: "replica 가 DR 자산으로서 죽는다. 앱은 master 만 읽으므로 **서비스는 멀쩡하고 아무도 모른 채 복구 지점만 뒤로 밀린다.**"
+          action: "`docker exec q-mysql sh -c 'mysql -uroot -p$MYSQL_ROOT_PASSWORD -e \"SHOW REPLICA STATUS\\G\"' (로컬이면 mysql -h127.0.0.1 -P3307 -uroot -p)` 로 Last_IO_Error / Last_SQL_Error 를 먼저 읽는다. ⚠️ **오류를 읽기 전에 `SET GLOBAL SQL_SLAVE_SKIP_COUNTER`나 GTID 건너뛰기를 하지 마라** — 건너뛴 트랜잭션은 영원히 사라지고 그 사실이 어디에도 안 남는다. 되돌리기: 원인 해소 후 `START REPLICA`."
 
       # 복제 지연이 30초를 넘어 5분간 유지된다.
       #
@@ -250,6 +258,7 @@ groups:
           severity: warning
         annotations:
           summary: "MySQL 복제 지연 {{ $value }}초 5분 지속 — {{ $labels.instance }} (DR 복구 지점이 그만큼 뒤에 있다)"
+          impact: "장애가 나면 이 지연만큼의 원장을 잃는다. 과금 대상 토큰이 그 구간에 있으면 **청구 근거가 사라진다.**"
           action: "`SHOW REPLICA STATUS\\G` 의 Seconds_Behind_Source 와 Relay_Log_Space 를 본다. 지연의 흔한 원인은 대량 DDL/DELETE다 — `doc/schema.sql` 파티션 DROP이 방금 돌았는지 확인(DROP은 테이블 MDL을 3초 잡는다, 실측). ⚠️ 지연 중에 replica로 조회를 옮기지 마라. 앱은 지금 replica를 읽지 않는 것이 정상이다(§4-3)."
 
   # ===========================================================================
@@ -281,15 +290,16 @@ groups:
       # `maxmemory > 0` 가드: 한도 미설정(0) 인스턴스가 섞이면 비교가 항상 참이 되어 오탐이 터진다.
       - alert: RedisMemoryWillHitMaxmemory
         expr: |
-          predict_linear(redis_memory_used_bytes{job="redis-cluster"}[1h], 6 * 3600)
-            > redis_config_maxmemory{job="redis-cluster"}
-          and redis_config_maxmemory{job="redis-cluster"} > 0
+          predict_linear(redis_memory_used_bytes{job=~"redis|redis-cluster"}[1h], 6 * 3600)
+            > redis_config_maxmemory{job=~"redis|redis-cluster"}
+          and redis_config_maxmemory{job=~"redis|redis-cluster"} > 0
         for: 30m
         labels:
           severity: warning
         annotations:
           summary: "Redis {{ $labels.instance }} 현 추세면 6시간 내 maxmemory 도달 — noeviction이라 쓰기(enqueue)가 거부된다"
-          action: "`redis-cli -c -p 7001 CONFIG GET maxmemory` (앱이 붙는 Cluster. 6379는 Sentinel이라 다른 값이다) 로 현재 한도 확인 → `INFO memory`의 used_memory → `--bigkeys`로 어느 큐가 키우는지 본다. ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다."
+          impact: "noeviction 이라 닿는 순간 **쓰기(enqueue)가 503 으로 거부된다.** 같은 마스터를 쓰는 **다른 테넌트까지** 함께 죽는다 — 총량이 남아 있어도 터진다."
+          action: "`docker exec q-redis-a-1 redis-cli -c -p 7001 CONFIG GET maxmemory` (앱이 붙는 Cluster. 6379는 Sentinel이라 다른 값이다) 로 현재 한도 확인 → `INFO memory`의 used_memory → `--bigkeys`로 어느 큐가 키우는지 본다. ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다."
 
       # 디스크 고갈 예측.
       #
@@ -314,7 +324,8 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $labels.instance }} 루트 파일시스템 현 추세면 24시간 내 고갈 — MySQL 쓰기가 멈춘다"
-          action: "`df -h /` → `du -sh /var/lib/mysql/*` 로 tokens 파티션 크기 확인 → `doc/schema.sql`의 파티션 운영 쿼리로 오래된 파티션 DROP 상태 점검. ⚠️ DROP은 테이블 MDL을 잡아 INSERT를 함께 막는다(실측 3.05초) — lock_wait_timeout을 걸고 실행한다."
+          impact: "MySQL 쓰기가 멈춘다. 그 시점부터 **토큰 적재가 통째로 실패**하고 원장이 비기 시작한다."
+          action: "`df -h /` → `sudo du -sh /var/lib/docker/volumes/queue-data_mysql-data/_data (로컬이면 du -sh /var/lib/mysql/*)` 로 tokens 파티션 크기 확인 → `doc/schema.sql`의 파티션 운영 쿼리로 오래된 파티션 DROP 상태 점검. ⚠️ DROP은 테이블 MDL을 잡아 INSERT를 함께 막는다(실측 3.05초) — lock_wait_timeout을 걸고 실행한다."
 
       # ═══ 시계가 어긋났다. **가용성 + 원장 무결성 문제다.** ═══════════════════════════
       #
@@ -351,7 +362,7 @@ groups:
       #       🪤 **이 문장을 근거로 그 변경을 되돌리지 마라** — 되돌리면 batch 서버 시계와
       #          `admitted_at`이 다시 갈려 방향만 반대인 같은 사고가 난다.
       #
-      # 🔑 **queue_admission_clock_skew_total은 이 사건을 못 잡는다 — 대신이 아니라 별개다.**
+      # 🔑 **queue_admission_clock_skew_seconds_count은 이 사건을 못 잡는다 — 대신이 아니라 별개다.**
       #    그 카운터의 축은 **enqueue 서버 ↔ admit 서버**(둘 다 앱 시계)인데, 고장 모드의 축은
       #    **앱 ↔ MySQL**이다. API 서버들이 **같은 방향으로** 어긋나면 그 카운터는 영원히 0이고,
       #    그 상태가 정확히 실효 창이 0인 상태다. (dba·monitoring·architect 3인 독립 확인)
@@ -394,6 +405,7 @@ groups:
           severity: critical
         annotations:
           summary: "{{ $labels.instance }} 시계가 NTP에 동기화돼 있지 않다 — issued_at(파티션 키·멱등 키)과 Redis TTL이 이 시계를 쓴다"
+          impact: "issued_at 이 파티션 키이자 멱등 키다. 시계가 틀어지면 **엉뚱한 월 파티션에 적재**되거나 Kafka 재처리 중복 판정이 깨진다."
           action: "① `timedatectl status` 의 'System clock synchronized: yes' 확인 → ② `chronyc tracking` 또는 `systemctl status systemd-timesyncd` 로 동기화 재개. ⚠️ **`date -s` 로 손으로 맞추지 마라** — 시간이 뒤로 점프하면 이미 발급된 토큰의 TTL·유효 창이 어긋난다(데몬에 맡겨라. 작은 오차는 slew로 서서히, 큰 오차는 step으로 한 번에 맞춘다). ③ 🔴 **피해 범위를 status로 세지 마라** — §36으로 정상 만료자도 status=1에 머물러 `WHERE status=1 AND admitted_at < ...` 는 평상시에도 대량으로 잡힌다(오진 유도). 판별식은 `expired_reason` 이다: `SELECT queue_id, COUNT(*) FROM tokens WHERE status=4 AND expired_reason=2 AND completed_at IS NULL AND admitted_at >= UTC_TIMESTAMP(3) - INTERVAL 1 HOUR GROUP BY queue_id;` — 평상시에도 0은 아니다(입장권 쥐고 안 들어온 Tenant). **급증이 신호다.** 🪤 예전 판이 지목하던 `status=2` 행의 `TIMESTAMPDIFF(admitted_at, completed_at)` 은 **쓰지 마라** — 손상된 행은 status=4/completed_at=NULL 이라 그 술어가 재려는 대상을 스스로 배제하고, §90 이후 admitted_at은 DB 시계이고 completed_at은 **기록자가 둘**이라(complete API는 앱 시계, 컨슈머는 UTC_TIMESTAMP(3)) 그 차이가 앱↔DB 스큐를 주지 않는다. 애초에 첫 근거 하나로 결론이 선다 — 손상된 행은 술어에서 배제된다(거짓 안심). ④ 🪤 WSL 호스트는 절전에서 깨어날 때 시계가 튄다 — 로컬에서 뜨면 대개 그것이다."
 
 
@@ -420,15 +432,16 @@ groups:
       #            버스트로 깨우지 않기 위해 이 파일에서 가장 긴 for를 쓴다.
       - alert: RedisMainThreadSaturated
         expr: |
-          rate(redis_cpu_user_main_thread_seconds_total{job="redis-cluster"}[5m])
-          + rate(redis_cpu_sys_main_thread_seconds_total{job="redis-cluster"}[5m])
+          rate(redis_cpu_user_main_thread_seconds_total{job=~"redis|redis-cluster"}[5m])
+          + rate(redis_cpu_sys_main_thread_seconds_total{job=~"redis|redis-cluster"}[5m])
             > 0.8
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Redis {{ $labels.instance }} 단일 스레드 {{ $value | humanizePercentage }} — 상한(코어 1개)에 근접"
-          action: "핫키를 먼저 의심한다. 키가 전부 `{queueId}` 해시태그라 Cluster여도 큐 하나 = 마스터 한 대다. 절차 전체는 `doc/monitoring/runbook/enqueue.md` 의 [증상] Redis master CPU가 100%에 붙었다 — `redis-cli -c -p 7001 --stat` 와 `info commandstats`. ⚠️ **`KEYS *` / `DEBUG SLEEP` 금지** — 단일 스레드를 통째로 막아 전면 장애가 된다. 스케일업으로 못 푼다(코어를 늘려도 단일 스레드다)."
+          impact: "Redis 는 단일 스레드라 코어 1개가 상한이다. 여기 붙으면 **더 올릴 방법이 없고**, 그 마스터의 모든 큐가 함께 느려진다."
+          action: "핫키를 먼저 의심한다. 키가 전부 `{queueId}` 해시태그라 Cluster여도 큐 하나 = 마스터 한 대다. 절차 전체는 `doc/monitoring/runbook/enqueue.md` 의 [증상] Redis master CPU가 100%에 붙었다 — `docker exec q-redis-a-1 redis-cli -c -p 7001 --stat` 와 `info commandstats`. ⚠️ **`KEYS *` / `DEBUG SLEEP` 금지** — 단일 스레드를 통째로 막아 전면 장애가 된다. 스케일업으로 못 푼다(코어를 늘려도 단일 스레드다)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # <보류> — 2026-09-04 전면 재구성
@@ -455,7 +468,7 @@ groups:
 #        되돌리기 포함)를 이미 적고 있었다. **보류 사유가 자기 런북과 모순이었다.**
 #     2. "redis-cluster 16노드는 앱이 붙지 않으므로 규칙을 안 만든다" → 거짓.
 #        §75로 앱이 붙는 곳이 **Cluster다**. 그리고 RedisInstanceDown·RedisClusterDegraded·
-#        ExporterDown·RedisMemoryWillHitMaxmemory 가 **이미 job="redis-cluster"를 보고 있었다.**
+#        ExporterDown·RedisMemoryWillHitMaxmemory 가 **이미 job=~"redis|redis-cluster"를 보고 있었다.**
 #        규칙은 이미 있는데 보류 문구만 남아 있었다. 항목 통째로 삭제.
 #        ⚠️ 반대로 job="redis"(6379-6381)·job="redis-sentinel"은 §75로 코드에서 제거된
 #           학습 자산이다. **새 규칙을 그쪽에 걸지 마라** — 런북이 다른 Redis를 가리키던 전례가 있다.

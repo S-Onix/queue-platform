@@ -38,6 +38,24 @@
 #      evaluation_interval=15s, scrape_interval=15s.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔑 **시간 상수 네 개를 헷갈리지 마라.** 알람 문구에 이름을 적는 이유가 이것이다.
+#    2026-09-17 실측 중 실제로 "어느 TTL 인지 모르겠다"는 지적이 나왔다.
+#
+#   admitToken TTL   60초    Redis PX. admit 이 **입장권을 발급한 시점**부터.
+#                            넘으면 그 입장권은 죽는다(복귀 없음, §36)
+#   complete 유효 창  300초   MySQL `admitted_at` 부터. 넘으면 완료 기록이 영구 유실된다
+#   inactiveTtl      300초*  큐 설정. **폴링이 끊긴 대기자**를 배치가 회수하는 값
+#                            🪤 complete 창과 숫자가 같지만 재는 대상도 주체도 다르다
+#   waitingTtl      7200초*  큐 설정. 줄에 너무 오래 있은 사람을 배치가 회수하는 값
+#                            (*는 큐 생성 시 바꿀 수 있는 기본값)
+#
+#   그리고 `QueueAdmissionWaitP95High` 의 60초는 **위 넷 중 어느 것도 아니다.**
+#   위 넷은 **시스템이 강제하는 값**이라 넘는 순간 실제로 데이터가 죽는다(입장권 만료·완료
+#   기록 유실·대기자 회수). 반면 그 60초는 **알람을 울리려고 우리가 정한 숫자**여서
+#   시스템은 그 값을 모르고, 넘어도 아무것도 만료되지 않는다.
+# ─────────────────────────────────────────────────────────────────────────────
+
 groups:
 
   - name: queue-platform-kafka-persistence
@@ -84,7 +102,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "token-lifecycle 적재 예상 소화 시간 {{ $value | humanizeDuration }} — admitToken TTL(60초) 초과, complete의 Redis 폴백이 못 받는다"
+          summary: "token-lifecycle **DB 적재 지연** {{ $value | humanizeDuration }} — **admitToken TTL(60초)** 을 넘었다. 🔑 이 60초는 admit 이 입장권을 **발급한 시점부터**의 유효 시간이다(대기열의 inactiveTtl·waitingTtl 과 무관)"
+          impact: "DB 적재가 admitToken TTL(60초)보다 늦다. verify·complete 가 DB 폴백을 못 받아 **정상 입장자가 404** 를 받기 시작한다."
           action: "런북 [증상] consumer lag이 줄지 않는다 (doc/monitoring/runbook/kafka-persistence.md). ⚠️ 오프셋을 latest로 리셋하지 마라 — 건너뛴 이벤트는 영원히 DB에 안 들어가고 그게 곧 유령 토큰이다. lag은 지표이지 문제가 아니다."
 
       # 소화 시간이 complete의 DB 유효 창(300초)을 넘는다.
@@ -110,7 +129,8 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "token-lifecycle 적재 예상 소화 시간 {{ $value | humanizeDuration }} — complete 유효 창(300초) 초과, 완료 기록이 영구 유실된다"
+          summary: "token-lifecycle **DB 적재 지연** {{ $value | humanizeDuration }} — **complete 유효 창(300초)** 을 넘었다. 🔑 이 300초는 DB 의 `admitted_at` 부터 재는 완료 허용 창이다. 🪤 큐 설정의 `inactiveTtl` 기본값도 300초라 숫자가 같지만 **완전히 다른 것**이다(그쪽은 폴링이 끊긴 대기자를 회수하는 값)"
+          impact: "complete 유효 창(300초)을 넘긴다. 그 구간 사용자의 **완료 기록이 영구 유실**되고, 토큰은 status=1 에 남아 과금만 된다."
           action: "컨슈머 인스턴스를 늘려라(파티션 18개까지). ⚠️ concurrency를 올리는 것은 실측상 역효과였다(application.yml 주석). 유실 범위는 queries/kafka-persistence.md §3의 차집합 스크립트로 뽑는다."
 
       # 랙은 있는데 소화가 완전히 멈췄다.
@@ -131,8 +151,9 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "token-lifecycle 컨슈머가 3분간 한 건도 소화하지 못했다 (잔여 {{ $value }}건)"
-          action: "`kafka-consumer-groups.sh --describe --group db-writer`로 파티션 할당 확인 → 리밸런스 루프면 consumer.log의 rebalance 로그, 독약이면 DLT를 본다. max.poll.interval.ms를 무작정 키우지 마라(런북)."
+          summary: "token-lifecycle 컨슈머가 **3분간 한 건도 적재하지 못했다** (잔여 {{ $value }}건). 🔑 여기서 멈춘 것은 Kafka→MySQL **적재**다 — 대기열(Redis)과 입장(admit)은 계속 돈다"
+          impact: "적재가 완전히 멈췄다. 위 둘은 시간 문제일 뿐이고, lag 이 계속 늘어 **복구 시 소화에도 그만큼 걸린다.**"
+          action: "`docker exec q-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group db-writer`로 파티션 할당 확인 → 리밸런스 루프면 consumer.log의 rebalance 로그, 독약이면 DLT를 본다. max.poll.interval.ms를 무작정 키우지 마라(런북)."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # <보류>

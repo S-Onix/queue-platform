@@ -164,11 +164,17 @@ public class QueueEngineService {
                 //    0으로 내므로 스큐 1건은 그대로 두면 안 잡힌다 — 보정은 앱이 아니라
                 //    alerts/app.yml의 QueueAdmissionClockSkewDetected가 unless...offset 절로 한다
                 //    (recordAdmitRequest javadoc에 같은 판단의 근거가 있다).
-                Counter.builder("queue.admission.clock.skew")
-                        .description("admit 시각이 enqueue 시각보다 앞선 건수 (API 서버 간 시계 스큐)")
+                // 🔑 **크기까지 남긴다(2026-09-17).** 건수만 세면 "무해한 경계 잡음"과
+                //    "진짜 시계 고장"을 구분할 수 없다 — 실측으로 그 상태를 확인했다.
+                //    AWS 실측: 스큐 32건/475,323건(0.0067%)인데 호스트 시계 오차는 1~2µs 였다.
+                //    대기가 0에 가까운 토큰의 부호가 뒤집힌 것인지, 어딘가 분 단위로 어긋난 것인지
+                //    (주석 위의 -398초가 그 사례다) **알람을 받은 사람이 판별할 방법이 없었다.**
+                //    Timer 로 두면 count 는 종전과 같고 sum·max 가 더 생긴다 — 미터는 안 는다.
+                Timer.builder("queue.admission.clock.skew")
+                        .description("admit 시각이 enqueue 시각보다 앞선 크기 (API 서버 간 시계 스큐)")
                         .tag("queue_id", queueId)
                         .register(meterRegistry)
-                        .increment();
+                        .record(-waitMillis, TimeUnit.MILLISECONDS);
                 continue;
             }
             if (timer == null) {
