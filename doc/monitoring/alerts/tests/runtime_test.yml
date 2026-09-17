@@ -1,0 +1,64 @@
+# app.yml 의 queue-platform-runtime 그룹 단위 테스트.
+#
+# 왜 필요한가: 알람 규칙은 **틀려도 조용하다.** 식이 빈 벡터를 내면 "정상"과 구분되지 않는다.
+# 이 레포가 반복해서 밟은 형태다(메트릭 이름 철자가 갈려 규칙이 영원히 안 뜬 건 §80 U9).
+# 실행 중인 스택을 건드리지 않고 규칙의 의미를 고정한다.
+#
+#   promtool test rules doc/monitoring/alerts/tests/runtime_test.yml
+rule_files:
+  - ../app.yml
+
+evaluation_interval: 15s
+
+tests:
+  # ── AppRestarted ────────────────────────────────────────────────────────────
+  - interval: 1m
+    input_series:
+      # 시작 시각이 도중에 바뀐다 = 재시작했다.
+      - series: 'process_start_time_seconds{job="queue-api", instance="app1:8080"}'
+        values: '1000 1000 1000 2000 2000 2000'
+      # 이쪽은 계속 같은 값 = 안 죽었다.
+      - series: 'process_start_time_seconds{job="queue-consumer", instance="w1:8082"}'
+        values: '1000 1000 1000 1000 1000 1000'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AppRestarted
+        exp_alerts: []          # 아직 아무도 안 죽었다
+      - eval_time: 4m
+        alertname: AppRestarted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: queue-api
+              instance: app1:8080
+            exp_annotations:
+              summary: "app1:8080 가 최근 15분 안에 재시작됐다 (1회)"
+              action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② `docker inspect <컨테이너> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 cgroup OOM**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **비힙**(메타스페이스·코드캐시·다이렉트 버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
+
+  # ── JvmMemoryNearContainerLimit ─────────────────────────────────────────────
+  # 🔑 2GiB = 2147483648. 임계 85% = 1825361101 바이트.
+  #    아래는 committed 1.7GiB + direct 128MiB = 약 1.83GiB 로 임계를 살짝 넘긴다.
+  - interval: 1m
+    input_series:
+      - series: 'jvm_memory_committed_bytes{job="queue-api", instance="app1:8080", area="heap"}'
+        values: '1288490188x5'
+      - series: 'jvm_memory_committed_bytes{job="queue-api", instance="app1:8080", area="nonheap"}'
+        values: '536870912x5'
+      - series: 'jvm_buffer_memory_used_bytes{job="queue-api", instance="app1:8080", id="direct"}'
+        values: '134217728x5'
+      # 여유 있는 인스턴스 — 울리면 안 된다.
+      - series: 'jvm_memory_committed_bytes{job="queue-consumer", instance="w1:8082", area="heap"}'
+        values: '536870912x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: JvmMemoryNearContainerLimit
+        exp_alerts: []          # for: 2m 을 아직 안 채웠다
+      - eval_time: 4m
+        alertname: JvmMemoryNearContainerLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: app1:8080
+            exp_annotations:
+              summary: "app1:8080 의 JVM 커밋 메모리가 컨테이너 한도(2GiB)의 91.25% — cgroup OOM 이 가까울 수 있다"
+              action: "① 힙과 비힙을 갈라 본다: `jvm_memory_committed_bytes{area=\"heap\"}` vs `{area=\"nonheap\"}`. **5차에 넘긴 것은 비힙이었다** → ② 비힙이면 메타스페이스·코드캐시를 본다(`{id=\"Metaspace\"}`·`{id=~\".*Code.*\"}`). 부하 중 클래스로딩·JIT가 계속 자라면 `-XX:MaxMetaspaceSize`를 건다 → ③ direct 버퍼면 Kafka 프로듀서·Lettuce가 범인일 확률이 높다(`jvm_buffer_memory_used_bytes{id=\"direct\"}`) → ④ **이 규칙이 조용한데 OOM 이 나면 이 식이 부족한 것이다** — 그때는 cAdvisor(`container_memory_working_set_bytes`)를 세워 cgroup 실사용을 직접 재라. 이 식은 RSS 가 아니라 근사치다"

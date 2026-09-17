@@ -8,11 +8,24 @@ global:
   evaluation_interval: 15s
 
 rule_files:
-  # 🔑 app.yml(http_server_requests_*)·kafka.yml(kafka_consumer_fetch_manager_*)만 태운다.
-  #    infra.yml 은 redis_exporter(redis_up)·node_timex 를 요구하는데 그 exporter 를 안 돌린다 —
-  #    태우면 영원히 안 뜨는 규칙만 늘어난다.
+  # 🔑 **infra.yml 을 태운다 (2026-09-17 변경).** 옛 주석은 "redis_exporter·node_timex 를 안
+  #    돌리니 영원히 안 뜨는 규칙만 늘어난다"였는데, 그 전제가 낡았다 — deploy.sh 가 지금은
+  #    redis-exporter·node-exporter 를 함께 띄운다. 500만 판에서 봐야 하는
+  #    RedisMemoryWillHitMaxmemory·DiskWillFill 이 바로 이 파일에 있다.
+  #
+  # ⚠️ **MySQL 계열 넷은 여전히 no-data 다** — mysqld-exporter 를 안 띄운다.
+  #    (MysqlExporterCannotConnect · MysqlReplicationStopped · MysqlReplicationLagHigh ·
+  #     up{job="mysqld"} 계열) 발화하지 않을 뿐 해롭지는 않다. 복제를 봐야 하면
+  #    익스포터를 먼저 띄워라 — 규칙만 태우면 **조용한 초록**이 된다.
   - /etc/prometheus/rules/app.yml
+  - /etc/prometheus/rules/infra.yml
   - /etc/prometheus/rules/kafka.yml
+
+# 발화한 알람이 갈 곳. 없으면 규칙은 평가만 되고 **아무도 모른다** — 사람이 Prometheus 의
+# Alerts 탭을 보고 있을 때만 알게 된다. host 네트워크라 같은 노드면 localhost 다.
+alerting:
+  alertmanagers:
+    - static_configs: [{ targets: ['localhost:9093'] }]
 
 scrape_configs:
   - job_name: queue-api
@@ -43,3 +56,7 @@ scrape_configs:
 
   - job_name: prometheus
     static_configs: [{ targets: ['localhost:9090'] }]
+  # 🔑 알림 경로 자체가 죽었을 때 그걸 알려줄 수 있는 건 이 시계열뿐이다
+  #    (alertmanager_notifications_failed_total · alertmanager_cluster_health_score).
+  - job_name: alertmanager
+    static_configs: [{ targets: ['localhost:9093'] }]

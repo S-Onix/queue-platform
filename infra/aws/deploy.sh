@@ -103,8 +103,21 @@ wait
 # 🔑 Prometheus·Grafana·redis-exporter 는 mysql 노드에 얹는다. 셋 중 가장 한가하고
 #    (0.83코어), redis-exporter 는 multi-target 이라 Redis 와 같은 노드일 필요가 없다.
 #    다만 prometheus.yml 이 익스포터를 localhost:9121 로 부르므로 **둘은 같은 노드여야 한다.**
+# 🔴 Slack webhook 은 레포에 없다. .env 값을 노드에 파일로 쓴다 — 설정 파일에 박으면
+#    PUBLIC 레포에 공개된다(2026-09-12 에 실제로 한 번 당했다). 비어 있어도 기동은 된다.
+#
+# 🪤 **chown 65534 가 핵심이다.** Alertmanager 컨테이너는 nobody(65534) 로 도는데 600 만
+#    주면 소유자(ubuntu) 외에는 못 읽어 통지가 통째로 실패한다 — 그런데 **기동은 성공하고
+#    알람도 Alertmanager 까지 정상으로 보인다.** 로그를 안 보면 모른다
+#    (`permission denied`, reason="other"). 2026-09-17 로컬 검증에서 실제로 났다.
+#    644 로 푸는 대신 소유자를 옮긴다 — 시크릿을 world-readable 로 만들 이유가 없다.
+on "$MYSQL" "mkdir -p ~/queue-platform/infra/aws/monitoring && \
+  printf '%s' '${SLACK_WEBHOOK_URL:-}' > ~/queue-platform/infra/aws/monitoring/slack_url && \
+  chmod 600 ~/queue-platform/infra/aws/monitoring/slack_url && \
+  sudo chown 65534:65534 ~/queue-platform/infra/aws/monitoring/slack_url"
+
 on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f infra/aws/data.yml up -d \
-  mysql prometheus grafana redis-exporter node-exporter &&
+  mysql prometheus grafana alertmanager redis-exporter node-exporter &&
   until docker exec q-mysql mysqladmin ping -h127.0.0.1 -p$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do sleep 3; done"
 
 echo "[4/5] 이미지 빌드 (app·worker 병렬. 최초 5~10분)"

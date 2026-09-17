@@ -350,7 +350,8 @@ Cluster·Kafka를 쓰는 테스트에만 태그를 붙이고, CI 단위 레인�
 **먼저 밝힌다. 이 프로젝트는 운영 경험을 증명하지 못한다.**
 
 **① 운영 배선이 없다**
-- Alertmanager **0건** — 경보 규칙 21개가 갈 데가 없다
+- Alertmanager를 배선했지만 **마지막 한 구간이 비어 있다** — 규칙 23개가 Alertmanager까지는
+  모이는데(AWS), receiver에 채널(Slack·Telegram)이 없어 **사람에게는 안 간다**. 로컬은 미설치
 - prod 프로필 actuator는 `health,info`뿐 (스크레이퍼 경계가 없어 일부러 닫아뒀다)
 - 배포는 compose뿐. 롤백 절차 없음
 
