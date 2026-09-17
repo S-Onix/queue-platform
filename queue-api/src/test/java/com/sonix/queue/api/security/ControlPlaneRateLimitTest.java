@@ -141,6 +141,66 @@ class ControlPlaneRateLimitTest {
             verify(tokenBucket).tryAcquire("rl:tenant:t_dev",
                     RateLimitFilter.TENANT_CAPACITY, RateLimitFilter.TENANT_REFILL_PER_SEC);
         }
+
+        /**
+         * 오버라이드 값을 준 필터로 요청 한 건을 태우고, 그 요청이 때린 버킷 목을 돌려준다.
+         * 세 지갑이 각각 어떤 인자를 받았는지를 <b>같은 방식으로</b> 재기 위한 것이다.
+         */
+        private RateLimiter fire(int capOverride, double refillOverride, String path) throws Exception {
+            RateLimiter bucket = mock(RateLimiter.class);
+            when(bucket.tryAcquire(anyString(), anyInt(), anyDouble())).thenReturn(true);
+            TenantCache cache = mock(TenantCache.class);
+            Tenant tenant = mock(Tenant.class);
+            when(tenant.getTenantId()).thenReturn("t_dev");
+            when(cache.get(1L)).thenReturn(Optional.of(tenant));
+            RateLimitFilter f = new RateLimitFilter(
+                    bucket, mock(FixedWindowRateLimiter.class), mock(TenantRepository.class),
+                    cache, capOverride, refillOverride);
+
+            MockHttpServletRequest req = new MockHttpServletRequest("POST", path);
+            req.setRemoteAddr("127.0.0.1");
+            f.doFilter(req, new MockHttpServletResponse(), new MockFilterChain());
+            return bucket;
+        }
+
+        /**
+         * 🔴 <b>유입만 올리면 실측이 또 리미터를 잰다.</b> 500만 판에서 배출(admit·verify·complete)은
+         * 유저 1명당 2.05회라 유입 다음으로 큰 소비처인데, {@code :drain} 가지가 상수로 되돌아가도
+         * {@link #overrideReachesBucket}(유입만 본다)은 <b>초록</b>이다. 그 가지를 따로 잠근다.
+         */
+        @Test
+        @DisplayName("🔴 오버라이드가 배출 지갑(:drain)에도 닿는다")
+        void overrideReachesDrainBucket() throws Exception {
+            verify(fire(3_000_000, 50_000.0, "/api/v1/queues/q_1/admit"))
+                    .tryAcquire("rl:tenant:t_dev:drain", 3_000_000, 50_000.0);
+        }
+
+        /**
+         * 🔴 <b>오버라이드의 폭발 반경은 정확히 두 지갑이다.</b> 제어 지갑까지 따라 올라가면
+         * 실측용 프로퍼티 하나가 남용 방어(분당 60회)를 <b>조용히 끄고</b>, §92의 지갑 분리는
+         * "키가 다르다"만 남고 "한도가 다르다"는 사라진다. 기존 {@link #controlBucket}은
+         * 키만 보므로 이 회귀를 못 잡는다.
+         */
+        @Test
+        @DisplayName("🔴 제어 지갑(:control)은 오버라이드에 영향받지 않는다")
+        void overrideDoesNotReachControlBucket() throws Exception {
+            verify(fire(3_000_000, 50_000.0, "/api/v1/queues/q_1/pause"))
+                    .tryAcquire("rl:tenant:t_dev:control",
+                            RateLimitFilter.CONTROL_CAPACITY, RateLimitFilter.CONTROL_REFILL_PER_SEC);
+        }
+
+        /**
+         * 계약은 "0"이 아니라 <b>"0 이하"</b>다(생성자 javadoc). {@code > 0} 가드가 {@code != 0}으로
+         * 바뀌면 오타 하나({@code -1})가 capacity 음수 버킷을 만들어 그 테넌트의 인증 요청이
+         * 전부 429가 되는데, 0만 보는 {@link #defaultsWhenUnset}은 그때도 초록이다.
+         */
+        @Test
+        @DisplayName("음수 오버라이드도 §89 상수로 떨어진다")
+        void negativeOverrideFallsBack() throws Exception {
+            verify(fire(-1, -1.0, "/api/v1/queues/q_1/tokens"))
+                    .tryAcquire("rl:tenant:t_dev",
+                            RateLimitFilter.TENANT_CAPACITY, RateLimitFilter.TENANT_REFILL_PER_SEC);
+        }
     }
 
     @Nested

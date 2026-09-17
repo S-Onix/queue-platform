@@ -29,7 +29,7 @@
 | 경로 | 알고리즘 | 키 | 한도 | 코드 |
 |---|---|---|---|---|
 | 폴링 `GET /queues/*/tokens/*` | Token Bucket | `rl:poll:token:{tokenId}` | **cap 5, refill 1.0/s** (하드코딩) | `RateLimitFilter.java:121-134` |
-| 인증 후 (X-API-Key / JWT) | Token Bucket | `rl:tenant:{tenantId}` | **상수** `TENANT_CAPACITY`/`TENANT_REFILL_PER_SEC` (전 테넌트 동일, §88) | `RateLimitFilter` |
+| 인증 후 (X-API-Key / JWT) | Token Bucket | `rl:tenant:{tenantId}` | **상수** `TENANT_CAPACITY`/`TENANT_REFILL_PER_SEC` (전 테넌트 동일, §88). 🪤 부하 실측 판은 `queue.ratelimit.tenant.*` 로 올려 둘 수 있다 — **기동 로그의 오버라이드 WARN 이 실제 값의 정본이다** | `RateLimitFilter` |
 | 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip{ip}` | SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분 | `:185-219` |
 | `/actuator/**` | 적용 제외 | — | — | `:139-142` |
 

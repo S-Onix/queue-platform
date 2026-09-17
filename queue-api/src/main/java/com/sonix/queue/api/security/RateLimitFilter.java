@@ -135,10 +135,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * 재는 것이 리미터가 된다. 2026-09-16 판의 천장이 24테넌트 × 833.34 = <b>19,992/s</b>였다.
      * 테넌트를 늘려 우회할 수도 있으나 signup 5/분/IP 때문에 프로비저닝이 선형으로 길어진다.
      *
-     * <p>🪤 <b>둘은 반드시 같이 바꿔라.</b> {@code capacity = refill × 60} 비율을 깨면
-     * 버킷 TTL({@code ceil(capacity/refill) + 60})과 {@code Retry-After}가 함께 어긋난다.
-     * 그 계약을 잠그는 {@code TenantRateLimitConstantsTest}가 보는 것은 <b>기본값이지
-     * 런타임 오버라이드가 아니다.</b>
+     * <p>🪤 <b>둘은 같이 바꿔라.</b> {@code capacity = refill × 60} 비율을 깨도 <b>고장나지는
+     * 않는다</b> — {@code token-bucket.lua}가 TTL을 60~3600으로 클램프한다(확인함). 대신 버킷
+     * 키가 의도한 2분 대신 <b>1시간</b> 살아 Redis 메모리를 먹는다. 그 계약을 잠그는
+     * {@code TenantRateLimitConstantsTest}가 보는 것은 <b>기본값이지 런타임 오버라이드가 아니라</b>
+     * 여기서 깨뜨려도 빨개지지 않는다.
      */
     private final int tenantCapacity;
     private final double tenantRefillPerSec;
