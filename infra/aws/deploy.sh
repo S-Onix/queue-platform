@@ -111,10 +111,14 @@ wait
 #    알람도 Alertmanager 까지 정상으로 보인다.** 로그를 안 보면 모른다
 #    (`permission denied`, reason="other"). 2026-09-17 로컬 검증에서 실제로 났다.
 #    644 로 푸는 대신 소유자를 옮긴다 — 시크릿을 world-readable 로 만들 이유가 없다.
+#
+# 🔑 **실패해도 배포를 멈추지 않는다**(`|| echo`). set -e 가 걸려 있어 그냥 두면 알림용 파일
+#    하나 때문에 실측 판 전체가 죽는다. 알림이 없는 것과 플랫폼이 안 뜨는 것은 무게가 다르다.
 on "$MYSQL" "mkdir -p ~/queue-platform/infra/aws/monitoring && \
   printf '%s' '${SLACK_WEBHOOK_URL:-}' > ~/queue-platform/infra/aws/monitoring/slack_url && \
   chmod 600 ~/queue-platform/infra/aws/monitoring/slack_url && \
-  sudo chown 65534:65534 ~/queue-platform/infra/aws/monitoring/slack_url"
+  sudo chown 65534:65534 ~/queue-platform/infra/aws/monitoring/slack_url" \
+  || echo "⚠️  Slack webhook 파일 준비 실패 — 배포는 계속한다. 알림만 안 간다"
 
 on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f infra/aws/data.yml up -d \
   mysql prometheus grafana alertmanager redis-exporter node-exporter &&

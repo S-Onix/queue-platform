@@ -64,9 +64,28 @@ receivers:
         # 🔑 여기는 **Alertmanager 의 Go 템플릿**이라 중괄호가 정상이다.
         #    (Prometheus 의 annotation 과 헷갈리지 마라 — 거기 중괄호를 넣으면 렌더가 깨진다)
         title: '[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}'
-        # 링크는 Prometheus·Alertmanager 둘 다 SG 에서 안 열려 SSH 터널 안에서만 닿는다.
+        # 링크는 전부 SSH 터널 안에서만 닿는다(SG 는 내 IP 의 22 만 연다):
+        #   ssh -i ~/.ssh/queue-aws -L 3300:localhost:3000 -L 9090:localhost:9090 \
+        #       -L 9093:localhost:9093 ubuntu@<mysql 노드 퍼블릭 IP>
+        #
+        # 🪤 **Grafana 를 3300 으로 받는 이유.** 로컬에 Grafana 가 이미 3000 을 잡고 있어서
+        #    `-L 3000:...` 은 바인드에 실패하는데, **SSH 는 경고 한 줄만 찍고 접속은 유지한다.**
+        #    그러면 브라우저에 로컬 Grafana 가 떠서 그걸 AWS 로 착각한다(4차 실측에서 실제로
+        #    당했다). 판별은 버전이다 — `/api/health` 가 13.x 면 로컬, 11.3.1 이면 AWS.
         title_link: 'http://localhost:9090/alerts'
         text: |-
           {{ range .Alerts }}*{{ .Labels.severity | toUpper }}* {{ .Annotations.summary }}
           {{ if .Annotations.action }}*조치*: {{ .Annotations.action }}
           {{ end }}{{ end }}
+        # 🔑 버튼 셋. 알람을 받은 사람이 **다음에 눌러야 할 것**을 고르게 한다 —
+        #    주소를 기억해 두는 곳을 런북 하나로 줄인다.
+        actions:
+          - type: button
+            text: '대시보드'
+            url: 'http://localhost:3300/d/queue-platform-local'
+          - type: button
+            text: '알람 목록'
+            url: 'http://localhost:9090/alerts'
+          - type: button
+            text: '알림 끄기(silence)'
+            url: 'http://localhost:9093/#/silences/new'
