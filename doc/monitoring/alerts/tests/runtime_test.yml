@@ -34,7 +34,7 @@ tests:
             exp_annotations:
               summary: "app1:8080 가 최근 15분 안에 재시작됐다 (1회)"
               impact: "배포가 아니라면 **커널 OOM Kill** 일 확률이 높다. 앱은 로그를 남길 틈이 없고, 그 인스턴스로 가던 요청은 전부 실패한다(2026-09-15 에 connection refused 17,085건)."
-              action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② `docker inspect <컨테이너> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 cgroup OOM**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **비힙**(메타스페이스·코드캐시·다이렉트 버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
+              action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② 🔑 알람의 instance 는 주소(ip:port)라 컨테이너 이름이 아니다. 이름부터 찾는다: `docker ps -a --filter name=q-api --filter name=q-batch --filter name=q-consumer` (포트 8080/8083/8084=api · 8081=batch · 8082=consumer). 그다음 `docker inspect <위에서 찾은 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 컨테이너 메모리 한도 초과로 커널이 죽인 것**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 **힙이 아니라 그 바깥**(메타스페이스·코드캐시·버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
 
   # ── JvmMemoryNearContainerLimit ─────────────────────────────────────────────
   # 🔑 2GiB = 2147483648. 임계 85% = 1825361101 바이트.
@@ -61,6 +61,6 @@ tests:
               severity: warning
               instance: app1:8080
             exp_annotations:
-              summary: "app1:8080 의 JVM 커밋 메모리가 컨테이너 한도(2GiB)의 91.25% — cgroup OOM 이 가까울 수 있다"
+              summary: "app1:8080 의 JVM 커밋 메모리가 컨테이너 한도(2GiB)의 91.25% — 컨테이너 메모리 한도 초과로 커널이 죽인 것 이 가까울 수 있다"
               impact: "컨테이너 한도에 닿으면 커널이 프로세스를 죽인다. **앱 로그 0건으로 사라진다** — 재시작 알람이 아니면 못 본다."
-              action: "① 힙과 비힙을 갈라 본다: `jvm_memory_committed_bytes{area=\"heap\"}` vs `{area=\"nonheap\"}`. **5차에 넘긴 것은 비힙이었다** → ② 비힙이면 메타스페이스·코드캐시를 본다(`{id=\"Metaspace\"}`·`{id=~\".*Code.*\"}`). 부하 중 클래스로딩·JIT가 계속 자라면 `-XX:MaxMetaspaceSize`를 건다 → ③ direct 버퍼면 Kafka 프로듀서·Lettuce가 범인일 확률이 높다(`jvm_buffer_memory_used_bytes{id=\"direct\"}`) → ④ **이 규칙이 조용한데 OOM 이 나면 이 식이 부족한 것이다** — 그때는 cAdvisor(`container_memory_working_set_bytes`)를 세워 cgroup 실사용을 직접 재라. 이 식은 RSS 가 아니라 근사치다"
+              action: "에스컬레이션 필요 — 한도를 올리려면 재배포가 필요하다. ① 수집: 힙과 그 바깥을 갈라 적는다. Prometheus 웹(SSH 터널 `-L 9390:localhost:9090` 후 http://localhost:9390/graph)에서 `sum by (area) (jvm_memory_committed_bytes{job=~\"queue-.*\"})` 를 조회한다. 🔑 판단: 합이 컨테이너 한도 2GiB(2147483648)의 **85% 미만이면** 이미 해소된 것이다. **95% 이상이면** 곧 커널이 죽이므로 즉시 깨워라 (5차에 넘긴 것은 힙 바깥(메타스페이스·코드캐시·버퍼)이었다). 어느 인스턴스인지도 적는다 → ② 임시 조치: 없다. 재시작하면 일시적으로 내려가지만 원인은 그대로이고 그 인스턴스의 요청이 끊긴다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: 인스턴스 · 힙/힙 바깥(메타스페이스·코드캐시·버퍼) 값 · 컨테이너 한도(2GiB) · AppRestarted 동반 여부 ⚠️ 이 값은 실제 프로세스 메모리(RSS)가 아니라 근사치다. 이 알람이 조용한데 OOM 이 나면 cAdvisor 가 필요하다는 뜻이니 그것도 함께 적어라"
