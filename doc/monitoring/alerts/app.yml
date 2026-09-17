@@ -151,7 +151,7 @@ groups:
         annotations:
           summary: "admit 5xx 비율 {{ $value | humanizePercentage }} 5분 지속 — 고객사(Tenant) 서버가 입장을 못 시키고 있다"
           impact: "Tenant 가 입장을 못 시킨다. 줄은 계속 쌓이는데 배출이 0 이라 대기 인원과 Redis 메모리가 함께 늘어난다."
-          action: "에스컬레이션 필요 — 원인이 코드·인프라 쪽이라 당직자가 고칠 수 없다. ① 수집: queue-api 로그에서 admit 스택트레이스 첫 줄과 발생 시각을 적는다. `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster info` 의 cluster_state 도 함께 → ② 임시 조치: RedisClusterDegraded / RedisInstanceDown 이 같이 떠 있으면 그쪽 조치가 먼저다(그게 원인이다). 아니면 없다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: 스택트레이스 · 5xx 비율 · cluster_state · 같이 뜬 알람 목록 ⚠️ 앱을 먼저 재시작하지 마라 — 원인 스택이 사라지고 5xx 는 그대로 난다"
+          action: "에스컬레이션 필요 — 원인이 코드·인프라 쪽이라 당직자가 고칠 수 없다. ① 수집: `docker logs --tail 200 q-api-1 2>&1 | grep -iE 'admit|exception'` 로 스택트레이스 첫 줄과 시각을 적는다(api 는 q-api-1~3 이니 셋 다 본다). 🔑 판단: 예외가 **Redis 계열이면** ② 로, **Kafka 계열이면** QueueAdmitPublishFailing 조치로 간다. `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster info` 의 cluster_state 도 함께 → ② 임시 조치: RedisClusterDegraded / RedisInstanceDown 이 같이 떠 있으면 그쪽 조치가 먼저다(그게 원인이다). 아니면 없다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: 스택트레이스 · 5xx 비율 · cluster_state · 같이 뜬 알람 목록 ⚠️ 앱을 먼저 재시작하지 마라 — 원인 스택이 사라지고 5xx 는 그대로 난다"
 
       # 🔴 B2 — "admit 요청이 아예 안 온다". <보류> 절이 남긴 함정을 여기서 푼다.
       #
@@ -342,4 +342,4 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} 의 JVM 커밋 메모리가 컨테이너 한도(2GiB)의 {{ $value | humanizePercentage }} — 컨테이너 메모리 한도 초과로 커널이 죽인 것 이 가까울 수 있다"
           impact: "컨테이너 한도에 닿으면 커널이 프로세스를 죽인다. **앱 로그 0건으로 사라진다** — 재시작 알람이 아니면 못 본다."
-          action: "에스컬레이션 필요 — 한도를 올리려면 재배포가 필요하다. ① 수집: 힙과 그 바깥(메타스페이스·코드캐시·버퍼)을 갈라 적는다. Prometheus 에서 `jvm_memory_committed_bytes{area=\"heap\"}` 와 `{area=\"nonheap\"}` (5차에 넘긴 것은 힙 바깥(메타스페이스·코드캐시·버퍼)이었다). 어느 인스턴스인지도 적는다 → ② 임시 조치: 없다. 재시작하면 일시적으로 내려가지만 원인은 그대로이고 그 인스턴스의 요청이 끊긴다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: 인스턴스 · 힙/힙 바깥(메타스페이스·코드캐시·버퍼) 값 · 컨테이너 한도(2GiB) · AppRestarted 동반 여부 ⚠️ 이 값은 실제 프로세스 메모리(RSS)가 아니라 근사치다. 이 알람이 조용한데 OOM 이 나면 cAdvisor 가 필요하다는 뜻이니 그것도 함께 적어라"
+          action: "에스컬레이션 필요 — 한도를 올리려면 재배포가 필요하다. ① 수집: 힙과 그 바깥을 갈라 적는다. Prometheus 웹(SSH 터널 `-L 9390:localhost:9090` 후 http://localhost:9390/graph)에서 `sum by (area) (jvm_memory_committed_bytes{job=~\"queue-.*\"})` 를 조회한다. 🔑 판단: 합이 컨테이너 한도 2GiB(2147483648)의 **85% 미만이면** 이미 해소된 것이다. **95% 이상이면** 곧 커널이 죽이므로 즉시 깨워라 (5차에 넘긴 것은 힙 바깥(메타스페이스·코드캐시·버퍼)이었다). 어느 인스턴스인지도 적는다 → ② 임시 조치: 없다. 재시작하면 일시적으로 내려가지만 원인은 그대로이고 그 인스턴스의 요청이 끊긴다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: 인스턴스 · 힙/힙 바깥(메타스페이스·코드캐시·버퍼) 값 · 컨테이너 한도(2GiB) · AppRestarted 동반 여부 ⚠️ 이 값은 실제 프로세스 메모리(RSS)가 아니라 근사치다. 이 알람이 조용한데 OOM 이 나면 cAdvisor 가 필요하다는 뜻이니 그것도 함께 적어라"
