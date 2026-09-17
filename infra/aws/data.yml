@@ -20,6 +20,17 @@ x-redis: &redis
   network_mode: host
   # appendonly/noeviction 은 호스트 판과 같은 값이다 — 되돌리지 말 것(유실 감지 전제).
   # maxmemory 는 상한이지 할당이 아니다.
+  #
+  # 🔑 **512mb → 1gb (2026-09-17, 500만 판).** 실측 477 B/명이라 512mb 는 마스터당 1.13M 명이고,
+  #    동시 대기 봉우리가 거기 닿으면 noeviction 이라 **같은 마스터를 쓰는 다른 테넌트의
+  #    enqueue 까지 503** 이 된다(§87). 1gb 면 2.25M 명. redis 노드는 m7g.large(8GB)라
+  #    6 × 1gb = 6GB 가 상한이지만, 상한이지 할당이 아니고 실제 적재는 5M × 477B ≈ 2.4GB 다.
+  #
+  # ⚠️ **대가: 클러스터 B 전환이 늦어진다.** RedisClusterAssigner 는 A 최악 마스터
+  #    used/maxmemory 가 50% 를 넘어야 신규 큐를 B 로 보낸다(단조). 임계가 마스터당
+  #    563k 명 → **1,126k 명**으로 같이 올라간다. 파도 1(15큐)이 만드는 최악 마스터 적재가
+  #    500~800k 명이라 **이 설정에서는 전환이 안 일어날 수 있다** = 6대 중 3대만 쓴다.
+  #    분산까지 보려면 768mb(임계 844k)가 절충이다 — 그건 실측 결과를 보고 정한다.
 
 services:
   mysql:
@@ -65,7 +76,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 7001 --cluster-announce-bus-port 17001
-      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
 
   redis-a-2:
     <<: *redis
@@ -75,7 +86,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 7002 --cluster-announce-bus-port 17002
-      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
 
   redis-a-3:
     <<: *redis
@@ -85,7 +96,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 7003 --cluster-announce-bus-port 17003
-      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
 
   # Cluster B — A 와 완전 독립, 슬롯 공유 없음 (§75)
   redis-b-1:
@@ -96,7 +107,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 8001 --cluster-announce-bus-port 18001
-      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
 
   redis-b-2:
     <<: *redis
@@ -106,7 +117,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 8002 --cluster-announce-bus-port 18002
-      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
 
   redis-b-3:
     <<: *redis
@@ -116,7 +127,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 8003 --cluster-announce-bus-port 18003
-      --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
 
   # ── Kafka 3 브로커 (KRaft) ────────────────────────────────────────────────
   # 🔑 CLUSTER_ID 를 고정한다. 안 주면 각 브로커가 제 멋대로 포맷해 쿼럼이 영원히 안 선다.

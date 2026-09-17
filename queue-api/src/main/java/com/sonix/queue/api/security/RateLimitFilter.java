@@ -12,6 +12,7 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.log4j.Log4j2;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
@@ -126,16 +127,40 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private final TenantRepository tenantRepository;
     private final TenantCache tenantCache;
 
+    /**
+     * 실측용 오버라이드. 기본값(0 이하)이면 위 상수 그대로다 — <b>운영 값은 §89의 50,000이고
+     * 여기서 바뀌지 않는다.</b>
+     *
+     * <p>왜 필요한가: 부하 실측의 목표가 <b>플랫폼 천장</b>인데 테넌트 한도가 먼저 걸리면
+     * 재는 것이 리미터가 된다. 2026-09-16 판의 천장이 24테넌트 × 833.34 = <b>19,992/s</b>였다.
+     * 테넌트를 늘려 우회할 수도 있으나 signup 5/분/IP 때문에 프로비저닝이 선형으로 길어진다.
+     *
+     * <p>🪤 <b>둘은 반드시 같이 바꿔라.</b> {@code capacity = refill × 60} 비율을 깨면
+     * 버킷 TTL({@code ceil(capacity/refill) + 60})과 {@code Retry-After}가 함께 어긋난다.
+     * 그 계약을 잠그는 {@code TenantRateLimitConstantsTest}가 보는 것은 <b>기본값이지
+     * 런타임 오버라이드가 아니다.</b>
+     */
+    private final int tenantCapacity;
+    private final double tenantRefillPerSec;
+
     public RateLimitFilter(
             RateLimiter tokenBucketRateLimiter,
             FixedWindowRateLimiter fixedWindowRateLimiter,
             TenantRepository tenantRepository,
-            TenantCache tenantCache
+            TenantCache tenantCache,
+            @Value("${queue.ratelimit.tenant.capacity:0}") int tenantCapacityOverride,
+            @Value("${queue.ratelimit.tenant.refill-per-sec:0}") double tenantRefillOverride
     ){
         this.tokenBucketRateLimiter = tokenBucketRateLimiter;
         this.fixedWindowRateLimiter = fixedWindowRateLimiter;
         this.tenantRepository = tenantRepository;
         this.tenantCache = tenantCache;
+        this.tenantCapacity = tenantCapacityOverride > 0 ? tenantCapacityOverride : TENANT_CAPACITY;
+        this.tenantRefillPerSec = tenantRefillOverride > 0 ? tenantRefillOverride : TENANT_REFILL_PER_SEC;
+        if (this.tenantCapacity != TENANT_CAPACITY || this.tenantRefillPerSec != TENANT_REFILL_PER_SEC) {
+            log.warn("테넌트 rate limit 오버라이드: capacity={} refill={}/s (기본 {} / {}/s)",
+                    this.tenantCapacity, this.tenantRefillPerSec, TENANT_CAPACITY, TENANT_REFILL_PER_SEC);
+        }
     }
 
 
@@ -300,12 +325,12 @@ public class RateLimitFilter extends OncePerRequestFilter {
             // 🔑 배출(admit·verify·complete)은 유입과 지갑을 나눈다. 같이 쓰면 유입이 한도를
             //    비운 순간 줄이 안 빠지고, 안 빠지면 더 쌓이는 악순환이 된다.
             key = RateLimitKeys.tenantDrain(tenant.getTenantId());
-            capacity = TENANT_CAPACITY;
-            refill = TENANT_REFILL_PER_SEC;
+            capacity = tenantCapacity;
+            refill = tenantRefillPerSec;
         } else {
             key = RateLimitKeys.tenant(tenant.getTenantId());
-            capacity = TENANT_CAPACITY;
-            refill = TENANT_REFILL_PER_SEC;
+            capacity = tenantCapacity;
+            refill = tenantRefillPerSec;
         }
 
         boolean allowed = tokenBucketRateLimiter.tryAcquire(key, capacity, refill);

@@ -40,7 +40,7 @@ class RateLimitFilterIpSourceTest {
         when(tokenBucket.tryAcquire(anyString(), anyInt(), anyDouble())).thenReturn(true);
         filter = new RateLimitFilter(
                 tokenBucket, fixedWindow,
-                mock(TenantRepository.class), mock(TenantCache.class));
+                mock(TenantRepository.class), mock(TenantCache.class), 0, 0);
     }
 
     /** 인증 전 분기를 타야 하므로 SecurityContext는 비운 상태를 보장한다. */

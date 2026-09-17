@@ -69,7 +69,7 @@ class ControlPlaneRateLimitTest {
             when(tenant.getTenantId()).thenReturn("t_dev");
             when(cache.get(1L)).thenReturn(Optional.of(tenant));
 
-            filter = new RateLimitFilter(tokenBucket, fixedWindow, repo, cache);
+            filter = new RateLimitFilter(tokenBucket, fixedWindow, repo, cache, 0, 0);
             SecurityContextHolder.getContext().setAuthentication(
                     new UsernamePasswordAuthenticationToken(
                             new TenantAuth(1L, "t_dev"), null, java.util.List.of()));
@@ -105,6 +105,41 @@ class ControlPlaneRateLimitTest {
         @DisplayName("🔴 pause 는 제어 지갑 — enqueue 가 한도를 다 써도 여기는 줄지 않는다")
         void controlBucket() throws Exception {
             assertThat(keyFor("/api/v1/queues/q_1/pause")).isEqualTo("rl:tenant:t_dev:control");
+        }
+
+        /**
+         * 🔑 오버라이드가 <b>실제로 버킷까지 닿는지</b>를 본다.
+         *
+         * <p>필드에 값이 담기는 것만 보면 부족하다 — 이 레포는 "기본값이 {@code 999999999}여도
+         * 초록"이던 테스트를 이미 한 번 가졌다(드레인 용량 캐시). 값이 {@code tryAcquire}의
+         * 인자로 넘어가는 것까지 잡아야 회귀가 빨개진다.
+         */
+        @Test
+        @DisplayName("실측 오버라이드가 유입·배출 버킷의 capacity·refill 로 넘어간다")
+        void overrideReachesBucket() throws Exception {
+            FixedWindowRateLimiter fixedWindow = mock(FixedWindowRateLimiter.class);
+            RateLimiter bucket = mock(RateLimiter.class);
+            when(bucket.tryAcquire(anyString(), anyInt(), anyDouble())).thenReturn(true);
+            TenantCache cache = mock(TenantCache.class);
+            Tenant tenant = mock(Tenant.class);
+            when(tenant.getTenantId()).thenReturn("t_dev");
+            when(cache.get(1L)).thenReturn(Optional.of(tenant));
+            RateLimitFilter overridden = new RateLimitFilter(
+                    bucket, fixedWindow, mock(TenantRepository.class), cache, 3_000_000, 50_000.0);
+
+            MockHttpServletRequest req = new MockHttpServletRequest("POST", "/api/v1/queues/q_1/tokens");
+            req.setRemoteAddr("127.0.0.1");
+            overridden.doFilter(req, new MockHttpServletResponse(), new MockFilterChain());
+
+            verify(bucket).tryAcquire("rl:tenant:t_dev", 3_000_000, 50_000.0);
+        }
+
+        @Test
+        @DisplayName("오버라이드가 없으면(0) §89 상수 그대로다")
+        void defaultsWhenUnset() throws Exception {
+            keyFor("/api/v1/queues/q_1/tokens");
+            verify(tokenBucket).tryAcquire("rl:tenant:t_dev",
+                    RateLimitFilter.TENANT_CAPACITY, RateLimitFilter.TENANT_REFILL_PER_SEC);
         }
     }
 

@@ -42,6 +42,11 @@ x-api: &api
     # prod 프로필이 요구한다. 실측용 값이며 운영 시크릿이 아니다.
     JWT_ACTIVE_KID: key-loadtest-01
     JWT_SECRET_CURRENT: ${JWT_SECRET_CURRENT:?JWT_SECRET_CURRENT 필요 — .env 를 만들어라}
+    # 🔑 테넌트 rate limit 오버라이드. **여기서만 올린다** — 코드 기본값은 §89 의 50,000/833.34 그대로다.
+    #    안 올리면 재는 것이 플랫폼이 아니라 리미터가 된다(24테넌트 × 833.34 = 19,992/s 가 어제의 천장).
+    #    🪤 비율 capacity = refill × 60 을 지켜라. 깨면 버킷 TTL 과 Retry-After 가 같이 어긋난다.
+    QUEUE_RATELIMIT_TENANT_CAPACITY: ${RL_TENANT_CAPACITY:-0}
+    QUEUE_RATELIMIT_TENANT_REFILL_PER_SEC: ${RL_TENANT_REFILL:-0}
 
 services:
   # 🔑 build 는 1호에만 둔다. 같은 태그(queue-api:local)를 빌더 3개가 동시에 구우면
