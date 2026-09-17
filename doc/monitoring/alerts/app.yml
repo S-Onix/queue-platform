@@ -28,7 +28,8 @@
 #   라벨              queue_id 하나  (MONITORING_DESIGN.md 4-3)
 #   버킷(SLO)         10, 30, 60, 120, 300, 600, 1800, 3600 (초) + +Inf
 #                     = QueueEngineService.ADMISSION_WAIT_SLO (구현과 대조 완료 2026-09-04)
-#   부수 카운터       queue_admission_clock_skew_total{queue_id}
+#   부수 Timer        queue_admission_clock_skew_seconds_{count,sum,max}{queue_id}
+#                     🔑 크기를 같이 남긴다 — 건수만으로는 µs 잡음과 분 단위 고장을 구분 못 한다
 #                     — 음수 대기(admit 시각 < enqueue 시각)를 표본에서 빼고 여기 센다
 #
 # 🔴 **publishPercentileHistogram(true) 를 쓰면 안 된다.** 기본 버킷은 실측 69개다(§80).
@@ -103,8 +104,9 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "큐 {{ $labels.queue_id }} 입장 대기 p95 = {{ $value | humanizeDuration }} (경고선 1분)"
-          action: "Tenant가 admit을 충분히 안 부르고 있다는 뜻이다. ① `redis-cli -c -p 7001 zcard 'queue:{{ $labels.queue_id }}:waiting'` 로 대기 인원과 추세 확인 → ② 그 큐가 사는 마스터의 `INFO memory`. 대기자 1명당 477 B이고 같은 마스터의 **다른 테넌트**가 OOM으로 먼저 죽는다(§87). ③ 조치 절차는 `doc/monitoring/runbook/enqueue.md`의 [증상] enqueue가 429(Q005)를 반환한다."
+          summary: "큐 {{ $labels.queue_id }} 에서 **대기자가 입장까지 걸린 시간**(상위 5% 기준) = {{ $value | humanizeDuration }}. 경고선 60초를 넘겼다. 🔑 이 60초는 **알람을 울리려고 정한 숫자일 뿐이다** — 넘어도 입장권이 만료되거나 자리가 사라지지는 않는다(admitToken TTL 60초와 숫자만 같고 아무 관계가 없다)"
+          impact: "사용자가 기다리다 창을 닫는다. admit 이 멈춘 게 아니라 **느린 것**이라 5xx 로는 안 보이고, 이탈은 지표에 안 남는다."
+          action: "Tenant가 admit을 충분히 안 부르고 있다는 뜻이다. ① `docker exec q-redis-a-1 redis-cli -c -p 7001 zcard \"queue:{{\"{\"}}{{ $labels.queue_id }}{{\"}\"}}:waiting\" (0 이 나오면 다른 클러스터다 — -p 8001 로 한 번 더. 🔑 중괄호를 빼면 **대기자가 30만이어도 0 이 나온다**)` 로 대기 인원과 추세 확인 → ② 그 큐가 사는 마스터의 `INFO memory`. 대기자 1명당 477 B이고 같은 마스터의 **다른 테넌트**가 OOM으로 먼저 죽는다(§87). ③ 조치 절차는 `doc/monitoring/runbook/enqueue.md`의 [증상] enqueue가 429(Q005)를 반환한다."
 
   # ===========================================================================
   # admit 경로 — 구현 0으로 지금 쓸 수 있는 것 (2026-09-04 <보류>에서 승격, 사용자 결정)
@@ -148,7 +150,8 @@ groups:
           severity: critical
         annotations:
           summary: "admit 5xx 비율 {{ $value | humanizePercentage }} 5분 지속 — Tenant가 입장을 못 시키고 있다"
-          action: "① queue-api 로그에서 admit 스택트레이스 확인 → ② Redis Cluster 상태(`redis-cli -c -p 7001 cluster info`)와 RedisClusterDegraded / RedisInstanceDown firing 여부. admit.lua는 다중 키라 슬롯이 갈리면 통째로 실패한다 → ③ Kafka 발행 실패면 QE001 계열이다. ⚠️ **앱을 먼저 재시작하지 마라** — 재시작하면 원인 스택이 사라지고 5xx는 그대로 난다."
+          impact: "Tenant 가 입장을 못 시킨다. 줄은 계속 쌓이는데 배출이 0 이라 대기 인원과 Redis 메모리가 함께 늘어난다."
+          action: "① queue-api 로그에서 admit 스택트레이스 확인 → ② Redis Cluster 상태(`docker exec q-redis-a-1 redis-cli -c -p 7001 cluster info`)와 RedisClusterDegraded / RedisInstanceDown firing 여부. admit.lua는 다중 키라 슬롯이 갈리면 통째로 실패한다 → ③ Kafka 발행 실패면 QE001 계열이다. ⚠️ **앱을 먼저 재시작하지 마라** — 재시작하면 원인 스택이 사라지고 5xx는 그대로 난다."
 
       # 🔴 B2 — "admit 요청이 아예 안 온다". <보류> 절이 남긴 함정을 여기서 푼다.
       #
@@ -191,7 +194,8 @@ groups:
           severity: info
         annotations:
           summary: "queue-api는 살아 있는데 admit 호출이 15분간 0건 — 전 테넌트가 입장을 안 시키고 있다"
-          action: "로컬이면 부하를 안 준 것이 원인이다. 그 외에는 ① 대기자가 실제로 있는지부터: `redis-cli -c -p 7001 --scan --pattern 'queue:*:waiting'` 로 큐를 찾고 각 `zcard`. 대기자 0이면 정상이다. ② 대기자가 있는데 admit이 0이면 Tenant 쪽 문제다(Backpressure Pull — Platform은 먼저 안 뺀다). ③ 이 상태가 길어지면 `waiting`이 단조 증가해 Redis 마스터를 채운다(대기자 1명당 477 B, §87)."
+          impact: "Platform 은 멀쩡한데 **아무도 입장하지 못한다.** 대기자는 계속 쌓이고, 오래 기다린 사람부터 inactiveTtl 로 만료된다(과금은 되고 입장은 못 한 상태)."
+          action: "로컬이면 부하를 안 준 것이 원인이다. 그 외에는 ① 대기자가 실제로 있는지부터: `for p in 7001 7002 7003 8001 8002 8003; do docker exec q-redis-a-1 redis-cli -p $p --scan --pattern 'queue:*:waiting'; done (🔑 --scan 은 접속한 노드만 훑는다 — 한 포트만 찍으면 1/6 만 보인다)` 로 큐를 찾고 각 `zcard`. 대기자 0이면 정상이다. ② 대기자가 있는데 admit이 0이면 Tenant 쪽 문제다(Backpressure Pull — Platform은 먼저 안 뺀다). ③ 이 상태가 길어지면 `waiting`이 단조 증가해 Redis 마스터를 채운다(대기자 1명당 477 B, §87)."
 
       # 음수 대기 시간이 관측됐다 = API 서버들 사이 시계가 어긋나 있다.
       #
@@ -210,16 +214,17 @@ groups:
       #    지연 등록이라 **첫 스큐 1건이면 시계열이 1로 태어나** increase가 0을 낸다.
       - alert: QueueAdmissionClockSkewDetected
         expr: |
-          sum by (queue_id) (increase(queue_admission_clock_skew_total[1h])) > 0
+          sum by (queue_id) (increase(queue_admission_clock_skew_seconds_count[1h])) > 0
           or
-          sum by (queue_id) (queue_admission_clock_skew_total
-                             unless queue_admission_clock_skew_total offset 1h) > 0
+          sum by (queue_id) (queue_admission_clock_skew_seconds_count
+                             unless queue_admission_clock_skew_seconds_count offset 1h) > 0
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "큐 {{ $labels.queue_id }} 에서 음수 대기 {{ $value }}건/1h — API 서버 간 시계 스큐 (p95 표본이 그만큼 빠진다)"
-          action: "queue-api 인스턴스 전부에서 `timedatectl status` 의 'System clock synchronized' 확인 → 어긋난 노드에서 `chronyc tracking` 또는 `systemctl status systemd-timesyncd`. ⚠️ **`date -s` 로 손으로 맞추지 마라** — 시간이 뒤로 점프하면 이미 발급된 토큰의 TTL 계산이 어긋난다. NTP가 slew로 서서히 맞추게 둔다."
+          summary: "큐 {{ $labels.queue_id }} 에서 '입장한 시각이 줄 선 시각보다 빠른' 기록이 1시간에 {{ $value }}건 나왔다. 있을 수 없는 값이다 — 줄 세운 서버와 입장시킨 서버의 시계가 서로 다르다는 뜻이다(API 서버가 6대다)"
+          impact: "그 건수만큼 대기 시간 통계에서 빠진다. 통계가 실제보다 빨라 보이고, 정말 느려졌을 때 대기 시간 경보가 안 뜬다. 사용자에게 직접 가는 피해는 없다"
+          action: "🔑 먼저 **얼마나 어긋났는지** 본다. Grafana 나 Prometheus 에서 `max by (queue_id) (queue_admission_clock_skew_seconds_max)` 를 조회한다 → ① 값이 **0.01초 미만**이면 고장이 아니다. 대기 시간이 0에 가까운 사람의 부호가 뒤집힌 것뿐이다 (2026-09-17 실측: 호스트 시계 오차 1~2µs 인데 47만 건 중 32건 발생). 건수만 적어 두고 넘어간다 → ② 값이 **1초 이상**이면 진짜 시계 고장이다. API 서버(app·app2) 각각에서 `timedatectl status` 의 `System clock synchronized` 를 확인하고, `no` 인 서버에서 `sudo systemctl restart chrony` 후 1분 뒤 다시 본다 → ③ 전부 `yes` 인데 값이 1초 이상이면 백엔드 담당에게 넘긴다. 넘길 것: 큐 ID · 건수 · 최대 크기 · 각 서버의 `timedatectl status` ⚠️ `date -s` 로 시계를 손으로 맞추지 마라. 시간이 뒤로 점프하면 이미 발급된 입장권이 한꺼번에 만료된다"
 
   # ===========================================================================
   # admit 커스텀 메트릭 — §80 U9 (2026-09-09 구현). infra.yml <보류> B절에서 승격.
@@ -277,7 +282,8 @@ groups:
           severity: critical
         annotations:
           summary: "큐 {{ $labels.queue_id }} 에서 ADMITTED 발행 실패 admit {{ $value }}건/10m — 영향 사용자는 그 이상이다(1건에 최대 100명)"
-          action: "① queue-api 로그에서 `ADMITTED 발행 중단` / `ADMITTED 발행 생략` 을 찾아 **첫 tokenId와 건너뛴 건수**를 확보한다(개별 식별 수단은 이 로그뿐이다) → ② 원인 갈래가 둘이다. `발행 중단`이면 Kafka다: `$KAFKA_HOME/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092,localhost:9094,localhost:9096`(3대 전부 찍어라 — 한 대만 찍으면 그 한 대가 죽었을 때 명령 자체가 실패해 오진한다), 그리고 KafkaConsumerStalled(alerts/kafka.yml) firing 여부. `발행 생략`이면 **브로커는 멀쩡하다** — 롤링 배포 중 구 포맷 payload이므로 배포 완료를 기다린다 → ③ 🔴 **복구가 불가능할 수 있다.** complete의 술어는 `admit_token = :admitToken`을 포함하는데(TokenJpaRepository.markCompleted), 그 컬럼의 유일한 기록자가 방금 실패한 ADMITTED 이벤트다. 즉 행에는 NULL이고 **로그에도 admitToken은 안 찍힌다**(Redis 키는 PX 60초라 알람이 뜰 땐 이미 없다). 사본을 가진 곳은 admit 200 응답을 받아 간 **Tenant뿐**이다 — 받아낼 수 있으면 그 값과 `admitted_at = UTC_TIMESTAMP(3)`(300초 창을 새로 연다)을 함께 UPDATE하고, 못 받아내면 그 사용자는 complete 불가로 확정하고 EXPIRED 회수에 맡긴다. ⚠️ **앱을 재시작해도 안 낫는다** — 건너뛴 분은 재발행되지 않는다."
+          impact: "그 토큰들은 **complete 가 영구 404** 가 된다. 사용자는 입장했는데 원장에 완료 기록이 없다. admit 은 200 을 돌려줬으므로 HTTP 지표로는 절대 안 보인다."
+          action: "① queue-api 로그에서 `ADMITTED 발행 중단` / `ADMITTED 발행 생략` 을 찾아 **첫 tokenId와 건너뛴 건수**를 확보한다(개별 식별 수단은 이 로그뿐이다) → ② 원인 갈래가 둘이다. `발행 중단`이면 Kafka다: `docker exec q-kafka-1 /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092,localhost:9192,localhost:9292`(3대 전부 찍어라 — 한 대만 찍으면 그 한 대가 죽었을 때 명령 자체가 실패해 오진한다), 그리고 KafkaConsumerStalled(alerts/kafka.yml) firing 여부. `발행 생략`이면 **브로커는 멀쩡하다** — 롤링 배포 중 구 포맷 payload이므로 배포 완료를 기다린다 → ③ 🔴 **복구가 불가능할 수 있다.** complete의 술어는 `admit_token = :admitToken`을 포함하는데(TokenJpaRepository.markCompleted), 그 컬럼의 유일한 기록자가 방금 실패한 ADMITTED 이벤트다. 즉 행에는 NULL이고 **로그에도 admitToken은 안 찍힌다**(Redis 키는 PX 60초라 알람이 뜰 땐 이미 없다). 사본을 가진 곳은 admit 200 응답을 받아 간 **Tenant뿐**이다 — 받아낼 수 있으면 그 값과 `admitted_at = UTC_TIMESTAMP(3)`(300초 창을 새로 연다)을 함께 UPDATE하고, 못 받아내면 그 사용자는 complete 불가로 확정하고 EXPIRED 회수에 맡긴다. ⚠️ **앱을 재시작해도 안 낫는다** — 건너뛴 분은 재발행되지 않는다."
 
   # ── 런타임 (프로세스가 살아 있는가 · 컨테이너 한도에 붙었는가) ─────────────────
   #
@@ -307,6 +313,7 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $labels.instance }} 가 최근 15분 안에 재시작됐다 ({{ $value }}회)"
+          impact: "배포가 아니라면 **커널 OOM Kill** 일 확률이 높다. 앱은 로그를 남길 틈이 없고, 그 인스턴스로 가던 요청은 전부 실패한다(2026-09-15 에 connection refused 17,085건)."
           action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② `docker inspect <컨테이너> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 cgroup OOM**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **비힙**(메타스페이스·코드캐시·다이렉트 버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
 
       # 임계값 근거: **절반만 있다.**
@@ -334,4 +341,5 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $labels.instance }} 의 JVM 커밋 메모리가 컨테이너 한도(2GiB)의 {{ $value | humanizePercentage }} — cgroup OOM 이 가까울 수 있다"
+          impact: "컨테이너 한도에 닿으면 커널이 프로세스를 죽인다. **앱 로그 0건으로 사라진다** — 재시작 알람이 아니면 못 본다."
           action: "① 힙과 비힙을 갈라 본다: `jvm_memory_committed_bytes{area=\"heap\"}` vs `{area=\"nonheap\"}`. **5차에 넘긴 것은 비힙이었다** → ② 비힙이면 메타스페이스·코드캐시를 본다(`{id=\"Metaspace\"}`·`{id=~\".*Code.*\"}`). 부하 중 클래스로딩·JIT가 계속 자라면 `-XX:MaxMetaspaceSize`를 건다 → ③ direct 버퍼면 Kafka 프로듀서·Lettuce가 범인일 확률이 높다(`jvm_buffer_memory_used_bytes{id=\"direct\"}`) → ④ **이 규칙이 조용한데 OOM 이 나면 이 식이 부족한 것이다** — 그때는 cAdvisor(`container_memory_working_set_bytes`)를 세워 cgroup 실사용을 직접 재라. 이 식은 RSS 가 아니라 근사치다"
