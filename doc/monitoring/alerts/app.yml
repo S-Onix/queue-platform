@@ -106,7 +106,7 @@ groups:
         annotations:
           summary: "큐 {{ $labels.queue_id }} 에서 **대기자가 입장까지 걸린 시간**(상위 5% 기준) = {{ $value | humanizeDuration }}. 경고선 60초를 넘겼다. 🔑 이 60초는 **알람을 울리려고 정한 숫자일 뿐이다** — 넘어도 입장권이 만료되거나 자리가 사라지지는 않는다(입장권 TTL 60초와 숫자만 같고 아무 관계가 없다)"
           impact: "사용자가 기다리다 창을 닫는다. admit 이 멈춘 게 아니라 **느린 것**이라 5xx 로는 안 보이고, 이탈은 지표에 안 남는다."
-          action: "에스컬레이션 필요 — 입장 속도는 이 큐를 쓰는 고객사(Tenant)가 정한다. 당직자가 빠르게 만들 수단이 없다. ① 수집: `docker exec q-redis-a-1 redis-cli -c -p 7001 zcard \"queue:{{\"{\"}}{{ $labels.queue_id }}{{\"}\"}}:waiting\"` 로 대기 인원을 적는다(0 이면 다른 클러스터다 — -p 8001 로 한 번 더). 큐 ID·대기 인원·p95 값을 기록한다 → ② 임시 조치: 없다. 단 대기가 계속 늘고 Redis 메모리도 함께 오르면 큐를 일시 정지해 유입을 끊는 것은 할 수 있다 (`POST /api/v1/queues/{id}/pause`, 되돌리기는 resume) → ③ 테넌트 연락 담당에게 넘긴다. 넘길 것: 큐 ID · 대기 인원 · p95 · 그 테넌트가 admit 을 부르는 주기 ⚠️ 큐를 지우거나 Redis 키를 건드리지 마라 — 대기열이 사라진다"
+          action: "에스컬레이션 필요 — 입장 속도는 이 큐를 쓰는 고객사(Tenant)가 정한다. 당직자가 빠르게 만들 수단이 없다. ① 수집: `docker exec q-redis-a-1 redis-cli -c -p 7001 zcard \"queue:{{\"{\"}}{{ $labels.queue_id }}{{\"}\"}}:waiting\"` 로 대기 인원을 적는다(0 이면 다른 클러스터다 — -p 8001 로 한 번 더). 큐 ID·대기 인원·p95 값을 기록한다 → ② 임시 조치: 없다. 단 대기가 계속 늘고 Redis 메모리도 함께 오르면 큐를 일시 정지해 유입을 끊는 것은 할 수 있다 (`POST /api/v1/queues/{{ $labels.queue_id }}/pause` — 큐 ID 는 이 알람 제목에 있는 그 값이다. 되돌리기는 같은 주소의 resume) → ③ 테넌트 연락 담당에게 넘긴다. 넘길 것: 큐 ID · 대기 인원 · p95 · 그 테넌트가 admit 을 부르는 주기 ⚠️ 큐를 지우거나 Redis 키를 건드리지 마라 — 대기열이 사라진다"
 
   # ===========================================================================
   # admit 경로 — 구현 0으로 지금 쓸 수 있는 것 (2026-09-04 <보류>에서 승격, 사용자 결정)
@@ -314,7 +314,7 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} 가 최근 15분 안에 재시작됐다 ({{ $value }}회)"
           impact: "배포가 아니라면 **커널 OOM Kill** 일 확률이 높다. 앱은 로그를 남길 틈이 없고, 그 인스턴스로 가던 요청은 전부 실패한다(2026-09-15 에 connection refused 17,085건)."
-          action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② `docker inspect <컨테이너> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 컨테이너 메모리 한도 초과로 커널이 죽인 것**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **힙이 아니라 그 바깥**(메타스페이스·코드캐시·버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
+          action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② 🔑 알람의 instance 는 주소(ip:port)라 컨테이너 이름이 아니다. 이름부터 찾는다: `docker ps -a --filter name=q-api --filter name=q-batch --filter name=q-consumer` (포트 8080/8083/8084=api · 8081=batch · 8082=consumer). 그다음 `docker inspect <위에서 찾은 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 컨테이너 메모리 한도 초과로 커널이 죽인 것**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **힙이 아니라 그 바깥**(메타스페이스·코드캐시·버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
 
       # 임계값 근거: **절반만 있다.**
       #   85% — 근거 없음(관례). 5차 OOM 직전 값은 안 남아 있다.

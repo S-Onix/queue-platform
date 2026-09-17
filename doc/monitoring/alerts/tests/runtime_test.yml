@@ -34,7 +34,7 @@ tests:
             exp_annotations:
               summary: "app1:8080 가 최근 15분 안에 재시작됐다 (1회)"
               impact: "배포가 아니라면 **커널 OOM Kill** 일 확률이 높다. 앱은 로그를 남길 틈이 없고, 그 인스턴스로 가던 요청은 전부 실패한다(2026-09-15 에 connection refused 17,085건)."
-              action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② `docker inspect <컨테이너> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 컨테이너 메모리 한도 초과로 커널이 죽인 것**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **힙이 아니라 그 바깥**(메타스페이스·코드캐시·버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
+              action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② 🔑 알람의 instance 는 주소(ip:port)라 컨테이너 이름이 아니다. 이름부터 찾는다: `docker ps -a --filter name=q-api --filter name=q-batch --filter name=q-consumer` (포트 8080/8083/8084=api · 8081=batch · 8082=consumer). 그다음 `docker inspect <위에서 찾은 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 컨테이너 메모리 한도 초과로 커널이 죽인 것**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **힙이 아니라 그 바깥**(메타스페이스·코드캐시·버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
 
   # ── JvmMemoryNearContainerLimit ─────────────────────────────────────────────
   # 🔑 2GiB = 2147483648. 임계 85% = 1825361101 바이트.

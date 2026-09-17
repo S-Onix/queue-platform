@@ -77,7 +77,7 @@ groups:
         annotations:
           summary: "{{ $labels.job }} ({{ $labels.instance }}) 스크레이프 실패 2분"
           impact: "그 인스턴스로 가던 요청이 전부 실패한다. 남은 인스턴스가 부하를 나눠 받으므로 **다음 인스턴스가 연쇄로 넘어질 수 있다.**"
-          action: "① `docker ps -a --filter name=q-api` 로 컨테이너가 떠 있는지 본다. 로컬이면 앱을 안 띄운 것이 원인이니 여기서 끝이다 → ② 떠 있는데 스크레이프가 안 되면 포트를 본다: `ss -lnt | grep -E ':808[0-2]'` (api 8080/8083/8084 · batch 8081 · consumer 8082). 포트가 열려 있으면 네트워크/방화벽 문제이므로 ④ 로 간다 → ③ 죽어 있으면 되살린다: `docker start <컨테이너>`. 2분 안에 이 알람이 해소되면 끝이다. 바로 또 죽으면 `docker logs --tail 50 <컨테이너>` 와 `docker inspect <컨테이너> | grep -E '\"OOMKilled\"|\"ExitCode\"'` 를 본다 — **true / 137 이면 메모리 한도 초과**이고 JvmMemoryNearContainerLimit 조치로 넘어간다 → ④ 그래도 안 되면 인프라 담당에게 넘긴다. 넘길 것: 컨테이너 상태 · 로그 50줄 · OOMKilled 값 ⚠️ 남은 인스턴스가 부하를 나눠 받으므로 **연쇄로 넘어질 수 있다** — 하나 살린 뒤 나머지도 함께 확인해라"
+          action: "① `docker ps -a --filter name=q-api` 로 컨테이너가 떠 있는지 본다. 로컬이면 앱을 안 띄운 것이 원인이니 여기서 끝이다 → ② 떠 있는데 스크레이프가 안 되면 포트를 본다: `ss -lnt | grep -E ':808[0-2]'` (api 8080/8083/8084 · batch 8081 · consumer 8082). 포트가 열려 있으면 네트워크/방화벽 문제이므로 ④ 로 간다 → ③ 죽어 있으면 되살린다: `docker start <① 에서 본 이름>`. 2분 안에 이 알람이 해소되면 끝이다. 바로 또 죽으면 `docker logs --tail 50 <① 에서 본 이름>` 와 `docker inspect <① 에서 본 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'` 를 본다 — **true / 137 이면 메모리 한도 초과**이고 JvmMemoryNearContainerLimit 조치로 넘어간다 → ④ 그래도 안 되면 인프라 담당에게 넘긴다. 넘길 것: 컨테이너 상태 · 로그 50줄 · OOMKilled 값 ⚠️ 남은 인스턴스가 부하를 나눠 받으므로 **연쇄로 넘어질 수 있다** — 하나 살린 뒤 나머지도 함께 확인해라"
 
       # Redis 인스턴스가 죽었다.
       #
@@ -99,7 +99,7 @@ groups:
         annotations:
           summary: "Redis {{ $labels.instance }} ({{ $labels.job }}) 응답 없음 1분"
           impact: "그 마스터에 걸린 큐 전체가 멈춘다 — 한 큐의 키 4종은 한 마스터에 고정된다(§75 D26). **다른 마스터의 큐는 멀쩡해서 '일부만 죽은' 상태가 된다.**"
-          action: "① 전체 시야부터: `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster nodes` 로 어느 노드가 fail 인지 본다(B 면 -p 8001). 끝이 connected 로 돌아왔으면 이미 해소된 것이다 → ② 죽어 있으면 그 노드만 되살린다: `docker start q-redis-a-N` (N 은 포트 끝자리 — 7003 이면 a-3, 8003 이면 b-3). 1분 뒤 ① 을 다시 봐서 connected 면 끝이다 → ③ 올라왔는데 cluster_state 가 ok 가 아니면 RedisClusterDegraded 조치로 넘어간다 → ④ 안 올라오면 인프라 담당에게 넘긴다. 넘길 것: cluster nodes 전문 · `docker logs --tail 50 q-redis-a-N` ⚠️ **Sentinel(옛 구성) 명령을 치지 마라** — 운영은 Cluster 이고 Sentinel 은 학습 자산이다. 🔑 죽은 마스터에 걸린 큐만 멈춘다. 다른 큐는 멀쩡해서 전면 장애로 보이지 않는다"
+          action: "① 어느 노드가 죽었는지 확인한다. **아무 노드에나 접속하면 전체 목록이 나온다**: `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster nodes` (B 면 -p 8001). fail 이 붙은 줄을 찾는다 — 끝이 connected 로 돌아왔으면 이미 해소된 것이다 → ② 죽어 있으면 그 노드만 되살린다: `docker start q-redis-a-N` (N 은 포트 끝자리 — 7003 이면 a-3, 8003 이면 b-3). 1분 뒤 ① 을 다시 봐서 connected 면 끝이다 → ③ 올라왔는데 cluster_state 가 ok 가 아니면 RedisClusterDegraded 조치로 넘어간다 → ④ 안 올라오면 인프라 담당에게 넘긴다. 넘길 것: cluster nodes 전문 · `docker logs --tail 50 q-redis-a-N` ⚠️ **Sentinel(옛 구성) 명령을 치지 마라** — 운영은 Cluster 이고 Sentinel 은 학습 자산이다. 🔑 죽은 마스터에 걸린 큐만 멈춘다. 다른 큐는 멀쩡해서 전면 장애로 보이지 않는다"
 
       # 익스포터 자체가 죽었다 = 위 RedisInstanceDown 규칙이 침묵한다.
       #
@@ -158,7 +158,7 @@ groups:
         annotations:
           summary: "Redis 복제 끊김 — {{ $labels.instance }} → master {{ $labels.master_host }}:{{ $labels.master_port }}"
           impact: "복제본이 뒤처진 채 멈춘다. 마스터가 죽으면 그 시점까지의 대기열만 남는다 — **failover 해도 줄이 옛날 상태다.**"
-          action: "① 클러스터 전체 시야부터 본다: `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster nodes` (B 클러스터면 -p 8001). 해당 노드 줄 끝이 connected 로 돌아왔으면 이미 해소된 것이다 → ② disconnected 이거나 fail 플래그가 있으면 그 노드만 되살린다: `docker start q-redis-a-N` (N 은 포트 끝자리 — 7003 이면 a-3, 8003 이면 b-3). 2분 뒤 ① 을 다시 봐서 connected 면 끝이다 → ③ 안 바뀌면 인프라 담당에게 넘긴다. 넘길 것: cluster nodes 전문 · `docker logs --tail 50 q-redis-a-N` ⚠️ `CLUSTER FAILOVER` 를 치지 마라 — 뒤처진 복제본이 승격돼 그만큼의 대기열이 사라진다"
+          action: "① 어느 노드가 문제인지부터 확인한다. **아무 노드에나 접속하면 전체 목록이 나온다**: `docker exec q-redis-a-1 redis-cli -c -p 7001 cluster nodes` (B 클러스터면 -p 8001). 알람의 instance 와 같은 주소를 가진 줄을 찾아 맨 끝을 본다 — connected 면 이미 해소된 것이다 → ② disconnected 이거나 fail 플래그가 있으면 그 노드만 되살린다: `docker start q-redis-a-N` (N 은 포트 끝자리 — 7003 이면 a-3, 8003 이면 b-3). 2분 뒤 ① 을 다시 봐서 connected 면 끝이다 → ③ 안 바뀌면 인프라 담당에게 넘긴다. 넘길 것: cluster nodes 전문 · `docker logs --tail 50 q-redis-a-N` ⚠️ `CLUSTER FAILOVER` 를 치지 마라 — 뒤처진 복제본이 승격돼 그만큼의 대기열이 사라진다"
 
       # Sentinel quorum이 깨졌다 = master가 죽어도 승격이 불가능하다.
       # "지금 서비스는 멀쩡한데 다음 장애를 복구할 수단이 사라진" 전형적 critical이다.
@@ -299,7 +299,7 @@ groups:
         annotations:
           summary: "Redis {{ $labels.instance }} 현 추세면 6시간 내 maxmemory 도달 — 가득 차면 지우지 않고 쓰기를 거부하는 설정(noeviction)이라 쓰기(enqueue)가 거부된다"
           impact: "가득 차면 지우지 않고 쓰기를 거부하는 설정(noeviction) 이라 닿는 순간 **쓰기(enqueue)가 503 으로 거부된다.** 같은 마스터를 쓰는 **다른 테넌트까지** 함께 죽는다 — 총량이 남아 있어도 터진다."
-          action: "에스컬레이션 필요 — 한도 상향·용량 증설은 당직 범위가 아니다. 🔑 닿으면 그 마스터를 쓰는 **다른 테넌트의 enqueue 까지 503** 이 된다. ① 수집: `docker exec q-redis-a-1 redis-cli -c -p 7001 INFO memory` 의 used_memory 와 maxmemory, `--bigkeys` 로 어느 큐가 키우는지 적는다(B 클러스터면 -p 8001) → ② 임시 조치: 해당 큐를 일시 정지해 유입을 끊는 것은 할 수 있다(`POST /api/v1/queues/{id}/pause`). 이미 줄 선 사람은 그대로 남고 배출은 계속된다 → ③ 인프라 담당에게 넘긴다. 넘길 것: 노드 · used/maxmemory · 가장 큰 큐와 그 인원 ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다"
+          action: "에스컬레이션 필요 — 한도 상향·용량 증설은 당직 범위가 아니다. 🔑 닿으면 그 마스터를 쓰는 **다른 테넌트의 enqueue 까지 503** 이 된다. ① 수집: `docker exec q-redis-a-1 redis-cli -c -p 7001 INFO memory` 의 used_memory 와 maxmemory, `--bigkeys` 로 어느 큐가 키우는지 적는다(B 클러스터면 -p 8001) → ② 임시 조치: 가장 큰 큐의 유입을 끊는 것은 할 수 있다. 🔑 이 알람에는 큐 ID 가 없다 — ① 의 `--bigkeys` 출력에 나온 `queue:{<큐ID>}:waiting` 에서 중괄호 안이 큐 ID 다. 그걸로 `POST /api/v1/queues/<큐ID>/pause`. 이미 줄 선 사람은 그대로 남고 배출은 계속된다 → ③ 인프라 담당에게 넘긴다. 넘길 것: 노드 · used/maxmemory · 가장 큰 큐와 그 인원 ⚠️ FLUSHALL 금지 — 대기열 전체가 사라진다"
 
       # 디스크 고갈 예측.
       #
@@ -406,7 +406,7 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} 시계가 NTP에 동기화돼 있지 않다 — 토큰이 어느 월별 테이블에 저장되는지와 Redis 만료가 이 시계로 정해진다"
           impact: "토큰의 저장 시각(issued_at)이 어느 월별 테이블에 들어갈지와 중복 판정을 정한다. 시계가 틀어지면 **엉뚱한 달의 테이블에 저장**되거나 Kafka 재처리 중복 판정이 깨진다."
-          action: "🔑 이 서버가 찍는 시각으로 토큰이 저장되고 Redis 만료가 계산된다. ① `timedatectl status` 의 **System clock synchronized** 를 본다. yes 면 이미 해소된 것이다 → ② no 면 시간 동기화를 되살린다: `sudo systemctl restart chrony` (없으면 `sudo systemctl restart systemd-timesyncd`). 1분 기다렸다 ① 을 다시 본다. yes 로 바뀌면 끝이다 → ③ 안 바뀌면 인프라 담당에게 넘긴다. 넘길 것: `timedatectl status` 전문 · `chronyc tracking` 전문 · 호스트 이름 ⚠️ `date -s` 로 손으로 맞추지 마라 — 시간이 뒤로 점프하면 이미 발급된 입장권이 한꺼번에 만료된다. NTP 가 조금씩 당겨 맞추게 둬라. 피해 범위 조사(어느 토큰이 영향을 받았는지)는 조치가 끝난 뒤 `doc/monitoring/queries/` 로 한다 — 새벽에 할 일이 아니다"
+          action: "🔑 이 서버가 찍는 시각으로 토큰이 저장되고 Redis 만료가 계산된다. ① `timedatectl status` 의 **System clock synchronized** 를 본다. yes 면 이미 해소된 것이다 → ② no 면 시간 동기화를 되살린다: 시간 동기화 데몬을 재시작한다. 🪤 **배포판마다 이름이 다르다** — `systemctl status chrony chronyd systemd-timesyncd 2>/dev/null | grep -E 'Loaded|Active'` 로 어느 것이 있는지 먼저 보고 그 이름으로 `sudo systemctl restart <그 이름>`. 1분 기다렸다 ① 을 다시 본다. yes 로 바뀌면 끝이다 → ③ 안 바뀌면 인프라 담당에게 넘긴다. 넘길 것: `timedatectl status` 전문 · `chronyc tracking` 전문(chrony 를 쓰는 경우) 또는 `timedatectl show` 전문 · 호스트 이름 ⚠️ `date -s` 로 손으로 맞추지 마라 — 시간이 뒤로 점프하면 이미 발급된 입장권이 한꺼번에 만료된다. NTP 가 조금씩 당겨 맞추게 둬라. 피해 범위 조사(어느 토큰이 영향을 받았는지)는 조치가 끝난 뒤 `doc/monitoring/queries/` 로 한다 — 새벽에 할 일이 아니다"
 
 
       # Redis 마스터 단일 스레드가 포화에 다가간다. (2026-09-04 <보류>에서 승격)
