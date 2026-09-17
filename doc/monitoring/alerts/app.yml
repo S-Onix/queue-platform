@@ -106,7 +106,7 @@ groups:
         annotations:
           summary: "큐 {{ $labels.queue_id }} 에서 **대기자가 입장까지 걸린 시간**(상위 5% 기준) = {{ $value | humanizeDuration }}. 경고선 60초를 넘겼다. 🔑 이 60초는 **알람을 울리려고 정한 숫자일 뿐이다** — 넘어도 입장권이 만료되거나 자리가 사라지지는 않는다(입장권 TTL 60초와 숫자만 같고 아무 관계가 없다)"
           impact: "사용자가 기다리다 창을 닫는다. admit 이 멈춘 게 아니라 **느린 것**이라 5xx 로는 안 보이고, 이탈은 지표에 안 남는다."
-          action: "에스컬레이션 필요 — 입장 속도는 이 큐를 쓰는 고객사(Tenant)가 정한다. 당직자가 빠르게 만들 수단이 없다. ① 수집: `docker exec q-redis-a-1 redis-cli -c -p 7001 zcard \"queue:{{\"{\"}}{{ $labels.queue_id }}{{\"}\"}}:waiting\"` 로 대기 인원을 적는다(0 이면 다른 클러스터다 — -p 8001 로 한 번 더). 큐 ID·대기 인원·p95 값을 기록한다 → ② 임시 조치: 없다. 단 대기가 계속 늘고 Redis 메모리도 함께 오르면 큐를 일시 정지해 유입을 끊는 것은 할 수 있다 (`POST /api/v1/queues/{{ $labels.queue_id }}/pause` — 큐 ID 는 이 알람 제목에 있는 그 값이다. 되돌리기는 같은 주소의 resume) → ③ 테넌트 연락 담당에게 넘긴다. 넘길 것: 큐 ID · 대기 인원 · p95 · 그 테넌트가 admit 을 부르는 주기 ⚠️ 큐를 지우거나 Redis 키를 건드리지 마라 — 대기열이 사라진다"
+          action: "에스컬레이션 필요 — 입장 속도는 이 큐를 쓰는 고객사(Tenant)가 정한다. 당직자가 빠르게 만들 수단이 없다. ① 수집: `docker exec q-redis-a-1 redis-cli -c -p 7001 zcard \"queue:{{\"{\"}}{{ $labels.queue_id }}{{\"}\"}}:waiting\"` 로 대기 인원을 적는다(0 이면 다른 클러스터다 — -p 8001 로 한 번 더). 큐 ID·대기 인원·p95 값을 기록한다 → ② 임시 조치: 없다. 없다. 🪤 큐 일시 정지(`/pause`)를 떠올릴 수 있지만 **그 API 는 테넌트 JWT 를 요구한다** — 당직자에게는 그 토큰이 없어 401 이다. 멈추려면 고객사가 직접 해야 한다 → ③ 테넌트 연락 담당에게 넘긴다. 넘길 것: 큐 ID · 대기 인원 · p95 · 그 테넌트가 admit 을 부르는 주기 ⚠️ 큐를 지우거나 Redis 키를 건드리지 마라 — 대기열이 사라진다"
 
   # ===========================================================================
   # admit 경로 — 구현 0으로 지금 쓸 수 있는 것 (2026-09-04 <보류>에서 승격, 사용자 결정)
@@ -283,7 +283,7 @@ groups:
         annotations:
           summary: "큐 {{ $labels.queue_id }} 에서 ADMITTED 발행 실패 admit {{ $value }}건/10m — 영향 사용자는 그 이상이다(1건에 최대 100명)"
           impact: "그 토큰들은 **complete 가 영구 404** 가 된다. 사용자는 입장했는데 과금 기록에 완료 기록이 없다. admit 은 200 을 돌려줬으므로 HTTP 지표로는 절대 안 보인다."
-          action: "에스컬레이션 필요 — 복구가 DB 직접 수정이라 당직자가 손대지 않는다. ① 수집(가장 먼저, 로그는 사라진다): queue-api 로그에서 `ADMITTED 발행 중단` 또는 `ADMITTED 발행 생략` 을 찾아 **둘 중 어느 문구인지 · 첫 tokenId · 건수**를 적는다. 개별 사용자를 식별할 수단은 이 로그뿐이다 → ② 임시 조치: `발행 생략` 이고 배포 중이면 배포 완료를 기다리면 멈춘다. `발행 중단` 이면 브로커를 본다 `docker exec q-kafka-1 /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092,localhost:9192,localhost:9292` — 3대 전부 응답하면 브로커는 정상이다(한 대만 찍으면 그 한 대가 죽었을 때 오진한다) → ③ 백엔드 담당에게 넘긴다. 넘길 것: 로그 문구 · 첫 tokenId · 건수 · 브로커 응답 여부 ⚠️ tokens 테이블을 직접 UPDATE 하지 마라. 앱을 재시작해도 건너뛴 분은 재발행되지 않는다 — 지금 더 나빠지지는 않으니 새벽이면 기록만 남겨도 된다"
+          action: "에스컬레이션 필요 — 복구가 DB 직접 수정이라 당직자가 손대지 않는다. ① 수집(가장 먼저, 로그는 사라진다): queue-api 로그에서 `ADMITTED 발행 중단` 또는 `ADMITTED 발행 생략` 을 찾아 **둘 중 어느 문구인지 · 첫 tokenId · 건수**를 적는다. 개별 사용자를 식별할 수단은 이 로그뿐이다 → ② 임시 조치: `발행 생략` 이고 배포 중이면 배포 완료를 기다리면 멈춘다. `발행 중단` 이면 브로커를 본다 `docker exec q-kafka-1 /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092,localhost:9192,localhost:9292` — 3대 전부 응답하면 브로커는 정상이다(한 대만 찍으면 그 한 대가 죽었을 때 오진한다) → ③ 백엔드 담당에게 넘긴다. 넘길 것: 로그 문구 · 첫 tokenId · 건수 · 브로커 응답 여부 ⚠️ tokens 테이블을 직접 UPDATE 하지 마라. 앱을 재시작해도 건너뛴 분은 재발행되지 않는다 — 🔑 **수집(①)은 지금 해야 한다 — 로그가 사라진다.** 그 뒤의 복구는 더 나빠지지 않으므로 아침으로 넘겨도 된다"
 
   # ── 런타임 (프로세스가 살아 있는가 · 컨테이너 한도에 붙었는가) ─────────────────
   #
@@ -314,7 +314,7 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} 가 최근 15분 안에 재시작됐다 ({{ $value }}회)"
           impact: "배포가 아니라면 **커널 OOM Kill** 일 확률이 높다. 앱은 로그를 남길 틈이 없고, 그 인스턴스로 가던 요청은 전부 실패한다(2026-09-15 에 connection refused 17,085건)."
-          action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② 🔑 알람의 instance 는 주소(ip:port)라 컨테이너 이름이 아니다. 이름부터 찾는다: `docker ps -a --filter name=q-api --filter name=q-batch --filter name=q-consumer` (포트 8080/8083/8084=api · 8081=batch · 8082=consumer). 그다음 `docker inspect <위에서 찾은 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 컨테이너 메모리 한도 초과로 커널이 죽인 것**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 힙이 아니라 **힙이 아니라 그 바깥**(메타스페이스·코드캐시·버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
+          action: "① 배포 중이면 정상이다 — 아니라면 계속한다 → ② 🔑 알람의 instance 는 주소(ip:port)라 컨테이너 이름이 아니다. 이름부터 찾는다: `docker ps -a --filter name=q-api --filter name=q-batch --filter name=q-consumer` (포트 8080/8083/8084=api · 8081=batch · 8082=consumer). 그다음 `docker inspect <위에서 찾은 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'`. **true / 137이면 컨테이너 메모리 한도 초과로 커널이 죽인 것**이다 (🪤 `--format` 으로 Go 템플릿을 쓰지 마라 — 이 문장은 Prometheus 가 템플릿으로 렌더하므로 중괄호를 넣으면 **알람이 뜰 때 annotation 이 통째로 에러가 된다**. promtool 단위 테스트가 실제로 잡았다)(2026-09-15 5차에 실제로 났고 앱 로그는 0건이었다) → ③ OOM이면 `jvm_memory_committed_bytes` 합을 mem_limit과 대조한다. 넘긴 것이 **힙이 아니라 그 바깥**(메타스페이스·코드캐시·버퍼)일 수 있다 — 힙만 보고 '여유 있다'고 판정하지 마라 → ④ 반복되면 mem_limit을 올린다. app.yml의 2g는 '힙 × 2' 어림에서 왔고, 그 어림이 부하에서 깨진 것이 5차다"
 
       # 임계값 근거: **절반만 있다.**
       #   85% — 근거 없음(관례). 5차 OOM 직전 값은 안 남아 있다.
@@ -342,4 +342,4 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} 의 JVM 커밋 메모리가 컨테이너 한도(2GiB)의 {{ $value | humanizePercentage }} — 컨테이너 메모리 한도 초과로 커널이 죽인 것 이 가까울 수 있다"
           impact: "컨테이너 한도에 닿으면 커널이 프로세스를 죽인다. **앱 로그 0건으로 사라진다** — 재시작 알람이 아니면 못 본다."
-          action: "에스컬레이션 필요 — 한도를 올리려면 재배포가 필요하다. ① 수집: 힙과 힙과 그 바깥(메타스페이스·코드캐시·버퍼)을 갈라 적는다. Prometheus 에서 `jvm_memory_committed_bytes{area=\"heap\"}` 와 `{area=\"nonheap\"}` (5차에 넘긴 것은 힙 바깥(메타스페이스·코드캐시·버퍼)이었다). 어느 인스턴스인지도 적는다 → ② 임시 조치: 없다. 재시작하면 일시적으로 내려가지만 원인은 그대로이고 그 인스턴스의 요청이 끊긴다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: 인스턴스 · 힙/힙 바깥(메타스페이스·코드캐시·버퍼) 값 · 컨테이너 한도(2GiB) · AppRestarted 동반 여부 ⚠️ 이 값은 RSS 가 아니라 근사치다. 이 알람이 조용한데 OOM 이 나면 cAdvisor 가 필요하다는 뜻이니 그것도 함께 적어라"
+          action: "에스컬레이션 필요 — 한도를 올리려면 재배포가 필요하다. ① 수집: 힙과 그 바깥(메타스페이스·코드캐시·버퍼)을 갈라 적는다. Prometheus 에서 `jvm_memory_committed_bytes{area=\"heap\"}` 와 `{area=\"nonheap\"}` (5차에 넘긴 것은 힙 바깥(메타스페이스·코드캐시·버퍼)이었다). 어느 인스턴스인지도 적는다 → ② 임시 조치: 없다. 재시작하면 일시적으로 내려가지만 원인은 그대로이고 그 인스턴스의 요청이 끊긴다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: 인스턴스 · 힙/힙 바깥(메타스페이스·코드캐시·버퍼) 값 · 컨테이너 한도(2GiB) · AppRestarted 동반 여부 ⚠️ 이 값은 실제 프로세스 메모리(RSS)가 아니라 근사치다. 이 알람이 조용한데 OOM 이 나면 cAdvisor 가 필요하다는 뜻이니 그것도 함께 적어라"
