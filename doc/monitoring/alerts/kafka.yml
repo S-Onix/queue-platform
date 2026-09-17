@@ -102,9 +102,9 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "token-lifecycle **DB 적재 지연** {{ $value | humanizeDuration }} — **admitToken TTL(60초)** 을 넘었다. 🔑 이 60초는 admit 이 입장권을 **발급한 시점부터**의 유효 시간이다(대기열의 inactiveTtl·waitingTtl 과 무관)"
-          impact: "DB 적재가 admitToken TTL(60초)보다 늦다. verify·complete 가 DB 폴백을 못 받아 **정상 입장자가 404** 를 받기 시작한다."
-          action: "런북 [증상] consumer lag이 줄지 않는다 (doc/monitoring/runbook/kafka-persistence.md). ⚠️ 오프셋을 latest로 리셋하지 마라 — 건너뛴 이벤트는 영원히 DB에 안 들어가고 그게 곧 유령 토큰이다. lag은 지표이지 문제가 아니다."
+          summary: "token-lifecycle **DB 적재 지연** {{ $value | humanizeDuration }} — **입장권 유효 시간(60초)** 을 넘었다. 🔑 이 60초는 admit 이 입장권을 **발급한 시점부터**의 유효 시간이다(대기열의 폴링이 끊긴 대기자를 회수하는 시간·줄에 너무 오래 있은 사람을 회수하는 시간 과 무관)"
+          impact: "DB 적재가 입장권 유효 시간(60초)보다 늦다. verify·complete 가 DB 폴백을 못 받아 **정상 입장자가 404** 를 받기 시작한다."
+          action: "에스컬레이션 필요 — 적재 속도를 올리려면 증설이나 코드 변경이 필요하다. ① 수집: `docker exec q-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group db-writer` 의 LAG 합계를 적는다. 5분 뒤 다시 재서 **줄고 있는지**도 적는다 → ② 임시 조치: 없다. 🔑 lag 은 지표이지 문제가 아니다 — 줄고 있으면 기다리는 것이 맞다 → ③ 줄지 않으면 백엔드 담당에게 넘긴다. 넘길 것: LAG 두 번의 값과 간격 · KafkaConsumerStalled 동반 여부. 절차는 `doc/monitoring/runbook/kafka-persistence.md` 의 [증상] consumer lag이 줄지 않는다 ⚠️ 오프셋을 latest 로 리셋하지 마라 — 건너뛴 이벤트는 영원히 DB 에 안 들어가고 그게 곧 Redis 에만 있고 DB 에는 없는 토큰이다"
 
       # 소화 시간이 complete의 DB 유효 창(300초)을 넘는다.
       #
@@ -129,9 +129,9 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "token-lifecycle **DB 적재 지연** {{ $value | humanizeDuration }} — **complete 유효 창(300초)** 을 넘었다. 🔑 이 300초는 DB 의 `admitted_at` 부터 재는 완료 허용 창이다. 🪤 큐 설정의 `inactiveTtl` 기본값도 300초라 숫자가 같지만 **완전히 다른 것**이다(그쪽은 폴링이 끊긴 대기자를 회수하는 값)"
-          impact: "complete 유효 창(300초)을 넘긴다. 그 구간 사용자의 **완료 기록이 영구 유실**되고, 토큰은 status=1 에 남아 과금만 된다."
-          action: "컨슈머 인스턴스를 늘려라(파티션 18개까지). ⚠️ concurrency를 올리는 것은 실측상 역효과였다(application.yml 주석). 유실 범위는 queries/kafka-persistence.md §3의 차집합 스크립트로 뽑는다."
+          summary: "token-lifecycle **DB 적재 지연** {{ $value | humanizeDuration }} — **완료를 받아주는 시간(300초)** 을 넘었다. 🔑 이 300초는 DB 의 `admitted_at` 부터 재는 완료 허용 창이다. 🪤 큐 설정의 `폴링이 끊긴 대기자를 회수하는 시간` 기본값도 300초라 숫자가 같지만 **완전히 다른 것**이다(그쪽은 폴링이 끊긴 대기자를 회수하는 값)"
+          impact: "완료를 받아주는 시간(300초)을 넘긴다. 그 구간 사용자의 **완료 기록이 영구 유실**되고, 토큰은 status=1 에 남아 과금만 된다."
+          action: "에스컬레이션 필요 — 컨슈머 증설은 배포 작업이다. 🔑 이 구간의 완료 기록은 나중에 밀린 것이 처리돼도 복구되지 않는다. ① 수집: 위 AdmitTtl 알람과 같은 명령으로 LAG 합계를 두 번(5분 간격) 재서 적는다 → ② 임시 조치: 없다 → ③ 백엔드 담당에게 즉시 넘긴다(critical). 넘길 것: LAG 값 두 개 · 시작 시각 · 영향 구간 추정. 유실 범위는 `doc/monitoring/queries/kafka-persistence.md` §3 의 차집합 스크립트로 뽑는다(아침에 해도 된다) ⚠️ concurrency 를 올리는 것은 실측상 역효과였다(200→147/s). 당직자가 임의로 올리지 마라"
 
       # 랙은 있는데 소화가 완전히 멈췄다.
       #
@@ -153,7 +153,7 @@ groups:
         annotations:
           summary: "token-lifecycle 컨슈머가 **3분간 한 건도 적재하지 못했다** (잔여 {{ $value }}건). 🔑 여기서 멈춘 것은 Kafka→MySQL **적재**다 — 대기열(Redis)과 입장(admit)은 계속 돈다"
           impact: "적재가 완전히 멈췄다. 위 둘은 시간 문제일 뿐이고, lag 이 계속 늘어 **복구 시 소화에도 그만큼 걸린다.**"
-          action: "`docker exec q-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group db-writer`로 파티션 할당 확인 → 리밸런스 루프면 consumer.log의 rebalance 로그, 독약이면 DLT를 본다. max.poll.interval.ms를 무작정 키우지 마라(런북)."
+          action: "에스컬레이션 필요 — 컨슈머가 담당 Kafka 파티션을 계속 주고받는 상태·처리 불가능한 메시지 판정은 코드 쪽이다. ① 수집: `docker exec q-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group db-writer` 로 **Kafka 파티션이 컨슈머에 할당돼 있는지**(CONSUMER-ID 가 비어 있지 않은지)와 LAG 을 적는다 → ② 임시 조치: 컨슈머 컨테이너가 죽어 있으면 `docker start q-consumer` 한 번은 해도 된다. 살아 있으면 없다 → ③ 백엔드 담당에게 넘긴다. 넘길 것: CONSUMER-ID 유무 · LAG · consumer 로그의 rebalance 문구 유무 ⚠️ max.poll.interval.ms 를 무작정 키우지 마라 — 컨슈머가 담당 Kafka 파티션을 계속 주고받는 상태를 늦출 뿐 원인은 그대로다"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # <보류>
