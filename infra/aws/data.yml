@@ -201,6 +201,34 @@ services:
       # 세션이 끝나면 destroy 하므로 길게 보관할 이유가 없다.
       - --storage.tsdb.retention.time=6h
 
+  # 알람이 모이는 곳. Prometheus 와 같은 노드라 localhost:9093 으로 붙는다.
+  # 🪤 Kafka 컨트롤러도 9093 을 쓰지만 **다른 노드**다(kafka 노드). 여기는 mysql 노드다.
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: q-alertmanager
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 200m
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # 🔴 Slack webhook URL. **레포에 없다** — deploy.sh 가 .env 를 읽어 노드에 쓴다.
+      #    없으면 기동은 되고 통지만 실패한다(alertmanager_notifications_failed_total 로 보인다).
+      #    🪤 **compose 를 손으로 돌릴 때 주의**: 이 경로가 없으면 Docker 가 같은 이름의
+      #       **디렉터리를 만들어 버린다**(파일이 아니라). 그러면 Alertmanager 가 그걸 읽다
+      #       실패한다 — deploy.sh 는 항상 파일을 먼저 만든다. 수동 기동 전에 확인해라:
+      #       `[ -f infra/aws/monitoring/slack_url ] || : > infra/aws/monitoring/slack_url`
+      - ./monitoring/slack_url:/etc/alertmanager/slack_url:ro
+      - am-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      # silence 를 걸 때 쓰는 UI. SG 에서 안 열므로 SSH 터널로 본다.
+      - --web.external-url=http://localhost:9093
+      # 🪤 **gossip 을 끈다.** 인스턴스가 하나라 클러스터링이 필요 없는데, 기본값이면 9094 를
+      #    연다. 로컬 검증에서 그 포트가 Kafka 브로커와 충돌해 기동이 실패했다(2026-09-17) —
+      #    host 네트워크라 노드 안 포트가 전부 같은 공간이다. 안 쓰는 포트는 열지 않는다.
+      - --cluster.listen-address=
+
   grafana:
     image: grafana/grafana:11.3.1
     container_name: q-grafana
@@ -244,3 +272,4 @@ services:
 volumes:
   mysql-data:
   prom-data:
+  am-data:

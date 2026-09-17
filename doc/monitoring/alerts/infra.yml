@@ -40,8 +40,11 @@
 #              (로컬은 앱을 안 띄운 시간이 대부분이라 상시 firing이 정상이다.
 #               이걸 warning에 섞으면 warning 등급 전체가 오염된다 → 등급으로 격리한다)
 #
-# ⚠️ Alertmanager는 미설치다(의도적, 알림 채널 없음). 즉 지금 severity는 라우팅을 하지 않고
-#    문서 라벨로만 존재한다. firing 확인은 http://localhost:9090/alerts 에서 눈으로 한다.
+# ⚠️ Alertmanager는 **AWS에만 설치돼 있다**(2026-09-17, infra/aws/data.yml). severity는 거기서
+#    실제로 라우팅한다 — critical은 group_wait 10s·repeat 1h, warning은 상위 알람에 억제된다
+#    (inhibit_rules). **로컬은 여전히 미설치**라 firing 확인이 http://localhost:9090/alerts 눈이다.
+#    🔑 그리고 AWS에서도 **사람에게 가는 마지막 구간은 비어 있다** — receiver가 채널 없이
+#    비어 있어 알람은 Alertmanager까지만 모인다. 확인: `curl -s localhost:9093/api/v2/alerts`
 #
 # ⚠️ 전제: evaluation_interval=15s, scrape_interval=15s (실가동 prometheus.yml 실측)
 #    `for:` 값은 전부 "스크레이프 N회 연속"으로 환산해 근거를 각 규칙에 적었다.

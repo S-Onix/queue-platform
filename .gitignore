@@ -55,3 +55,7 @@ doc/blog/
 scratchpad/
 # graphify 코드 그래프 인덱스 — 로컬 전용, 재생성 가능(graphify update .)
 graphify-out/
+
+# 🔴 Alertmanager 의 Slack webhook URL. **URL 자체가 비밀번호다.**
+# deploy.sh 가 .env 값을 노드에 쓰는 파일이라 레포에 들어올 일이 없어야 한다.
+infra/aws/monitoring/slack_url
