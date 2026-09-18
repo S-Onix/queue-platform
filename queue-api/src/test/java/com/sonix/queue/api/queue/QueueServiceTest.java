@@ -66,7 +66,9 @@ class QueueServiceTest {
                 "createQueue에 @Transactional이 다시 붙었다. package-private이라 무시되므로 "
                         + "동작은 그대로지만, 달려 있는 것 자체가 다음 사람을 속인다 (§87)");
 
-        for (String name : new String[]{"updateQueue", "pauseQueue", "deleteQueue"}) {
+        // 🪤 resumeQueue 가 빠져 있었다(2026-09-18 3인 검토). 형제 넷 중 셋만 보고 있어서,
+        //    resumeQueue 의 @Transactional 을 지워도 이 테스트는 초록이었다.
+        for (String name : new String[]{"updateQueue", "pauseQueue", "resumeQueue", "deleteQueue"}) {
             assertNotNull(txAttrOf(source, name), name + "에는 트랜잭션이 걸려야 한다");
         }
     }
