@@ -200,9 +200,13 @@ resource "aws_instance" "node" {
 #       EIP 는 "Grafana 가 사는 노드"를 따라간다. 둘을 따로 움직이면 링크가 죽는다.
 #    나머지 노드는 SSH 로만 닿고 주소를 사람이 기억할 이유가 없다 — EIP 는 붙인 만큼 돈이 든다.
 #
-# ⚠️ **destroy 해도 EIP 는 남는다**(그래야 다음 판에서 같은 주소를 받는다). 안 쓰는 동안
-#    시간당 요금이 붙으므로, 한동안 실측을 안 할 거면 이 리소스를 함께 지워라:
-#      terraform destroy -target=aws_eip.monitoring
+# 🔴 **"destroy 해도 EIP 는 남는다"는 거짓이었다 (2026-09-18 실측).** terraform 이 관리하는
+#    리소스라 `terraform destroy` 가 **같이 지운다** — 9차 destroy 후 EIP 가 0개였다.
+#    즉 지금 이 리소스가 주는 것은 "판을 건너는 고정 주소"가 아니라 **한 판 안에서의 고정**뿐이다.
+#    ⚖️ 판을 건너 고정하려면 `lifecycle { prevent_destroy = true }` 로 바꿔야 하고, 그러면
+#       안 쓰는 동안에도 시간당 $0.005 가 계속 나간다. **아직 그렇게 하지 않았다** — Slack 링크가
+#       지금은 localhost 터널 주소라, 고정 주소로 얻는 것이 없기 때문이다(GRAFANA_BASE 주입이 선행).
+
 resource "aws_eip" "monitoring" {
   domain = "vpc"
   tags   = { Name = "queue-loadtest-monitoring" }
