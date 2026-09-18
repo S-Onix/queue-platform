@@ -234,7 +234,7 @@ output "public_ip" {
   #    `aws_instance.public_ip` 는 그 해제된 주소를 그대로 들고 있다 → deploy.sh 가 죽은 IP 로
   #    SSH 를 걸어 [0/5] 에서 무한 대기한다(②와 증상이 똑같아 원인을 헷갈린다).
   value = { for k, i in aws_instance.node :
-  k => k == "mysql" ? aws_eip.monitoring.public_ip : i.public_ip }
+  k => k == "obs" ? aws_eip.monitoring.public_ip : i.public_ip }
 }
 
 # 🔑 컨테이너가 서로를 찾는 주소. Redis announce-ip · Kafka advertised.listeners ·
