@@ -117,52 +117,11 @@ public class TokenJpaAdapter implements TokenRepository {
                 admit_token = IF(tokens.status = 0, new.admit_token, tokens.admit_token),
                 admitted_at = IF(tokens.status = 0, new.admitted_at, tokens.admitted_at),
                 status      = IF(tokens.status = 0, 1, tokens.status)""");
-        // 🔴 completed_at을 **여기서 찍는다.** 예전엔 "complete API가 동기 UPDATE로 이미 채운
-        //    값"이라 안 건드렸는데, verify가 완료를 확정하게 되면서 complete API를 거치지 않고
-        //    status가 2가 되는 경로가 생겼다. 안 채우면 그 행의 completed_at이 영원히 NULL이라
-        //      ① complete의 findCompletedAt이 빈 값을 읽어 정상 Tenant가 404를 받고
-        //      ② schema.sql의 AVG/MAX(TIMESTAMPDIFF(SECOND, issued_at, completed_at))에서 통째로 빠진다
-        //
-        //    값을 이벤트로 실어오지 않고 UTC_TIMESTAMP(3)을 쓰는 이유는 둘이다.
-        //      · EnqueueEvent에 필드를 더하면 생성 지점 15곳 + Token.reconstruct 5곳 + INSERT 컬럼
-        //        + 바인더 + 컨슈머 매핑으로 번진다
-        //      · 🪤 ODKU의 SET 절에 '?'를 쓰면 rewriteBatchedStatements가 **조용히 꺼진다**.
-        //        함수 호출은 그 문제가 아예 없다
-        //    대가는 "verify 응답 시각"이 아니라 "컨슈머 적용 시각"이 되는 것인데(보통 1초 미만),
-        //    소비자가 초 단위 일별 집계 하나뿐이라 실질 차이가 없다.
-        //
-        //    complete API 경로는 영향이 없다 — 동기 UPDATE가 이미 status=2로 만들어 놓아
-        //    IF(tokens.status = 1, ...)이 거짓이 되고 자기가 찍은 값이 보존된다.
-        // 🔴 **가드가 `status IN (0, 1)`인 것은 의도다 (§91).** `status = 1`이던 시절, 이 가드는
-        //    "ADMITTED가 먼저 적용됐다"를 전제했는데 **프로듀서가 그 순서를 보장하지 않는다.**
-        //    `admit.lua`가 커밋되면 admitToken이 Redis에 즉시 보이고 폴링은 Redis만 보는데,
-        //    `publishAdmitted`는 그 뒤에 건별 블로킹 `.get()`으로 **직렬** 발행한다(실측 67~128ms).
-        //    사용자가 그 사이에 verify·complete를 끝내면 **COMPLETED가 ADMITTED보다 먼저**
-        //    파티션에 들어가고, 여기서 no-op이 되어 행이 `status=1 / completed_at=NULL`로 고착됐다
-        //    → 300초 뒤 ReconcileJob이 status=4로 확정. **사용자는 200을 받아 알 수단이 없었다.**
-        //    실측(2026-09-09, Kafka 오프셋 전수): stuck 7건 전부 COMPLETED 오프셋 < ADMITTED 오프셋.
-        //    폴백 complete 1,117건 중 **16건(1.43%)**이 원장을 잃었다.
-        //
-        //    🔑 **동기 경로는 진작 `status IN (0,1)`이었다** — `TokenJpaRepository.markCompleted`.
-        //       비동기 경로만 `= 1`로 좁아 **두 코드가 서로 다른 것을 참이라 가정**하고 있었다.
-        //       원래 이 가드가 막으려던 것은 `status=2` 덮어쓰기지 0이 아니다. 2와 4는 여전히 배제된다.
-        //
-        // 🔴 **네 줄 전부 하중을 받는다. 하나도 군더더기가 아니다.**
-        //    `status`/`completed_at`만 넓히면, 뒤늦게 온 ADMITTED가 `IF(tokens.status = 0, ...)`에
-        //    걸려 no-op이 되어 `admit_token`·`admitted_at`이 **영구 NULL**로 남는다. 그 결과는
-        //      ① `SUM(admitted_at IS NOT NULL)`(= 입장권 개수의 유일한 근거)이 **과소 계상**
-        //      ② `findCompletedAt`이 `admit_token = ?`을 요구해 빈 값 → **complete 재시도가 404**
-        //    즉 원장 유실이 과금 누락으로 **모양만 바뀐다.** 3인 검토가 각각 다른 경로로 같은 결론에 왔다.
-        //
-        // 🔴 **`status`는 반드시 마지막 줄이다.** ODKU SET은 좌→우로 평가되고 아래 줄이 위 줄의
-        //    결과를 본다. `status`를 위로 올리면 나머지 셋이 이미 2로 바뀐 값을 봐서 전부 거짓이 되고,
-        //    실측 결과 `admit_token=NULL / admitted_at=NULL / completed_at=NULL`이 된다 —
-        //    **지금 버그보다 나쁘다**(status=2라 ReconcileJob이 손도 못 대고 흔적조차 안 남는다).
-        //
-        // 🪤 `admitted_at`의 대가: 이 경로의 값은 "admit 시각"이 아니라 **"complete 적용 시각"**이 된다.
-        //    §90의 불변식(값이 MySQL 시계에서 나온다)은 그대로 지킨다 — 흐리는 게 아니다.
-        //    대기 시간 집계가 그만큼 짧아지는데, 이 경합에서는 COMPLETED가 ADMITTED보다 **먼저**
-        //    도착하므로 편향은 아래쪽이고 폭은 컨슈머 배치 간격이다(초 단위 집계에서 대개 0).
+        // COMPLETED 는 completed_at 을 여기서 찍는다 — verify 가 완료를 확정하는 경로(§92)가
+        // complete API 를 안 거치므로, 안 채우면 그 행이 영원히 NULL 이다(findCompletedAt 404).
+        // 🔴 **SET 절 네 줄이 전부 하중을 받고, `status` 는 반드시 마지막 줄이다** — ODKU 는 좌→우
+        //    평가라 위로 올리면 나머지 셋이 전부 거짓이 되어 세 컬럼이 NULL 이 된다(결함 주입 실측).
+        // 가드가 `IN (0,1)` 인 이유·네 줄의 개별 근거·`status=4` 를 넓히면 안 되는 이유는 §91.
         sql.put(TokenEventType.COMPLETED, TRANSITION_INSERT + """
                 admit_token  = IF(tokens.status IN (0, 1) AND tokens.admit_token IS NULL, new.admit_token, tokens.admit_token),
                 admitted_at  = IF(tokens.status IN (0, 1) AND tokens.admitted_at IS NULL, UTC_TIMESTAMP(3), tokens.admitted_at),

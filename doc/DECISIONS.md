@@ -8009,3 +8009,55 @@ Tenant의 verify 재시도도 같다 — verify DB 폴백은 `status = 1`을 요
   막아야 할 것이 없어 만들지 않았다(§4)
 - 검토 5인(architect·security·planner → code-reviewer·tester) 보고 원문과 조건 반영 내역:
   `doc/reviews/2026-09-11-verify-redis-cleanup.md`
+
+---
+
+## §93 — `complete`의 Redis 폴백: 불변식·순서·시계 (주석 이관, 2026-09-18)
+
+> 📌 **이 절은 코드 주석에서 옮겨온 것이다.** 주석 정책(블록 ≤5줄)에 따라 긴 근거는 여기 두고,
+> 코드에는 `§93 참조`만 남긴다. 옮기면서 **주장을 전부 재검증**했다(아래 각 항목의 ✅ 표시).
+
+### 폴백이 왜 있나
+
+`complete`는 DB(`markCompleted`)를 먼저 보고 **0행일 때만** Redis `admit-by-admit`으로 간다.
+0행에는 두 가지가 섞여 있다 — ① 자격 없음 ② **컨슈머가 `ADMITTED`를 아직 적재하지 않음**.
+②까지 404로 돌려주면 **정상 입장자가 거절된다**. 랙 구간에서는 정상 입장자도 0행이다.
+
+### 폴백이 자격을 넓히지 않는 근거 — 실측이 아니라 **불변식**이다
+
+```
+admit-by-admit PX 60초  ⊂  DB 창 300초
+```
+✅ 재검증(2026-09-18): `RedisQueueEngine.ADMIT_TTL_MILLIS = 60_000` ·
+`QueueEngineService.ADMIT_TTL_SECONDS = 60` · `Token.COMPLETE_VALID_WINDOW_SECONDS = 300`.
+그래서 폴백이 통과시키는 요청은 **적재만 끝났다면 UPDATE도 통과시켰을 것들뿐**이다.
+🪤 **두 상수가 갈리면 불변식이 깨진다** — 하나를 고칠 때 다른 하나를 같이 봐라.
+
+### 시계는 더 이상 전제가 아니다 (§90)
+
+두 창을 재는 시계가 다르다: 60초는 **Redis가 PX로**(상대 시간이라 시계 오차에 면역),
+300초는 **MySQL의 `UTC_TIMESTAMP(3)`** 가 `admitted_at`과 비교해 잰다. 그리고 그 `admitted_at`도
+**MySQL이 찍는다**(§90). 비교의 양변이 같은 프로세스에서 나오므로 **어떤 앱 시계 스큐에도
+창이 300초 그대로**다. 게다가 `admitted_at = admit + 컨슈머랙(≥0)`이라 DB 창의 시작점이
+Redis 창보다 항상 뒤에 있어 포함 관계가 **구조적으로** 성립한다.
+
+🪤 **예전엔 여기가 원장 손상 경로였다.** `admitted_at`이 API 서버 시계로 찍히던 시절, 그 서버가
+S초 뒤처지면 DB 술어의 창이 `max(300 − S, 0)`으로 줄었다(실측 2026-09-09: S=398이면 admit
+0초 뒤에도 0행). S > 240이면 `60 ⊄ 300`이 되어 폴백이 자격을 넓히고, 결과는 404보다 나빴다 —
+행이 `status=4 / completed_at=NULL`로 **영구 고정**되고 재시도는 키가 지워져 404였다.
+🔑 **이 이력을 지우지 마라** — `admitted_at`을 이벤트 payload 값으로 되돌리거나 reconcile cutoff를
+앱에서 계산하면 같은 사고가 그대로 재발한다.
+
+### ⚠️ 순서를 뒤집지 마라 — DB 먼저, Redis 나중
+
+Redis를 먼저 보게 만들면, `publishQuietly`가 발행을 삼켰을 때 행이 `status=1`로 남고
+**`ReconcileJob`이 완료된 토큰을 EXPIRED로 확정**한다(Redis 키는 이미 지워진 뒤라 복구 경로가 없다).
+✅ 재검증: `expireStaleAdmitted`의 술어가 `status = 1` + `SET status = 4, expired_reason = 2`다.
+
+### 🔴 폴백에 닿는 이유는 최소 둘이다 (§91)
+
+① 컨슈머 적재 지연 ② **`ADMITTED`가 아직 발행조차 안 됨** — `admit.lua` 커밋 즉시 admitToken이
+Redis에 보이는데 `publishAdmitted`는 그 뒤 **직렬 블로킹 발행**(실측 67~128ms)이다. 그 사이에
+verify·complete가 끝나면 `COMPLETED`가 `ADMITTED`보다 **먼저** 파티션에 들어간다
+(Kafka 오프셋 전수 실측 7/7). 폴백 1,117건 중 **16건(1.43%)** 이 그렇게 원장을 잃었고,
+§91이 `COMPLETED` 가드를 `status IN (0,1)`로 넓혀 닫았다.

@@ -432,65 +432,11 @@ public class QueueEngineService {
                 return already.get();
             }
 
-            // 🔑 **여기까지 왔다 = DB가 이 토큰을 아직 모른다.** markCompleted가 요구하는
-            //    admit_token·admitted_at은 컨슈머가 ADMITTED를 적재해야 채워진다 —
-            //    랙 구간에서는 정상 입장자도 0행이다.
-            //
-            // 🔑 **폴백의 근거는 실측이 아니라 불변식이다.** admit-by-admit의 PX 60초 ⊂ DB 창
-            //    300초. 그래서 이 폴백이 통과시키는 요청은 적재만 끝났다면 위 UPDATE도
-            //    통과시켰을 것들뿐이고 자격이 넓어지지 않는다.
-            //    (두 상수가 갈리면 불변식이 깨진다 — Token.COMPLETE_VALID_WINDOW_SECONDS와
-            //     admit TTL을 같이 보고 고쳐라.)
-            //
-            // 🔑 **이 불변식은 상수 둘만으로 성립한다 — 시계는 더 이상 전제가 아니다** (§90).
-            //    두 창을 재는 시계: 60초는 **Redis**가 PX로 재고(상대 시간이라 시계 오차에 면역),
-            //    300초는 **MySQL의 UTC_TIMESTAMP(3)** 가 `admitted_at`과 비교해 잰다.
-            //    그리고 그 `admitted_at`도 이제 **MySQL이 찍는다**(TokenJpaAdapter의 ADMITTED ODKU) —
-            //    비교의 양변이 같은 프로세스에서 나오므로 **어떤 앱 시계 스큐에도 창이 300초 그대로**다.
-            //    게다가 `admitted_at = admit + 컨슈머랙(≥0)`이라 DB 창의 시작점이 Redis 창보다
-            //    항상 뒤에 있어, 포함 관계가 **구조적으로** 성립한다.
-            //
-            // 🪤 **예전엔 여기가 원장 손상 경로였다** — `admitted_at`이 admit을 처리한 API 서버
-            //    시계로 찍히던 시절, 그 서버가 S초 뒤처지면 DB 술어의 창이 `max(300 − S, 0)`으로
-            //    줄었다(실측 2026-09-09: S=398이면 admit 0초 뒤에도 markCompleted가 0행).
-            //    S > 240이면 60 ⊄ 300이 되어 이 폴백이 자격을 넓히고, 그 결과가 404보다 나빴다:
-            //      ① ReconcileJob.expireStaleAdmitted가 그 행을 status=4로 확정
-            //      ② 사용자는 이 폴백으로 **200**을 받고 COMPLETED가 발행됨
-            //      ③ 컨슈머 가드가 `IF(tokens.status = 1, ...)`라 status=4에서 **no-op**
-            //         (TokenJpaAdapter) → 행은 `status=4 / completed_at=NULL`로 **영구 고정**
-            //      ④ 재시도는 폴백 키가 지워져 404 — 멱등성까지 깨졌다
-            //    가용성이 아니라 **원장 무결성** 문제였고, Tenant는 200을 받아 알 수단이 없었다.
-            //    🔑 **이 이력을 지우지 마라** — `admitted_at`을 이벤트 payload 값으로 되돌리거나
-            //       reconcile cutoff를 다시 앱에서 계산하면 같은 사고가 그대로 재발한다.
-            //       (batch 시계로 되돌리면 방향만 반대인 같은 사고다.)
-            //
-            // ⚠️ 남은 앱 시계는 **원장 밖**이다: Redis `admitted` ZSet score와 TokenReclaimJob은
-            //    여전히 앱 시계고, 거기서 어긋나면 회수가 이르거나 늦을 뿐 되돌릴 수 있다.
-            //    issued_at도 앱 시계인데 **그게 맞다** — UNIQUE(token_id, issued_at) + 파티션 키 +
-            //    Kafka 재처리 멱등의 절반이라, DB 시계로 만들면 재처리마다 새 행이 생긴다.
-            //
-            // 🔴 **아래 WARN의 문구를 믿지 마라 — 폴백에 닿는 이유는 최소 둘이다.**
-            //    ① 컨슈머 적재 지연 (WARN이 말하는 그것)
-            //    ② **ADMITTED가 아직 발행조차 안 됐다** — admit.lua가 커밋되면 admitToken이 Redis에
-            //       즉시 보이는데(폴링은 Redis만 본다), publishAdmitted는 그 뒤에 건별 블로킹
-            //       .get()으로 **직렬** 발행한다. 그 사이에 사용자가 폴링 → verify → complete를
-            //       끝내면 COMPLETED가 ADMITTED보다 **먼저** 파티션에 append된다.
-            //    실측(2026-09-09, Kafka 오프셋 전수): stuck 7건 **전부** COMPLETED 오프셋 < ADMITTED
-            //    오프셋이었다. ADMITTED 발행 지연 67~128ms. 폴백 1,117건 중 16건(1.43%)이
-            //    COMPLETED 가드 `IF(tokens.status = 1, ...)`에서 no-op이 되어 status=1로 고착됐고,
-            //    300초 뒤 ReconcileJob이 status=4 / completed_at=NULL로 확정했다.
-            //    🪤 **이 WARN만 보고 Kafka·컨슈머를 조사하면 원인을 영영 못 찾는다** —
-            //       ②의 경우 컨슈머 랙은 0이다. 판별은 그 tokenId의 ADMITTED·COMPLETED
-            //       **오프셋 대소**로 한다. (별건 미해결)
-            //
-            // 🪤 시계 스큐로 여기 오던 경로는 §90으로 닫혔다. 예전 주석이 감시를
-            //    HostClockNotSynchronized에 맡긴다고 적었는데, 그 알람은 `node_timex_sync_status`
-            //    (= NTP 데몬이 커널을 먹이는가)를 볼 뿐이라 수동 `date -s`·스냅샷 복원·절전 복귀·
-            //    NTP가 틀린 시각 배포를 **못 잡는다**. 그 신뢰가 필요 없어진 것이 §90의 요점이다.
-            //
-            // ⚠️ **순서를 뒤집지 마라.** Redis를 먼저 보게 만들면, publishQuietly가 발행을
-            //    삼켰을 때 행이 status=1로 남고 ReconcileJob이 **완료된 토큰을 EXPIRED로
-            //    확정**한다(Redis 키는 이미 지워진 뒤라 복구 경로가 없다).
+            // 여기까지 왔다 = DB가 이 토큰을 아직 모른다(컨슈머 랙). 그래서 Redis로 폴백한다.
+            // 자격이 넓어지지 않는 근거는 불변식이다 — admit-by-admit PX 60초 ⊂ DB 창 300초.
+            // 🔑 시계는 전제가 아니다: 양변을 MySQL이 찍으므로 앱 시계 스큐에 면역이다(§90).
+            // ⚠️ 순서를 뒤집지 마라 — Redis를 먼저 보면 ReconcileJob이 완료 토큰을 EXPIRED로 확정한다.
+            // 근거·이력·실측 전문은 doc/DECISIONS.md §93.
             AdmitRef ref = queueEngine.findAdmitRefByAdmitToken(queueId, admitToken)
                     .filter(AdmitRef::complete)
                     .filter(r -> tokenId.equals(r.tokenId()))
