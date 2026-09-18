@@ -18,6 +18,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 
@@ -131,11 +137,45 @@ public class BatchProcessor implements SmartLifecycle {
      */
     private volatile Long drainDeadlineNanos = null;
 
+    /** 드레인 1틱의 소요. 이 값이 drain-interval(20ms)을 넘으면 틱이 밀리기 시작한 것이다. */
+    private final Timer drainTimer;
+    /** 한 틱이 빼간 건수. MAX_DRAIN(5000)에 붙으면 유입이 배출을 앞선 것이다. */
+    private final DistributionSummary drainBatchSize;
+    /** 구간별 소요. tag = tick(큐 대기) · redis(Lua) · mysql(용량 조회). kafka는 API 스레드에서 잰다. */
+    private final Timer tickWait, redisTimer, mysqlTimer;
+
+    /** 테스트용 — 레지스트리 없이 만든다. 측정은 SimpleMeterRegistry가 흡수한다. */
     public BatchProcessor(RedisQueueEngine queueEngine, QueueRepository queueRepository,
-                          @Value("${queue.enqueue.capacity-cache-ttl-ms:30000}") long capacityCacheTtlMillis) {
+                          long capacityCacheTtlMillis) {
+        this(queueEngine, queueRepository, capacityCacheTtlMillis, null);
+    }
+
+    /**
+     * 이유: enqueue 를 모아 한 Lua 로 보내는 드레인 루프.
+     * 문제: 지금까지 "어디서 30ms 가 가는가"를 **손으로만** 쟀다 — 다음 달엔 아무도 모른다.
+     * 해결: 계기판 넷을 코드에 심는다(길이·소요·배치크기·구간). 손으로 잰 숫자는 지식이고
+     *       코드에 심은 숫자는 자산이다.
+     * 🪤 MeterRegistry 가 없는 컨텍스트가 있어 ObjectProvider 로 받고 없으면 Simple 로 흡수한다.
+     *
+     * @author sonix
+     */
+    @Autowired
+    public BatchProcessor(RedisQueueEngine queueEngine, QueueRepository queueRepository,
+                          @Value("${queue.enqueue.capacity-cache-ttl-ms:30000}") long capacityCacheTtlMillis,
+                          ObjectProvider<MeterRegistry> registries) {
         this.queueEngine = queueEngine;
         this.queueRepository = queueRepository;
         this.capacityCacheTtlMillis = capacityCacheTtlMillis;
+        MeterRegistry reg = registries == null ? new SimpleMeterRegistry()
+                : registries.getIfAvailable(SimpleMeterRegistry::new);
+        this.drainTimer = Timer.builder("queue.drain.duration")
+                .description("드레인 1틱 소요. drain-interval(20ms)을 넘으면 틱이 밀린다").register(reg);
+        this.drainBatchSize = DistributionSummary.builder("queue.drain.batch.size")
+                .description("한 틱이 빼간 건수. MAX_DRAIN에 붙으면 유입이 배출을 앞섰다").register(reg);
+        this.tickWait = Timer.builder("queue.stage.duration").tag("stage", "tick")
+                .description("큐에 담긴 뒤 드레인까지 기다린 시간").register(reg);
+        this.redisTimer = Timer.builder("queue.stage.duration").tag("stage", "redis").register(reg);
+        this.mysqlTimer = Timer.builder("queue.stage.duration").tag("stage", "mysql").register(reg);
         log.info("enqueue drain: capacity-cache-ttl={}ms (0=off)", capacityCacheTtlMillis);
     }
 
@@ -299,7 +339,16 @@ public class BatchProcessor implements SmartLifecycle {
     @Scheduled(fixedRateString = "${queue.enqueue.drain-interval-ms:20}")
     public void processBatches() {
         // 1. Global Queue에서 최대 MAX_DRAIN 건 drain
+        long tickStart = System.nanoTime();
         List<PendingEnqueue> drained = drainGlobalQueue();
+        // 계기판: 몇 건을 빼갔고, 각자 얼마나 기다렸나. "틱 대기"가 지연의 정체였던 적이 있다(§enqueue-drain-interval).
+        // 🪤 빈 틱은 기록하지 않는다 — 20ms 주기라 초당 50건의 0이 분포를 덮어 백분위가 무의미해진다(실측).
+        if (!drained.isEmpty()) {
+            drainBatchSize.record(drained.size());
+            for (PendingEnqueue p : drained) {
+                tickWait.record(tickStart - p.getCreatedNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
+            }
+        }
 
         if (drained.isEmpty()) {
             return;
@@ -310,6 +359,7 @@ public class BatchProcessor implements SmartLifecycle {
 
         // 3. 바깥 루프: queue별
         grouped.forEach(this::processQueueGroup);
+        drainTimer.record(System.nanoTime() - tickStart, java.util.concurrent.TimeUnit.NANOSECONDS);
     }
 
     /**
@@ -377,7 +427,9 @@ public class BatchProcessor implements SmartLifecycle {
 
         long maxCapacity;
         try {
+            long mysqlStart = System.nanoTime();
             maxCapacity = getMaxCapacity(queueId);
+            mysqlTimer.record(System.nanoTime() - mysqlStart, java.util.concurrent.TimeUnit.NANOSECONDS);
         } catch (Exception e) {
             // 이 그룹의 실패가 사이클 전체를 깨면, 이미 drain된 다른 그룹의 요청들이
             // 아무 결과도 받지 못한 채 버려진다(Global Queue에서 이미 빠져나왔으므로
@@ -413,7 +465,9 @@ public class BatchProcessor implements SmartLifecycle {
         try {
             Instant issuedAt = Instant.now();
 
+            long redisStart = System.nanoTime();
             List<Object> bulkResult = queueEngine.executeBulkLua(queueId, chunk, maxCapacity, issuedAt);
+            redisTimer.record(System.nanoTime() - redisStart, java.util.concurrent.TimeUnit.NANOSECONDS);
             List<EnqueueResult> results = queueEngine.parseBulkResult(bulkResult);
             completePending(chunk, results);
         } catch (Exception e) {

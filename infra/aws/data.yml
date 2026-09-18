@@ -250,6 +250,30 @@ services:
   #    maxmemory 에 닿으면 enqueue 가 503 으로 죽는다 — 그 여유를 볼 수단이 이것뿐이다.
   # 🔑 노드마다 하나씩 띄우지 않는다. multi-target 모드로 하나가 6노드를 긁는다
   #    (Prometheus 가 /scrape?target=redis://... 로 호출한다).
+  # 🔴 **MySQL 서버 지표가 통째로 안 보였다.** 오늘(2026-09-18) 찾은 결함 셋이 전부 서버 쪽
+  #    지표로 드러났는데(커넥션 거절 8,296 · 인덱스 스캔 11.2억 행 · 락 대기), 볼 방법이 SSH
+  #    뿐이었다. 게다가 alerts/infra.yml 의 mysql_up·mysql_slave_status_* 규칙이 **대상이 없어
+  #    계속 no-data** 였다 — 규칙은 있는데 지표가 없는 상태다.
+  # 🪤 mysql 노드에서 돈다(DATA_IP 가 그 노드다). 전용 계정을 쓰지 않고 root 를 쓰는 이유는
+  #    이 판이 실측용이고 계정을 하나 더 만들면 .env·init 에 손이 더 가기 때문이다.
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.15.1
+    container_name: q-mysqld-exporter
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 200m
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 필요}
+    command:
+      - --mysqld.username=root
+      - --mysqld.address=127.0.0.1:3306
+      - --web.listen-address=:9104
+      # 🔑 기본 수집에 없는 것들을 켠다 — 오늘 손으로 떠야 했던 바로 그 지표들이다.
+      - --collect.info_schema.innodb_metrics
+      - --collect.global_status
+      - --collect.global_variables
+      - --collect.perf_schema.eventsstatementssum
+
   redis-exporter:
     image: oliver006/redis_exporter:v1.66.0
     container_name: q-redis-exporter
