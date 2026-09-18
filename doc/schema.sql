@@ -185,8 +185,14 @@ CREATE TABLE tokens (
     --    전용이라 no-op이고, 그것이 complete의 status IN (0,1) + 300초 창을 살린다.
     status            TINYINT      NOT NULL DEFAULT 0,
     -- 만료 사유 (ExpiredReason, §86). 셋의 의미가 정반대라 조치가 갈린다 —
-    --   1 ADMIT_TTL    admitToken TTL(60초) 만료.  ⚠️ **DB에는 남지 않는다** — 그 경로는 status=1이라
-    --                  EXPIRED 가드에서 no-op이고, 같은 사람이 300초 뒤 2로 기록된다. 이벤트에만 있다
+    --   1 ADMIT_TTL    admitToken TTL(60초) 만료.  🔴 **랙 구간에서는 DB에 남는다**(실측 259건,
+    --                  2026-09-18). 소비 가드가 status=0 에서만 4 로 바꾸는데, 컨슈머가 ADMITTED 를
+    --                  아직 적재하지 않았으면 DB status 가 0 이라 **가드가 참이 되어 0→4 를 적용한다.**
+    --                  그 뒤 도착한 ADMITTED 는 IF(status=0) 거짓으로 no-op → admit_token·admitted_at 이
+    --                  **영구 NULL**. 그러면 total_admit_issued(SUM(admitted_at IS NOT NULL))에서 빠지고,
+    --                  아래 queue_daily_stats 의 사유 3칸 어디에도 안 들어간다(1을 담는 컬럼이 없다).
+    --                  ⚠️ 랙이 없으면 status=1 이라 no-op 이고 300초 뒤 ReconcileJob 이 ADMIT_STALE(2)로
+    --                  쓴다 — 실측 비율 259 : 30,071. **발행 중단(안 A)은 미결이다**(AWS 측정 대기).
     --   2 ADMIT_STALE  complete 창(300초) 초과. ReconcileJob이 **직접 UPDATE**로 쓴다 → Tenant 귀책
     --   3 INACTIVE     inactiveTtl 초과(폴링 끊김) → 정상 이탈. 조치 없음
     --   4 WAITING_TTL  waitingTtl 초과 → **용량 부족**. "슬롯을 늘리라"고 통보할 유일한 값
@@ -309,7 +315,10 @@ CREATE TABLE queue_daily_stats (
     -- 만료 사유별 분해 (§86). 셋의 의미가 정반대라 합치면 조치로 이어지지 않는다 —
     --   admit_stale = Tenant 귀책(입장권 쥐고 안 들어옴) / inactive = 정상 이탈
     --   waiting_ttl = 용량 부족. "슬롯을 늘리라"고 통보해야 하는 유일한 값이다
-    -- ⚠️ 합이 total_expired와 다를 수 있다. expired_reason이 없던 시기의 행은 NULL이다
+    -- ⚠️ 합이 total_expired 와 다를 수 있다. **원인이 둘이다** —
+    --   ① expired_reason 이 없던 시기의 행(NULL)  ② 🔴 ADMIT_TTL(1). 1을 담는 컬럼이 없다(위 주석)
+    --   실측(2026-09-18): 99,062 = 30,071 + 0 + 68,732 + **259**, 그리고 NULL 행은 **0건**이었다.
+    --   즉 지금 그 격차는 100% ②다 — "차이가 곧 언제부터 사유를 남기기 시작했나"로 읽으면 틀린다.
     expired_admit_stale INT       NOT NULL DEFAULT 0,
     expired_inactive    INT       NOT NULL DEFAULT 0,
     expired_waiting_ttl INT       NOT NULL DEFAULT 0,

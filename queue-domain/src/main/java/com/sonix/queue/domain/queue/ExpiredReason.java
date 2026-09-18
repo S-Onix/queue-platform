@@ -25,10 +25,13 @@ public enum ExpiredReason {
     /**
      * admitToken TTL(60초) 만료. 입장권을 발급받고 그 안에 쓰지 않았다.
      *
-     * <p>🪤 <b>이 사유는 {@code EXPIRED} 이벤트로는 DB에 못 남긴다.</b> 컨슈머의 상태 가드가
-     * {@code IF(status = 0, 4, status)}라 {@code ADMIT_ISSUED(1)}에서 통째로 no-op이고,
-     * 그 가드는 늦은 입장을 살리려고 일부러 넣은 것이다(§36). 그래서 실제로 DB에 기록되는 것은
-     * {@link #ADMIT_STALE}이고, 이 상수는 <b>이벤트에 실려 사유를 잃지 않기 위한</b> 것이다.
+     * <p>🔴 <b>"이 사유는 DB에 못 남긴다"는 거짓이었다 — 랙 구간에서는 남는다</b>(실측 259건, 2026-09-18).
+     * 컨슈머 가드가 {@code IF(status = 0, 4, status)}인데 <b>그 {@code status}는 DB 값</b>이고,
+     * 회수 판정은 Redis가 한다. {@code ADMITTED}가 아직 적재되지 않았으면 DB는 {@code 0}이라
+     * 가드가 참이 되어 {@code 0 → 4}를 적용하고, 뒤늦은 {@code ADMITTED}는 no-op이 되어
+     * {@code admit_token}·{@code admitted_at}이 <b>영구 NULL</b>로 남는다.
+     * 랙이 없으면 의도대로 {@code ADMIT_ISSUED(1)}에서 no-op이고(늦은 입장을 살리는 가드다, §36),
+     * 그때 DB에 남는 것은 {@link #ADMIT_STALE}이다 — 실측 비율 <b>259 : 30,071</b>.
      */
     ADMIT_TTL(1),
 

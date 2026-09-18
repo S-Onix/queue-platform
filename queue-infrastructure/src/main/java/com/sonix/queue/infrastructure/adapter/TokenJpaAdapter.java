@@ -177,8 +177,11 @@ public class TokenJpaAdapter implements TokenRepository {
         // 🪤 값을 '?'가 아니라 new.expired_reason으로 받는 이유: ODKU의 SET 절에 '?'를 쓰면
         //    rewriteBatchedStatements가 조용히 꺼진다(admit_token이 같은 우회를 하는 그 이유).
         //    INSERT의 VALUES 자리에 있는 '?'는 그 문제가 없다.
-        // 🪤 admitToken TTL 만료(ADMIT_TTL)는 status가 1이라 여기서 통째로 no-op이므로
-        //    DB에 남지 않는다. 그 경로의 사유는 ReconcileJob의 직접 UPDATE가 ADMIT_STALE로 쓴다.
+        // 🔴 **admitToken TTL 만료(ADMIT_TTL)가 "DB에 남지 않는다"는 거짓이었다** (실측 259건, 2026-09-18).
+        //    랙 구간에는 ADMITTED가 아직 적재되지 않아 DB status가 0이고, 그러면 이 가드가 참이 되어
+        //    0→4를 적용한다. 뒤늦은 ADMITTED는 위 가드(status=0)에 걸려 no-op이 되므로
+        //    admit_token·admitted_at이 영구 NULL이다 → total_admit_issued 과소 계상.
+        //    랙이 없으면 status=1이라 통째로 no-op이고, 그 경로의 사유는 ReconcileJob이 ADMIT_STALE로 쓴다.
         sql.put(TokenEventType.EXPIRED, TRANSITION_INSERT + """
                 expired_reason = IF(tokens.status = 0, new.expired_reason, tokens.expired_reason),
                 status         = IF(tokens.status = 0, 4, tokens.status)""");

@@ -290,8 +290,11 @@ public class TokenReclaimJob {
      *
      * <table><caption>경로별 효과</caption>
      *   <tr><th>호출자</th><th>회수 시점 status</th><th>발행의 효과</th></tr>
-     *   <tr><td>{@link #reclaimExpiredAdmits}(§36)</td><td>1 (ADMIT_ISSUED)</td>
-     *       <td><b>no-op</b> — 발행에 실패해도 결과가 같다</td></tr>
+     *   <tr><td>{@link #reclaimExpiredAdmits}(§36)</td><td>Redis 기준 만료 · <b>DB는 1 또는 0</b></td>
+     *       <td>🔴 <b>DB가 1이면 no-op, 0이면 0→4를 적용한다</b> — 실측 259건(2026-09-18).
+     *       회수 판정은 Redis가 하고 가드는 DB를 보므로, 컨슈머가 ADMITTED를 아직 적재하지 않았으면
+     *       가드가 참이 된다. 그 행은 admit_token·admitted_at이 영구 NULL이 되어 통계에서 샌다
+     *       (발행 중단 안은 미결 — AWS 측정 대기)</td></tr>
      *   <tr><td>{@link #reclaimInactive}(§82)</td><td><b>0 (WAITING)</b></td>
      *       <td><b>실제로 0 → 4를 적용한다</b></td></tr>
      *   <tr><td>{@link #reclaimExpiredWaiting}(waitingTtl)</td><td><b>0 (WAITING)</b></td>
@@ -309,7 +312,8 @@ public class TokenReclaimJob {
      * <p><b>발행 실패를 삼킨다.</b> Redis는 이미 커밋됐고(키에서 빠졌고 {@code tokens} 필드도
      * 지워졌다) 되돌릴 수단이 없어 재시도해도 상태가 나아지지 않는다 (§80 Consequences ③).
      *
-     * <p><b>🔴 대가는 경로마다 다르다.</b> admit 만료분은 위 표대로 no-op이라 피해가 없지만,
+     * <p><b>🔴 대가는 경로마다 다르다.</b> admit 만료분은 <b>DB가 1일 때만</b> no-op이라 피해가 없고,
+     * 랙으로 DB가 0이면 잘못된 종결을 만든다(위 표). inactive·waitingTtl 회수분은 발행이 유실되면
      * inactive·waitingTtl 회수분은 발행이 유실되면 Redis에서 사라진 채 DB가 영원히
      * {@code WAITING(0)}으로 남고 <b>reconciliation이 대조할 원본조차 없다</b>.
      * <b>지금은 에러 로그가 유일한 단서</b>다.

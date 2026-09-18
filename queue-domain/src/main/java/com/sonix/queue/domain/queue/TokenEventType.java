@@ -62,7 +62,11 @@ public enum TokenEventType {
      * {@code status = 1}인데 소비 측 가드가 {@code IF(status = 0, 4, status)}라 no-op이다.
      * 의도된 동작이다(§36) — {@code complete}의 술어가 {@code status IN (0, 1)}이고 유효 창이
      * 300초라 <b>늦은 입장이 정상 경로로 실재</b>한다. 가드를 넓히면 그 경로가 죽는다.
-     * {@code 4}에 실제로 닿는 것은 {@code waitingTtl}·{@code inactiveTtl} 만료(출발이 0)뿐이다.
+     * 🔴 <b>{@code 4}에 닿는 경로는 셋이다 — 이 줄은 예전에 하나라고 적고 있었고 거짓이었다.</b>
+     * ① {@code waitingTtl}·{@code inactiveTtl} 만료(출발 {@code 0}, 위 가드)
+     * ② {@code ReconcileJob}의 직접 UPDATE({@code status=1 → 4}, {@code ADMIT_STALE}) — 실측 30,071건
+     * ③ 🔴 랙 구간의 admitToken TTL 만료 — DB가 아직 {@code 0}이라 가드가 참이 된다. 실측 259건
+     *    (2026-09-18). ③은 결함이고 ①②는 설계다 — {@code ExpiredReason.ADMIT_TTL} 참조.
      */
     public TokenStatus targetStatus() {
         return targetStatus;
