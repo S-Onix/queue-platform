@@ -8,14 +8,17 @@
 # ============================================================================
 
 spring:
+  # 🔑 useLocalSessionState=true — 드라이버가 autocommit·isolation 을 서버에 되묻지 않는다.
+  #    AWS 8차(500만) 전수 집계에서 이 왕복이 **쿼리 1,055만 건 / MySQL CPU 756초(예산 2.8%)** 였다.
+  #    🪤 앱이 세션 변수를 직접 바꾸면 드라이버가 그것을 모른다 — 이 레포엔 그런 코드가 없다(전수 확인).
   datasource:
     master:
-      jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      jdbc-url: jdbc:mysql://127.0.0.1:3306/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: queueapp
       password: queueapp1234
       maximum-pool-size: 10
     replica:
-      jdbc-url: jdbc:mysql://127.0.0.1:3307/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      jdbc-url: jdbc:mysql://127.0.0.1:3307/queue_platform?useSSL=false&allowPublicKeyRetrieval=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: queueapp
       password: queueapp1234
       maximum-pool-size: 10

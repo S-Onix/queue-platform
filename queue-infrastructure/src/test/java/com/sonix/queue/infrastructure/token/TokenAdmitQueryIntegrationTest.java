@@ -356,6 +356,35 @@ class TokenAdmitQueryIntegrationTest {
         assertThat(adapter.countWaitingUpTo(QUEUE_ID, 100L)).isEqualTo(2L);
     }
 
+    @Test
+    @Transactional
+    @DisplayName("findSettledMaxSeq: FORCE INDEX가 가리키는 인덱스가 실제로 있고, 정착 경계 이전의 최대 seq를 준다")
+    void findSettledMaxSeq_usesPinnedIndexAndRespectsBoundary() {
+        // 🔑 이 단정의 첫째 목적은 값이 아니라 **쿼리가 실행되는 것 자체**다.
+        //    findSettledMaxSeq는 FORCE INDEX (idx_tokens_queue_issued_seq)로 인덱스 이름을 SQL에
+        //    박아 뒀다(예산 6.1% + 판 안에서 5배 악화를 끊기 위해서다). 이름이 schema.sql과
+        //    어긋나면 MySQL이 1176 에러로 죽는데, 목으로 막힌 테스트는 그걸 절대 못 잡는다.
+        LocalDateTime early = ISSUED_AT;                       // 경계 이전
+        LocalDateTime late = ISSUED_AT.plusMinutes(10);        // 경계 이후
+        jdbc.update("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, "tok_dev_r9", QUEUE_ID, tenantId, "u9", 30L, early);
+        jdbc.update("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, "tok_dev_r10", QUEUE_ID, tenantId, "u10", 40L, late);
+
+        LocalDateTime cutoff = ISSUED_AT.plusMinutes(5);
+        // 경계 이후의 seq=40은 빠진다 — 컨슈머가 아직 못 따라온 구간을 대사에 넣지 않으려는 것이 이 쿼리의 일이다.
+        assertThat(adapter.findSettledMaxSeq(QUEUE_ID, cutoff)).isEqualTo(30L);
+        // 경계를 넓히면 둘 다 들어온다.
+        assertThat(adapter.findSettledMaxSeq(QUEUE_ID, late.plusMinutes(1))).isEqualTo(40L);
+        // 🪤 status를 보지 않는다 — 대사 기준선은 "발행된 것 중 가장 큰 seq"라야 한다.
+        jdbc.update("UPDATE tokens SET status = 2 WHERE token_id = ?", "tok_dev_r9");
+        assertThat(adapter.findSettledMaxSeq(QUEUE_ID, cutoff)).isEqualTo(30L);
+    }
+
     private int statusOf(String tokenId) {
         return jdbc.queryForObject("SELECT status FROM tokens WHERE token_id = ?", Integer.class, tokenId);
     }

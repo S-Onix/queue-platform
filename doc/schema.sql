@@ -210,7 +210,18 @@ CREATE TABLE tokens (
     UNIQUE KEY uq_tokens_token_id         (token_id, issued_at),
     INDEX idx_tokens_token_status         (token_id, status),          -- ⚠️ 삭제 후보: uq_tokens_token_id가 (token_id, ...) 접두로 커버
     INDEX idx_tokens_queue_status_issued  (queue_id, status, issued_at),
-    INDEX idx_tokens_queue_user_status    (queue_id, user_id, status), -- ⚠️ 삭제 후보: 중복 판정은 Lua HSETNX(tokens Hash)가 한다. 6개 중 가장 넓다
+    -- 🔑 idx_tokens_queue_user_status (queue_id, user_id, status) 를 **이것으로 교체했다** (AWS 8차).
+    --    지운 이유: user_id 가 술어에 쓰이는 쿼리가 **0건**이다(전수 확인 — INSERT 컬럼 목록에만 등장).
+    --    중복 판정은 Lua HSETNX(tokens Hash)가 하므로 DB 인덱스가 할 일이 없었고, 6개 중 가장 넓었다.
+    --    넣은 이유: ReconcileJob 의 findSettledMaxSeq 가
+    --      SELECT MAX(seq) WHERE queue_id = ? AND issued_at < ?
+    --    인데 (queue_id, status, issued_at) 로는 **status 를 안 줘서 두 번째 컬럼에서 멈춘다.**
+    --    게다가 seq 가 인덱스에 없어 행 조회까지 갔다 — 호출 4,100번에 MySQL CPU 1,686초(예산 6.1%),
+    --    그리고 판 안에서 372ms → **1,776ms 로 5배 악화**했다. 부하가 아니라 **행 수의 함수**라
+    --    방치하면 혼자 커진다. 이 인덱스로는 범위 끝에서 바로 읽고 seq 가 안에 있어 커버링이다.
+    --    🔑 **추가가 아니라 교체인 이유**: 인덱스 총량이 이미 데이터보다 크다(2,719 vs 1,865MB).
+    --       버퍼풀 2GB 로는 안 들어가는 상태라, 늘리면 다른 쿼리의 이득을 깎는다.
+    INDEX idx_tokens_queue_issued_seq     (queue_id, issued_at, seq),
     INDEX idx_tokens_status_admit         (status, issued_at)          -- ⚠️ 삭제 후보(Sprint 9 확정 후). 이름의 admit은 admit_token과 무관 — 오해를 부른다
 
     -- 🔴 fk_tokens_queue 삭제 (2026-08-17)
@@ -248,6 +259,33 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
     PARTITION p_future  VALUES LESS THAN MAXVALUE
 );
 
+
+-- ================================================================
+-- 🔧 기존 DB 마이그레이션 — tokens 인덱스 교체 (2026-09-18, AWS 8차 후속)
+-- ================================================================
+--   위 CREATE TABLE 은 새로 만드는 DB 용이다. **이미 돌고 있는 DB 에는 아래를 실행한다.**
+--   master · replica 양쪽에서 실행하라 (복제로 전파되지만, 수동 구성이면 확인이 필요하다).
+--
+--   ⚠️ **순서를 지켜라 — DROP 을 먼저.** 인덱스 총량이 이미 데이터보다 크고(2,719 vs 1,865MB)
+--      버퍼풀이 2GB 다. ADD 를 먼저 하면 그 순간 총량이 더 커져 iowait 가 튄다.
+--
+--   ⚠️ **부하가 도는 중에 하지 마라.** 파티션 26개짜리 대형 테이블의 ALTER 는 테이블 MDL 을
+--      잡고, 뒤에 온 INSERT 가 **함께 막힌다**(2026-08-26 DROP PARTITION 실측 3.05초).
+--      lock_wait_timeout 기본값이 365일이라 세션에서 먼저 유계화하라.
+
+--   🪤 **주석으로 둔다 — 실행 가능한 문장으로 두면 CI 가 깨진다.** CI 는 이 파일을 통째로
+--      주입하는데(scripts/ci/load-schema.sh), 새로 만드는 DB 에는 지울 인덱스가 애초에 없어
+--      `ERROR 1091` 로 죽는다(2026-09-18 실측). 위 CREATE TABLE 이 이미 새 인덱스를 갖고 있어
+--      **새 DB 에는 할 일이 없다.** 아래는 이미 돌고 있는 DB 에만 사람이 붙여 실행한다.
+--
+--     SET SESSION lock_wait_timeout = 3;
+--     ALTER TABLE tokens DROP INDEX idx_tokens_queue_user_status;
+--     ALTER TABLE tokens ADD  INDEX idx_tokens_queue_issued_seq (queue_id, issued_at, seq);
+
+--   검증 — 교체가 실제로 먹었는지 본다. type=range, key=idx_tokens_queue_issued_seq,
+--   Extra 에 "Using index" 가 있어야 한다(커버링). 행 조회가 남아 있으면 seq 가 인덱스에
+--   안 들어간 것이다.
+-- EXPLAIN SELECT MAX(seq) FROM tokens WHERE queue_id = 'q-...' AND issued_at < '2026-09-18 00:00:00';
 
 -- ================================================================
 -- 🔴 admit_requests 테이블 삭제 (2026-08-17, DECISIONS §80)
