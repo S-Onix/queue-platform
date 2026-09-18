@@ -17,12 +17,26 @@ spring:
       jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
-      maximum-pool-size: 50
+      # 🔴 **풀 크기는 Little's law 로 정한다 — 크게 잡는 것이 안전한 게 아니다** (AWS 10차 실측).
+      #    L = λ × W = 548/s × 9.41ms = **5.15 커넥션**(api 6대 합) = 인스턴스당 0.86개.
+      #    그런데 예전 설정은 6×(50+50)=600 이었고, batch·consumer 를 더해 **640 > max_connections 500** 이라
+      #    `Threads_connected 501` 로 한도를 채워 **연결 거절 8,296회**가 났다. 관리자 접속조차 막혔다.
+      #    🪤 활성은 **1개**였다 — 트랜잭션이 길어서가 아니라 Hikari 의 `minimumIdle` 기본값이
+      #       `maximumPoolSize` 라 **쓰지도 않는 커넥션을 최대치로 열어두기** 때문이다. 그래서 둘 다 적는다.
+      maximum-pool-size: 20
+      minimum-idle: 5
     replica:
       jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
-      maximum-pool-size: 50
+      # replica 는 **앱이 읽는 경로가 0** 이다(master-replica-routing). 그런데 예전엔 50 을 열어
+      # 커넥션의 43%(213개)를 점유했다. 빈 풀로 두지 않는 이유는 readOnly 트랜잭션이 새로 생길 때
+      # 최소한 동작은 해야 하기 때문이다.
+      # 🔴 **실측 판(infra/aws)에는 replica 인스턴스가 없다 — DB_REPLICA_HOST 가 master 를 가리킨다**
+      #    (app.yml:28). 즉 이 풀은 분산이 아니라 **같은 MySQL 에 두 번 붙는 것**이고, 그래서
+      #    한도(max_connections)를 두 배로 먹었다. "replica 니까 부하가 갈린다"고 읽지 마라.
+      maximum-pool-size: 5
+      minimum-idle: 1
 
   jpa:
     hibernate:
