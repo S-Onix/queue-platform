@@ -130,9 +130,37 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
                             @Param("validWindowSeconds") int validWindowSeconds,
                             @Param("limit") int limit);
 
-    /** 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq. 없으면 NULL이라 호출자가 0으로 바꾼다. */
+    /**
+     * 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq. 없으면 NULL이라 호출자가 0으로 바꾼다.
+     *
+     * <p>🔑 <b>{@code FORCE INDEX}가 붙은 이유 — 인덱스만 만들어도 안 쓴다.</b> AWS 8차에서 이 쿼리가
+     * 호출 4,100번에 MySQL CPU <b>1,686초(예산 6.1%)</b>를 먹고 판 안에서 372ms → 1,776ms로 5배
+     * 악화했다. {@code status}를 술어에 안 줘서 {@code (queue_id, status, issued_at)}의 두 번째
+     * 컬럼에서 멈추고, {@code seq}가 그 인덱스에 없어 <b>행 조회까지</b> 갔기 때문이다.
+     *
+     * <p>그래서 {@code (queue_id, issued_at, seq)}를 만들었는데(schema.sql), <b>옵티마이저가
+     * 고르지 않는다</b> — {@code queue_id} 등치만 쓰는 {@code ref} 접근을 {@code range}보다 싸게
+     * 본다. {@code ANALYZE TABLE} 뒤에도 같다(2026-09-18 로컬 27만 행 실측):
+     * <pre>
+     *   기존 인덱스(옵티마이저 선택)  ref   rows 130,689  Using index condition   43ms
+     *   새 인덱스(FORCE)             range rows 123,370  Using index(커버링)     24ms
+     *   교체 이전 원래 상태           ref   rows 112,722                          57ms
+     * </pre>
+     * 커버링이라 행 조회가 0이다 — <b>버퍼풀이 테이블보다 작은 환경(AWS 8차: 2GB &lt; 4,584MB)에서
+     * 차이가 더 커진다.</b> 로컬은 27만 행이 전부 버퍼풀에 들어가 이 이득의 하한만 보인 것이다.
+     *
+     * <p>🪤 <b>{@code MAX(seq)}를 {@code ORDER BY issued_at DESC LIMIT 1}로 바꾸면 1행만 읽어
+     * 훨씬 빠르지만, 그렇게 하지 않았다.</b> 그 변환은 "{@code seq}와 {@code issued_at}이 같은
+     * 방향으로 증가한다"를 전제하는데, {@code seq}는 Redis {@code INCR}이고 {@code issued_at}은
+     * <b>API 서버 N대의 앱 시계</b>라 동시 구간에서 역전될 수 있다. 이 값은 대사의 기준선이고
+     * Redis·DB 양쪽이 <b>같은 경계</b>를 세야 하므로, 경계가 몇 개 흔들리면 없는 불일치가 보인다.
+     * 정확성을 성능과 바꾸지 않는다.
+     *
+     * <p>🪤 인덱스 이름이 바뀌면 이 쿼리는 <b>에러로 죽는다</b>(조용히 느려지지 않는다) —
+     * 그게 낫다. schema.sql의 {@code idx_tokens_queue_issued_seq}와 이름이 묶여 있다.
+     */
     @Query(value = """
-            SELECT MAX(seq) FROM tokens
+            SELECT MAX(seq) FROM tokens FORCE INDEX (idx_tokens_queue_issued_seq)
              WHERE queue_id = :queueId AND issued_at < :issuedBefore
             """, nativeQuery = true)
     Long findSettledMaxSeq(@Param("queueId") String queueId,
