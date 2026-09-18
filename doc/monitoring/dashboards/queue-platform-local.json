@@ -1001,12 +1001,12 @@
     },
     {
       "type": "timeseries",
-      "title": "구간별 소요 p95 (queue.stage.duration)",
+      "title": "구간별 소요 p5·p30·p95·p99 (queue.stage.duration)",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "손으로 쟀던 분해를 영구히 — tick(틱 대기) · redis(Lua) · mysql(용량) · kafka(동기 발행).\n📏 기준선(로컬 실측): kafka 18ms(콜드 404ms) · tick 평균 10ms · redis 0.16ms · mysql 1.34ms",
+      "description": "손으로 쟀던 분해를 영구히 — tick(틱 대기) · redis(Lua) · mysql(용량) · kafka(동기 발행).\n📏 기준선(로컬): kafka 18ms(콜드 404ms) · tick 평균 10ms · redis 0.16ms · mysql 1.34ms\n🪤 p5 는 '가장 빠른 쪽이 얼마나 빠른가'다 — p95 만 보면 꼬리만 보고 분포 이동을 놓친다.",
       "gridPos": {
         "h": 6,
         "w": 8,
@@ -1030,15 +1030,42 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
+          "refId": "A",
+          "expr": "histogram_quantile(0.05, sum by (le,stage) (rate(queue_stage_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{stage}} p5"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "refId": "B",
+          "expr": "histogram_quantile(0.3, sum by (le,stage) (rate(queue_stage_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{stage}} p30"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "refId": "C",
           "expr": "histogram_quantile(0.95, sum by (le,stage) (rate(queue_stage_duration_seconds_bucket[5m])))",
-          "legendFormat": "{{stage}}",
-          "refId": "A"
+          "legendFormat": "{{stage}} p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "refId": "D",
+          "expr": "histogram_quantile(0.99, sum by (le,stage) (rate(queue_stage_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{stage}} p99"
         }
       ]
     },
     {
       "type": "timeseries",
-      "title": "드레인 틱 소요 · 배치 크기",
+      "title": "드레인 틱 p5·p30·p95·p99 · 배치 크기",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1067,18 +1094,45 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(queue_drain_duration_seconds_bucket[5m])))",
-          "legendFormat": "drain p95",
-          "refId": "A"
+          "refId": "A",
+          "expr": "histogram_quantile(0.05, sum by (le) (rate(queue_drain_duration_seconds_bucket[5m])))",
+          "legendFormat": "drain p5"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
+          "refId": "B",
+          "expr": "histogram_quantile(0.3, sum by (le) (rate(queue_drain_duration_seconds_bucket[5m])))",
+          "legendFormat": "drain p30"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "refId": "C",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(queue_drain_duration_seconds_bucket[5m])))",
+          "legendFormat": "drain p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "refId": "D",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(queue_drain_duration_seconds_bucket[5m])))",
+          "legendFormat": "drain p99"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "refId": "E",
           "expr": "rate(queue_drain_batch_size_sum[5m]) / rate(queue_drain_batch_size_count[5m])",
-          "legendFormat": "배치 평균",
-          "refId": "B"
+          "legendFormat": "배치 평균"
         }
       ]
     },

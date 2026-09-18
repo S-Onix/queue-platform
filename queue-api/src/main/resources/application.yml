@@ -162,7 +162,9 @@ management:
       percentiles-histogram:
         http.server.requests: true                # p50/p95/p99 자동
       percentiles:
-        http.server.requests: 0.5, 0.95, 0.99    # 명시적
+        # 🪤 이 값들은 **인스턴스 안에서 계산된 분위수**라 노드 간 합산이 불가능하다.
+        #    여러 대를 묶어 보려면 아래 percentiles-histogram 의 _bucket 을 PromQL 로 집계해야 한다.
+        http.server.requests: 0.05, 0.3, 0.5, 0.95, 0.99
 
 # JWT 관련 내용 추가 (Duration 표기: 15m, 7d, 30s 등)
 jwt:

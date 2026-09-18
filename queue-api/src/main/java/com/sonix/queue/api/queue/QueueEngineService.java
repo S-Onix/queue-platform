@@ -38,21 +38,30 @@ public class QueueEngineService {
     private final MeterRegistry meterRegistry;
 
     /**
-     * {@code queue_admission_wait_seconds}의 버킷 경계 (MONITORING_DESIGN 4-3).
-     *
-     * <p><b>여기 한 곳에만 있다.</b> 경계는 SLO 판단이라 바뀔 값이고(경고 p95 1분 · 위험 5분이
-     * 60·300에 걸려 있다), 흩어 놓으면 알람과 어긋난다. 늘리면 시계열이 큐당 버킷 수만큼 는다.
+     * 이유: {@code queue_admission_wait_seconds} 의 버킷 경계(MONITORING_DESIGN 4-3). <b>여기 한 곳에만 있다.</b>
+     * 문제: 상한이 3600초였을 때 AWS 8차(500만)에서 <b>p95 가 1시간에 박혔다 — 초과 27.1%</b>.
+     * 원인: 마지막 유한 버킷을 넘긴 표본은 전부 {@code +Inf} 로 몰려 백분위가 그 경계에서 포화한다.
+     *       <b>기록은 되는데 읽을 수 없는 값</b>이 된다.
+     * 해결: 위로 7200·14400(판 최대 소요 위), 아래로 1·3초를 더한다 —
+     *       <b>p5·p30 을 보려면 저구간 해상도가 필요하다</b>(10초에서 시작하면 p5 가 한 버킷에서 보간된다).
+     * 🪤 경계는 SLO 판단이라 흩어 놓으면 알람과 어긋난다(경고 p95 1분·위험 5분이 60·300 에 걸려 있다).
      */
     private static final Duration[] ADMISSION_WAIT_SLO = {
-            Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(60),
-            Duration.ofSeconds(120), Duration.ofSeconds(300), Duration.ofSeconds(600),
-            Duration.ofSeconds(1800), Duration.ofSeconds(3600)
+            Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(10), Duration.ofSeconds(30),
+            Duration.ofSeconds(60), Duration.ofSeconds(120), Duration.ofSeconds(300), Duration.ofSeconds(600),
+            Duration.ofSeconds(1800), Duration.ofSeconds(3600),
+            Duration.ofSeconds(7200), Duration.ofSeconds(14400)
     };
 
-    /** 구간별 소요 버킷. 실측 kafka 18ms(콜드 404ms) 를 덮는다 — 경계가 없으면 _bucket 미발행이라 p95 패널이 빈다. */
+    /**
+     * 이유: 구간별 소요 버킷. 경계가 없으면 {@code _bucket} 미발행이라 p95 패널이 빈다.
+     * 🪤 상한은 <b>가능한 최대</b>에 맞춘다 — kafka 구간은 {@code send-timeout} 12초까지 갈 수 있어
+     *    1초에서 끊으면 부하 중에 p95 가 1초에 포화한다(§admission-wait 와 같은 결함).
+     */
     private static final Duration[] STAGE_SLO = {
             Duration.ofMillis(1), Duration.ofMillis(5), Duration.ofMillis(10), Duration.ofMillis(20),
-            Duration.ofMillis(50), Duration.ofMillis(100), Duration.ofMillis(500), Duration.ofSeconds(1)};
+            Duration.ofMillis(50), Duration.ofMillis(100), Duration.ofMillis(500),
+            Duration.ofSeconds(1), Duration.ofSeconds(3), Duration.ofSeconds(12)};
 
     public QueueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher,
