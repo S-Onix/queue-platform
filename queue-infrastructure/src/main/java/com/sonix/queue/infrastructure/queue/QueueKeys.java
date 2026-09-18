@@ -3,8 +3,7 @@ package com.sonix.queue.infrastructure.queue;
 /**
  * 이유: Queue Engine Redis 키 중앙 관리. 캐시가 아니라 <b>Lua 원자 연산으로 다루는 원본</b>이다.
  * 🔴 <b>해시태그 {@code {queueId}} 필수</b> — 없으면 다중 키 Lua 가 {@code CROSSSLOT} 이다.
- * 🔑 <b>거부 기준이 둘이다</b>(실측) — 선언한 키는 슬롯이 갈리면 즉시 거부되지만, <b>선언 안 한 키는
- *    같은 노드면 조용히 성공</b>한다(4대 ≈ 25%). 초록은 증거가 아니다.
+ * 🔑 <b>거부 기준이 둘이다</b>(실측) — 선언한 키는 슬롯이 갈리면 즉시 거부되지만, <b>선언 안 한 키는 같은 노드면 조용히 성공</b>한다(4대 ≈ 25%). 초록은 증거가 아니다.
  * 🪤 로컬 Sentinel 로는 원리적으로 못 잡는다(슬롯 개념이 없다) — 그래서 분기를 지웠다(§75 D28).
  * ❌ 태그를 shard 단위로 옮기지 마라(§75 기각) — 판정이 <b>질문을 만들려면 답을 알아야</b> 하게 된다.
  *
@@ -26,8 +25,7 @@ public final class QueueKeys {
 
     /**
      * 이유: identifier → {@code "tokenId|issuedAt"} 매핑 Hash(발급 원장 + EXISTS 재사용).
-     * 🔴 <b>이 Hash 의 필드 존재가 중복 게이트다</b>({@code HSETNX}) — {@code waiting} ZSet 은 아니다
-     *    (admit 되면 빠지므로 게이트로 쓰면 재-enqueue 가 신규로 판정돼 <b>과금이 중복</b>된다).
+     * 🔴 <b>이 Hash 의 필드 존재가 중복 게이트다</b>({@code HSETNX}) — {@code waiting} ZSet 이 아니다(admit 되면 빠져 재-enqueue 가 신규로 판정된다).
      * 🔴 사람을 큐에서 빼는 <b>네 경로가 이 필드를 마지막에 {@code HDEL}</b> 한다(안 지우면 영구 락아웃).
      * 🔴 <b>키는 identifier(사람)인데 값은 tokenId(회차)</b>라 지울 때 값을 대조해야 한다 —
      *    안 하면 늦은 complete 가 <b>다음 회차를 축출</b>한다(실제 결함이었다).

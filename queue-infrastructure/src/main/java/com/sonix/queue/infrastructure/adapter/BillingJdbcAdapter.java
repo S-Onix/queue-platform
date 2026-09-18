@@ -35,10 +35,8 @@ public class BillingJdbcAdapter implements BillingRepository {
 
     /**
      * 이유: 큐×일 집계. {@code UPSERT_MONTHLY} 바로 뒤에 돌리면 버퍼풀이 따뜻하다(실측 180ms / 16만 행).
-     * 🔴 <b>{@code ODKU id = id} 로 두지 마라</b> — 멱등이 아니라 <b>불변</b>이 되어 늦은 admit 이 영원히
-     *    반영되지 않는다. <b>오래 기다린 사람일수록 늦게 붙어</b> 이 표가 남기려던 것만 버린다.
-     * 🔴 <b>{@code SUM(admitted_at IS NOT NULL)} 이다</b> — {@code status = 1} 로 세면 0 이 된다
-     *    (대사가 잔류를 4로 정리한다. 실측 15,151건이 4 아래 숨었다). <b>{@code AVG} 도 금지</b>(합산 불가).
+     * 🔴 <b>{@code ODKU id = id} 로 두지 마라</b> — 멱등이 아니라 <b>불변</b>이 되어 늦은 admit 이 영원히 반영되지 않는다. <b>오래 기다린 사람일수록 늦게 붙어</b> 이 표가 남기려던 것만 버린다.
+     * 🔴 <b>{@code SUM(admitted_at IS NOT NULL)} 이다</b> — {@code status = 1} 로 세면 0 이다(대사가 잔류를 4로 정리. 실측 15,151건). <b>{@code AVG} 도 금지</b>.
      * 🪤 <b>{@code =} 가 아니라 {@code <=>}</b> — NULL 허용 컬럼이라 전 행이 NULL 이면 SUM 이 NULL 을
      *    돌려주고 {@code NOT NULL} 컬럼에 적재가 통째로 실패한다(실측 8건).
      */
@@ -183,8 +181,7 @@ public class BillingJdbcAdapter implements BillingRepository {
 
     /**
      * 이유: 파티션을 지운다. 🔴 <b>되돌릴 수 없다</b>(호출 조건은 포트 javadoc).
-     * 문제: {@code DROP PARTITION} 은 <b>테이블 전체에 배타적 MDL</b> 을 잡아, 긴 트랜잭션이 물고 있으면
-     *       <b>그 뒤에 도착한 평범한 INSERT 가 전부 줄을 선다</b>(실측 3.05초 블록).
+     * 문제: {@code DROP PARTITION} 은 <b>테이블 전체에 배타적 MDL</b> 을 잡아, 긴 트랜잭션이 물고 있으면 <b>그 뒤에 도착한 평범한 INSERT 가 전부 줄을 선다</b>(실측 3.05초 블록).
      * 원인·해결: {@code lock_wait_timeout} 기본값이 <b>365일</b>이라 짧게 걸어 즉시 포기시킨다
      *       (3.05 → 1.04초) — <b>지연은 공짜고 블로킹은 사고다</b>.
      * 🪤 세션 변수라 <b>커넥션 풀에 남는다</b> — 원복까지 같은 {@code execute} 안에서 한다.

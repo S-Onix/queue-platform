@@ -237,8 +237,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     /**
      * 이유: 쓰기 경로 — 소유자를 못 찾으면 <b>DB 의 배정 기록</b>을 따른다.
-     * 문제: cluster1 을 기본값으로 주면 cluster2 에 배정된 큐의 <b>첫 enqueue</b> 가 cluster1 에 키를
-     *       만들어 배정이 통째로 무의미해진다.
+     * 문제: cluster1 을 기본값으로 주면 cluster2 에 배정된 큐의 <b>첫 enqueue</b> 가 cluster1 에 키를 만들어 배정이 통째로 무의미해진다.
      * 해결: 쓰기 경로에만 이 조회를 둔다 — 읽기에 달면 인증 없는 폴링이 DB 조회를 유발한다.
      * 🔴 <b>쓰기 계열은 전부 이걸 거쳐야 한다</b>(admit · claim 3종 · cleanup). 템플릿을 직접 쓰면
      *    명령이 엉뚱한 클러스터에서 돌아 <b>조용히 0건</b>을 반환하고, <b>단일 클러스터에서는 안 잡힌다</b>.

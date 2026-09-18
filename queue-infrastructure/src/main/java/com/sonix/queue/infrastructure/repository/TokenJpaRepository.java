@@ -96,11 +96,9 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
 
     /**
      * 이유: complete 유효 창이 지나도록 {@code ADMIT_ISSUED} 에 남은 행을 만료로 확정한다.
-     * 원인: <b>직접 UPDATE</b> 인 것은 EXPIRED 가드가 {@code status=1} 에서 no-op 이라서다
-     *       (넓히면 늦은 입장 §36 이 죽는다).
+     * 원인: <b>직접 UPDATE</b> 인 것은 EXPIRED 가드가 {@code status=1} 에서 no-op 이라서다 (넓히면 늦은 입장 §36 이 죽는다).
      * 해결: <b>큐 단위</b>로 끊는다 — 전역이면 한 큐의 백로그가 LIMIT 을 먹어 다른 큐를 굶긴다.
-     * 🔴 <b>cutoff 를 파라미터로 받지 않는다</b>(§90) — batch 시계로 계산해 넘기면 앞선 경우
-     *    아직 완료 가능한 행을 <b>{@code status=4 / completed_at=NULL} 로 영구 고정</b>시키고,
+     * 🔴 <b>cutoff 를 파라미터로 받지 않는다</b>(§90) — batch 시계로 계산해 넘기면 앞선 경우 아직 완료 가능한 행을 <b>{@code status=4 / completed_at=NULL} 로 영구 고정</b>시키고,
      *    사용자는 Redis 폴백으로 200 을 받아 <b>알 수단이 없다</b>.
      */
     @Modifying(clearAutomatically = true)
@@ -118,11 +116,9 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
 
     /**
      * 이유: 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq(없으면 NULL, 호출자가 0 으로 바꾼다).
-     * 문제: 🔑 <b>인덱스만 만들어도 옵티마이저가 안 쓴다</b> — AWS 8차에서 이 쿼리가 MySQL CPU
-     *       <b>예산 6.1%</b> 를 먹고 판 안에서 372ms → 1,776ms 로 5배 악화했다.
+     * 문제: 🔑 <b>인덱스만 만들어도 옵티마이저가 안 쓴다</b> — AWS 8차에서 이 쿼리가 MySQL CPU <b>예산 6.1%</b> 를 먹고 판 안에서 372ms → 1,776ms 로 5배 악화했다.
      * 해결: {@code FORCE INDEX} 로 커버링을 강제한다(43ms → 24ms. <b>버퍼풀 &lt; 테이블</b>이면 더 커진다).
-     * 🪤 {@code ORDER BY issued_at DESC LIMIT 1} 로 바꾸지 마라 — "seq 와 issued_at 이 같은 방향"을
-     *    전제하는데 issued_at 은 <b>N대의 앱 시계</b>라 역전될 수 있다(대사는 같은 경계를 세야 한다).
+     * 🪤 {@code ORDER BY issued_at DESC LIMIT 1} 로 바꾸지 마라 — issued_at 은 <b>N대의 앱 시계</b>라 seq 와 역전될 수 있다(대사는 같은 경계를 세야 한다).
      * 🪤 인덱스 이름이 바뀌면 이 쿼리는 <b>에러로 죽는다</b> — 조용히 느려지는 것보다 낫다.
      */
     @Query(value = """

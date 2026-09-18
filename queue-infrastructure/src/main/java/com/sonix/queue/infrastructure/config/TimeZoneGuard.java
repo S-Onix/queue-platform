@@ -13,22 +13,13 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 
 /**
- * 시각 규약(UTC) 기동 검증.
+ * 이유: 시각 규약(UTC) 기동 검증(§77).
+ * 문제: 🔴 <b>하나라도 어긋나면 예외도 로그도 없이 저장값만 9시간 밀린다</b>(한참 뒤 집계에서 드러난다).
+ * 원인: 보장이 <b>세 설정이 맞물려야</b> 성립한다 — JVM TZ · {@code connectionTimeZone} ·
+ *       {@code forceConnectionTimeZoneToSession}. 사고: TZ 다른 이미지 · yml 누락 · {@code main()} 삭제.
+ * 해결: 그 <b>조용한 실패를 기동 실패로 바꾼다</b>.
  *
- * <p>이 프로젝트는 저장 시각을 전부 UTC로 통일했는데(DECISIONS §77), 그 보장이
- * <b>서로 다른 세 설정이 맞물려야</b> 성립한다.
- * <ol>
- *   <li>JVM 기본 TZ = UTC — {@code *Application.main()}의 {@code TimeZone.setDefault}</li>
- *   <li>JDBC {@code connectionTimeZone=UTC} — (1)과 같아야 값이 항등으로 저장된다</li>
- *   <li>JDBC {@code forceConnectionTimeZoneToSession=true} — 세션 {@code time_zone}까지 UTC</li>
- * </ol>
- *
- * <p><b>하나라도 어긋나면 예외도 로그도 없이 저장값만 9시간 밀린다.</b> 그리고 그 사실은
- * 한참 뒤 집계가 이상할 때에야 드러난다. 이 클래스는 그 조용한 실패를 <b>기동 실패로 바꾼다.</b>
- *
- * <p>막으려는 구체적 사고: 컨테이너 기본 {@code TZ}가 UTC가 아닌 이미지로 배포,
- * 새 profile yml에 JDBC 파라미터 누락, 누군가 {@code main()}의 한 줄 삭제.
- * 셋 다 테스트로는 안 잡힌다(테스트는 이 빈을 통과하는 컨텍스트를 안 띄울 수도 있다).
+ * @author sonix
  */
 @Component
 public class TimeZoneGuard {
