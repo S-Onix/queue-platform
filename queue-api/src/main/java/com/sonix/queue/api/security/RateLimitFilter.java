@@ -23,17 +23,13 @@ import java.io.IOException;
 import java.util.Optional;
 
 /**
- * Rate Limit Filter.
+ * 이유: Rate Limit 필터. <b>알고리즘을 상황별로 나눈다</b>(§60·§61).
+ * 해결: 인증 후(테넌트)는 Token Bucket — burst 허용(티켓팅), 한도는 전 테넌트 상수(§88).
+ *       인증 전(signup·login·refresh)은 Fixed Window + IP — burst 불허(brute force 방지).
+ *       폴링은 Token Bucket + tokenId 이고, 인증이 없어 <b>선처리</b>한다.
+ * 🔴 반드시 {@link JwtAuthenticationFilter} <b>뒤에</b> 실행돼야 한다 — 인증 여부로 키를 고른다.
  *
- * <p>알고리즘을 상황별로 나눈다 (§60·§61).
- * <ul>
- *   <li>인증 후(테넌트 단위): Token Bucket — burst 허용(티켓팅). 한도는 전 테넌트 상수(§88)</li>
- *   <li>인증 전(signup/login/refresh): Fixed Window + IP — burst 불허(brute force 방지)</li>
- *   <li>폴링: Token Bucket + tokenId. 인증이 없어 <b>선처리</b>한다</li>
- * </ul>
- *
- * <p>🔴 <b>반드시 {@link JwtAuthenticationFilter} 뒤에 실행돼야 한다</b> — 인증 여부로 키와
- * 알고리즘을 고르기 때문이다. 한도 초과는 429 + {@code Retry-After}로 여기서 끝낸다.
+ * @author sonix
  */
 @Component
 @Log4j2
@@ -54,31 +50,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private static final double POLL_REFILL_PER_SEC = 1.0;
 
     /**
-     * 테넌트 한도 — <b>모든 테넌트에 동일</b>. 예전 {@code Plan.ENTERPRISE}와 같은 값이라
-     * 등급제를 걷어내도(§88) <b>동작이 바뀌지 않는다</b>(전 테넌트가 이미 ENTERPRISE였다).
-     *
-     * <p><b>100,000 → 50,000 (§89).</b> 근거는 실측 하나다 — 100,000에서는 <b>리미터가 한 건도
-     * 막지 않았다</b>(3,000 rps × 30초 = 90,000건이 capacity 안에서 끝나 429가 0건). 50,000이면
-     * 같은 공격이 23.1초에 개입해 15,000건을 막는다.
-     *
-     * <p>🔑 <b>버스트 비용과 지속 비용이 다르다.</b> 몰리는 순간 버킷을 먹는 것은 enqueue뿐이라
-     * "동시 N명 통과"는 {@code capacity}가 정한다(5만 명). 지속 소비는 유저 1명당 <b>3.01</b>
-     * (enqueue 1 + verify 1 + complete 1 + admit 1/20, 실측)이라 833.34÷3.01 = <b>초당 277명</b>,
-     * FRS 목표 부하를 한 테넌트가 혼자 다 써도 38% 여유가 남는다.
-     *
-     * <p>🪤 <b>enqueue 전용 버킷이 아니다</b> — 인증된 요청 전부가 공유하므로(admit·complete 포함)
-     * 값을 내리면 진행 중인 이벤트의 <b>입장까지</b> 조인다.
-     *
-     * <p>🪤 <b>테넌트 단위라 큐를 나눠도 늘지 않는다</b>({@code rl:tenant:&#123;id&#125;}에 queueId가
-     * 없다). 큐마다 버킷을 주는 안은 기각했다 — <b>§87과 같은 이유로 개수로 우회된다.</b>
-     *
-     * <p>비율 {@code capacity = refill × 60}은 §62에서 왔고 근거는 유지된다 — 티켓팅은 오픈
-     * 1분 안에 몰리므로 1분치 burst를 허용한다.
-     *
-     * <p>🪤 <b>refill이 833.33이 아니라 833.34인 이유.</b> 833.33이면 {@code capacity/refill}이
-     * 60.0002가 되어 {@code token-bucket.lua}의 {@code ceil()}이 <b>61</b>로 올라가고 버킷 TTL이
-     * 120초 → 121초로 어긋난다. 비율 단정({@code within(1)})은 둘 다 통과하므로
-     * <b>테스트가 이 어긋남을 안 잡는다</b>. 나눗셈이 정확히 60 이하로 떨어지는 값을 써야 한다.
+     * 이유: 테넌트 한도 — <b>모든 테넌트에 동일</b>(§88 에서 등급제를 걷어냈다).
+     * 문제: 100,000 에서는 <b>리미터가 한 건도 막지 않았다</b>(3,000rps × 30초가 capacity 안, 429 가 0건).
+     * 해결: 50,000 으로 내렸다(§89) — 같은 공격이 23.1초에 개입해 15,000건을 막는다.
+     * 🪤 <b>enqueue 전용이 아니다</b> — 인증 요청 전부가 공유하므로 내리면 <b>입장까지</b> 조인다.
+     * 🪤 refill 은 <b>833.34</b> 다(833.33 이면 TTL 이 121초로 어긋나는데 테스트가 못 잡는다, §89).
      */
     /**
      * 큐 상태 제어와 API Key 관리의 한도. <b>분당 60회</b>다.
@@ -128,20 +104,13 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private final TenantCache tenantCache;
 
     /**
-     * 실측용 오버라이드. 기본값(0 이하)이면 위 상수 그대로다 — <b>운영 값은 §89의 50,000이고
-     * 여기서 바뀌지 않는다.</b>
-     *
-     * <p>왜 필요한가: 부하 실측의 목표가 <b>플랫폼 천장</b>인데 테넌트 한도가 먼저 걸리면
-     * 재는 것이 리미터가 된다. 2026-09-16 판의 천장이 24테넌트 × 833.34 = <b>19,992/s</b>였다.
-     * 테넌트를 늘려 우회할 수도 있으나 signup 5/분/IP 때문에 프로비저닝이 선형으로 길어진다.
-     *
-     * <p>🪤 <b>둘은 같이 바꿔라.</b> {@code capacity = refill × 60} 비율을 깨도 <b>고장나지는
-     * 않는다</b> — {@code token-bucket.lua}가 TTL을 60~3600으로 클램프한다(확인함). 대신 버킷
-     * 키가 의도한 2분 대신 <b>1시간</b> 살아 Redis 메모리를 먹는다. 그 계약을 잠그는
-     * {@code TenantRateLimitConstantsTest}가 보는 것은 <b>기본값이지 런타임 오버라이드가 아니라</b>
-     * 여기서 깨뜨려도 빨개지지 않는다.
+     * 이유: 실측용 오버라이드. 기본값(0 이하)이면 위 상수 그대로다 — <b>운영 값은 §89 의 50,000</b>.
+     * 문제: 부하 실측의 목표는 <b>플랫폼 천장</b>인데 테넌트 한도가 먼저 걸리면 리미터를 재게 된다.
+     * 해결: 실측 때만 올린다(2026-09-16 판의 천장이 24테넌트 × 833.34 = 19,992/s 였다).
+     * 🪤 <b>둘을 같이 바꿔라</b> — {@code capacity = refill × 60} 을 깨도 고장나진 않지만 버킷 키가
+     *    2분 대신 <b>1시간</b> 산다. 계약 테스트는 <b>기본값만</b> 보므로 여기서 깨도 빨개지지 않는다.
      */
-    private final int tenantCapacity;
+   private final int tenantCapacity;
     private final double tenantRefillPerSec;
 
     public RateLimitFilter(
@@ -166,17 +135,13 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
 
     /**
-     * 경로 판정에 쓰는 <b>유일한</b> 문자열원.
+     * 이유: 경로 판정에 쓰는 <b>유일한</b> 문자열원.
+     * 문제: 🔴 {@code getRequestURI()} 를 쓰면 디스패처와 다른 문자열을 봐 <b>한도가 통째로 사라진다</b>.
+     *       2026-08-28 에 실제로 뚫렸다 — {@code /tenants/log%69n} 15회가 한도 없이 통과했다.
+     * 해결: 🔑 목표는 "완전한 디코딩"이 아니라 <b>"같은 문자열"</b>이다 — {@link UrlPathHelper} 가
+     *       Spring MVC 와 같은 정규화를 한다. 인코딩을 목록으로 막는 방향은 목록이 언젠가 어긋난다.
      *
-     * <p>🔴 <b>{@code getRequestURI()}를 쓰면 안 된다.</b> 디코딩 전 원문이라 디스패처가 보는
-     * 문자열과 다르고, 두 계층이 다른 문자열을 보면 한도가 통째로 사라진다. 2026-08-28에 두 곳이
-     * 실제로 뚫렸다 — {@code /tenants/log%69n}이 15회 전부 한도 없이 자격 증명 비교까지 갔고,
-     * 폴링은 {@code tokenId}를 한 글자 인코딩할 때마다 <b>버킷이 새로 생겼다</b>.
-     *
-     * <p>🔑 <b>목표는 "완전한 디코딩"이 아니라 "같은 문자열"이다.</b> {@link UrlPathHelper}는
-     * Spring MVC와 같은 정규화(1회 디코딩 · 컨텍스트 경로 제거 · {@code ;x=1} 제거)를 한다.
-     * 이중 인코딩({@code %2569})은 여기서도 안 맞지만 <b>디스패처에서도 안 맞아 404</b>라
-     * 우회가 성립하지 않는다. 인코딩을 목록으로 막는 방향은 목록이 언젠가 어긋난다.
+     * @author sonix
      */
     private static final UrlPathHelper PATH_HELPER = new UrlPathHelper();
     static {
@@ -197,13 +162,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        // 폴링은 인증이 없어 여기서 **선처리**한다.
-        //
-        // 🔴 뒤로 미루면 "늦게 걸리는" 게 아니라 **한도가 통째로 사라진다**. 폴링은 인증이 안 되니
-        //    아래 3)에서 auth == null → checkPublicRateLimit → resolvePublicEndpoint(path)가 null
-        //    (signup/login/refresh가 아니다) → **return true 로 그냥 통과**한다.
-        // 🔑 버킷을 테넌트 것과 따로 두는 이유는 다르다 — 합치면 대기자들의 폴링이 그 테넌트의
-        //    enqueue·admit 예산을 다 먹는다. 순서(여기)와 키 분리(아래)는 별개의 결정이다.
+        // 이유: 폴링은 인증이 없어 여기서 **선처리**한다.
+        // 문제: 뒤로 미루면 "늦게 걸리는" 게 아니라 **한도가 통째로 사라진다**.
+        // 원인: 아래 3)에서 auth == null → resolvePublicEndpoint 가 null → **그냥 통과**한다.
+        // 🔑 키를 테넌트와 따로 두는 것은 별개 결정이다 — 합치면 폴링이 enqueue·admit 예산을 먹는다.
         if (isPollPath(request.getMethod(), path)) {
             if (!checkPollRateLimit(path, response)) {
                 return;   // 429로 종료
@@ -212,12 +174,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        // 2) 공개 endpoint(signup/login/refresh)는 인증 여부와 무관하게 IP Fixed Window를 먼저 태운다.
-        //
-        // 🔴 3)의 else 가지에 맡기면 **클라이언트가 한도를 고를 수 있다** — /login은 permitAll이라
-        //    Authorization 헤더를 붙이면 3)이 "인증된 요청"으로 분기하고, brute force가
-        //    LOGIN(10/분/IP)이 아니라 공격자 자신의 테넌트 버킷을 먹는다(계정 K개 = 버킷 K개).
-        //    로그인 시도의 신원은 **body의 email**이지 헤더의 토큰이 아니다.
+        // 이유: 공개 endpoint(signup·login·refresh)는 인증 여부와 무관하게 IP Fixed Window 를 먼저 태운다.
+        // 문제: 3)의 else 에 맡기면 **클라이언트가 한도를 고를 수 있다**.
+        // 원인: /login 은 permitAll 이라 Authorization 헤더만 붙이면 "인증된 요청"으로 분기해
+        //       brute force 가 LOGIN(10/분/IP) 대신 공격자 자신의 테넌트 버킷을 먹는다.
+        // 해결: 여기서 먼저 태운다 — 로그인 시도의 신원은 **body 의 email** 이지 헤더의 토큰이 아니다.
         if (resolvePublicEndpoint(path) != null) {
             if (!checkPublicRateLimit(request, path, response)) {
                 return;   // 429로 종료
@@ -251,20 +212,13 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * tokenId 기준 Token Bucket.
+     * 이유: tokenId 기준 Token Bucket. 폴링은 인증이 없어 이 키가 유일한 구분자다.
+     * 🪤 <b>없는 tokenId 도 버킷을 만든다</b> — 무작위로 쏘면 한도 대신 <b>요청 1건 = 새 키 1개</b>다
+     *    (실측 200건 → +200). 무한 누적은 아니다(TTL 65초라 상주 키 = 유입률 × 65초).
+     * 🔴 종착점은 {@code noeviction} 이라 <b>쓰기 거부</b>다 — <b>같은 마스터의 다른 테넌트가 503</b>. 상한은 아직 없다.
+     * ⚠️ 키가 되는 tokenId 는 <b>정규화된 경로</b>에서 뽑아라 — 원문이면 인코딩 변형마다 새 키다.
      *
-     * <p>🪤 <b>키가 tokenId 하나라 존재하지 않는 tokenId도 버킷을 만든다.</b> 인증이 없으니
-     * 무작위 tokenId를 쏘면 한도에 걸리는 대신 <b>요청 1건 = 새 키 1개</b>다(실측 200건 → +200).
-     * 무한 누적은 아니다 — {@code token-bucket.lua}가 {@code ceil(capacity/refill)+60 = 65초}
-     * TTL을 걸어 정상상태 키 수는 <b>유입률 × 65초</b>다(10,000 rps면 65만 개 상주).
-     * 🔴 종착점이 "느려진다"가 아니다. maxmemory 1GB + {@code noeviction}이라 한계에 닿으면
-     * <b>쓰기가 거부</b>되고, {@code rl:} 키엔 해시태그가 없어 마스터 전역에 퍼지므로
-     * <b>같은 마스터에 얹힌 다른 테넌트의 enqueue가 503</b>이 된다 — §87과 같은 종류의 위험이다
-     * (내 요청이 남의 테넌트를 죽인다). 상한은 아직 없다.
-     *
-     * <p>⚠️ 버킷 키가 되는 tokenId는 <b>정규화된 경로</b>에서 뽑아야 한다. 원문에서 뽑으면
-     * 인코딩 변형마다 다른 키가 나와 버킷이 무한정 새로 생긴다(위 PATH_HELPER 주석의 실측 참조).
-     *
+     * @author sonix
      * @return true=통과, false=거부(429 완료).
      */
     private boolean checkPollRateLimit(String path, HttpServletResponse res)

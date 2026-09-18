@@ -11,27 +11,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
- * JWT Secret Key 저장소 + Key Rotation 지원
+ * 이유: JWT Secret Key 저장소 + Key Rotation. {@code jwt.active-kid} 와 {@code jwt.keys} 를 바인딩한다.
+ * 문제: 키를 한 번에 갈면 <b>이미 발급된 토큰이 전부 무효</b>가 되어 전원이 재로그인한다.
+ * 해결: 발급은 active key 하나로, 검증은 토큰 헤더의 {@code kid} 로 찾은 키로 한다 —
+ *       옛 키를 검증용으로 남겨 <b>점진적 만료</b>가 되게 한다.
+ * 🪤 회전 순서를 지켜라 — 새 키를 <b>먼저 배포</b>하고 그 뒤에 active 를 옮긴다(거꾸로면 401).
  *
- * application.yml 바인딩:
- *   jwt:
- *     active-kid: key-2026-01           # 발급용 active key ID
- *     keys:
- *       - kid: key-2026-01
- *         secret: <current secret>       # 발급 + 검증
- *       - kid: key-2025-12
- *         secret: <previous secret>      # 검증만 (이전 토큰 grace period)
- *
- * 동작:
- *   - 발급: getActiveKey()로 active key 사용
- *   - 검증: 토큰 헤더의 kid로 findKey() 후 그 키로 검증
- *   - active 전환 시점부터 새 토큰은 새 키로 발급
- *   - 옛 키는 검증용으로 유지 → 점진적 만료 (사용자 영향 최소)
- *
- * Rotation 절차:
- *   Day 0: keys 리스트에 새 키 추가 + 배포
- *   Day 1: active-kid를 새 키로 전환 + 배포
- *   Day 8+: keys에서 옛 키 제거 (Refresh Token TTL 후)
+ * @author sonix
  */
 @Configuration
 @ConfigurationProperties(prefix = "jwt")

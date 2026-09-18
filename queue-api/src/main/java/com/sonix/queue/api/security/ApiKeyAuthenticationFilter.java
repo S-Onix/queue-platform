@@ -20,17 +20,12 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * X-API-Key 기반 인증 필터.
+ * 이유: X-API-Key 기반 인증 필터. Tenant 서버가 엔진 API 를 부를 때 쓰는 키를 검증한다.
+ * 해결: 헤더 추출 → SHA-256 → 캐시(양성·음성) → 미스면 DB → ACTIVE 확인 →
+ *       {@link TenantAuth} 를 SecurityContext 에 주입한다.
+ * 🔑 {@link JwtAuthenticationFilter} 와 대칭이고 <b>엔진 계열 경로에서만</b> 돈다.
  *
- * <p>Tenant 서버가 대기열 엔진 API(enqueue 등)를 호출할 때 사용하는 X-API-Key를
- * 검증하고, 인증 성공 시 {@link TenantAuth}를 SecurityContext에 주입한다.
- *
- * <p>JWT 인증({@link JwtAuthenticationFilter})과 대칭 구조이며,
- * 엔진 계열 경로에서만 동작한다(shouldNotFilter로 대상 제한).
- *
- * <p><b>검증 흐름:</b> 헤더 추출 → SHA-256 해싱 → 캐시 조회(양성/음성) →
- * 캐시 미스 시 DB 조회 후 캐시 반영 → ACTIVE 확인 → tenantId를 SecurityContext에 주입.
- * 실패 시 컨텍스트를 비우고 다음 필터로 진행하여 SecurityConfig가 최종 401을 처리한다.
+ * @author sonix
  */
 @Component
 @Log4j2
@@ -104,44 +99,15 @@ public class ApiKeyAuthenticationFilter extends OncePerRequestFilter {
     }
 
     /**
-     * <b>Tenant가 X-API-Key로 부르는 경로에만</b> 이 필터를 적용한다.
+     * 이유: <b>Tenant 가 X-API-Key 로 부르는 경로에만</b> 필터를 적용한다(화이트리스트).
+     * 🔴 <b>새 엔드포인트를 추가하고 여기를 잊으면 401 이다</b> — §80 의 세 경로가 전부 그랬고
+     *    JWT 로는 통과해 테스트가 못 잡았다. 컨트롤러 매핑과 <b>전수로 대조</b>할 것.
+     * 🪤 폴링·{@code /status} 는 제외다 — 두 경로를 가르는 정규식이 뭉개지면 <b>폴링이 401</b> 이 된다.
+     * 🔴 정규식에 {@code getRequestURI()}(원문)를 쓰지 마라 — 정규화된 경로를 써야 fail-closed 가 유지된다.
      *
-     * <p>화이트리스트라 <b>새 엔드포인트를 추가하고 여기를 잊으면 조용히 401</b>이 된다.
-     * 실제로 그렇게 됐다 — §80이 admit·verify·complete 컨트롤러를 추가했으나 이 조건이
-     * enqueue 하나에 머물러, FRS가 X-API-Key로 명세한 세 경로가 <b>전부 401</b>이었다.
-     * (JWT Bearer로는 통과해서 테스트가 잡지 못했다.) 컨트롤러의 {@code @*Mapping}을
-     * 전수로 세어 대조할 것.
-     *
-     * <p>🪤 <b>인증 주체가 경로마다 다르다.</b> 아래 둘은 이 필터를 <b>타지 않아야</b> 한다.
-     * <ul>
-     *   <li>{@code GET /{queueId}/tokens/{tokenId}} — 폴링. <b>유저가 직접</b> 부르고 API Key가 없다</li>
-     *   <li>{@code GET /{queueId}/status} — 공용 전광판. {@code permitAll}이다</li>
-     * </ul>
-     * 그래서 {@code /tokens/{tokenId}/complete}와 {@code /tokens/{tokenId}}를 구분해야 한다 —
-     * 정규식이 뭉개지면 <b>폴링이 401</b>이 된다.
-     *
-     * <p>🔴 <b>정규식에 넣는 문자열로 {@code getRequestURI()}(원문)를 쓰면 안 된다.</b> {@code RateLimitFilter}가 같은 이유로
-     * 뚫렸다 — 원문으로 판정하면 디스패처가 보는 문자열과 갈린다.
-     *
-     * <p>여기는 갈려도 <b>fail-closed</b>라 우회가 아니라 오작동이었다(실측 2026-08-28):
-     * {@code POST /api/v1/queues/q_x/tokens} → 404 Q001(정상 도달)인데
-     * {@code POST /api/v1/queues/q_x/token%73} → <b>401</b>. 경로를 인코딩하는 Tenant 클라이언트는
-     * enqueue·admit·verify·complete가 통째로 401이 된다.
-     *
-     * <p>⚠️ 더 중요한 건 <b>방향이 뒤집힐 수 있다는 것</b>이다. 위 4경로 중 하나라도 permitAll이
-     * 되는 순간 fail-closed가 fail-open이 된다. 두 필터가 같은 문자열을 보게 두는 것이 유일한 방어다.
-     *
-     * <p>🔑 {@code setDefaultEncoding("UTF-8")}: {@code UrlPathHelper}는 기본적으로
-     * {@code request.getCharacterEncoding()}으로 디코딩하는데 GET·JSON POST에서는 그게 {@code null}이라
-     * ISO-8859-1로 떨어진다. Tomcat·{@code PathPatternParser}는 UTF-8이다. 지금 쓰는 경로는
-     * 전부 ASCII(UUID hex)라 도달 불가지만, 두 계층의 규칙을 굳이 다르게 둘 이유가 없다.
-     * ⚠️ 다만 이것으로 완전히 같아지지는 않는다 — {@code setDefaultEncoding}은
-     * {@code getCharacterEncoding()}이 <b>null일 때만</b> 덮으므로, 클라이언트가
-     * {@code Content-Type: ...;charset=EUC-KR}을 보내면 경로가 그 charset으로 디코딩된다.
-     * 지금 매칭 대상 세그먼트가 전부 ASCII라 세 charset에서 결과가 같아 도달 불가이나
-     * <b>미측정이다.</b>
+     * @author sonix
      */
-    @Override
+   @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
         String uri = PATH_HELPER.getPathWithinApplication(request);   // 원문 금지 — 위 javadoc
         boolean isTenantEnginePath =
