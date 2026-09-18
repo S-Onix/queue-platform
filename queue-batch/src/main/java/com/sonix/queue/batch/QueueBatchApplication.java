@@ -6,16 +6,12 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 import java.util.TimeZone;
 
 /**
- * 스케줄 작업 전담 서버.
+ * 이유: 스케줄 작업 전담 서버. 잡 셋 — TokenReclaimJob(10초) · ReconcileJob(5분) · BillingSnapshotJob(매일).
+ * 문제: queue-consumer 와 한 프로세스에 두면 어느 쪽도 제대로 늘릴 수 없다.
+ * 원인: 소비는 유입량에 비례해 늘려야 하고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요하다.
+ * 해결: 모듈을 나눈다(§73 D20). 적재는 {@code queue-consumer} 가 맡는다.
  *
- * <p>잡 3개가 돈다 — {@code TokenReclaimJob}(회수 3경로, 10초) ·
- * {@code ReconcileJob}(Redis↔DB 대사, 5분) · {@code BillingSnapshotJob}(과금 스냅샷, 매일).
- * enqueue 적재를 담당하던 outbox 드레인 스케줄러는 Kafka 전환으로 사라졌다
- * (적재는 {@code queue-consumer}가 맡는다).
- *
- * <p>모듈을 지우지 않고 남겨 둔 이유는 <b>확장 방향이 다르기</b> 때문이다. 소비는 유입량에
- * 비례해 인스턴스를 늘려야 하지만, 스케줄 작업은 늘릴수록 중복 실행을 막을 장치가 필요해진다.
- * 둘을 한 프로세스에 두면 어느 쪽도 제대로 늘릴 수 없다.
+ * @author sonix
  */
 @SpringBootApplication(scanBasePackages = "com.sonix.queue")
 @EnableScheduling
