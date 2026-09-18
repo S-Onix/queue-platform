@@ -22,12 +22,40 @@
   },
   "panels": [
     {
+      "type": "row",
+      "title": "📏 기준선 (먼저 읽으세요)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 301,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "text",
+      "title": "기준선 — AWS 9·10차 실측",
+      "gridPos": {
+        "h": 15,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "id": 302,
+      "options": {
+        "mode": "markdown",
+        "content": "## 📏 기준선 — 이 숫자와 비교해서 보세요\n\n**AWS 9차(결함 상태) vs 10차(정상)** 실측입니다. \"지금 값이 몇인가\"보다 **\"기준선의 몇 배인가\"**가 판단을 만듭니다.\n\n| 지표 | 9차(결함) | 10차(정상) | 🔴 이러면 본다 |\n|---|---|---|---|\n| mysql CPU user | **90.5%** | 34.3% | > 70% → 쿼리부터 의심 (digest 상위) |\n| mysql CPU iowait | 0.4% | 34.6% | 커밋/디스크 축. `io_time` > 0.95면 장치 포화 |\n| 컨슈머 LAG | **7,159,009** | **0** | 0에서 지속 이탈 = 적재가 밀린다 |\n| verify DB 폴백 | 회당 **193.3ms** | 0.63ms | > 10ms → 인덱스 회귀 |\n| complete 0행 비율 | **97.3%** | — | 높으면 verify·complete 둘 다 부르는 것(계약 위반) |\n| MySQL 연결 거절 | **8,296** | 0 | > 0 이면 풀 설정 오류 |\n| enqueue 처리량 | 1,004 rps | 1,004 rps | 유입 기준선 |\n| enqueue 응답 p50 | 22.66ms | 22.66ms | 절반이 Kafka·Redis다 |\n| `queue.pending.size` | — | **0** | 0에서 멀어지면 배출이 유입을 못 따라간다 |\n| 드레인 틱 | — | 20ms | `drain.duration`이 20ms를 넘으면 틱이 밀린다 |\n\n🪤 **절대 초로 비교하지 마세요.** 9차 값의 최소 33%는 경합 대기였습니다(노드 공유).\n**비율과 횟수**로 보세요. 🪤 **유입이 끝난 뒤의 CPU 하락은 개선이 아닙니다** — 부하가 빠진 것입니다.\n\n근거: `~/queue-platform-it/aws-round9-20260918/` · `aws-round10-20260918/` · DECISIONS §93\n\n### 로컬 실측 (2026-09-18, 저부하 40건 · 이 대시보드로 직접 확인한 값)\n\n| 지표 | 값 | 읽는 법 |\n|---|---|---|\n| `stage=kafka` 평균 | **20.0ms** | enqueue 응답의 최대 항목. AWS 실측 18ms 와 일치 |\n| `stage=tick` 평균 | 13.4ms | 드레인 틱 20ms 의 절반 — 기대대로 |\n| `stage=redis` 평균 | 2.42ms | 콜드 포함. 워밍 후 0.16ms |\n| `stage=mysql` 평균 | 0.18ms | 용량 캐시 히트 |\n| `complete zero_row` | **0 / 10** | 계약(정확히 하나)을 지키면 0 이다. 9차는 97.3% 였다 |\n| `verify redis` | 10 / 10 | db_fallback 0 건 — 인덱스 정상 |\n"
+      }
+    },
+    {
       "id": 100,
       "title": "정합성 — 0이 아니면 사람이 봐야 한다",
       "type": "row",
       "gridPos": {
         "x": 0,
-        "y": 0,
+        "y": 16,
         "w": 24,
         "h": 1
       },
@@ -41,7 +69,7 @@
       "description": "waiting에 있는데 tokens Hash에 없는 사람. admit.lua가 HGET 미스로 되돌려 놓은 고아다.\n매 admit 주기마다 뽑혔다 되돌아가며 count 슬롯을 하나씩 먹고, admit이 그를 지나가지 못한다.\n\n⚠️ sum이 아니라 max다 — claim 없는 순수 읽기라 batch N대가 같은 값을 각자 보고한다.",
       "gridPos": {
         "x": 0,
-        "y": 1,
+        "y": 17,
         "w": 6,
         "h": 5
       },
@@ -100,7 +128,7 @@
       "description": "Redis엔 있는데 DB엔 없다 = ENQUEUED 발행 유실(§73 D15).\n100만건 실측에서 835건 발생한 그 갭이다. 복구(재발행)는 아직 없다 — 이 값이 0이 아닌 것을 본 뒤에 붙인다.",
       "gridPos": {
         "x": 6,
-        "y": 1,
+        "y": 17,
         "w": 6,
         "h": 5
       },
@@ -159,7 +187,7 @@
       "description": "DB는 활성인데 Redis엔 없다 = 종료 이벤트 유실.\n🔴 자동 복구를 하지 않는다 — Redis 전손과 구분할 수단이 없어 전원을 만료로 오판할 수 있다.",
       "gridPos": {
         "x": 12,
-        "y": 1,
+        "y": 17,
         "w": 6,
         "h": 5
       },
@@ -218,7 +246,7 @@
       "description": "셋 다 0에 붙어 있어야 정상이다. 튀는 순간이 사건 시각이다.",
       "gridPos": {
         "x": 18,
-        "y": 1,
+        "y": 17,
         "w": 6,
         "h": 5
       },
@@ -268,7 +296,7 @@
       "type": "row",
       "gridPos": {
         "x": 0,
-        "y": 6,
+        "y": 22,
         "w": 24,
         "h": 1
       },
@@ -282,7 +310,7 @@
       "description": "폴링(/tokens/*)이 압도적으로 많은 게 정상이다 — 사용자당 enqueue 1회 vs 폴링 수십~수백회.",
       "gridPos": {
         "x": 0,
-        "y": 7,
+        "y": 23,
         "w": 12,
         "h": 7
       },
@@ -316,7 +344,7 @@
       "description": "enqueue는 BatchProcessor 주기(1초) 때문에 평균 500ms 부담이 있다 — 원안(10ms) 대비 100배 이탈분이다.",
       "gridPos": {
         "x": 12,
-        "y": 7,
+        "y": 23,
         "w": 12,
         "h": 7
       },
@@ -350,7 +378,7 @@
       "description": "404는 정상 신호일 수 있다 — 회수된 토큰의 폴링, 만료된 admitToken의 verify.\n429는 폴링 Rate Limit(cap 5 / refill 1.0/s)이다.",
       "gridPos": {
         "x": 0,
-        "y": 14,
+        "y": 30,
         "w": 8,
         "h": 6
       },
@@ -381,10 +409,10 @@
       "id": 13,
       "title": "Kafka 소비 지연 (consumer lag)",
       "type": "timeseries",
-      "description": "이게 쌓이면 DB 적재가 밀린다 — Redis엔 있고 DB엔 없는 구간이 커진다.\n실측: 회수 중 앱을 끊자 큐마다 -500이 찍혔다가 컨슈머 재기동 40초 만에 0으로 회복됐다.",
+      "description": "이게 쌓이면 DB 적재가 밀린다 — Redis엔 있고 DB엔 없는 구간이 커진다.\n실측: 회수 중 앱을 끊자 큐마다 -500이 찍혔다가 컨슈머 재기동 40초 만에 0으로 회복됐다.\n\n📏 기준선: 10차 정상=0. 0에서 지속 이탈하면 적재가 밀린다(9차 715만)",
       "gridPos": {
         "x": 8,
-        "y": 14,
+        "y": 30,
         "w": 8,
         "h": 6
       },
@@ -405,7 +433,25 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {}
+          "custom": {},
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 100000
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -417,7 +463,7 @@
       "description": "queue-consumer가 token-lifecycle을 소비하는 속도.",
       "gridPos": {
         "x": 16,
-        "y": 14,
+        "y": 30,
         "w": 8,
         "h": 6
       },
@@ -451,7 +497,7 @@
       "description": "result=error는 ADMITTED 발행 실패다. admit은 Lua 커밋 뒤라 항상 200이므로 상태 코드 패널에는 절대 안 나온다 — 여기서만 보인다. 발행이 빠진 토큰은 admitted_at이 NULL로 남아 complete가 영구 404가 된다.",
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 36,
         "w": 24,
         "h": 6
       },
@@ -493,7 +539,7 @@
       "type": "row",
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 42,
         "w": 24,
         "h": 1
       },
@@ -507,7 +553,7 @@
       "description": "앱 3대를 안 띄우면 25/28이 정상이다. 그보다 낮으면 exporter나 인프라가 죽은 것이다.",
       "gridPos": {
         "x": 0,
-        "y": 27,
+        "y": 43,
         "w": 6,
         "h": 5
       },
@@ -575,7 +621,7 @@
       "description": "@Transactional(readOnly)가 Replica로 라우팅되므로, 이 값이 커지면 읽기가 낡은 데이터를 본다.",
       "gridPos": {
         "x": 6,
-        "y": 27,
+        "y": 43,
         "w": 6,
         "h": 5
       },
@@ -639,7 +685,7 @@
       "description": "Cluster A(7001~) + B(8001~) 각 8노드. 큐 상태 키 4종은 반드시 같은 클러스터에 있어야 한다(§75 D26).",
       "gridPos": {
         "x": 12,
-        "y": 27,
+        "y": 43,
         "w": 6,
         "h": 5
       },
@@ -691,10 +737,10 @@
       "id": 23,
       "title": "Hikari 커넥션",
       "type": "timeseries",
-      "description": "pending이 0이 아니면 풀이 마른 것이다. verify가 Kafka를 기다리며 커넥션을 쥐던 문제(F-3)가 여기 보인다.",
+      "description": "pending이 0이 아니면 풀이 마른 것이다. verify가 Kafka를 기다리며 커넥션을 쥐던 문제(F-3)가 여기 보인다.\n\n📏 기준선: 10차 L=λW≈5. master 풀 20 이므로 15 부터 주의(PR #104)",
       "gridPos": {
         "x": 18,
-        "y": 27,
+        "y": 43,
         "w": 6,
         "h": 5
       },
@@ -724,7 +770,25 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {}
+          "custom": {},
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 15
+              },
+              {
+                "color": "red",
+                "value": 18
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -736,7 +800,7 @@
       "description": "maxmemory 1gb / noeviction이다. 차오르면 쓰기가 실패하지 evict되지 않는다.",
       "gridPos": {
         "x": 0,
-        "y": 32,
+        "y": 48,
         "w": 8,
         "h": 6
       },
@@ -767,10 +831,10 @@
       "id": 25,
       "title": "JVM 힙",
       "type": "timeseries",
-      "description": "",
+      "description": "📏 기준선: 버스트 실측 380MB/4GB. 3GB 부터 주의",
       "gridPos": {
         "x": 8,
-        "y": 32,
+        "y": 48,
         "w": 8,
         "h": 6
       },
@@ -792,7 +856,24 @@
       "fieldConfig": {
         "defaults": {
           "custom": {},
-          "unit": "bytes"
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3221225472
+              },
+              {
+                "color": "red",
+                "value": 3758096384
+              }
+            ]
+          }
         },
         "overrides": []
       }
@@ -801,10 +882,10 @@
       "id": 26,
       "title": "MySQL 연결 수",
       "type": "timeseries",
-      "description": "prod 풀은 api 50 / consumer 20 / batch 10이다. 앱 대수 × 풀 크기가 max_connections를 넘지 않아야 한다.",
+      "description": "prod 풀은 api 50 / consumer 20 / batch 10이다. 앱 대수 × 풀 크기가 max_connections를 넘지 않아야 한다.\n\n📏 기준선: max_connections 500. 9차에 501 로 붙어 거절 8,296 회",
       "gridPos": {
         "x": 16,
-        "y": 32,
+        "y": 48,
         "w": 8,
         "h": 6
       },
@@ -825,10 +906,255 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {}
+          "custom": {},
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 350
+              },
+              {
+                "color": "red",
+                "value": 450
+              }
+            ]
+          }
         },
         "overrides": []
       }
+    },
+    {
+      "type": "row",
+      "title": "⏱ enqueue 파이프라인 (2026-09-18 신설)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "id": 303,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "드레인 대기 큐 깊이 (queue.pending.size)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "🔴 상한 없는 ConcurrentLinkedQueue 다. 0 에서 멀어지면 **배출이 유입을 못 따라간다**.\n📏 기준선: 10차 정상 = 0. 이 값이 계속 오르면 드레인이 멈춘 것이다.",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 54
+      },
+      "id": 304,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 10000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(queue_pending_size)",
+          "legendFormat": "pending",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "구간별 소요 p95 (queue.stage.duration)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "손으로 쟀던 분해를 영구히 — tick(틱 대기) · redis(Lua) · mysql(용량) · kafka(동기 발행).\n📏 기준선(로컬 실측): kafka 18ms(콜드 404ms) · tick 평균 10ms · redis 0.16ms · mysql 1.34ms",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 54
+      },
+      "id": 305,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le,stage) (rate(queue_stage_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "드레인 틱 소요 · 배치 크기",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "📏 기준선: drain-interval 20ms. p95 가 20ms 를 넘으면 **틱이 밀리는 중**이다.\n배치 평균이 MAX_DRAIN(5000)에 붙으면 유입이 배출을 앞섰다.",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 54
+      },
+      "id": 306,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(queue_drain_duration_seconds_bucket[5m])))",
+          "legendFormat": "drain p95",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(queue_drain_batch_size_sum[5m]) / rate(queue_drain_batch_size_count[5m])",
+          "legendFormat": "배치 평균",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "verify 경로 분해 (queue.verify.result)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "🔴 **db_fallback 이 올라가면 인덱스·랙을 본다.** 9차에 이 경로가 313,842회 · MySQL 시간의 86% 였다.\n📏 기준선: 정상 판에서는 redis 가 압도적이어야 한다.",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 60
+      },
+      "id": 307,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (result) (rate(queue_verify_result_total[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "complete 경로 분해 (queue.complete.path)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "🔴 **zero_row 비율 = 계약 위반율.** verify·complete 를 둘 다 부르면 UPDATE 가 0행이 된다.\n📏 기준선: 9차 97.3% 가 0행이었다(하니스가 둘 다 불렀다). 낮을수록 계약을 지키는 것이다.",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 60
+      },
+      "id": 308,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (path) (rate(queue_complete_path_total[5m]))",
+          "legendFormat": "{{path}}",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "description": "로컬 검증용. 위에서 아래로 '정합성 → 서비스 흐름 → 인프라' 순이다.\n맨 윗줄 3개가 0이 아니면 사람이 봐야 한다 — 나머지는 맥락이다."

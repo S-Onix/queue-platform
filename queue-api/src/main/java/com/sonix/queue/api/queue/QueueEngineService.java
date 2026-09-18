@@ -49,6 +49,11 @@ public class QueueEngineService {
             Duration.ofSeconds(1800), Duration.ofSeconds(3600)
     };
 
+    /** 구간별 소요 버킷. 실측 kafka 18ms(콜드 404ms) 를 덮는다 — 경계가 없으면 _bucket 미발행이라 p95 패널이 빈다. */
+    private static final Duration[] STAGE_SLO = {
+            Duration.ofMillis(1), Duration.ofMillis(5), Duration.ofMillis(10), Duration.ofMillis(20),
+            Duration.ofMillis(50), Duration.ofMillis(100), Duration.ofMillis(500), Duration.ofSeconds(1)};
+
     public QueueEngineService(QueueRepository queueRepository, TokenRepository tokenRepository,
                               QueueEngine queueEngine, EnqueueEventPublisher eventPublisher,
                               Clock clock, MeterRegistry meterRegistry) {
@@ -94,6 +99,7 @@ public class QueueEngineService {
             long kafkaStart = System.nanoTime();
             eventPublisher.publish(EnqueueEvent.of(tenantId, queueId, result));
             io.micrometer.core.instrument.Timer.builder("queue.stage.duration").tag("stage", "kafka")
+                    .serviceLevelObjectives(STAGE_SLO)
                     .register(meterRegistry)
                     .record(System.nanoTime() - kafkaStart, java.util.concurrent.TimeUnit.NANOSECONDS);
         }
