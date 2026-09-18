@@ -49,7 +49,10 @@ push() {
     ./ "ubuntu@$1:~/queue-platform/"
 }
 
-ALL="$MYSQL $KAFKA $REDIS $APP $APP2 $WORKER"
+# 🔴 **obs 를 빼먹으면 그 노드에 레포가 없어 compose 가 "no such file" 로 죽는다**
+#    (2026-09-18 실측: 관측 4종이 통째로 안 떴는데 deploy.sh 는 exit 0 이었다).
+#    노드를 추가할 때 이 줄을 **같이** 고쳐라 — pubip 만 추가하면 조용히 샌다.
+ALL="$MYSQL $KAFKA $REDIS $APP $APP2 $WORKER $OBS"
 
 echo "[0/5] 인스턴스 준비 대기 (user_data 설치 완료까지)"
 for h in $ALL; do
