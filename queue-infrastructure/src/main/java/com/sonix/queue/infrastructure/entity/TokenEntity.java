@@ -12,19 +12,13 @@ import org.springframework.lang.Nullable;
 import java.time.LocalDateTime;
 
 /**
- * 🔴 <b>2026-09-14 기준 아래 {@code @SQLInsert}를 타는 코드가 0건이다.</b> 유일한 호출자였던
- * {@code TokenJpaAdapter.saveAllIfAbsent}가 raw JDBC로 옮겨갔다 — JPA의 지연 플러시가 한
- * 트랜잭션 안에서 전이와 실행 순서를 뒤집었기 때문이다(그쪽 주석 참조). SQL 원문은
- * {@code TokenJpaAdapter.ENQUEUE_INSERT}로 <b>그대로</b> 옮겨갔다.
- * <b>지우지 않고 남겨둔 것은 아래 {@code insertable = false} 셋과 묶여 있어서다</b> — 푸는 순간
- * 고정 컬럼 수와 어긋나 11건이 깨진 전례가 있다. 제거는 별도 판단 대상이다.
+ * 이유: tokens 테이블 매핑.
+ * 🔴 <b>아래 {@code @SQLInsert} 를 타는 코드는 0건이다</b> — 호출자가 raw JDBC 로 옮겨갔다
+ *    (JPA 지연 플러시가 실행 순서를 뒤집었다). 원문은 {@code TokenJpaAdapter.ENQUEUE_INSERT} 다.
+ * 🪤 <b>그래도 지우지 않는다</b> — {@code insertable = false} 셋과 묶여 있어 풀면 <b>11건이 깨진다</b>.
+ * 🔑 이 문장은 §80 가드 표의 <b>{@code ENQUEUED} 한 줄</b>이다({@code @SQLInsert} 는 엔티티당 하나뿐).
  *
- * ⚠️ 아래 {@code @SQLInsert}는 §80 가드 표의 <b>{@code ENQUEUED} 한 줄</b>이었다(허용 출발: 신규,
- * 충돌 시 no-op). 나머지 다섯 줄은 이벤트마다 SQL이 달라 여기 담을 수 없어
- * {@code TokenJpaAdapter.applyTransition}에 있다 — {@code @SQLInsert}는 엔티티당 한 문장뿐이다.
- *
- * <p>그래서 {@code admit_token}·{@code admitted_at}의 {@code insertable = false}는 그대로 둔다.
- * 이 경로는 WAITING 삽입 전용이라 두 칸에 넣을 값이 애초에 없다.
+ * @author sonix
  */
 @Entity
 @Table(name = "tokens")
@@ -60,17 +54,13 @@ public class TokenEntity implements Persistable<TokenEntityId> {
     // WAITING 삽입 시엔 DB 기본값 사용 → INSERT에서 제외 (insertable=false)
     @JdbcTypeCode(SqlTypes.TINYINT)
     /**
-     * 만료 사유({@link com.sonix.queue.domain.queue.ExpiredReason}). {@code EXPIRED}에서만 채워진다.
-     *
-     * <p>🪤 <b>{@code insertable = false}는 유지한다.</b> "컬럼이 있는데 쓸 수조차 없다"는 지적이
-     * 있었지만 절반만 맞다 — 막히는 건 <b>JPA 경로뿐</b>이고, 사유를 쓰는 {@code EXPIRED} 전이는
-     * {@code TokenJpaAdapter.TRANSITION_INSERT}(raw JDBC)를 탄다. JPA 경로는 {@code ENQUEUED}
-     * 적재라 애초에 사유가 없다.
-     *
-     * <p>🔴 <b>풀면 {@code @SQLInsert}가 깨진다</b>(실측: {@code Parameter index out of range (8 > 7)}).
-     * 그 어노테이션은 컬럼 수가 고정된 SQL 문자열이라 매핑이 바뀌면 바인딩이 어긋난다.
+     * 이유: 만료 사유({@link com.sonix.queue.domain.queue.ExpiredReason}).
+     * 🪤 <b>{@code insertable = false} 는 유지한다.</b> "쓸 수가 없다"는 지적은 <b>절반만 맞다</b> —
+     *    막히는 건 JPA 경로뿐이고 그 경로는 {@code ENQUEUED} 적재라 애초에 사유가 없다.
+     * 🔴 <b>풀면 {@code @SQLInsert} 가 깨진다</b>(실측 {@code Parameter index out of range}, 11건) —
+     *    그 어노테이션은 컬럼 수가 고정된 SQL 문자열이라 매핑이 바뀌면 어긋난다.
      */
-    @Column(insertable = false) Integer expiredReason;
+   @Column(insertable = false) Integer expiredReason;
     @Column(insertable = false, length = 50) String  admitToken;
     /**
      * admit 시각 (DECISIONS §80). verify·complete의 유효 창 판정 기준 컬럼이다 —

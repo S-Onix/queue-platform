@@ -29,80 +29,34 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Redis 연결 설정 (독립 2 Cluster, DECISIONS §75).
+ * 이유: Redis 연결 설정 — <b>독립 2 Cluster</b>(§75). {@link LettuceConnectionFactory} 를 직접 정의한다.
+ * 원인: Boot 표준 키는 <b>클러스터를 하나만</b> 표현해 둘을 독립으로 띄울 수 없다 → 커스텀 프로퍼티.
+ * 🔴 <b>Sentinel 분기를 코드에서 지웠다</b> — 프로파일로 나누면 <b>"Cluster 에서만 터지는" 결함이 숨을 통로</b>가 생긴다(인프라는 학습 자산으로 보존, §75 D28).
+ * 🔑 <b>큐 상태가 아닌 키는 전부 cluster1 이다</b>({@code rl:*}·캐시) — queueId 가 없어 라우팅 대상이
+ *    아니고, WAS 마다 다른 클러스터로 가면 버킷·캐시가 갈라지므로 {@code @Primary} 에 고정한다.
  *
- * <p>RedisAutoConfiguration은 application.yml에서 여전히 제외 상태이므로,
- * 여기서 명시적으로 {@link LettuceConnectionFactory}를 정의한다 (학습/제어 목적).
- *
- * <p><b>왜 커스텀 프로퍼티({@code queue.redis.cluster1/2.nodes})인가:</b>
- * Boot 표준 키 {@code spring.data.redis.cluster.nodes}는 <b>클러스터를 하나만</b> 표현한다.
- * 두 개를 독립으로 띄우는 구성은 표준 키로 표현할 방법이 없다.
- *
- * <p><b>Sentinel 설정은 제거했다.</b> 프로파일로 분기하지 않는다 — 해시태그 누락처럼
- * "Cluster에서만 터지는" 결함이 Sentinel 경로로 숨을 통로를 남기지 않기 위함이다.
- * Sentinel 인프라·문서 자체는 학습/로컬 자산으로 보존한다(§75 D28).
- *
- * <p><b>큐 상태가 아닌 키는 전부 cluster1에 있다.</b> {@code rl:*}(Rate Limit),
- * {@code apikey-cache:*}, {@code tenant-cache:*}는 queueId가 없어 라우팅 대상이 아니다.
- * 이들이 WAS마다 다른 클러스터로 가면 버킷·캐시가 갈라지므로, {@code @Primary}(cluster1)에
- * 고정한다.
+ * @author sonix
  */
 @Configuration
 public class RedisConfig {
 
     /**
-     * Redis 커맨드 응답 대기 상한.
-     *
-     * <p>Lettuce 기본값은 60초다. 그 값이면 종료 경로에 시한이 없어진다 —
-     * Redis가 응답하지 못하는 상태에서 SIGTERM이 오면 BatchProcessor의 마지막 drain이
-     * 실행 중인 커맨드 하나에 60초를 매달리고, {@code SmartLifecycle.stop()}은 동기라
-     * {@code timeout-per-shutdown-phase}로도 끊을 수 없다.
-     *
-     * <p><b>트레이드오프:</b> Sentinel failover 실측 5~10초({@code doc/INFRA_SETUP.md})를
-     * 못 타고 넘는 대신, 종료 시한을 확정한다. 실패가 <b>5xx로 드러나는 것</b>(흔적이 남음)과
-     * SIGKILL로 인한 in-memory 유실(<b>회복 불가·검출 불가</b>)을 견주어, 드러나는 실패를 택했다.
-     *
-     * <p><b>⚠️ 단, enqueue 경로에서 이 실패는 "재시도하면 회복된다"가 아니다.</b>
-     * 클라이언트 타임아웃은 서버 실행을 취소하지 않는다. Lua가 Redis에서 이미 성공한 뒤
-     * 이 시한에 걸려 포기하면, 사용자가 재시도해도 {@code enqueue_bulk.lua}의 {@code HSETNX}가
-     * 0을 반환해 <b>EXISTS</b>로 떨어진다. {@code QueueEngineService.enqueue()}는
-     * {@code if (result.isOk())}일 때만 Kafka에 발행하므로 <b>발행이 스킵되고 DB row가 생기지 않는다</b>
-     * — Redis에만 있고 DB에 없는 좀비 WAITING이 된다.
-     *
-     * <p>블라스트 반경은 1건이 아니다. Lua는 요청 스레드가 아니라 {@code BatchProcessor.processChunk}에서
-     * 실행되므로, 이 타임아웃 1회가 <b>청크 하나(최대 {@code CHUNK_SIZE}=500건)</b>를 통째로 실패시킨다.
-     *
-     * <p>이 창은 60초에서도 동일하게 존재했고 5초는 <b>빈도만 바꾼다</b>(창을 넓힌다).
-     * 해소는 이 값을 되돌리는 것이 아니라 <b>reconciliation 스위퍼</b>(Redis↔DB 대조 후 보정)의
-     * 몫이다 — 최우선 후속 과제로 등록돼 있다.
-     *
-     * <p>같은 프로젝트의 Kafka 프로듀서도 request 3s / delivery 8s / send 12s로 전부
-     * 시한이 명시돼 있다. Redis만 무기한인 것은 설계가 아니라 누락이었다.
-     *
-     * <p><b>⚠️ 이 값이 확정하는 것은 "Redis 쪽" 시한뿐이다.</b> 종료 drain의 상한
-     * ({@code BatchProcessor.SHUTDOWN_DRAIN_TIMEOUT_MS 5s} + 이 값 5s ≈ 10s)은
-     * <b>MySQL이 응답한다는 전제 위에서만</b> 성립한다. 같은 사이클의 DB 호출
-     * ({@code findByQueueId}, 캐시 없음)은 JDBC {@code socketTimeout} 미설정
-     * (Connector/J 기본 0 = 무기한)이라 시한이 없고, DB 무응답 시 종료 상한도 없다.
-     * → 후속 과제(부하 검증 후 별도 브랜치).
+     * 이유: Redis 커맨드 응답 대기 상한. 기본값 60초면 <b>종료 경로에 시한이 없어진다</b>(stop 은 동기다).
+     * 문제: 🔴 <b>"재시도하면 회복된다"가 아니다</b> — Lua 가 이미 성공했으면 재시도가 EXISTS 로 떨어져 발행이 스킵되고 <b>DB 에 없는 좀비</b>가 된다. 반경도 <b>청크 하나(최대 500건)</b> 다.
+     * 해결: 5초 — 드러나는 실패(5xx)를 SIGKILL 로 인한 검출 불가 유실보다 택했다(창은 60초에도 있었고 5초는 <b>빈도만 바꾼다</b>). 대가는 failover 5~10초를 못 넘는 것이다.
+     * 🔧 옛 주석 둘이 낡았다 — 대사는 <b>구현됐지만 탐지만 한다</b>(보정 없음), 그리고
+     *    "JDBC socketTimeout 미설정이라 종료 상한이 없다"는 <b>거짓이 됐다</b>(PR #96).
      */
     private static final Duration COMMAND_TIMEOUT = Duration.ofSeconds(5);
 
     /**
-     * 클러스터 토폴로지 갱신 주기.
-     *
-     * <p><b>이 설정이 없으면 failover 후 토폴로지가 영영 갱신되지 않는다.</b> Lettuce의
-     * {@code ClusterClientOptions} 기본값은 {@code periodicRefreshEnabled=false} +
-     * {@code adaptiveRefreshTriggers=emptySet()}이라, 기동 시 한 번 읽은 슬롯→노드 지도를
-     * 그대로 들고 간다. Sentinel 구성에서는 Sentinel이 대신하던 일이라 코드가 필요 없었지만,
-     * Cluster에서는 클라이언트가 직접 해야 한다.
-     *
-     * <p>주기 갱신만으로는 최대 이 주기만큼 MOVED/실패가 이어지므로 적응형 트리거
-     * (MOVED/ASK 재지정, 연결 끊김, 재연결 시도 등)를 함께 켠다. 트리거는 즉시가 아니라
-     * {@link #ADAPTIVE_REFRESH_TIMEOUT} 만큼 debounce되어, 대량 MOVED가 몰려도
-     * 토폴로지 조회가 폭주하지 않는다.
+     * 이유: 클러스터 토폴로지 갱신 주기.
+     * 문제: 🔴 <b>이 설정이 없으면 failover 후 토폴로지가 영영 갱신되지 않는다.</b>
+     * 원인: Lettuce 기본값이 주기 갱신 off + 트리거 없음이라 기동 시 읽은 지도를 그대로 들고 간다.
+     * 해결: 주기 갱신 + 적응형 트리거를 함께 켠다 — 주기만으로는 그 주기만큼 MOVED 가 이어진다.
+     * 🪤 트리거는 즉시가 아니라 {@link #ADAPTIVE_REFRESH_TIMEOUT} 만큼 debounce 된다(조회 폭주 방지).
      */
-    private static final Duration TOPOLOGY_REFRESH_PERIOD = Duration.ofSeconds(30);
+   private static final Duration TOPOLOGY_REFRESH_PERIOD = Duration.ofSeconds(30);
 
     /** 적응형 토폴로지 갱신의 debounce 간격(이 시간 안의 중복 트리거는 1회로 합쳐진다). */
     private static final Duration ADAPTIVE_REFRESH_TIMEOUT = Duration.ofSeconds(10);

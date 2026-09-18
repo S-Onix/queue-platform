@@ -48,8 +48,7 @@ public class BatchProcessor implements SmartLifecycle {
      *           문제: 경계를 안 주면 Micrometer 가 _bucket 을 아예 발행하지 않아 패널이 영구히 빈다(실측).
      *           원인: Timer 기본값은 count/sum/max 뿐이다. 해결: 실측 기준선(redis 0.16ms · mysql 1.34ms ·
      *           tick 10ms · kafka 18ms/콜드 404ms · 틱 20ms)을 덮는 경계를 준다. §4-1
-     * 🪤 {@code QueueEngineService.STAGE_SLO}(kafka 구간)와 <b>같은 값이어야 한다</b> —
-     *    같은 지표 이름이라 버킷이 갈리면 stage 태그 없이 집계할 때 백분위가 깨진다.
+     * 🪤 {@code QueueEngineService.STAGE_SLO} 와 <b>같은 값이어야 한다</b>(버킷이 갈리면 집계가 깨진다).
      */
     private static final Duration[] STAGE_SLO = {
             Duration.ofMillis(1), Duration.ofMillis(5), Duration.ofMillis(10), Duration.ofMillis(20),
@@ -319,8 +318,7 @@ public class BatchProcessor implements SmartLifecycle {
     /**
      * 이유: 큐 그룹 하나를 청크로 나눠 처리한다.
      * 문제: 사이클 바깥에서만 보면 사이클 하나가 통째로 시한을 넘기는데 아무도 끊어주지 못한다.
-     * 해결: <b>청크마다 + 그룹 진입 시</b> 확인한다 — 진입 검사가 없으면 {@code stop()} 경과가
-     *       <b>그룹 수에 선형 비례</b>한다(실측: 그룹 3개 → 9,016ms). 남은 청크는 예외로 완결시킨다.
+     * 해결: <b>청크마다 + 그룹 진입 시</b> 확인한다 — 진입 검사가 없으면 {@code stop()} 경과가 <b>그룹 수에 선형 비례</b>한다(실측: 그룹 3개 → 9,016ms). 남은 청크는 예외로 완결시킨다.
      * 🪤 DB 호출이 <b>2회</b>인 것은 §75 라우팅 때문이다 — 용량 조회(캐시 TTL당 1회)와
      *    {@code redis_cluster_no} 조회((WAS, queueId)당 평생 1회)다.
      *

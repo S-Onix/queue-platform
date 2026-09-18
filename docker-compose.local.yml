@@ -104,6 +104,16 @@ services:
   # ─────────────────────────────────────────────────────────────────────────
   queue-api-2:
     <<: *common
+    # 🔴 build args 를 명시해야 한다 — `<<: *common` 이 build 를 물려주는데 args 가 없으면
+    #    MODULE 이 비어 `::bootJar` 로 죽는다(2026-09-19 실측). `docker compose build` 는
+    #    build 절이 있는 **모든** 서비스를 빌드하므로 이 둘이 같이 걸린다.
+    # 🔑 queue-api 와 args 가 같아 BuildKit 캐시가 맞고 image 태그도 같아 재빌드 비용이 0 이다.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MODULE: queue-api
+        APP_PORT: "8080"
     image: queue-api:local
     container_name: queue-api-2
     environment:
@@ -114,6 +124,16 @@ services:
 
   queue-api-3:
     <<: *common
+    # 🔴 build args 를 명시해야 한다 — `<<: *common` 이 build 를 물려주는데 args 가 없으면
+    #    MODULE 이 비어 `::bootJar` 로 죽는다(2026-09-19 실측). `docker compose build` 는
+    #    build 절이 있는 **모든** 서비스를 빌드하므로 이 둘이 같이 걸린다.
+    # 🔑 queue-api 와 args 가 같아 BuildKit 캐시가 맞고 image 태그도 같아 재빌드 비용이 0 이다.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MODULE: queue-api
+        APP_PORT: "8080"
     image: queue-api:local
     container_name: queue-api-3
     environment:

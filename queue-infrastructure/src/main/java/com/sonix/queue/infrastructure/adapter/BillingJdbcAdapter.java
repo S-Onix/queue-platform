@@ -17,33 +17,11 @@ public class BillingJdbcAdapter implements BillingRepository {
     private static final DateTimeFormatter PARTITION_NAME = DateTimeFormatter.ofPattern("'p'yyyy'_'MM");
 
     /**
-     * {@code doc/schema.sql} Step 2의 집계를 한 문장으로. 집계와 적재가 같은 문장이라
-     * 수십만 행을 앱으로 끌어오지 않는다.
-     *
-     * <p>⚠️ {@code schema.sql}의 예제를 <b>그대로 옮긴 것이 아니다</b> — 그쪽은 실행하면 죽는다.
-     * 아래 세 곳이 다르고, 셋 다 이유가 있다.
-     *
-     * <p>🔴 <b>{@code `year_month`}의 백틱은 장식이 아니다.</b> {@code YEAR_MONTH}는 MySQL
-     * 예약어(INTERVAL 단위)라 백틱 없이 쓰면 {@code ERROR 1064}다. 컬럼 <b>정의</b> 자리에서는
-     * 통과해서 {@code CREATE TABLE}은 멀쩡히 성공한다 — 그래서 스키마만 보면 안 보인다.
-     *
-     * <p>🔴 <b>{@code INSERT ... SELECT}에는 행 별칭({@code AS new})을 못 붙인다</b>({@code ERROR
-     * 1064}, 실측). 대신 SELECT 쪽을 서브쿼리로 감싸 별칭을 주고 ODKU에서 참조한다.
-     *
-     * <p>🔴 <b>{@code updated_at = NOW(3)}을 쓰지 않는다.</b> {@code NOW()}는 세션 TZ를 따라 UTC
-     * 컬럼에 KST가 들어간다. SET 절에서 빼면 {@code ON UPDATE CURRENT_TIMESTAMP(3)}이 값이 실제로
-     * 바뀔 때만 찍어 "마지막으로 금액이 변한 시각"이 보존된다.
-     *
-     * <p><b>{@code PARTITION (pYYYY_MM)}은 §83 결정이다.</b> {@code RANGE (YEAR*100 + MONTH)}는
-     * 옵티마이저가 단조성을 증명하지 못해 <b>범위 조건으로는 프루닝이 안 되고</b> 13개를 전부
-     * 스캔한다(실측). 집계 배치는 대상 월을 아니까 이 절로 공짜로 얻는다.
-     *
-     * <p>🪤 대가는 <b>fail-loud</b>다. 미생성 파티션을 지목하면 {@code ERROR 1735}로 죽는다 —
-     * 범위 조건이라면 {@code p_future}로 조용히 성공했을 자리다. 파티션 사전 생성 누락을
-     * 청구서가 나온 뒤에 아는 것보다 그날 죽는 게 낫다는 판단이다.
-     *
-     * <p>🪤 <b>파티션 이름은 바인딩 파라미터로 못 넣는다</b>(식별자 자리다). {@code YearMonth}에서
-     * 포맷한 값이라 외부 입력이 닿지 않는다.
+     * 이유: 월별 과금 집계를 <b>한 문장</b>으로 한다 — 수십만 행을 앱으로 끌어오지 않는다.
+     * ⚠️ {@code schema.sql} 예제를 그대로 옮기면 <b>죽는다</b>: ①{@code `year_month`} 백틱(예약어인데
+     *    <b>컬럼 정의 자리에선 통과</b>한다) ②{@code AS new} 불가 → 서브쿼리 ③{@code NOW()} 는 세션 TZ
+     * 🔑 {@code PARTITION (pYYYY_MM)} 은 §83 — 범위 조건으로는 프루닝이 안 돼 13개를 전부 스캔한다(실측).
+     * 🪤 대가는 <b>fail-loud</b> — 미생성 파티션이면 {@code ERROR 1735} 다. 청구서가 나온 뒤 아는 것보다 낫다.
      */
     private static final String UPSERT_MONTHLY = """
             INSERT INTO billing_snapshots (tenant_id, `year_month`, `count`)
@@ -56,45 +34,11 @@ public class BillingJdbcAdapter implements BillingRepository {
             """;
 
     /**
-     * {@code doc/schema.sql} Step 1의 집계. {@code UPSERT_MONTHLY}와 같은 파티션을 훑으므로
-     * 바로 뒤에 붙여 돌리면 버퍼풀이 따뜻하다(실측 180ms / 16만 행).
-     *
-     * <p>🔴 <b>{@code ON DUPLICATE KEY UPDATE id = id}로 두면 안 된다.</b> {@code schema.sql}의
-     * 원안이 그랬고, 그러면 <b>늦게 도착한 admit이 영원히 반영되지 않는다</b>(도커 실증:
-     * 재집계해도 {@code total_admit_issued}가 0에 고정). 오래 기다린 사람일수록 늦게 admit되므로,
-     * 하필 이 표가 남기려던 것만 골라서 버린다. 전 컬럼을 덮어쓴다.
-     *
-     * <p>🔴 <b>{@code SUM(admitted_at IS NOT NULL)}이지 {@code SUM(status = 1)}이 아니다.</b>
-     * {@code ReconcileJob}이 잔류 {@code ADMIT_ISSUED}를 {@code status = 4}로 정리하므로
-     * 후자는 0이 나온다 — 실측에서 15,151건이 {@code status = 4} 아래 숨어 있었다.
-     * 그래서 {@code status}(집합을 분할)와 {@code admitted_at}(그 분할을 가로지름)이 둘 다 필요하다.
-     * 덕분에 {@code total_admit_issued - total_completed} = "입장권 받고 안 들어온 수"가 공짜로 나온다.
-     *
-     * <p>🔴 <b>{@code AVG}가 아니라 {@code SUM}이다.</b> 평균은 합산되지 않는다 — 일별 AVG로는
-     * 월 평균을 만들 수 없다(각 날의 표본 수를 모르면 가중을 못 준다). 분모는 어차피 저장하는
-     * {@code total_admit_issued}가 갖고 있다. 같은 이유로 {@code p50}/{@code p99}는 컬럼으로
-     * 두지 않는다 — 백분위는 원리적으로 합산도 재계산도 안 된다.
-     *
-     * <p>🔴 <b>만료 사유는 {@code expired_reason}으로만 갈린다. {@code ADMIT_TTL}(코드 1)은 컬럼이 없는데,
-     * 그 근거였던 "DB에 도달하지 않는다"가 거짓이었다</b>(실측 259건, 2026-09-18). 랙 구간에는 DB status가
-     * 0이라 소비 가드가 참이 되어 {@code 0 → 4}가 적용된다. 그래서 <b>1은 집계 3칸 어디에도 안 들어가면서
-     * {@code total_expired}에는 들어간다</b> — 아래 격차 주석이 그 결과다.
-     * 랙이 없으면 no-op이고 같은 사람이 300초 뒤 {@code ADMIT_STALE}(2)로 기록된다(실측 259 : 30,071).
-     *
-     * <p>🪤 <b>{@code =}가 아니라 {@code <=>}다.</b> {@code expired_reason}은 NULL 허용이라
-     * 그 그룹의 전 행이 NULL이면 {@code SUM(expired_reason = 2)}가 <b>0이 아니라 NULL</b>을
-     * 돌려주고, 컬럼이 {@code NOT NULL}이라 적재가 통째로 실패한다(실측:
-     * {@code DataIntegrityViolationException} 8건). NULL-safe 비교는 항상 0/1이다.
-     * {@code SUM(status = 2)}에 같은 문제가 없는 건 {@code status}가 {@code NOT NULL}이라서다.
-     *
-     * <p>🔴 셋의 합은 {@code total_expired}와 다를 수 있고 <b>원인이 둘이다</b> — ① 사유가 없던 시기의
-     * NULL 행 ② {@code ADMIT_TTL}(1). 억지로 맞추지 마라. 단 <b>"차이가 곧 언제부터 사유를 남기기
-     * 시작했나"로 읽지도 마라</b>: 실측(2026-09-18)에서 NULL 행은 <b>0건</b>이었고 격차 259는 100% ②였다.
-     *
-     * <p>🪤 {@code stat_date = DATE(issued_at)}은 <b>"줄 선 날"</b> 기준이라, 4/30 발행 · 5/1 입장인
-     * 토큰의 대기 시간은 4/30에 붙는다. {@code admitted_at} 기준으로 바꾸면 안 되는 이유는
-     * 취향이 아니다 — <b>한 토큰 = 한 파티션 = 한 stat 행</b>이 깨져 재집계가 멱등하지 않게 되고,
-     * {@code PARTITION} 절도 못 쓰게 된다. 밀림은 {@code waitingTtl} 7200초가 상한이다.
+     * 이유: 큐×일 집계. {@code UPSERT_MONTHLY} 바로 뒤에 돌리면 버퍼풀이 따뜻하다(실측 180ms / 16만 행).
+     * 🔴 <b>{@code ODKU id = id} 로 두지 마라</b> — 멱등이 아니라 <b>불변</b>이 되어 늦은 admit 이 영원히 반영되지 않는다. <b>오래 기다린 사람일수록 늦게 붙어</b> 이 표가 남기려던 것만 버린다.
+     * 🔴 <b>{@code SUM(admitted_at IS NOT NULL)} 이다</b> — {@code status = 1} 로 세면 0 이다(대사가 잔류를 4로 정리. 실측 15,151건). <b>{@code AVG} 도 금지</b>.
+     * 🪤 <b>{@code =} 가 아니라 {@code <=>}</b> — NULL 허용 컬럼이라 전 행이 NULL 이면 SUM 이 NULL 을
+     *    돌려주고 {@code NOT NULL} 컬럼에 적재가 통째로 실패한다(실측 8건).
      */
     private static final String UPSERT_DAILY_STATS = """
             INSERT INTO queue_daily_stats
@@ -139,20 +83,15 @@ public class BillingJdbcAdapter implements BillingRepository {
     }
 
     /**
-     * 🔴 <b>{@code READ COMMITTED}가 아니면 이 문장이 {@code tokens} 적재를 막는다.</b>
-     * REPEATABLE READ에서 {@code INSERT ... SELECT}는 source 행에 <b>shared next-key lock</b>을
-     * 걸고, 그 사이 같은 구간으로 들어오는 INSERT가 대기한다. 실측: 집계 트랜잭션이 열려 있는 동안
-     * {@code tokens} INSERT가 <b>6초 대기 후 {@code ERROR 1205}</b>로 죽었고,
-     * {@code READ COMMITTED}에서는 <b>0.033초</b>에 통과했다.
+     * 이유: 🔴 <b>{@code READ COMMITTED} 가 아니면 이 문장이 {@code tokens} 적재를 막는다.</b>
+     * 원인: REPEATABLE READ 에서 {@code INSERT ... SELECT} 는 source 행에 <b>shared next-key lock</b> 을 걸어
+     *       같은 구간의 INSERT 가 대기한다(실측: 6초 대기 후 {@code ERROR 1205} → RC 에서는 0.033초).
+     * 해결: 격리수준을 <b>이 메서드에만</b> 건다 — 레포 전체엔 설정이 없어 기본값에 기대는 경로를 안 건드린다.
+     * 🪤 {@code PARTITION} 절로는 안 풀린다 — 당월 집계는 <b>컨슈머가 지금 쓰는 그 파티션</b>을 훑는다.
      *
-     * <p>당월 집계는 <b>컨슈머가 지금 쓰고 있는 바로 그 파티션</b>을 훑으므로 {@code PARTITION} 절로는
-     * 안 풀린다 — 두 조치는 겹치지 않는다. 막히면 {@code queue-consumer}의 적재가 밀리고,
-     * 그건 Kafka lag → {@code ReconcileJob}의 정착 판정 오염으로 이어진다.
-     *
-     * <p>격리수준을 이 메서드에만 건다. 레포 전체엔 격리수준 설정이 없어 MySQL 기본
-     * REPEATABLE READ이고, 그 기본값에 기대는 다른 경로를 건드리지 않기 위해서다.
+     * @author sonix
      */
-    @Override
+   @Override
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public void upsertMonthlySnapshot(YearMonth month) {
         jdbcTemplate.update(
@@ -198,18 +137,15 @@ public class BillingJdbcAdapter implements BillingRepository {
     }
 
     /**
-     * 🔴 <b>{@code @Transactional(readOnly = true)}를 붙이면 안 된다.</b>
-     * {@code ReplicationRoutingDataSource}가 그걸 보고 <b>replica로 보낸다</b>(prod는 별도 호스트).
-     * 이 조회는 <b>방금 master에 커밋한 두 표</b>를 대조하는 것이라, 복제가 한쪽만 따라잡은 창에
-     * 걸리면 그 달 토큰이 있는 거의 모든 테넌트가 불일치로 잡힌다.
+     * 이유: 두 집계표를 대조한다. 🔴 <b>{@code @Transactional(readOnly = true)} 를 붙이면 안 된다.</b>
+     * 원인: 그걸 보고 <b>replica 로 보내는데</b> 이 조회는 <b>방금 master 에 커밋한 두 표</b>를 대조한다 —
+     *       복제가 한쪽만 따라잡은 창에 걸리면 거의 모든 테넌트가 불일치로 잡힌다.
+     * 해결: 트랜잭션 자체를 걸지 않는다 — 없으면 라우팅 키가 master 다(§4-3). 하루 한 번이라 비용도 없다.
+     * 🪤 <b>통합 테스트로는 못 잡는다</b> — 테스트가 replica url 을 master 로 줘 라우팅이 갈라지지 않는다.
      *
-     * <p>트랜잭션 자체를 안 건다 — 단문 {@code SELECT}라 필요가 없고, 트랜잭션이 없으면
-     * 라우팅 키가 {@code "master"}가 되어 원하는 쪽으로 간다. 하루 한 번이라 비용도 문제가 아니다.
-     *
-     * <p>🪤 <b>통합 테스트로는 이 결함을 못 잡는다</b> — 테스트 설정이 replica url을 master(3306)로
-     * 준다. 라우팅이 갈라지지 않으므로 어떤 단정도 빨개지지 않는다.
+     * @author sonix
      */
-    @Override
+   @Override
     public long countBillingMismatch(YearMonth month) {
         Long n = jdbcTemplate.queryForObject(COUNT_MISMATCH, Long.class,
                 month.atDay(1), month.plusMonths(1).atDay(1), month.format(YYYYMM));
@@ -244,25 +180,13 @@ public class BillingJdbcAdapter implements BillingRepository {
     }
 
     /**
-     * 🔴 <b>되돌릴 수 없다.</b> 호출 조건은 포트 javadoc 참조.
+     * 이유: 파티션을 지운다. 🔴 <b>되돌릴 수 없다</b>(호출 조건은 포트 javadoc).
+     * 문제: {@code DROP PARTITION} 은 <b>테이블 전체에 배타적 MDL</b> 을 잡아, 긴 트랜잭션이 물고 있으면 <b>그 뒤에 도착한 평범한 INSERT 가 전부 줄을 선다</b>(실측 3.05초 블록).
+     * 원인·해결: {@code lock_wait_timeout} 기본값이 <b>365일</b>이라 짧게 걸어 즉시 포기시킨다
+     *       (3.05 → 1.04초) — <b>지연은 공짜고 블로킹은 사고다</b>.
+     * 🪤 세션 변수라 <b>커넥션 풀에 남는다</b> — 원복까지 같은 {@code execute} 안에서 한다.
      *
-     * <p>{@code @Transactional}을 걸지 않는다 — DDL은 MySQL에서 <b>암묵적 커밋</b>이라 트랜잭션이
-     * 아무것도 보호하지 못한다. 걸어 두면 "롤백되겠지"라는 잘못된 안심만 준다.
-     *
-     * <h2>🔴 {@code lock_wait_timeout}이 이 메서드의 핵심이다</h2>
-     * {@code DROP PARTITION}은 <b>테이블 전체에 배타적 MDL</b>을 잡는다(파티션 단위가 아니라
-     * 비어 있어도 소용없다). 긴 트랜잭션이 {@code tokens}를 물고 있으면 DDL이 대기하고,
-     * <b>그 뒤에 도착한 평범한 INSERT가 전부 줄을 선다</b> — 실측 3.05초 블록. 그러면 컨슈머
-     * 적재가 밀려 Kafka lag → {@code ReconcileJob} 정착 판정 오염으로 번진다.
-     *
-     * <p><b>MySQL 기본값은 365일</b>이라 대기에 상한이 없다. 짧게 걸면 {@code ERROR 1205}로
-     * 즉시 포기하고 뒤에 막힌 요청도 그때 풀린다(블록 3.05초 → 1.04초).
-     * 포기해도 되는 이유는 <b>DROP이 늦어서 잃는 것이 스토리지뿐</b>이라서다 —
-     * <b>지연은 공짜고 블로킹은 사고다.</b>
-     *
-     * <p>🪤 세션 변수라 커넥션 풀에 남는다. {@code SET SESSION}을 DDL과 <b>한 문장으로 보내면</b>
-     * 반납된 커넥션에 값이 남아 다른 쿼리가 2초 만에 포기하게 된다. 그래서 {@code execute} 안에서
-     * 원복까지 한다.
+     * @author sonix
      */
     @Override
     public void dropPartition(YearMonth month) {

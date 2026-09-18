@@ -2,25 +2,13 @@ package com.sonix.queue.infrastructure.cache;
 
 
 /**
- * Redis 캐시 키 중앙 관리.
+ * 이유: Redis <b>캐시</b> 키 중앙 관리. Enum 이 아니라 static 메서드다(가변인수 타입 안전성, §7).
+ * 🔑 Rate Limit·큐 상태 키는 여기 없다 — 원자 연산으로 다루는 <b>원본</b>이라 각자 클래스가 있다.
+ * 🔴 {@link #refreshToken(String)} 은 <b>호출자가 0 이다</b>(2026-09-19 전수) — Refresh 는 DB 조회로
+ *    충분해 캐시를 붙이지 않았다. 쓸 곳이 생기기 전에는 §4-1 대상이니 <b>쓰거나 지워라</b>.
+ * 실제로 쓰이는 것은 {@link #apiKey(String)}(인증 핫패스)와 {@link #tenant(Long)}(Rate Limit) 둘이다.
  *
- * <p>주의: Rate Limit 키는 여기 없음.
- * Rate Limit은 Redis 원자 연산(INCR, Lua Script)으로 캐시가 아니므로
- * {@code infrastructure.ratelimit} 패키지에서 별도 관리 예정.
- *
- * <p>설계 결정 (CLAUDE.md §7):
- * <ul>
- *   <li>Enum 대신 static 메서드 — 가변인수 타입 안전성</li>
- *   <li>키 파라미터가 메서드 시그니처로 문서화됨</li>
- *   <li>인스턴스화 방지 (private 생성자)</li>
- * </ul>
- *
- * <p>Sprint 5-D 캐시 대상:
- * <ul>
- *   <li>Tenant — Rate Limiter의 테넌트 조회 부담 해소 (버킷 키용 tenantId 문자열)</li>
- *   <li>Refresh Token — 재사용 감지 성능 향상</li>
- *   <li>ApiKey — Sprint 6 ApiKey 인증 도입 대비</li>
- * </ul>
+ * @author sonix
  */
 public final class RedisKeyFactory {
     private RedisKeyFactory(){}

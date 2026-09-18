@@ -8,18 +8,12 @@ import com.sonix.queue.domain.tenant.TenantStatus;
 import java.time.LocalDateTime;
 
 /**
- * Tenant 도메인 객체의 Jackson 직렬화/역직렬화 설정.
+ * 이유: {@link Tenant} 의 Jackson 직렬화 설정.
+ * 문제: 도메인에 Jackson 어노테이션을 붙이면 <b>헥사고날이 깨진다</b>(queue-domain 은 순수 Java 다).
+ * 해결: Mixin 으로 분리하고 {@code RedisConfig} 의 ObjectMapper 에 {@code addMixIn} 으로 등록한다.
+ * 🪤 이 클래스는 인스턴스화되지 않는다 — Jackson 이 <b>어노테이션만</b> 참조한다.
  *
- * <p>도메인 오염 방지를 위해 Tenant.java에는 Jackson 어노테이션을 직접 붙이지 않고
- * Mixin으로 분리 관리.
- *
- * <p>RedisConfig에서 ObjectMapper에 등록:
- * <pre>{@code
- * objectMapper.addMixIn(Tenant.class, TenantMixin.class);
- * }</pre>
- *
- * <p>이 클래스 자체는 인스턴스화되지 않음.
- * Jackson이 "Tenant 처리 시 이 클래스의 어노테이션 참조"만 사용.
+ * @author sonix
  */
 public abstract class TenantMixin {
 

@@ -227,8 +227,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     /**
      * 이유: 읽기 경로 — 소유자를 못 찾으면 관찰 메모에 <b>기록하지 않고</b> cluster1 에서 읽는다.
-     * 🪤 <b>이 폴백의 결과는 빈 결과가 아니라 404 다</b>(종료 신호) — 캐시가 데워진 WAS 는 5xx 를 낸다.
-     * 🔑 그래도 상태는 갈라지지 않는다 — {@code poll_verify} 는 불일치 시 아무것도 쓰지 않는다.
+     * 🪤 <b>결과는 빈 결과가 아니라 404 다</b>(종료 신호) — 상태는 갈라지지 않는다(불일치 시 안 쓴다).
      *
      * @author sonix
      */
@@ -238,8 +237,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     /**
      * 이유: 쓰기 경로 — 소유자를 못 찾으면 <b>DB 의 배정 기록</b>을 따른다.
-     * 문제: cluster1 을 기본값으로 주면 cluster2 에 배정된 큐의 <b>첫 enqueue</b> 가 cluster1 에 키를
-     *       만들어 배정이 통째로 무의미해진다.
+     * 문제: cluster1 을 기본값으로 주면 cluster2 에 배정된 큐의 <b>첫 enqueue</b> 가 cluster1 에 키를 만들어 배정이 통째로 무의미해진다.
      * 해결: 쓰기 경로에만 이 조회를 둔다 — 읽기에 달면 인증 없는 폴링이 DB 조회를 유발한다.
      * 🔴 <b>쓰기 계열은 전부 이걸 거쳐야 한다</b>(admit · claim 3종 · cleanup). 템플릿을 직접 쓰면
      *    명령이 엉뚱한 클러스터에서 돌아 <b>조용히 0건</b>을 반환하고, <b>단일 클러스터에서는 안 잡힌다</b>.
