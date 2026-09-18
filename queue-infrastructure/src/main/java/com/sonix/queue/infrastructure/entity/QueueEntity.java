@@ -39,15 +39,11 @@ public class QueueEntity {
     LocalDateTime deletedAt;
 
     /**
-     * 이 큐의 Redis 상태(waiting/seq/tokens/last-active)가 사는 클러스터 번호 (1 또는 2, §75).
-     *
-     * <p><b>도메인 {@code Queue}에는 이 필드가 없다.</b> {@code queue-domain}은 순수 자바이고
-     * Redis 토폴로지를 알아서는 안 된다. 배정과 기록은 어댑터 안에 가둔다.
-     *
-     * <p><b>{@code updatable = false}인 이유:</b> {@code QueueJpaAdapter.save()}는 수정 시에도
-     * {@code fromDomain()}으로 <b>새 detached 엔티티</b>를 만들어 merge한다. 이 컬럼이
-     * 수정 대상이면 큐 이름을 바꾸는 것만으로 배정 기록이 기본값(1)으로 덮여 사라진다.
-     * 값은 INSERT 시점에 한 번만 정해지고(§75 D27-2: 큐는 옮기지 않는다) 이후 불변이다.
+     * 이유: 이 큐의 Redis 상태가 사는 클러스터 번호(§75).
+     * 🔑 <b>도메인 {@code Queue} 엔 이 필드가 없다</b> — 배정·기록은 어댑터 안에 갇힌다(헥사고날).
+     * 🔴 <b>{@code updatable = false} 다</b> — {@code save()} 가 새 detached 엔티티를 만들어 merge 하므로
+     *    수정 대상이면 <b>큐 이름만 바꿔도 배정 기록이 기본값으로 덮인다</b>.
+     * 해결: 값은 INSERT 시점에 한 번만 정해진다(§75 D27-2 — 큐는 클러스터를 옮기지 않는다).
      */
     @Column(name = "redis_cluster_no", updatable = false)
     @JdbcTypeCode(SqlTypes.TINYINT)
