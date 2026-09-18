@@ -273,10 +273,14 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
 --      잡고, 뒤에 온 INSERT 가 **함께 막힌다**(2026-08-26 DROP PARTITION 실측 3.05초).
 --      lock_wait_timeout 기본값이 365일이라 세션에서 먼저 유계화하라.
 
-SET SESSION lock_wait_timeout = 3;
-
-ALTER TABLE tokens DROP INDEX idx_tokens_queue_user_status;
-ALTER TABLE tokens ADD  INDEX idx_tokens_queue_issued_seq (queue_id, issued_at, seq);
+--   🪤 **주석으로 둔다 — 실행 가능한 문장으로 두면 CI 가 깨진다.** CI 는 이 파일을 통째로
+--      주입하는데(scripts/ci/load-schema.sh), 새로 만드는 DB 에는 지울 인덱스가 애초에 없어
+--      `ERROR 1091` 로 죽는다(2026-09-18 실측). 위 CREATE TABLE 이 이미 새 인덱스를 갖고 있어
+--      **새 DB 에는 할 일이 없다.** 아래는 이미 돌고 있는 DB 에만 사람이 붙여 실행한다.
+--
+--     SET SESSION lock_wait_timeout = 3;
+--     ALTER TABLE tokens DROP INDEX idx_tokens_queue_user_status;
+--     ALTER TABLE tokens ADD  INDEX idx_tokens_queue_issued_seq (queue_id, issued_at, seq);
 
 --   검증 — 교체가 실제로 먹었는지 본다. type=range, key=idx_tokens_queue_issued_seq,
 --   Extra 에 "Using index" 가 있어야 한다(커버링). 행 조회가 남아 있으면 seq 가 인덱스에
