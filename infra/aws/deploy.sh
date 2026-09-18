@@ -146,7 +146,12 @@ cat <<EOF
 
 완료.
   k6 대상    : $APP_IP · $APP2_IP (각 포트 8080 · 8083 · 8084 = api 6대)
-  Grafana    : ssh -i ~/.ssh/queue-aws -L 3000:localhost:3000 ubuntu@$MYSQL
-               열고 http://localhost:3000 (익명 Admin, 로그인 없음)
-  Prometheus : 같은 방식으로 -L 9090:localhost:9090
+  관측 터널  : ssh -i ~/.ssh/queue-aws -o ExitOnForwardFailure=yes \\
+                 -L 3300:localhost:3000 -L 9390:localhost:9090 -L 9393:localhost:9093 ubuntu@$MYSQL
+               Grafana http://localhost:3300 (익명 Admin) · Prometheus :9390 · Alertmanager :9393
+               🔑 3000/9090 이 아니라 3300/9390 이다 — 로컬이 그 포트를 이미 쓰고 있어서,
+                  Slack 알람 링크도 3300 으로 박혀 있다(alertmanager.yml).
+               🪤 ExitOnForwardFailure 가 없으면 포워딩이 실패해도 SSH 는 경고 한 줄만 찍고
+                  접속을 유지한다 → 브라우저에 **로컬 Grafana** 가 떠서 AWS 로 착각한다.
+                  판별: http://localhost:3300/api/health 가 11.3.1 이면 AWS, 13.x 면 로컬.
 EOF

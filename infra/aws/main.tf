@@ -72,19 +72,19 @@ locals {
   nodes = {
     # 🔴 6차(2026-09-16): 200만 전 구간 + 생애주기 판. 쿼터가 64 로 올라 16 vCPU ×2 가 된다
     #    (app 32 + data 10 + k6 8 = 50). 5차는 쿼터 32 가 벽이라 8+4 로 갈 수밖에 없었다.
-    app    = "m7g.4xlarge" # queue-api ×3 — 4차 f500 에서 CPU 90.1%. 5차에서 증설해 잰다
+    app = "m7g.4xlarge" # queue-api ×3 — 4차 f500 에서 CPU 90.1%. 5차에서 증설해 잰다
     # 🔑 5차: app 노드를 둘로 나눠 **수평 확장 전제를 실증한다**(CLAUDE.md "N대 Stateless").
     #    같은 노드에 컨테이너만 늘리는 것은 무의미하다 — 폴링 10,000 rps 에서 노드 CPU 가
     #    94.86% 로 이미 포화였다. 늘려야 하는 것은 프로세스가 아니라 **노드(=vCPU)** 다.
     #    🪤 스팟 쿼터가 32 vCPU 다. data 10 + app 8 + k6 8 = 26 이라 여유가 6 뿐이라 xlarge(4)다.
-    app2   = "m7g.4xlarge"  # queue-api ×3 (2번째 노드)
-    mysql  = "m7g.large"  # mysql (0.83코어) + prometheus·grafana·redis-exporter
-    kafka  = "c7g.xlarge" # kafka ×3 (1.09코어) — RF=3 복제가 네트워크로 나간다
-    redis  = "m7g.large"  # redis ×6 (0.34코어) — 싱글스레드라 코어 수보다 코어 성능이다
-    worker = "c7g.large"  # queue-batch + queue-consumer (3.4% — 남아돈다)
+    app2   = "m7g.4xlarge" # queue-api ×3 (2번째 노드)
+    mysql  = "m7g.large"   # mysql (0.83코어) + prometheus·grafana·redis-exporter
+    kafka  = "c7g.xlarge"  # kafka ×3 (1.09코어) — RF=3 복제가 네트워크로 나간다
+    redis  = "m7g.large"   # redis ×6 (0.34코어) — 싱글스레드라 코어 수보다 코어 성능이다
+    worker = "c7g.large"   # queue-batch + queue-consumer (3.4% — 남아돈다)
     # 🔴 5차에서 c7g.large(2 vCPU) → c7g.2xlarge(8 vCPU). 폴링 목표 25,448 rps 를 재려면
     #    드라이버부터 커야 한다 — 로컬 6코어 천장이 15,500 이었다(그때도 천장은 Platform 이 아니라 CPU).
-    k6     = "c7g.2xlarge" # 부하 드라이버
+    k6 = "c7g.2xlarge" # 부하 드라이버
   }
 
   # 루트 볼륨. mysql 은 데이터 + 파티션, kafka 는 로그 세그먼트, app 은 Gradle 빌드 + 이미지.
@@ -159,7 +159,7 @@ resource "aws_instance" "node" {
     for_each = var.use_spot ? [1] : []
     content {
       market_type = "spot"
-    # 정지(stop)가 아니라 종료(terminate). 정지만 해도 EBS 요금이 계속 나간다.
+      # 정지(stop)가 아니라 종료(terminate). 정지만 해도 EBS 요금이 계속 나간다.
       spot_options { instance_interruption_behavior = "terminate" }
     }
   }
@@ -172,12 +172,47 @@ resource "aws_instance" "node" {
   tags = { Name = "queue-${each.key}" }
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔑 관측 노드에만 **고정 IP**를 붙인다.
+#
+# 왜: 판마다 terraform apply → destroy 를 반복하면 퍼블릭 IP 가 매번 바뀐다. 그러면
+#     Grafana 접속 주소도 매번 바뀌고, **Slack 알람에 박아 둔 대시보드 링크는 영영 맞지 않는다.**
+#     EIP 를 붙이면 그 노드 주소가 판을 건너 유지되므로 링크를 한 번 박아 두면 된다.
+#
+# 🪤 **왜 mysql 노드 하나뿐인가**: Prometheus·Grafana·Alertmanager 가 거기 있다(deploy.sh).
+#    나머지 노드는 SSH 로만 닿고 주소를 사람이 기억할 이유가 없다 — EIP 는 붙인 만큼 돈이 든다.
+#
+# ⚠️ **destroy 해도 EIP 는 남는다**(그래야 다음 판에서 같은 주소를 받는다). 안 쓰는 동안
+#    시간당 요금이 붙으므로, 한동안 실측을 안 할 거면 이 리소스를 함께 지워라:
+#      terraform destroy -target=aws_eip.monitoring
+resource "aws_eip" "monitoring" {
+  domain = "vpc"
+  tags   = { Name = "queue-loadtest-monitoring" }
+
+  # 인스턴스가 사라져도 주소는 유지한다(그게 이걸 쓰는 이유다).
+  lifecycle { prevent_destroy = false }
+}
+
+resource "aws_eip_association" "monitoring" {
+  instance_id   = aws_instance.node["mysql"].id
+  allocation_id = aws_eip.monitoring.id
+}
+
+output "monitoring_ip" {
+  description = "Grafana·Prometheus·Alertmanager 가 있는 노드의 고정 주소"
+  value       = aws_eip.monitoring.public_ip
+}
+
 output "ssh" {
   value = { for k, i in aws_instance.node : k => "ssh -i ~/.ssh/queue-aws ubuntu@${i.public_ip}" }
 }
 
 output "public_ip" {
-  value = { for k, i in aws_instance.node : k => i.public_ip }
+  # 🪤 mysql 만 EIP 를 읽는다. EIP 를 붙이면 인스턴스의 자동 할당 공인 IP 가 **해제**되는데
+  #    `aws_instance.public_ip` 는 그 해제된 주소를 그대로 들고 있다 → deploy.sh 가 죽은 IP 로
+  #    SSH 를 걸어 [0/5] 에서 무한 대기한다(②와 증상이 똑같아 원인을 헷갈린다).
+  value = { for k, i in aws_instance.node :
+  k => k == "mysql" ? aws_eip.monitoring.public_ip : i.public_ip }
 }
 
 # 🔑 컨테이너가 서로를 찾는 주소. Redis announce-ip · Kafka advertised.listeners ·
