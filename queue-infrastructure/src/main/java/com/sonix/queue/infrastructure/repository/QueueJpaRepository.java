@@ -12,51 +12,26 @@ import java.util.Optional;
 public interface QueueJpaRepository extends JpaRepository<QueueEntity, Long> {
 
     /**
-     * 전체 큐 목록. 🔴 <b>상속받은 {@code findAll}을 쓰지 마라 — 그건 replica로 간다.</b>
-     *
-     * <p>{@code SimpleJpaRepository}가 직접 구현한 CRUD 메서드에는 그 클래스의
-     * {@code @Transactional(readOnly = true)}가 걸려 있어 {@code ReplicationRoutingDataSource}가
-     * <b>replica로 보낸다</b>(실측). 인터페이스에 선언한 파생 쿼리는 트랜잭션이 열리지 않아
-     * <b>master</b>로 간다 — 판정 기준은 "readOnly 트랜잭션이 열렸는가" 하나다(§4-3).
-     *
-     * <p><b>왜 master여야 하나:</b> {@code TokenReclaimJob}(10초)과 {@code ReconcileJob}(5분)이
-     * 이걸로 큐 목록을 얻는데, <b>루프 최상단이라 감싸는 try가 없다</b>. replica가 죽으면 회수
-     * 3경로(admitToken TTL·inactiveTtl·waitingTtl)가 <b>통째로 멈추고</b>, §82로 Cancel을 폐기해
-     * 그게 유일한 정리 경로다. 종착점은 {@code waiting} 유령 누적 → {@code maxCapacity} 도달 →
-     * <b>enqueue 503</b>이며, 그때까지 아무 신호도 없다.
-     *
-     * <p>부수 효과로 복제 지연도 사라진다 — 새로 만든 큐가 복제 도착 전이라 <b>그 주기의 회수·대사에서
-     * 빠지던</b> 창이 없어진다({@code doc/reviews/2026-09-01-replica-assumption-audit.md} D-3).
-     *
-     * <p>⚠️ 대신 {@code @Transactional(readOnly = true)}로 replica에 붙이는 <b>반대 방향은 안 된다</b>.
-     * 잡의 루프 안에서 Redis EVAL을 치므로 순회 내내 DB 커넥션을 잡는다
-     * ({@code QueueEngineService.admit}에 트랜잭션을 안 붙인 것과 같은 이유).
-     *
-     * <p>상태로 거르지 않는 이유는 포트 {@code QueueRepository.findAll} 주석에 있다.
+     * 이유: 전체 큐 목록. 🔴 <b>상속받은 {@code findAll} 을 쓰지 마라 — 그건 replica 로 간다.</b>
+     * 원인: 상속 CRUD 에는 클래스 레벨 {@code readOnly} 가 걸려 있고, 선언한 파생 쿼리는 트랜잭션이
+     *       안 열려 master 다 — 기준은 <b>"readOnly 트랜잭션이 열렸는가" 하나</b>다(§4-3).
+     * 🔴 <b>왜 master 여야 하나</b>: 배치 <b>루프 최상단이라 감싸는 try 가 없다</b> — replica 가 죽으면
+     *    회수 3경로가 멈추고 종착점은 <b>enqueue 503</b> 인데 그때까지 아무 신호도 없다.
+     * ⚠️ 반대로 {@code readOnly} 로 붙이지도 마라 — 순회 내내 DB 커넥션을 잡는다.
      */
-    List<QueueEntity> findAllBy();
+   List<QueueEntity> findAllBy();
 
     Optional<QueueEntity> findByQueueId(String queueId);
     List<QueueEntity> findAllByTenantId(Long tenantId);
     boolean existsByTenantIdAndName(Long tenantId, String name);
 
     /**
-     * 테넌트가 보유한 큐 수 (DELETED 제외). 큐 생성 상한 판정용.
-     *
-     * <p><b>master로 간다.</b> 여기서는 그게 필수다 — 방금 만든 큐가 복제 도착 전이면 상한을
-     * 넘겨서 통과한다.
-     *
-     * <p>🪤 <b>근거를 "선언한 파생 쿼리라서"로 적지 마라.</b> §4-3의 판정 기준은
-     * <b>"readOnly 트랜잭션이 열렸는가"</b> 하나다. 여기서 안 열리는 실제 이유는 호출자
-     * {@code QueueService.createQueue}가 <b>package-private이라 그 메서드의
-     * {@code @Transactional}이 아예 안 걸리기 때문</b>이다(실측:
-     * {@code AnnotationTransactionAttributeSource}가 NULL을 준다 — 기본
-     * {@code publicMethodsOnly=true}). 걸렸더라도 {@code readOnly}가 아니라 master였겠지만,
-     * <b>이 COUNT를 {@code readOnly=true} 메서드에서 재사용하는 순간 replica로 가고
-     * 복제 지연 안에 만든 큐가 안 세어져 상한이 조용히 뚫린다.</b> 아무 테스트도 안 빨개진다.
-     *
-     * <p>인덱스는 {@code idx_queues_tenant_status(tenant_id, status)}가 그대로 커버한다
-     * (2026-09-03까지 이 인덱스를 쓰는 쿼리가 0건이었다 — 이게 첫 소비자다).
+     * 이유: 테넌트가 보유한 큐 수(DELETED 제외). 큐 생성 상한 판정용.
+     * 🔑 <b>master 로 가는 것이 여기서는 필수다</b> — 방금 만든 큐가 안 세어지면 상한을 넘겨 통과한다.
+     * 🪤 <b>근거를 "파생 쿼리라서"로 적지 마라</b> — 안 열리는 실제 이유는 호출자가 package-private 이라
+     *    {@code @Transactional} 이 <b>아예 안 걸리는 것</b>이다({@code publicMethodsOnly=true}).
+     * 🔴 그래서 이 COUNT 를 {@code readOnly=true} 메서드에서 재사용하는 순간 replica 로 가고
+     *    <b>복제 지연 안에 만든 큐가 안 세어져 상한이 조용히 뚫린다</b>. 아무 테스트도 안 빨개진다.
      */
     int countByTenantIdAndStatusNot(Long tenantId, int status);
 
