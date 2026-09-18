@@ -51,7 +51,10 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 > 받으므로 **no-op**이다. **의도된 동작이다** — `complete`의 술어가 `status IN (0, 1)`이고 유효 창이
 > 300초라, admitToken TTL(60초)이 지난 뒤 도착하는 **늦은 입장이 정상 경로로 실재**한다(§36).
 > 가드를 `IN (0, 1)`로 넓히면 그 경로가 죽는다. **넓히지 마라.**
-> `4`에 도달하는 것은 `waitingTtl`·`inactiveTtl` 만료(출발이 `0`)뿐이다.
+> 🔴 **`4`에 도달하는 경로는 셋이다 — 이 줄은 예전에 하나라고 적고 있었고 거짓이었다.**
+> ① `waitingTtl`·`inactiveTtl` 만료(출발 `0`, 컨슈머 가드)  ② **`ReconcileJob`의 직접 UPDATE**
+> (`status=1 → 4`, 사유 `ADMIT_STALE`) — 실측 30,071건  ③ 🔴 **랙 구간의 `ADMIT_TTL`**(실측 259건,
+> 아래 사유 표 참조). ③은 결함이고 ①②는 설계다.
 
 > **왜 파티션 순서에 기대지 않는가**: 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있다.
 > 특히 `ZADD`(enqueue Lua)가 Kafka 발행보다 먼저라 **`ENQUEUED`보다 `ADMITTED`가 먼저 도착**하는
@@ -101,10 +104,14 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | 3 | `INACTIVE` | `inactiveTtl`(300초) 초과 — 폴링이 끊김. 이탈이고 정상이다(§82) | `TokenReclaimJob` → Kafka |
 | 4 | `WAITING_TTL` | `waitingTtl`(기본 7200초) 초과 — 기다리고도 못 뽑힘. **용량 부족 신호** | `TokenReclaimJob` → Kafka |
 
-🪤 **`ADMIT_TTL`은 DB에 그 값으로 남지 않는다.** 컨슈머 가드가 `IF(status = 0, 4, status)`라
-`ADMIT_ISSUED(1)`에서 통째로 no-op이고, 그 가드는 늦은 입장(complete 300초 창)을 살리려고 일부러
-넣은 것이다(§36). 같은 사람이 DB에 남는 것은 300초 뒤 `ReconcileJob`이 쓰는 `ADMIT_STALE(2)`다.
-`ADMIT_TTL`은 **이벤트에서 사유를 잃지 않기 위한** 값이다.
+🔴 **`ADMIT_TTL`은 "DB에 남지 않는다"가 아니다 — 랙 구간에서는 남는다**(실측 259건, 2026-09-18).
+컨슈머 가드가 `IF(status = 0, 4, status)`인데, **그 `status`는 DB 값이고 회수 판정은 Redis가 한다.**
+컨슈머가 `ADMITTED`를 아직 적재하지 않았으면 DB는 `0`이라 **가드가 참이 되어 `0→4`를 적용**하고,
+뒤늦은 `ADMITTED`는 `IF(status=0)` 거짓으로 no-op이 되어 `admit_token`·`admitted_at`이 **영구 NULL**이다.
+랙이 없으면 의도대로 `1`에서 no-op이고(그 가드는 늦은 입장을 살리려고 일부러 넣었다, §36),
+같은 사람이 DB에 남는 것은 300초 뒤 `ReconcileJob`이 쓰는 `ADMIT_STALE(2)`다 — 실측 비율 **259 : 30,071**.
+⚠️ 피해는 완료·과금이 아니라 **통계**다: `total_admit_issued` 과소 계상 + 사유 3칸 합 불일치.
+(`ADMIT_TTL` 발행 자체를 멈추는 안은 **미결** — AWS `result=error` 측정 대기)
 
 감지 방식:
 - `WAITING_TTL` — 🔴 `ZRANGEBYSCORE`가 **아니다.** `waiting`의 score는 seq라 시간축이 아니다.

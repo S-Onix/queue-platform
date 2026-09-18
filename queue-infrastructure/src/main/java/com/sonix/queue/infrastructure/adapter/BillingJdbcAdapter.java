@@ -75,10 +75,11 @@ public class BillingJdbcAdapter implements BillingRepository {
      * {@code total_admit_issued}가 갖고 있다. 같은 이유로 {@code p50}/{@code p99}는 컬럼으로
      * 두지 않는다 — 백분위는 원리적으로 합산도 재계산도 안 된다.
      *
-     * <p>🔴 <b>만료 사유는 {@code expired_reason}으로만 갈린다.</b> {@code ADMIT_TTL}(코드 1)은
-     * 컬럼에 없다 — 그 경로는 컨슈머 가드에서 no-op이라 DB에 도달하지 않고, 같은 사람이
-     * 300초 뒤 {@code ReconcileJob}에 의해 {@code ADMIT_STALE}(2)로 기록된다.
-     * 즉 <b>1은 이벤트에만 있고 DB에는 2로 남는다.</b>
+     * <p>🔴 <b>만료 사유는 {@code expired_reason}으로만 갈린다. {@code ADMIT_TTL}(코드 1)은 컬럼이 없는데,
+     * 그 근거였던 "DB에 도달하지 않는다"가 거짓이었다</b>(실측 259건, 2026-09-18). 랙 구간에는 DB status가
+     * 0이라 소비 가드가 참이 되어 {@code 0 → 4}가 적용된다. 그래서 <b>1은 집계 3칸 어디에도 안 들어가면서
+     * {@code total_expired}에는 들어간다</b> — 아래 격차 주석이 그 결과다.
+     * 랙이 없으면 no-op이고 같은 사람이 300초 뒤 {@code ADMIT_STALE}(2)로 기록된다(실측 259 : 30,071).
      *
      * <p>🪤 <b>{@code =}가 아니라 {@code <=>}다.</b> {@code expired_reason}은 NULL 허용이라
      * 그 그룹의 전 행이 NULL이면 {@code SUM(expired_reason = 2)}가 <b>0이 아니라 NULL</b>을
@@ -86,8 +87,9 @@ public class BillingJdbcAdapter implements BillingRepository {
      * {@code DataIntegrityViolationException} 8건). NULL-safe 비교는 항상 0/1이다.
      * {@code SUM(status = 2)}에 같은 문제가 없는 건 {@code status}가 {@code NOT NULL}이라서다.
      *
-     * <p>🪤 셋의 합은 {@code total_expired}와 다를 수 있다 — 사유가 없던 시기의 행이 NULL이다.
-     * 억지로 맞추지 마라. 차이가 곧 "언제부터 사유를 남기기 시작했나"다.
+     * <p>🔴 셋의 합은 {@code total_expired}와 다를 수 있고 <b>원인이 둘이다</b> — ① 사유가 없던 시기의
+     * NULL 행 ② {@code ADMIT_TTL}(1). 억지로 맞추지 마라. 단 <b>"차이가 곧 언제부터 사유를 남기기
+     * 시작했나"로 읽지도 마라</b>: 실측(2026-09-18)에서 NULL 행은 <b>0건</b>이었고 격차 259는 100% ②였다.
      *
      * <p>🪤 {@code stat_date = DATE(issued_at)}은 <b>"줄 선 날"</b> 기준이라, 4/30 발행 · 5/1 입장인
      * 토큰의 대기 시간은 4/30에 붙는다. {@code admitted_at} 기준으로 바꾸면 안 되는 이유는
