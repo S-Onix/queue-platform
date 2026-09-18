@@ -34,20 +34,13 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /**
- * Redis 기반 대기열 엔진 구현 (Global Queue 배치 방식).
- * <p>단건(hybrid) 분기는 제거되었으며, 모든 요청이 배치로 처리된다.
+ * 이유: Redis 기반 대기열 엔진(Global Queue 배치 방식) — 모든 요청이 배치로 간다(§70, 단건 분기 제거).
+ * 해결: Producer(enqueue)가 {@link PendingEnqueue} 를 큐에 offer 하고 {@code Future.get()} 으로 기다리면,
+ *       Consumer({@code BatchProcessor}) 가 drain → queueId 그룹 → 청크별 Bulk Lua → {@code complete()} 한다.
+ * 🔑 {@code enqueue_bulk.lua} 반환은 {identifier, tokenId, status, rank, total, seq, issuedAt} 목록이다.
  *
- * <p><b>Producer-Consumer 패턴:</b>
- * <ul>
- *   <li>Producer (이 클래스의 enqueue): PendingEnqueue를 Global Queue에 offer,
- *       Future.get() 대기</li>
- *   <li>Consumer (BatchProcessor @Scheduled): Global Queue drain,
- *       queueId groupBy, 청크별 Bulk Lua 실행 후 Future.complete()</li>
- * </ul>
- *
- * <p><b>Lua Script 반환 형식:</b>
- * enqueue_bulk.lua: [{identifier, tokenId, status, rank, total, seq, issuedAt}, ...]
- * */
+ * @author sonix
+ */
 
 @Slf4j
 @Component
@@ -59,14 +52,11 @@ public class RedisQueueEngine implements QueueEngine {
     private static final long ADMIT_TTL_MILLIS = 60_000L;
 
     /**
-     * {@code admit-by-admit} 값이 신 포맷인지 가르는 issuedAt 하한 (2020-01-01T00:00:00Z).
-     *
-     * <p>구 포맷 {@code "tokenId|identifier"}의 identifier가 {@code "12|34|56"} 같은 모양이면
-     * 조각 수도 4개고 숫자 파싱도 성공해서 <b>신 포맷과 구분되지 않는다</b>. 그때 issuedAt이
-     * 1970년으로 잡히고, 멱등 키 {@code (token_id, issued_at)}가 어긋나 <b>중복 행 = 중복 청구</b>가 된다.
-     *
-     * <p>실제 issuedAt은 이 서비스가 존재하기 시작한 뒤의 값이고 <b>시간은 앞으로만 가므로</b>,
-     * 하한보다 작은 값은 신 포맷일 수 없다. 오분류가 원리적으로 생기지 않는 기준이다.
+     * 이유: {@code admit-by-admit} 값이 신 포맷인지 가르는 issuedAt 하한(2020-01-01Z).
+     * 문제: 구 포맷 {@code "tokenId|identifier"} 의 identifier 가 {@code "12|34|56"} 이면 조각 수도
+     *       숫자 파싱도 통과해 <b>신 포맷과 구분되지 않는다</b> — issuedAt 이 1970년이 된다.
+     * 원인: 그러면 멱등 키가 어긋나 <b>중복 행 = 중복 청구</b>다.
+     * 해결: <b>시간은 앞으로만 가므로</b> 하한보다 작으면 신 포맷일 수 없다 — 오분류가 원리적으로 없다.
      */
     private static final long MIN_PLAUSIBLE_ISSUED_AT_MILLIS = 1_577_836_800_000L;
 
@@ -95,15 +85,11 @@ public class RedisQueueEngine implements QueueEngine {
     private final QueueJpaRepository queueJpaRepository;
 
     /**
-     * queueId → 소유 클러스터. <b>WAS 로컬 관찰 메모지 두 번째 진실이 아니다.</b>
-     *
-     * <p>서버마다 내용이 달라도 무해하다. 큐는 한 번 배정되면 다른 클러스터로 옮기지 않으므로
-     * (§75 D27-2) 여기 담기는 값은 <b>불변</b>이다. 각 WAS는 각자 관찰해 같은 정답에 도달하며,
-     * 그래서 무효화 로직도 동기화도 필요 없다.
-     *
-     * <p><b>카디널리티:</b> 요청 수가 아니라 <b>실재하는 큐 수</b>에 비례한다. 소유자를
-     * 확인하지 못한 queueId(= 존재하지 않는 큐)는 넣지 않는다 — 넣으면 임의 문자열을 던지는
-     * 폴링 하나로 맵을 무한히 부풀릴 수 있다.
+     * 이유: queueId → 소유 클러스터. <b>WAS 로컬 관찰 메모지 두 번째 진실이 아니다.</b>
+     * 원인: 큐는 한 번 배정되면 옮기지 않으므로(§75 D27-2) 담기는 값이 <b>불변</b>이다 —
+     *       서버마다 내용이 달라도 무해하고 무효화도 동기화도 필요 없다.
+     * 🪤 카디널리티는 요청 수가 아니라 <b>실재하는 큐 수</b>에 비례한다 — 소유자를 확인하지 못한
+     *    queueId 는 넣지 않는다. 넣으면 임의 문자열 폴링 하나로 맵을 무한히 부풀릴 수 있다.
      */
     private final Map<String, StringRedisTemplate> ownerByQueueId = new ConcurrentHashMap<>();
 
@@ -175,22 +161,13 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-     * queueId → 소유 클러스터 (§75 이중 라우팅, 안 a″).
+     * 이유: queueId → 소유 클러스터 판정(§75 이중 라우팅).
+     * 해결: ①맵 hit ②miss 면 {@code EXISTS ...:seq} 를 물어 응답한 쪽이 소유자 ③둘 다 없으면 폴백.
+     * 🔑 <b>미스 비용은 (WAS, queueId)당 평생 1회</b> — seq 키는 INCR 로만 생기고 지워지지 않아
+     *    한 번 enqueue 된 큐는 비어도 계속 소유권을 증명한다.
+     * 🪤 읽기 오배송은 안전하다 — 대조 실패 시 아무것도 쓰지 않아 최악이 "빈 결과 1회"다.
      *
-     * <ol>
-     *   <li>맵 hit → 그대로 사용</li>
-     *   <li>miss → 두 클러스터에 {@code EXISTS queue:&#123;queueId&#125;:seq} → 응답한 쪽이 소유자</li>
-     *   <li>둘 다 없음 → {@code fallbackForNewQueue}가 정한다</li>
-     * </ol>
-     *
-     * <p><b>미스 비용은 (WAS, queueId)당 평생 1회</b>다. seq 키는 INCR로만 만들어지고
-     * 어디서도 지우지 않으므로, 한 번 enqueue된 큐는 비어도 계속 소유권을 증명한다.
-     *
-     * <p><b>오배송이 안전한 이유(읽기 경로):</b> {@code poll_verify.lua}는 대조에 실패하면
-     * {@code return 0}으로 끝나 <b>아무것도 쓰지 않는다</b>. {@code ZADD last-active}는
-     * 소유권 대조를 통과한 뒤에만 실행된다. {@code readStatus}도 읽기뿐이다.
-     * 그래서 최악의 결과가 "빈 결과 1회"이며, 상태가 갈라지지 않는다.
-     *
+     * @author sonix
      * @param fallbackForNewQueue 양쪽 모두 키가 없을 때의 목적지 결정. 읽기는 cluster1로
      *                            떨어뜨려도 무해하지만(위 참조), 쓰기는 DB 배정 기록을 따라야 한다.
      */
@@ -224,18 +201,13 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-     * 한 클러스터에 소유권을 묻는다. <b>실패는 "소유자 아님"이 아니라 "모름"이다.</b>
+     * 이유: 한 클러스터에 소유권을 묻는다. <b>실패는 "소유자 아님"이 아니라 "모름"이다.</b>
+     * 문제: 예외를 그대로 올리면 <b>cluster1 의 장애가 cluster2 소유 큐를 죽인다</b>.
+     * 원인: 맵이 빈 WAS 에서 cluster1 슬롯이 죽어 있으면 cluster2 프로브에 도달조차 못 하고
+     *       {@code COMMAND_TIMEOUT}(5s) 뒤 실패한다 — 맵에 기록도 안 되니 <b>매 요청이 5초를 태운다</b>.
+     * 해결: 예외를 삼키고 false 를 돌린다 — 읽기 폴백은 맵에 안 남기고 쓰기 폴백은 <b>DB</b> 라 안전하다.
      *
-     * <p><b>왜 예외를 잡는가:</b> 이 검사가 예외를 그대로 올리면 <b>cluster1의 장애가 cluster2
-     * 소유 큐를 죽인다.</b> 맵이 빈 WAS(재기동·신규 인스턴스·처음 보는 큐)에서 cluster1의 해당
-     * 슬롯 마스터가 죽거나 failover 중이면, cluster2 프로브에 도달조차 못 하고
-     * {@code COMMAND_TIMEOUT}(5s) 뒤 실패한다. 맵에 기록도 안 되니 cluster1이 회복될 때까지
-     * <b>매 요청이 5초를 태운다.</b> (a″)를 고른 이유가 장애 격리인데 여기서 새면 안 된다.
-     *
-     * <p><b>false를 돌려도 잘못된 소유권이 기록되지 않는다:</b> 이 값이 false면 호출자는
-     * 다음 후보를 보고, 아무도 답하지 못하면 폴백으로 간다. 읽기 폴백은 {@code null}이라
-     * 맵에 아무것도 남기지 않고(다음 요청이 다시 묻는다), 쓰기 폴백은 Redis가 아니라
-     * <b>DB의 배정 기록</b>이라 Redis 장애와 무관하게 정답을 낸다.
+     * @author sonix
      */
     private static boolean probe(StringRedisTemplate redis, String seqKey, String label) {
         try {
@@ -254,36 +226,25 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-     * 읽기 경로: 소유자를 못 찾으면 관찰 메모에 <b>기록하지 않고</b> cluster1에서 읽는다.
+     * 이유: 읽기 경로 — 소유자를 못 찾으면 관찰 메모에 <b>기록하지 않고</b> cluster1 에서 읽는다.
+     * 🪤 <b>이 폴백의 결과는 빈 결과가 아니라 404 다</b>(종료 신호) — 캐시가 데워진 WAS 는 5xx 를 낸다.
+     * 🔑 그래도 상태는 갈라지지 않는다 — {@code poll_verify} 는 불일치 시 아무것도 쓰지 않는다.
      *
-     * <p><b>이 폴백의 결과는 빈 결과가 아니라 404다.</b> cluster2 소유 큐인데 프로브가 실패하면
-     * (해당 슬롯 failover 중 + 이 WAS가 그 큐를 아직 캐시 안 함) cluster1의 빈 키를 읽어
-     * {@code verifyWaiting}이 false가 되고, {@code QueueEngineService}가 이를
-     * {@code TOKEN_NOT_FOUND}(404)로 바꾼다. 클라이언트에게 404는 <b>재시도가 아니라 종료 신호</b>다.
-     * 같은 순간 캐시가 데워진 WAS는 예외를 그대로 올려 5xx를 내므로, 같은 사용자가 어느 WAS에
-     * 붙느냐로 응답이 갈린다.
-     *
-     * <p>상태가 갈라지지는 않는다 — {@code poll_verify}는 불일치 시 아무것도 쓰지 않는다.
-     * 그리고 이 분기는 <b>cluster2에 큐가 실제로 배정된 뒤에만</b> 발현한다.
+     * @author sonix
      */
     private StringRedisTemplate routeForRead(String queueId) {
         return route(queueId, () -> null);
     }
 
     /**
-     * 쓰기 경로: 소유자를 못 찾으면 <b>DB의 배정 기록</b>을 따른다.
+     * 이유: 쓰기 경로 — 소유자를 못 찾으면 <b>DB 의 배정 기록</b>을 따른다.
+     * 문제: cluster1 을 기본값으로 주면 cluster2 에 배정된 큐의 <b>첫 enqueue</b> 가 cluster1 에 키를
+     *       만들어 배정이 통째로 무의미해진다.
+     * 해결: 쓰기 경로에만 이 조회를 둔다 — 읽기에 달면 인증 없는 폴링이 DB 조회를 유발한다.
+     * 🔴 <b>쓰기 계열은 전부 이걸 거쳐야 한다</b>(admit · claim 3종 · cleanup). 템플릿을 직접 쓰면
+     *    명령이 엉뚱한 클러스터에서 돌아 <b>조용히 0건</b>을 반환하고, <b>단일 클러스터에서는 안 잡힌다</b>.
      *
-     * <p>여기서 cluster1로 기본값을 주면 cluster2에 배정된 큐의 <b>첫 enqueue</b>가 cluster1에
-     * 키를 만들어버려 배정이 통째로 무의미해진다. 반대로 읽기 경로에 이 조회를 달면,
-     * 인증 없는 폴링(최대 15만/s)에 임의 queueId를 섞는 것만으로 DB 조회를 유발할 수 있다.
-     * <b>그래서 쓰기 경로에만 있다.</b> 쓰기 경로는 호출 전에 큐 존재가 이미 확인된 상태다
-     * ({@code QueueEngineService.enqueue} → {@code findQueueAndVerifyOwner},
-     * {@code BatchProcessor.getMaxCapacity}).
-     *
-     * <p>🔴 <b>쓰기 계열은 전부 이걸 거쳐야 한다</b>(admit · claim 3종 · cleanup). 템플릿을 직접
-     * 쓰면 cluster2에 배정된 큐의 명령이 cluster1에서 돌아 <b>빈 자료구조를 보고 조용히 0건</b>을
-     * 반환한다. 에러가 없어 만료·이탈자가 영원히 남고, <b>단일 클러스터 로컬에서는 무해해
-     * 테스트로 안 잡힌다.</b>
+     * @author sonix
      */
     private StringRedisTemplate routeForWrite(String queueId) {
         return route(queueId, () -> {
@@ -312,13 +273,10 @@ public class RedisQueueEngine implements QueueEngine {
 
         globalQueue.offer(pending);
 
-        // 종료 중이면 이 요청을 처리해 줄 주체가 없다(스케줄러는 ContextClosedEvent에서 이미
-        // 멈췄고, BatchProcessor의 마지막 drain도 지나갔을 수 있다). 30초 매달렸다 503이 되느니
-        // 즉시 실패시켜 호출자가 다른 인스턴스로 재시도하게 한다.
-        //
-        // 위의 fast path만으로는 부족하다. 앞 검사만 있으면 "검사 통과 → 마지막 drain 완료 →
-        // offer" 순서가 가능해 그 요청이 아무에게도 처리되지 않는다. offer '뒤'에서 다시 보면
-        // remove 성공 여부가 곧 "아직 아무도 안 가져갔다"는 증거라 경합 구간이 남지 않는다.
+        // 이유: 종료 중이면 이 요청을 처리해 줄 주체가 없다 — 30초 매달렸다 503 이 되느니 즉시 실패시킨다.
+        // 문제: 위의 fast path 만으로는 부족하다.
+        // 원인: "검사 통과 → 마지막 drain 완료 → offer" 순서가 가능해 그 요청이 아무에게도 안 간다.
+        // 해결: offer **뒤**에서 다시 본다 — remove 성공이 곧 "아직 아무도 안 가져갔다"는 증거다.
         if (shuttingDown && globalQueue.remove(pending)) {
             throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         }
@@ -372,12 +330,10 @@ public class RedisQueueEngine implements QueueEngine {
             return false;
         }
 
-        // poll_verify.lua: seq -> identifier -> 저장된 tokenId 대조, 통과 시에만 last-active 갱신.
-        // 검증과 갱신을 한 스크립트에 묶어야 그 사이 이탈한 항목을 되살리지 않는다.
-        //
-        // ⚠️ KEYS는 최소 1개를 반드시 넘긴다. 비우면 Lettuce가 EVAL을 보낼 노드를 슬롯이 아니라
-        //    시드 노드로 고르므로, 4 master 중 3대에서 "Lua script attempted to access a
-        //    non local key"로 실패한다(= 3/4 확률로 죽는다).
+        // 이유: poll_verify.lua 가 seq → identifier → 저장된 tokenId 를 대조하고 통과 시에만 갱신한다.
+        // 해결: 검증과 갱신을 한 스크립트에 묶어야 그 사이 이탈한 항목을 되살리지 않는다.
+        // ⚠️ KEYS 를 <b>최소 1개</b> 넘겨라 — 비우면 Lettuce 가 슬롯이 아니라 시드 노드로 EVAL 을 보내
+        //    4 master 중 3대에서 "attempted to access a non local key" 로 실패한다(3/4 확률로 죽는다).
         Long result = routeForRead(queueId).execute(
                 pollVerifyScript,
                 List.of(QueueKeys.waiting(queueId), QueueKeys.tokens(queueId), QueueKeys.lastActive(queueId)),
@@ -425,15 +381,11 @@ public class RedisQueueEngine implements QueueEngine {
         if (raw == null) {
             return Optional.empty();
         }
-        // 값은 "tokenId|seq|issuedAt|identifier"다 (admit.lua).
-        // identifier는 Tenant 자유 문자열이라 '|'가 들어올 수 있고 앞 세 값에는 없다 →
-        // 앞에서 세 번만 쪼개고 나머지 전부가 identifier다(limit=4).
-        //
-        // 🔴 **구 포맷을 필드 개수로 가르면 안 된다.** 구 포맷 "tokenId|identifier"의 identifier에도
-        //    '|'가 들어올 수 있어 조각이 4개가 된다("tok_A|12|34|56"은 숫자 파싱까지 성공한다).
-        //    그러면 issuedAt이 1970년이 되고 멱등 키 (token_id, issued_at)가 어긋나 **중복 행**이
-        //    INSERT된다 — 과금이 행 수라(§82) 곧 중복 청구다.
-        //    그래서 값의 타당성까지 본다: 하한보다 작은 issuedAt은 신 포맷일 수 없다.
+        // 이유: 값은 "tokenId|seq|issuedAt|identifier"다(admit.lua). identifier 에 '|' 가 들어올 수
+        //       있고 앞 세 값엔 없으므로 세 번만 쪼갠다(limit=4).
+        // 문제: 🔴 **구 포맷을 필드 개수로 가르면 안 된다** — "tok_A|12|34|56"은 숫자 파싱까지 성공한다.
+        // 원인: 그러면 issuedAt 이 1970년이 되고 멱등 키가 어긋나 **중복 행 = 중복 청구**다(§82).
+        // 해결: 값의 타당성까지 본다 — 하한보다 작은 issuedAt 은 신 포맷일 수 없다.
         String[] f = raw.split("\\|", 4);
         if (f.length < 2) {
             // "tokenId"만 있던 더 옛날 포맷 — 신원도 모른다. 호출자가 DB 경로로 간다.
@@ -456,17 +408,15 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-     * 폴링 전용 역방향 조회. <b>{@code routeForRead}를 쓴다 — {@code routeForWrite}가 아니다.</b>
+     * 이유: 폴링 전용 역방향 조회. <b>{@code routeForRead} 를 쓴다 — {@code routeForWrite} 가 아니다.</b>
+     * 원인: verify 는 인증 뒤의 저빈도라 쓰기 폴백(DB 조회)을 타도 되지만 이쪽은 <b>인증 없는 폴링</b>이라,
+     *       쓰기 폴백을 달면 임의 queueId 를 섞은 요청만으로 DB 조회를 유발할 수 있다.
+     * 🔑 왕복이 추가되는 것은 {@code verifyWaiting} 이 false 일 때뿐이다(= admit 됐거나 없는 토큰) —
+     *    대기 중인 정상 폴링(최대 15만/s)은 여기 도달하지 않는다.
      *
-     * <p>{@code findAdmitRefByAdmitToken}(verify)은 Tenant 인증 뒤의 저빈도 호출이라 쓰기 폴백
-     * (DB 배정 조회)을 타도 되지만, 이 메서드는 <b>인증 없는 폴링</b> 경로다. 쓰기 폴백을 달면
-     * 임의 queueId를 섞은 요청만으로 DB 조회를 유발할 수 있다({@link #routeForWrite} 주석과 같은 이유).
-     *
-     * <p>왕복이 추가되는 것은 {@code verifyWaiting}이 false인 경우뿐이다(= admit됐거나 없는 토큰).
-     * 대기 중인 정상 폴링(최대 15만/s)은 여기에 도달하지 않는다. 소유 클러스터도 같은 요청의
-     * {@code verifyWaiting}이 이미 관찰해 뒀으므로 추가 프로브가 없다.
+     * @author sonix
      */
-    @Override
+   @Override
     public Optional<String> findAdmitTokenByTokenId(String queueId, String tokenId) {
         if (tokenId == null || tokenId.isBlank()) {
             return Optional.empty();
@@ -632,31 +582,17 @@ public class RedisQueueEngine implements QueueEngine {
         //    가서 아무것도 못 지운다 — 단일 클러스터 로컬에서는 무해해 테스트로 안 잡힌다(§75).
         StringRedisTemplate redis = routeForWrite(queueId);
 
-        // 🔴 **명령을 다시 쪼개지 마라.** 이 정리는 identifier(사람 키)로 지우는 둘과 회차 고유 키로
-        //    지우는 셋이 섞여 있고, 앞의 둘은 "지금 그 사람이 아직 이 회차인가"를 물어야 한다.
-        //    Java에서 HGET → 비교 → HDEL로 쪼개면 그 사이에 admit_expire + 재-enqueue가 끼어들어
-        //    같은 결함이 TOCTOU로 재발한다. 대조와 삭제가 한 EVAL 안에 있어야 성립한다.
-        //    (왜 대조가 필요한지, 왜 순서가 이런지는 cleanup_completed.lua 머리말에 있다)
-        //
-        // 🔑 seq는 Long.toString으로 넘긴다. double을 태우면 "42.0"이 되어 admit.lua가 ZADD한
-        //    member("42|U")와 어긋나 admitted 멤버가 조용히 안 지워진다.
+        // 🔴 **명령을 다시 쪼개지 마라.** identifier 로 지우는 둘은 "지금 그 사람이 아직 이 회차인가"를
+        //    물어야 하는데, Java 에서 HGET → 비교 → HDEL 로 쪼개면 그 사이 재-enqueue 가 끼어들어
+        //    같은 결함이 TOCTOU 로 재발한다 — 대조와 삭제가 한 EVAL 안이어야 성립한다.
+        // 🔑 seq 는 Long.toString 으로 넘겨라 — double 이면 "42.0"이 되어 admitted 멤버가 조용히 안 지워진다.
         Long cleaned = redis.execute(cleanupCompletedScript, keys, identifier, Long.toString(seq), tokenId);
 
-        // 🔴 **0은 사고가 아니다 — 가드가 제 일을 한 것이다.** 그래도 로그를 남기는 이유는 이
-        //    빈도가 "옛 회차의 늦은 정리가 새 회차를 만나는" 사건의 유일한 신호이기 때문이다.
-        //    완료 정리는 토큰당 1~2회라 폴링 핫패스(최대 15만/s)와 무관하다.
-        //
-        // ⚠️ **§92로 0의 출처가 둘이 됐다. 240초 모순의 빈도로만 읽지 마라.**
-        //    ① 원래 것 — §36(admitToken TTL 60초)과 complete 창(300초)의 240초 차. 늦은 complete가
-        //       그 사이 재-enqueue한 새 회차를 만난다
-        //    ② §92가 만든 것 — verify가 게이트를 풀어 **완료 직후 재-enqueue가 처음으로 가능해졌다.**
-        //       그 뒤 Tenant가 verify를 재시도하면(admit-by-admit을 60초 남겨둔 게 바로 그 계약이다)
-        //       옛 tokenId로 두 번째 정리가 와서 새 회차를 만난다. 이건 **초 단위** 사건이고 240초와
-        //       무관하다. 둘을 가르려면 호출자 구분이 필요한데, 지금 그걸 만들 근거는 없다(§4)
-        //
-        // ⚠️ **-1(정리할 게 없었음)에는 찍지 않는다.** 늦은 complete는 -1로도 온다 — TTL 만료로
-        //    게이트가 이미 풀렸는데 그 사람이 재-enqueue를 안 한 경우다. 둘을 합쳐 세면 "축출을
-        //    막았다"가 아무 일도 없던 경우에까지 찍혀 위 문장이 거짓이 된다. 0만 센다.
+        // 이유: **0은 사고가 아니다 — 가드가 제 일을 한 것이다.** 그래도 찍는 것은 이 빈도가
+        //       "옛 회차의 늦은 정리가 새 회차를 만나는" 사건의 유일한 신호이기 때문이다.
+        // ⚠️ **§92로 0의 출처가 둘이 됐다** — ①§36 의 240초 차(늦은 complete) ②verify 가 게이트를
+        //    풀어 생긴 **초 단위** 사건(완료 직후 재-enqueue + verify 재시도). 240초로만 읽지 마라.
+        // ⚠️ **-1 에는 찍지 않는다** — 아무 일도 없던 경우까지 세면 위 문장이 거짓이 된다. 0만 센다.
         if (cleaned != null && cleaned == 0L) {
             // 문구에서 "complete"를 뺀 것은 §92로 호출자가 둘이 됐기 때문이다 — verify도 여기 온다.
             log.warn("늦은 완료 정리가 다른 회차를 만나 건너뛰었다 — 재-enqueue 축출을 막았다. "
@@ -665,19 +601,15 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-     * admit.lua 결과 파싱:
-     * {@code { "OK"|"REPLAY", { {identifier, tokenId, seq, admitToken, issuedAt}, ... } }}
+     * 이유: admit.lua 결과 파싱 — {@code { "OK"|"REPLAY", { {identifier, tokenId, seq, admitToken, issuedAt} } }}.
+     * 🔑 seq·issuedAt 은 두 경로 모두 <b>문자열</b>이다(Lua 숫자 포맷 %.14g 를 피하려고 그대로 쓴다).
+     * 🪤 <b>원소가 4개인 행도 허용한다</b> — 멱등 payload 가 300초 남아 롤링 배포 중에는 이전 버전이
+     *    저장한 4개짜리가 REPLAY 로 돌아온다. 그 경우 issuedAt 이 null 이고 호출자가 발행을 건너뛴다.
+     * 🔴 아무 값이나 채우지 마라 — 컨슈머의 멱등 키 {@code (token_id, issued_at)} 가 어긋나 중복 행이 된다.
      *
-     * <p>seq·issuedAt은 두 경로 모두 <b>문자열</b>이다. OK는 ZPOPMIN score와 Hash 값을 문자열
-     * 그대로 쓰고(Lua 숫자 포맷 %.14g를 피하려고), REPLAY는 cjson 왕복을 거치는데 문자열은
-     * 문자열로 남기 때문이다.
-     *
-     * <p><b>원소가 4개인 행을 허용하는 이유:</b> 멱등 payload는 Redis에 300초 남는다. 롤링 배포
-     * 중에는 <b>이전 버전이 저장한 4개짜리 행</b>이 REPLAY로 돌아올 수 있다. 그 경우 issuedAt은
-     * null이고, 호출자가 ADMITTED 발행을 건너뛴다 — 아무 값이나 채우면 컨슈머의 멱등 키가
-     * 어긋나 같은 토큰의 두 번째 행이 생긴다.
+     * @author sonix
      */
-    @SuppressWarnings("unchecked")
+   @SuppressWarnings("unchecked")
     private static AdmitResult parseAdmitResult(List<Object> raw) {
         if (raw == null || raw.size() < 2) {
             throw new IllegalStateException("Invalid admit Lua result: " + raw);
