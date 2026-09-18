@@ -54,6 +54,11 @@ scrape_configs:
       - target_label: __address__
         replacement: localhost:9121   # host 네트워크라 Prometheus 와 같은 호스트다
 
+  # 🔴 alerts/infra.yml 의 mysql_up · mysql_slave_status_* 규칙이 **대상이 없어 no-data** 였다.
+  #    exporter 는 mysql 노드에서 돌고 Prometheus 는 obs 노드라 주소를 파일로 받는다.
+  - job_name: mysql
+    file_sd_configs: [{ files: [/etc/prometheus/targets/mysql.json] }]
+
   - job_name: prometheus
     static_configs: [{ targets: ['localhost:9090'] }]
   # 🔑 알림 경로 자체가 죽었을 때 그걸 알려줄 수 있는 건 이 시계열뿐이다

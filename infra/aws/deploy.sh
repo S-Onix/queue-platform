@@ -72,6 +72,9 @@ d = "infra/aws/monitoring/targets"
 json.dump([{"targets": [f"{h}:{p}" for h in (app, app2) for p in (8080, 8083, 8084)]}], open(f"{d}/api.json", "w"))
 json.dump([{"targets": [f"{worker}:8081"], "labels": {"app": "batch"}},
            {"targets": [f"{worker}:8082"], "labels": {"app": "consumer"}}], open(f"{d}/worker.json", "w"))
+# 🔴 mysqld-exporter 는 mysql 노드에서 돈다(9104). 이 파일이 없으면 alerts 의 mysql_* 규칙이
+#    대상 없이 no-data 로 남는다 — 규칙은 있는데 지표가 없는 상태였다(2026-09-18).
+json.dump([{"targets": [f"{mysql}:9104"]}], open(f"{d}/mysql.json", "w"))
 json.dump([{"targets": [f"redis://{redis}:{p}"], "labels": {"cluster": c}}
            for c, ports in (("A", (7001, 7002, 7003)), ("B", (8001, 8002, 8003))) for p in ports],
           open(f"{d}/redis.json", "w"))
@@ -128,7 +131,7 @@ on "$OBS" "mkdir -p ~/queue-platform/infra/aws/monitoring && \
   || echo "⚠️  Slack webhook 파일 준비 실패 — 배포는 계속한다. 알림만 안 간다"
 
 on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f infra/aws/data.yml up -d \
-  mysql node-exporter &&
+  mysql mysqld-exporter node-exporter &&
   until docker exec q-mysql mysqladmin ping -h127.0.0.1 -p$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do sleep 3; done" &
 on "$OBS" "cd ~/queue-platform && DATA_IP=$OBS_IP $SEC docker compose -f infra/aws/data.yml up -d \
   prometheus grafana alertmanager redis-exporter node-exporter"

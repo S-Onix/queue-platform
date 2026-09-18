@@ -334,6 +334,7 @@ public class QueueEngineService {
         // 값에 identifier가 들어 있으면 **DB를 읽지 않는다**. tokenId만 얻고 신원을 DB에서 찾던
         // 예전 경로는, 컨슈머 백로그로 행이 아직 없는 정상 토큰을 404로 만들었다.
         Optional<String> fromRedis = ref.map(AdmitRef::identifier).filter(id -> !id.isBlank());
+        countPath("queue.verify.result", "result", fromRedis.isPresent() ? "redis" : "db_fallback");
         if (fromRedis.isPresent()) {
             // 🔑 **verify 응답을 주는 시점이 완료다.** Platform의 책임은 답을 돌려주는 데까지이고,
             //    그 뒤 Tenant 안에서 좌석 배정·세션 생성이 어떻게 되는지는 관측할 수도 책임질 수도
@@ -426,6 +427,7 @@ public class QueueEngineService {
 
         int updated = tokenRepository.markCompleted(
                 queueId, tenantId, tokenId, admitToken, completedAt, Token.COMPLETE_VALID_WINDOW_SECONDS);
+        countPath("queue.complete.path", "path", updated == 1 ? "update" : "zero_row");
         if (updated == 0) {
             // 🔴 **이미 COMPLETED면 성공이다.** verify가 완료를 확정하게 되면서
             //    verify → complete를 둘 다 부르는 정상 Tenant가 여기 도달한다.
@@ -434,6 +436,7 @@ public class QueueEngineService {
             Optional<LocalDateTime> already =
                     tokenRepository.findCompletedAt(queueId, tenantId, tokenId, admitToken);
             if (already.isPresent()) {
+                countPath("queue.complete.path", "path", "already");
                 return already.get();
             }
 
@@ -507,6 +510,7 @@ public class QueueEngineService {
             log.warn("complete가 Redis 폴백으로 처리됐다 — 컨슈머 적재가 밀려 있다. "
                     + "tokenId={} queueId={} seq={}", tokenId, queueId, ref.seq());
 
+            countPath("queue.complete.path", "path", "redis_fallback");
             queueEngine.cleanupCompleted(queueId, ref.identifier(), tokenId, admitToken, ref.seq());
             // 이벤트에 필요한 값이 AdmitRef 안에 전부 있다. DB를 다시 읽지 않는다.
             publishQuietly(new EnqueueEvent(TokenEventType.COMPLETED.name(), tokenId, queueId, tenantId,
@@ -536,6 +540,20 @@ public class QueueEngineService {
      *
      * @return 성공 여부. 여러 건을 연달아 발행하는 호출자가 <b>첫 실패에서 끊을</b> 근거다
      */
+    /**
+     * 이유: 경로가 갈리는 지점의 **분기 비율**을 남긴다.
+     * 문제: 9차에서 verify 폴백 313,842회·complete 0행 97.3% 를 digest 를 떠야 알았다.
+     * 원인: 어느 분기로 갔는지는 로그에도 지표에도 없었다 — HTTP 는 전부 200 이다.
+     * 해결: 분기마다 카운터 1증가. 회귀가 나면 **비율이 먼저 움직인다**.
+     *
+     * @author sonix
+     * @param name 지표 이름
+     * @param tag  분기 이름(result/path)
+     */
+    private void countPath(String name, String tagKey, String tag) {
+        Counter.builder(name).tag(tagKey, tag).register(meterRegistry).increment();
+    }
+
     private boolean publishQuietly(EnqueueEvent event) {
         try {
             eventPublisher.publish(event);
