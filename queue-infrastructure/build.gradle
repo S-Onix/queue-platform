@@ -13,6 +13,11 @@ dependencies {
     // 어댑터는 헥사고날 원칙상 여기에 있어야 한다.
     implementation 'org.springframework.kafka:spring-kafka'
 
+    // 🔑 globalQueue 크기 Gauge 하나를 등록하려고 넣는다(QueueMetricsConfig).
+    //    앱 3종(api·batch·consumer)이 전부 actuator 를 갖고 있어 런타임에는 이미 있던 것이고,
+    //    여기 선언은 "이 모듈이 micrometer 를 쓴다"를 코드에 드러내는 것이다.
+    implementation 'io.micrometer:micrometer-core'
+
     // Jackson (Redis 캐시 JSON 직렬화용) ⭐ 추가
     implementation 'com.fasterxml.jackson.core:jackson-databind'
     implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'

@@ -31,12 +31,15 @@ public class PendingEnqueue {
     private final String identifier;
     private final String tokenId;
     private final CompletableFuture<EnqueueResult> future;
+    /** 큐에 담긴 시각. 드레인 틱까지 얼마나 기다렸는지를 재는 데만 쓴다(queue.stage.duration{stage=tick}). */
+    private final long createdNanos;
 
     public PendingEnqueue(String queueId, String identifier, String tokenId){
         this.queueId = queueId;
         this.identifier = identifier;
         this.tokenId = tokenId;
         this.future = new CompletableFuture<>();
+            this.createdNanos = System.nanoTime();
     }
 
     public String getTokenId() { return this.tokenId;}
@@ -46,6 +49,8 @@ public class PendingEnqueue {
     public String getIdentifier() {
         return this.identifier;
     }
+
+    public long getCreatedNanos() { return this.createdNanos; }
 
     public CompletableFuture<EnqueueResult> getFuture() {
         return this.future;

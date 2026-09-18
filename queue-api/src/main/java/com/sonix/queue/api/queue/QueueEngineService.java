@@ -90,7 +90,12 @@ public class QueueEngineService {
         }
 
         if (result.isOk()) {
+            // 계기판: enqueue 응답의 최대 항목이 이 동기 발행이다(손실측 약 18ms). 코드에 심어 회귀를 잡는다.
+            long kafkaStart = System.nanoTime();
             eventPublisher.publish(EnqueueEvent.of(tenantId, queueId, result));
+            io.micrometer.core.instrument.Timer.builder("queue.stage.duration").tag("stage", "kafka")
+                    .register(meterRegistry)
+                    .record(System.nanoTime() - kafkaStart, java.util.concurrent.TimeUnit.NANOSECONDS);
         }
 
         return result;
