@@ -17,43 +17,13 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Redis ↔ DB 정합성 대사 (Sprint 9 · §73 D15 후속).
+ * 이유: Redis ↔ DB 정합성 대사(§73 D15 후속). 큐당 두 숫자 — ZCOUNT waiting 과 COUNT status=0.
+ * 문제: Redis 와 Kafka 사이엔 분산 트랜잭션이 없어 발행 갭이 영구적이다(100만건에서 835건).
+ * 원인: 두 집합은 원래 같아야 한다 — admit 되면 양쪽에서 함께 빠진다. 차이가 곧 갭이다.
+ * 해결: 🔴 <b>정착 시간</b>으로 최근 구간을 잘라 낸다 — 없으면 컨슈머 지연이 곧 오탐이다(실측 -500).
+ * 🔑 <b>부호가 방향</b>이다: 양수=유령(발행 유실) · 음수=종료 유실. 둘 다 <b>탐지만</b> 한다.
  *
- * <p>§73이 "Redis와 Kafka 사이엔 분산 트랜잭션이 없어 <b>발행 갭은 영구적</b>"이라며 필수 후속으로
- * 남긴 작업이다. 100만건 실측에서 실제로 <b>835건</b>이 "Redis엔 있고 DB엔 없는 유령 토큰"으로 남았다.
- *
- * <h2>대사 방식 — 큐당 두 숫자</h2>
- * <pre>
- *   Redis  ZCOUNT waiting -inf {settledSeq}
- *   DB     COUNT(*) WHERE status = 0 AND seq &lt;= {settledSeq}
- * </pre>
- * {@code waiting} ZSet과 DB {@code status = 0}은 <b>정확히 같은 집합</b>이다 — admit되면 ZSet에서
- * 빠지고 DB에서도 1이 되므로 양쪽에서 함께 빠진다. 그래서 두 수를 그냥 빼면 갭이 나온다.
- *
- * <p><b>비싼 스캔은 갭이 0이 아닐 때만 한다.</b> 평상시 비용은 큐당 {@code ZCOUNT} 1회 +
- * {@code COUNT} 1회다.
- *
- * <h2>🔴 정착 시간(settle window)이 없으면 컨슈머 지연이 곧 오탐이다</h2>
- * 방금 들어온 사람은 Kafka를 타는 중이라 <b>Redis엔 있고 DB엔 없는 게 정상</b>이다.
- * 실측으로 밟았다 — 회수가 도는 중에 앱을 끊자 큐마다 -500이 찍혔고, 컨슈머를 다시 띄우자
- * <b>40초 만에 전부 0</b>이 됐다. 그래서 {@code settledSeq}로 최근 구간을 잘라 낸다.
- *
- * <h2>부호가 방향을 말해 준다 — 그래서 조치도 다르다</h2>
- * <table><caption>대사 결과별 조치</caption>
- *   <tr><th>부호</th><th>의미</th><th>조치</th></tr>
- *   <tr><td><b>양수</b> (Redis &gt; DB)</td><td>유령 토큰 — {@code ENQUEUED} 발행 유실</td>
- *       <td><b>탐지만</b>. 복구(재발행)는 이 값이 0이 아닌 것을 실제로 본 뒤에 붙인다</td></tr>
- *   <tr><td><b>음수</b> (Redis &lt; DB)</td><td>종료 이벤트 유실</td>
- *       <td>🔴 <b>탐지만</b>. Redis 전손과 구분할 수단이 없어 자동 복구가 전원을 만료로 오판할 수 있다</td></tr>
- * </table>
- *
- * <p>세 번째 갈래인 {@link #expireStaleAdmitted()}는 <b>Redis를 아예 보지 않아</b> 그 위험이 없고,
- * 그래서 유일하게 자동 정리를 한다.
- *
- * <h2>ShedLock을 쓰지 않는다</h2>
- * 읽기 두 개는 부수효과가 없어 batch가 N대여도 무해하다(같은 값을 각자 보고할 뿐 —
- * PromQL에서 {@code sum}이 아니라 {@code max}로 본다). 정리 UPDATE는 술어 {@code status = 1}이
- * 멱등성을 만들어 각 행이 한 번만 전이한다.
+ * @author sonix
  */
 @Slf4j
 @Component
@@ -162,22 +132,13 @@ public class ReconcileJob {
     }
 
     /**
-     * {@code complete} 유효 창이 지나도록 {@code ADMIT_ISSUED}에 남은 토큰을 만료로 정리한다.
+     * 이유: complete 유효 창이 지나도록 {@code ADMIT_ISSUED} 에 남은 토큰을 만료로 정리한다.
+     * 문제: Tenant 가 verify·complete 를 둘 다 안 부르면 status 가 1에 영원히 남는다.
+     * 원인: 회수 배치는 Redis 게이트만 풀고 EXPIRED 가드가 1에서 no-op 이다(늦은 입장을 살리려는 §36).
+     * 해결: 이 경로만 <b>직접 UPDATE</b> 한다. 더 일찍 자르면 늦은 통보가 404 다(실측 98초에도 200).
+     * 🔴 cutoff 를 여기서 계산하지 마라(§90) — batch 시계로 자르면 완료 가능한 행이 영구 고정된다.
      *
-     * <p>🔑 <b>Tenant가 {@code verify}도 {@code complete}도 안 부른 경우</b>가 여기로 온다.
-     * 회수 배치는 Redis 게이트만 풀고 status는 안 건드린다 — {@code EXPIRED} 소비 가드가
-     * {@code IF(status = 0, 4, status)}라 1에서는 no-op이고, 그건 늦은 입장을 살리려는 의도다(§36).
-     * 그래서 이 경로만은 <b>이벤트가 아니라 직접 UPDATE</b>다.
-     *
-     * <p><b>왜 {@link Token#COMPLETE_VALID_WINDOW_SECONDS}가 기준인가</b>: 그 창이 지나면
-     * {@code markCompleted}가 어차피 0행이라 <b>더 이상 완료가 올 수 없다</b> — 정리해도 되돌릴
-     * 것이 없다. 더 일찍(예: admitToken TTL 60초) 자르면 정상적인 늦은 통보가 404를 받는다.
-     * 실측으로 확인된 경로다 — admit 후 <b>98초</b>에도 {@code complete}가 200을 돌려준다.
-     *
-     * <p>🔴 <b>cutoff를 여기서 계산하지 않는다</b>(§90). 창의 길이만 넘기고 "지금"은 DB가 정한다 —
-     * {@link #nowUtc()}로 자르면 <b>batch 서버 시계</b>와 {@code admitted_at}(DB 시계)을 비교하게 되고,
-     * batch가 앞서면 아직 완료 가능한 행을 만료로 확정해 {@code status = 4 / completed_at = NULL}로
-     * 영구 고정시킨다. {@code markCompleted}와 <b>같은 시계로 같은 창</b>을 재는 것이 요점이다.
+     * @author sonix
      */
     private int expireStaleAdmitted(Queue queue) {
         try {
@@ -190,13 +151,12 @@ public class ReconcileJob {
     }
 
     /**
-     * 🔴 <b>반드시 UTC다.</b> 시각 컬럼이 전부 UTC이고(§77) 이 값이 그대로 SQL 술어에 들어간다.
-     * {@code LocalDateTime.now()}는 호스트 TZ(개발자 KST)를 쓰므로 9시간 어긋나 —
-     * 정리 대상이 아닌 행을 만료시키거나 대사 기준선이 통째로 밀린다.
+     * 이유: 배치가 쓰는 "지금". 🔴 <b>반드시 UTC 다</b> — 시각 컬럼이 전부 UTC 다(§77).
+     * 문제: 로컬 시각으로 자르면 창이 9시간 어긋난다.
+     * 해결: UTC 로 고정한다.
+     * 🪤 원장 판정(만료 확정)의 cutoff 로는 쓰지 마라 — 그건 DB 시계가 정한다(§90).
      *
-     * <p>{@code Clock} 빈을 주입하지 않는 이유는 {@link TokenReclaimJob}과 같다. 그 빈은
-     * {@code queue-api}의 {@code UtilConfig}에만 있고 <b>queue-batch는 queue-api를 의존하지 않는다</b> —
-     * 주입을 걸면 기동 자체가 실패한다. 시각 고정이 필요해지면 그때 이 모듈에 빈을 만든다.
+     * @author sonix
      */
     private LocalDateTime nowUtc() {
         return LocalDateTime.now(ZoneOffset.UTC);
