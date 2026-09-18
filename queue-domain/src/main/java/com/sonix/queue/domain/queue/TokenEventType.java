@@ -6,25 +6,13 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * {@code token-lifecycle} 토픽에 실리는 이벤트의 종류.
+ * 이유: {@code token-lifecycle} 토픽에 실리는 이벤트 종류. <b>토픽은 하나다</b>(§73 D16·D18).
+ * 문제: Kafka 헤더로 구분하면 헤더가 유실됐을 때 admit 이벤트가 <b>예외 없이</b> enqueue 로 읽힌다.
+ * 해결: <b>본문의 판별 필드</b>로 가른다 — 값이 남아 {@link #from} 이 "모르는 타입"으로 잡는다.
+ * 🔴 <b>이름 문자열이 계약이다</b> — 상수 이름을 바꾸면 흘러가는 구 메시지가 못 읽힌다.
+ * 🔴 <b>선언 순서도 고정</b>(상태 전이 순) — {@code persistGrouped} 가 EnumMap 순회에 기댄다.
  *
- * <p><b>토픽은 하나다.</b> 같은 토큰의 상태 전이는 같은 토픽·같은 파티션 안에서만 순서가
- * 보장되므로 타입별로 토픽을 나눌 수 없다(DECISIONS §73 D16·D18). 그래서 구분은
- * <b>메시지 본문의 판별 필드</b>({@link EnqueueEvent#eventType()})가 진다 (§80).
- *
- * <p><b>Kafka 헤더로 구분하지 않는 이유:</b> 헤더는 본문과 따로 다녀서, 헤더를 못 읽는 구
- * 컨슈머에게 admit 이벤트가 도착하면 <b>예외 없이</b> enqueue로 해석돼 조용히 적재된다.
- * 판별 필드는 본문에 있으므로 같은 상황에서 값이 남고, 아래 {@link #from(String)}이
- * "모르는 타입"으로 잡아낸다.
- *
- * <p>이름 문자열이 곧 계약이다 — <b>상수 이름을 바꾸면 흘러가는 메시지가 깨진다.</b>
- * 개수는 늘려도 되지만 <b>선언 순서는 상태 전이 순서(ENQUEUED→ADMITTED→COMPLETED→EXPIRED)로
- * 고정</b>이다 — {@code TokenLifecycleConsumer.persistGrouped}가 {@code EnumMap} 순회 순서에 기댄다.
- * <b>이름도 못 바꾼다</b>(ordinal이 아니라 name으로 직렬화된다).
- *
- * <p><b>넷 다 발행된다.</b> {@code ENQUEUED}(enqueue) · {@code ADMITTED}(admit) ·
- * {@code COMPLETED}(verify 또는 complete) · {@code EXPIRED}(회수 배치 3경로).
- * {@code RETURNED}는 <b>만든 적이 없다</b> — §36이 WAITING 복귀 자체를 폐기했다.
+ * @author sonix
  */
 public enum TokenEventType {
 
@@ -51,22 +39,13 @@ public enum TokenEventType {
     }
 
     /**
-     * 이 이벤트가 도달시키려는 상태 (§80 가드 표의 "도착" 칸).
+     * 이유: 이 이벤트가 도달시키려는 상태(§80 가드 표의 "도착" 칸).
+     * 🔑 <b>도달을 보장하지 않는다</b> — 허용 출발을 강제하는 것은 UPSERT 의 {@code IF(status = ...)}
+     *    가드이고 여기는 목표값일 뿐이다. Kafka 가 At-Least-Once 라 재전달이 일상이기 때문이다.
+     * 🔴 {@code 4}(EXPIRED)에 닿는 경로는 <b>셋</b> — ①waitingTtl·inactiveTtl ②ReconcileJob 직접 UPDATE
+     *    ③랙 구간의 admitToken TTL 만료(DB 가 아직 0). ①②는 설계고 <b>③은 결함이다</b>(2026-09-18).
      *
-     * <p><b>도달을 보장하지 않는다.</b> 허용 출발 상태를 강제하는 것은 소비 측 UPSERT의
-     * {@code IF(status = ...)} 가드이고, 여기는 "행이 없을 때 새로 넣을 값"이자 그 가드의
-     * 목표값일 뿐이다. 예컨대 이미 {@code COMPLETED}(2)인 행에 {@code ADMITTED}가 재전달돼도
-     * 2가 유지된다 — Kafka가 At-Least-Once라 재전달이 일상이기 때문이다.
-     *
-     * <p>🔴 {@code EXPIRED}는 <b>정상 경로에서 도달하지 않는다.</b> admitToken TTL 만료자는
-     * {@code status = 1}인데 소비 측 가드가 {@code IF(status = 0, 4, status)}라 no-op이다.
-     * 의도된 동작이다(§36) — {@code complete}의 술어가 {@code status IN (0, 1)}이고 유효 창이
-     * 300초라 <b>늦은 입장이 정상 경로로 실재</b>한다. 가드를 넓히면 그 경로가 죽는다.
-     * 🔴 <b>{@code 4}에 닿는 경로는 셋이다 — 이 줄은 예전에 하나라고 적고 있었고 거짓이었다.</b>
-     * ① {@code waitingTtl}·{@code inactiveTtl} 만료(출발 {@code 0}, 위 가드)
-     * ② {@code ReconcileJob}의 직접 UPDATE({@code status=1 → 4}, {@code ADMIT_STALE}) — 실측 30,071건
-     * ③ 🔴 랙 구간의 admitToken TTL 만료 — DB가 아직 {@code 0}이라 가드가 참이 된다. 실측 259건
-     *    (2026-09-18). ③은 결함이고 ①②는 설계다 — {@code ExpiredReason.ADMIT_TTL} 참조.
+     * @author sonix
      */
     public TokenStatus targetStatus() {
         return targetStatus;

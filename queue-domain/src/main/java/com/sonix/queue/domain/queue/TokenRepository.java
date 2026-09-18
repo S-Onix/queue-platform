@@ -17,22 +17,13 @@ public interface TokenRepository {
     void saveAllIfAbsent(List<Token> tokens);
 
     /**
-     * {@code ENQUEUED} 외의 생명주기 이벤트를 <b>가드 UPSERT</b>로 적재한다 (§80 / FRS §6.4).
+     * 이유: {@code ENQUEUED} 외의 생명주기 이벤트를 <b>가드 UPSERT</b> 로 적재한다.
+     * 문제: 도착 순서가 뒤집힌다 — Redis 커밋이 Kafka 발행보다 먼저라 ADMITTED 가 ENQUEUED 를 앞선다.
+     * 해결: 행이 없으면 {@code targetStatus()} 로 INSERT, 있으면 <b>허용 출발 상태에서만</b> 전이한다.
+     * 🔴 호출자는 <b>같은 타입이 연속하는 구간</b>으로 넘긴다 — ADMITTED·EXPIRED 가 {@code status = 0} 가드다.
+     * 🔧 COMPLETED 는 §91 에서 {@code IN (0,1)} 로 넓어져 <b>순서에 의존하지 않는다</b>.
      *
-     * <p>행이 없으면 {@code type.targetStatus()}로 INSERT하고, 있으면 <b>허용 출발 상태일 때만</b>
-     * 전이한다. INSERT가 필요한 이유는 도착 순서가 뒤집히기 때문이고({@code ZADD}가 Kafka 발행보다
-     * 먼저라 {@code ADMITTED}가 {@code ENQUEUED}보다 앞설 수 있다), 가드가 필요한 이유는 재전달이
-     * 일상이기 때문이다({@code COMPLETED}인 행에 {@code ADMITTED}가 다시 와도 2를 유지한다).
-     *
-     * <p>🔴 <b>호출자는 같은 타입이 연속하는 구간 단위로 넘긴다.</b> 타입별로 모으면 같은 토큰의
-     * {@code ADMITTED}→{@code COMPLETED} 순서가 뒤집혀 그 토큰이 영원히 완료되지 않는다.
-     *
-     * <p>🔧 <b>§91에서 갈렸다.</b> 위 문장의 예시({@code ADMITTED}→{@code COMPLETED})는 더 이상
-     * 실패 사례가 아니다 — {@code COMPLETED} 가드가 {@code status IN (0, 1)}로 넓어져
-     * <b>순서에 의존하지 않는다</b>. 다만 <b>구간 단위로 넘기는 규칙 자체는 살아 있다</b>:
-     * {@code ADMITTED}·{@code EXPIRED}는 여전히 {@code status = 0} 출발 가드라
-     * {@code ENQUEUED}보다 앞서면 결과가 달라진다.
-     *
+     * @author sonix
      * @param type {@code ENQUEUED}는 허용하지 않는다 — 그건 {@link #saveAllIfAbsent}의 몫이다
      */
     void applyTransition(TokenEventType type, List<Token> tokens);
@@ -85,22 +76,13 @@ public interface TokenRepository {
     // ── reconciliation (Sprint 9) ──
 
     /**
-     * {@code complete} 유효 창이 지나도록 {@code ADMIT_ISSUED}에 남은 토큰을 만료로 정리한다.
+     * 이유: complete 유효 창이 지나도록 {@code ADMIT_ISSUED} 에 남은 토큰을 만료로 확정한다.
+     * 문제: Tenant 가 verify·complete 를 둘 다 안 부르면 그 행이 <b>영원히 1 로 남는다</b>(실서버 재현).
+     * 원인: EXPIRED 가드가 {@code IF(status = 0, ...)} 라 1 에서 no-op 이다 — 늦은 complete 를 살리는 §36 의 의도다.
+     * 해결: 이것만 <b>직접 UPDATE</b> 다(도메인 전이가 아니라 원장 교정). 큐 단위로 끊어 한 큐가 상한을 독식하지 않게 한다.
+     * 🔴 <b>기준 시각을 호출자가 정하지 않는다</b>(§90) — 창의 길이만 넘기고 "지금"은 DB 가 정한다.
      *
-     * <p>Tenant가 {@code verify}도 {@code complete}도 안 부르면 그 행은 {@code status = 1}로
-     * <b>영원히 남는다</b>(실서버 재현). 회수 배치가 안 고치는 이유는 {@code EXPIRED} 소비 가드가
-     * {@code IF(status = 0, 4, status)}라 1에서 no-op이고, 그게 {@code complete} 유효 창을 살리려는
-     * 의도이기 때문이다(§36).
-     *
-     * <p>🔴 <b>Kafka 이벤트로는 고칠 수 없다</b> — 가드를 넓히면 늦은 입장이 죽는다. 그래서
-     * 이것만 <b>직접 UPDATE</b>다(도메인 전이가 아니라 원장 교정). 판정이 DB만으로 성립하므로
-     * Redis 전손 시 전원을 오판할 위험도 없다. 큐 단위인 것은 한 큐의 백로그가 {@code limit}을
-     * 다 먹어 다른 큐를 굶기지 않게 하기 위해서다.
-     *
-     * <p>🔴 <b>기준 시각을 호출자가 정하지 않는다</b>(§90). 창의 길이만 넘기고, "지금"은 술어를
-     * 실행하는 DB가 정한다. 호출자(batch)가 자기 시계로 cutoff를 계산해 넘기면 그 시계와
-     * {@code admitted_at}(DB 시계)이 갈려, 아직 완료 가능한 행을 만료로 확정해 원장을 깬다.
-     *
+     * @author sonix
      * @param validWindowSeconds complete 유효 창의 길이. 이만큼 <b>지난</b> 것이 대상이다
      *                           (= {@link Token#COMPLETE_VALID_WINDOW_SECONDS}).
      *                           더 짧게 주면 정상적인 늦은 통보가 404를 받는다

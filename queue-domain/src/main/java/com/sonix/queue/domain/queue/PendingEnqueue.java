@@ -4,27 +4,13 @@ package com.sonix.queue.domain.queue;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Bulk 처리를 위해 대기 중인 Enqueue 요청.
+ * 이유: Bulk 처리를 기다리는 Enqueue 요청 한 건. 모든 요청이 Global Queue 를 거친다(§70).
+ * 원인: Producer(HTTP 스레드)가 offer 하고 {@code future.get()} 으로 기다리면,
+ *       Consumer(드레인 스레드)가 poll 해 {@code enqueue_bulk.lua} 를 돌리고 complete() 한다.
+ * 해결: {@link java.util.concurrent.CompletableFuture} 로 결과를 건넨다 — future 가 건마다 독립이라
+ *       해당 Producer 만 깨어난다. 후보 tokenId 도 함께 실어 보낸다(OK 면 Lua 가 채택).
  *
- * <p>모든 Enqueue 요청은 Global Queue에 적재되어 배치로 처리된다(하이브리드 폐기, §70).
- * Producer가 요청을 이 객체로 감싸 globalQueue에 offer하고, 이때 후보 tokenId도
- * 함께 발급해 실어 보낸다(OK면 Lua가 채택, EXISTS/FULL이면 버려진다).
- *
- * <p><b>Producer-Consumer 흐름:</b>
- * <ul>
- *   <li>Producer (HTTP 요청 Thread): 요청을 PendingEnqueue로 감싸
- *       globalQueue에 offer, {@code future.get()}으로 결과 대기</li>
- *   <li>Consumer (@Scheduled Thread): globalQueue에서 poll,
- *       tokenId를 ARGV에 실어 enqueue_bulk.lua 실행 후 각 PendingEnqueue.complete() 호출</li>
- * </ul>
- *
- * <p>CompletableFuture를 통해 Producer와 Consumer가
- * 스레드 안전하게 결과를 전달한다. 각 PendingEnqueue의 future는
- * 독립적이므로, Consumer가 특정 pending.complete()를 호출하면
- * 해당 Producer만 정확히 깨어나 자기 결과를 획득한다.
- *
- * <p><b>Thread-safety:</b> CompletableFuture는 표준 Java의 스레드 안전한
- * 구현체로, 여러 스레드에서 동시 접근해도 안전하다.
+ * @author sonix
  */
 public class PendingEnqueue {
     private final String queueId;
