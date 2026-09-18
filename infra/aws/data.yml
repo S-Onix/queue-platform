@@ -26,11 +26,20 @@ x-redis: &redis
   #    enqueue 까지 503** 이 된다(§87). 1gb 면 2.25M 명. redis 노드는 m7g.large(8GB)라
   #    6 × 1gb = 6GB 가 상한이지만, 상한이지 할당이 아니고 실제 적재는 5M × 477B ≈ 2.4GB 다.
   #
-  # ⚠️ **대가: 클러스터 B 전환이 늦어진다.** RedisClusterAssigner 는 A 최악 마스터
-  #    used/maxmemory 가 50% 를 넘어야 신규 큐를 B 로 보낸다(단조). 임계가 마스터당
-  #    563k 명 → **1,126k 명**으로 같이 올라간다. 파도 1(15큐)이 만드는 최악 마스터 적재가
-  #    500~800k 명이라 **이 설정에서는 전환이 안 일어날 수 있다** = 6대 중 3대만 쓴다.
-  #    분산까지 보려면 768mb(임계 844k)가 절충이다 — 그건 실측 결과를 보고 정한다.
+  # ✅ **그 예측이 맞았다 — 8차에서 B 는 끝내 안 쓰였다**(A 최악 마스터 봉우리 **28%**).
+  #    RedisClusterAssigner 는 A 최악 마스터의 used/maxmemory 가 50% 를 넘어야 신규 큐를 B 로 보낸다.
+  #
+  # 🔧 **위 계산의 근거였던 477 B/명은 로컬 수치다. AWS 8차 실측은 248 B/명**(약 절반)이다.
+  #    그래서 512mb 는 마스터당 1.13M 명이 아니라 **2.16M 명**이다. 8차 관측 봉우리는
+  #    마스터당 **287MB**(A 마스터 3대, 1gb 의 28%) — 그 봉우리는 512mb 에서 **56%** 라
+  #    전환이 일어나고 OOM 여유는 44% 남는다. 🔑 봉우리가 관측값이라 마스터 수와 무관하다.
+  #    1gb 로 올린 판단은 **로컬 수치 위에서 내려졌고, 그 대가가 B 미검증이었다.**
+  #
+  # 🔑 **그래서 값을 변수로 뺐다.** 목적이 다르면 값이 달라야 한다:
+  #      REDIS_A_MAXMEMORY=1gb   (기본) 용량 안전 우선 — 500만으로는 28% 라 전환이 안 온다
+  #      REDIS_A_MAXMEMORY=512mb        **B 전환·이중 라우팅을 검증하는 판**(500만에서 56%)
+  #    🪤 512mb 는 **메커니즘 검증이지 용량 검증이 아니다.** 두 판의 숫자를 섞어 읽지 마라.
+  #    🪤 B 노드는 항상 1gb 다 — 넘어온 큐를 받는 쪽이 먼저 차면 의미가 없다.
 
 services:
   mysql:
@@ -76,7 +85,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 7001 --cluster-announce-bus-port 17001
-      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory ${REDIS_A_MAXMEMORY:-1gb} --maxmemory-policy noeviction --protected-mode no
 
   redis-a-2:
     <<: *redis
@@ -86,7 +95,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 7002 --cluster-announce-bus-port 17002
-      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory ${REDIS_A_MAXMEMORY:-1gb} --maxmemory-policy noeviction --protected-mode no
 
   redis-a-3:
     <<: *redis
@@ -96,7 +105,7 @@ services:
       --cluster-node-timeout 5000 --cluster-require-full-coverage yes
       --cluster-announce-ip ${DATA_IP:?DATA_IP 필요}
       --cluster-announce-port 7003 --cluster-announce-bus-port 17003
-      --appendonly yes --maxmemory 1gb --maxmemory-policy noeviction --protected-mode no
+      --appendonly yes --maxmemory ${REDIS_A_MAXMEMORY:-1gb} --maxmemory-policy noeviction --protected-mode no
 
   # Cluster B — A 와 완전 독립, 슬롯 공유 없음 (§75)
   redis-b-1:
