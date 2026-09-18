@@ -1,5 +1,6 @@
 package com.sonix.queue.infrastructure.queue;
 
+import java.time.Duration;
 import com.sonix.queue.domain.queue.EnqueueResult;
 import com.sonix.queue.domain.queue.PendingEnqueue;
 import com.sonix.queue.domain.queue.Queue;
@@ -49,6 +50,19 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 @Component
 public class BatchProcessor implements SmartLifecycle {
+    /**
+     * 구간별 소요의 버킷 경계.
+     *
+     * @author sonix
+     * @implNote 작성이유: 대시보드가 histogram_quantile(_bucket) 로 p95 를 뽑는다.
+     *           문제: 경계를 안 주면 Micrometer 가 _bucket 을 아예 발행하지 않아 패널이 영구히 빈다(실측).
+     *           원인: Timer 기본값은 count/sum/max 뿐이다. 해결: 실측 기준선(redis 0.16ms · mysql 1.34ms ·
+     *           tick 10ms · kafka 18ms/콜드 404ms · 틱 20ms)을 덮는 경계를 준다. §4-1
+     */
+    private static final Duration[] STAGE_SLO = {
+            Duration.ofMillis(1), Duration.ofMillis(5), Duration.ofMillis(10), Duration.ofMillis(20),
+            Duration.ofMillis(50), Duration.ofMillis(100), Duration.ofMillis(500), Duration.ofSeconds(1)};
+
     private static final Logger log = LoggerFactory.getLogger(BatchProcessor.class);
 
     /** 한 사이클에 Global Queue에서 drain할 최대 건수. */
@@ -169,13 +183,17 @@ public class BatchProcessor implements SmartLifecycle {
         MeterRegistry reg = registries == null ? new SimpleMeterRegistry()
                 : registries.getIfAvailable(SimpleMeterRegistry::new);
         this.drainTimer = Timer.builder("queue.drain.duration")
-                .description("드레인 1틱 소요. drain-interval(20ms)을 넘으면 틱이 밀린다").register(reg);
+                .description("드레인 1틱 소요. drain-interval(20ms)을 넘으면 틱이 밀린다")
+                .serviceLevelObjectives(STAGE_SLO).register(reg);
         this.drainBatchSize = DistributionSummary.builder("queue.drain.batch.size")
                 .description("한 틱이 빼간 건수. MAX_DRAIN에 붙으면 유입이 배출을 앞섰다").register(reg);
         this.tickWait = Timer.builder("queue.stage.duration").tag("stage", "tick")
-                .description("큐에 담긴 뒤 드레인까지 기다린 시간").register(reg);
-        this.redisTimer = Timer.builder("queue.stage.duration").tag("stage", "redis").register(reg);
-        this.mysqlTimer = Timer.builder("queue.stage.duration").tag("stage", "mysql").register(reg);
+                .description("큐에 담긴 뒤 드레인까지 기다린 시간")
+                .serviceLevelObjectives(STAGE_SLO).register(reg);
+        this.redisTimer = Timer.builder("queue.stage.duration").tag("stage", "redis")
+                .serviceLevelObjectives(STAGE_SLO).register(reg);
+        this.mysqlTimer = Timer.builder("queue.stage.duration").tag("stage", "mysql")
+                .serviceLevelObjectives(STAGE_SLO).register(reg);
         log.info("enqueue drain: capacity-cache-ttl={}ms (0=off)", capacityCacheTtlMillis);
     }
 
