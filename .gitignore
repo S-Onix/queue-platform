@@ -59,3 +59,7 @@ graphify-out/
 # 🔴 Alertmanager 의 Slack webhook URL. **URL 자체가 비밀번호다.**
 # deploy.sh 가 .env 값을 노드에 쓰는 파일이라 레포에 들어올 일이 없어야 한다.
 infra/aws/monitoring/slack_url
+
+# 🔴 2026-09-18: 220MB zip 이 `git add -A` 에 딸려가 push 가 거부됐다(GitHub 100MB 한도).
+#    레포를 통째로 압축한 산출물은 커밋 대상이 아니다.
+*.zip
