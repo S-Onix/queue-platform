@@ -36,7 +36,7 @@ import static org.mockito.Mockito.when;
  * {@code queue_admission_wait_seconds} 단위 테스트 (Mockito, 인프라 없음 → {@code @Tag} 없음).
  *
  * <p>알람 규칙이 <b>이름과 라벨을 문자열로</b> 참조하므로(MONITORING_DESIGN 4-3) 계약을 그대로 건다:
- * 미터 이름 {@code queue.admission.wait} · 라벨 {@code queue_id} · SLO 버킷 8개.
+ * 미터 이름 {@code queue.admission.wait} · 라벨 {@code queue_id} · SLO 버킷 12개.
  * 이름이나 라벨이 바뀌면 여기가 빨개진다 — 알람은 조용히 영원히 안 뜬다.
  */
 @ExtendWith(MockitoExtension.class)
@@ -94,7 +94,7 @@ class AdmissionWaitMetricTest {
     }
 
     @Test
-    @DisplayName("SLO 버킷 8개가 그대로 노출된다 (알람이 le=60·300을 본다)")
+    @DisplayName("SLO 버킷 12개가 그대로 노출된다 (알람이 le=60·300을 본다)")
     void publishesSloBuckets() {
         givenAdmit(false, record("t1", 30));
 
@@ -103,8 +103,11 @@ class AdmissionWaitMetricTest {
         double[] boundaries = Arrays.stream(waitTimer().takeSnapshot().histogramCounts())
                 .mapToDouble(CountAtBucket::bucket)
                 .toArray();
+        // 나노초 = 1·3·10·30·60·120·300·600·1800·3600·7200·14400초
+        // 🔑 위쪽 7200·14400 은 AWS 8차에서 p95 가 3600 에 박힌 것(초과 27.1%)을 풀려고,
+        //    아래쪽 1·3 은 p5·p30 해상도를 위해 더했다. 가운데 60·300 은 알람이 보는 값이라 고정이다.
         assertThat(boundaries).containsExactly(
-                1e10, 3e10, 6e10, 1.2e11, 3e11, 6e11, 1.8e12, 3.6e12);  // 나노초 = 10·30·60·120·300·600·1800·3600초
+                1e9, 3e9, 1e10, 3e10, 6e10, 1.2e11, 3e11, 6e11, 1.8e12, 3.6e12, 7.2e12, 1.44e13);
     }
 
     @Test
