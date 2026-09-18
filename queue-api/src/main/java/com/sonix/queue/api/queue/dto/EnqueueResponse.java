@@ -4,25 +4,13 @@ package com.sonix.queue.api.queue.dto;
 import com.sonix.queue.domain.queue.EnqueueResult;
 
 /**
- * 대기열 진입 응답 DTO.
+ * 이유: 대기열 진입 응답. Platform 이 Tenant 서버에 돌려주는 성공 응답(OK 또는 EXISTS).
+ * 해결: FULL 은 DTO 로 만들지 않고 서비스에서 {@code BusinessException} 으로 던진다.
+ * 🔑 {@code rank} 는 Redis 0-based 를 <b>사용자 관점 1-based</b> 로 바꾼 값이다.
+ *    {@code already} 는 이미 대기 중(EXISTS)일 때 true — 이때도 <b>과금은 1건</b>이다.
+ * 🪤 필드 단위 명세와 예시는 {@code doc/API.md} 가 정본이다(여기에 복사해 두면 갈라진다).
  *
- * <p>Platform이 Tenant 서버에게 반환하는 성공 응답 (OK 또는 EXISTS).
- * FULL 상태는 이 DTO로 변환하지 않고, Service Layer에서 BusinessException으로 처리한다.
- *
- * <p><b>rank</b>는 Redis 내부 0-based를 사용자 관점 1-based로 변환한 값이다.
- * <b>already</b>는 이미 대기 중인 경우(EXISTS) true가 된다.
- *
- * <p><b>예시 응답:</b>
- * <pre>{@code
- * {
- *   "queueId": "q_xyz789",
- *   "identifier": "user_12345",
- *   "tokenId": "tok_12345",
- *   "rank": 501,
- *   "total": 100,
- *   "already": false
- * }
- * }</pre>
+ * @author sonix
  */
 public class EnqueueResponse {
 

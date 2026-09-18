@@ -35,12 +35,11 @@ public class SecurityConfig {
                 .sessionManagement(session ->
                         session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
-                        // === ERROR 디스패치 ===
-                        // 🔴 없으면 검증 실패가 401로 위장된다(실측). Spring Boot는 400/404/405를
-                        //    /error로 forward하는데, 시큐리티 필터가 ERROR 디스패치에도 걸려
-                        //    anyRequest().authenticated()에 잡힌다. 그러면 signup에 빈 body를 보내도
-                        //    "인증이 필요합니다" 401이 나가고, 호출자는 자격 증명을 의심하며 헤맨다.
-                        //    permitAll이어도 /error가 내는 본문은 Boot의 표준 에러 응답이라 정보 노출이 아니다.
+                        // 이유: ERROR 디스패치를 열어 둔다.
+                        // 문제: 🔴 없으면 **검증 실패가 401로 위장된다**(실측) — 빈 body 로 signup 해도
+                        //       "인증이 필요합니다"가 나가 호출자가 자격 증명을 의심하며 헤맨다.
+                        // 원인: Boot 가 400/404/405 를 /error 로 forward 하는데 시큐리티가 ERROR 디스패치에도 걸린다.
+                        // 🪤 permitAll 이어도 정보 노출이 아니다 — /error 본문은 Boot 표준 에러 응답이다.
                         .requestMatchers("/error").permitAll()
 
                         // === 공개 엔드포인트 (HTTP Method 명시) ===

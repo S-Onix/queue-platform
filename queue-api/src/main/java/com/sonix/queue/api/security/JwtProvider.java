@@ -18,16 +18,13 @@ import java.util.UUID;
 
 
 /**
- * JWT 발급/검증 + Key Rotation 지원
+ * 이유: JWT 발급·검증. Key Rotation 을 지원한다({@link JwtKeyStore} 의 active key 로 발급).
+ * 문제: ACCESS 토큰으로 refresh 를 부르거나 그 반대가 되면 만료 정책이 무력해진다.
+ * 해결: {@code type} 클레임으로 강제하고 검증 메서드를 <b>ACCESS·REFRESH 로 분리</b>한다 —
+ *       같은 메서드로 둘을 받으면 호출자가 실수해도 통과한다.
+ * 🔑 검증은 토큰 헤더의 {@code kid} 로 키를 찾으므로 <b>옛 토큰도 그대로 검증된다</b>.
  *
- * 보안 강화:
- *   - type 클레임으로 ACCESS/REFRESH 구분 강제
- *   - parseAndValidateAccess / parseAndValidateRefresh 분리
- *
- * Key Rotation:
- *   - 발급: JwtKeyStore의 active key 사용 + 헤더에 kid 명시
- *   - 검증: 토큰 헤더의 kid로 JwtKeyStore에서 키 조회 → 검증
- *   - 옛 토큰도 검증 가능 (사용자 영향 최소)
+ * @author sonix
  */
 @Component
 @Log4j2
@@ -74,19 +71,11 @@ public class JwtProvider {
                 .subject(id.toString())
                 .claim(CLAIM_TENANT_ID, tenantId)
                 .claim(CLAIM_TYPE, TYPE_REFRESH)
-                // 🔴 jti — **발급 사건을 유일하게 만드는 nonce다.** 없으면 같은 초의 두 발급이
-                //    바이트 단위로 같아진다(sub·tenantId·type·iat·exp가 전부 같고 iat는 초 단위다).
-                //    그러면 sha256도 같아 refresh_tokens.token_hash UNIQUE에 걸려 500이 난다.
-                //    실측 경로 둘: ① 로그인 더블클릭 ② refresh()가 폐기(:127) 직후 재발급(:131)해
-                //    **자기가 방금 지운 행과 충돌**한다.
-                //
-                //    ⚠️ **이 값을 읽는 코드를 만들지 마라.** 조회 키로 쓰거나 검증에서 필수로 걸면
-                //       그 순간 되돌리기 어려운 축이 된다 — 롤링 배포 중 구버전이 낸 jti 없는 토큰이
-                //       7일(Refresh 유효기간) 내내 401이 된다. 지금은 **쓰기 전용**이라 모르는
-                //       클레임으로 무시되고 구/신 4방향이 전부 호환된다.
-                //
-                //    Access Token에는 넣지 않는다 — DB에 저장하지 않아 UNIQUE 충돌이 없다.
-                //    §42가 예고한 블랙리스트를 실제로 만들 때 그때 판단한다.
+                // 이유: jti — **발급 사건을 유일하게 만드는 nonce** 다.
+                // 문제: 없으면 같은 초에 두 번 발급된 Refresh 가 바이트 단위로 같아지고(클레임이 전부 같다),
+                //       sha256 도 같아 {@code token_hash} UNIQUE 에 걸려 500 이 난다.
+                // 원인: 실측 경로 둘 — ①로그인 더블클릭 ②refresh() 가 **방금 지운 행과 충돌**.
+                // ⚠️ **읽는 코드를 만들지 마라**(조회 키가 되면 되돌리기 어렵다). Access 엔 안 넣는다.
                 .id(UUID.randomUUID().toString())
                 .issuedAt(Date.from(now))
                 .expiration(Date.from(now.plus(jwtProperties.refreshTokenExpiry())))
