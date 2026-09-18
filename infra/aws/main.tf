@@ -68,7 +68,12 @@ locals {
   #    200 RPS 에서도 이벤트 유입이 ~590/s 라 lag 이 쌓인다(worker 는 4.2% 로 남아돈다).
   #    컨슈머를 안 고치고 app 만 키우면 lag 만 더 쌓인다.
   #
-  # 시간당 합계 약 $0.169 (m7g.xlarge ×1 + c7g.xlarge ×1 + m7g.large ×2 + c7g.large ×2)
+  # 🔴 **시간당 합계 $2.46 (2026-09-18 AWS Pricing API 실측, 서울·온디맨드).**
+  #    예전 주석은 "$0.169" 였는데 **14.5배 틀렸다** — app 이 m7g.xlarge ×1 이던 시절 값이
+  #    5차의 4xlarge ×2 증설 뒤에도 그대로 남아 있었다. 예산 판단의 근거라 특히 위험했다.
+  #      app 0.8024 ×2 · k6 0.3264 · kafka 0.1632 · mysql 0.1003 · obs 0.0816 · redis 0.1003
+  #      · worker 0.0816  (+ EIP 0.005). 170분 판이면 약 $7, 빌드·대기까지 4시간이면 약 $10.
+  #    총 52 vCPU — 온디맨드 쿼터(6차에 64로 올렸다)를 넘지 않는지 판 전에 확인하라.
   nodes = {
     # 🔴 6차(2026-09-16): 200만 전 구간 + 생애주기 판. 쿼터가 64 로 올라 16 vCPU ×2 가 된다
     #    (app 32 + data 10 + k6 8 = 50). 5차는 쿼터 32 가 벽이라 8+4 로 갈 수밖에 없었다.
@@ -77,18 +82,29 @@ locals {
     #    같은 노드에 컨테이너만 늘리는 것은 무의미하다 — 폴링 10,000 rps 에서 노드 CPU 가
     #    94.86% 로 이미 포화였다. 늘려야 하는 것은 프로세스가 아니라 **노드(=vCPU)** 다.
     #    🪤 스팟 쿼터가 32 vCPU 다. data 10 + app 8 + k6 8 = 26 이라 여유가 6 뿐이라 xlarge(4)다.
-    app2   = "m7g.4xlarge" # queue-api ×3 (2번째 노드)
-    mysql  = "m7g.large"   # mysql (0.83코어) + prometheus·grafana·redis-exporter
-    kafka  = "c7g.xlarge"  # kafka ×3 (1.09코어) — RF=3 복제가 네트워크로 나간다
-    redis  = "m7g.large"   # redis ×6 (0.34코어) — 싱글스레드라 코어 수보다 코어 성능이다
-    worker = "c7g.large"   # queue-batch + queue-consumer (3.4% — 남아돈다)
+    app2 = "m7g.4xlarge" # queue-api ×3 (2번째 노드)
+    # 🔴 **관측을 여기서 떼어냈다 (2026-09-18).** 8차에서 이 노드가 2 vCPU 인데 mysql +
+    #    prometheus + grafana + alertmanager + redis-exporter 를 같이 돌렸다. 그 결과
+    #    "쿼리 시간 27,468초 vs 이 노드가 낼 수 있었던 18,360 CPU-s" → **최소 33%가 대기**였고
+    #    항목별 절대 초를 **해석할 수 없게** 됐다. 게다가 Prometheus 가 같은 노드에 있어
+    #    **관측이 관측 대상을 오염**시켰다. 이제 이 노드는 MySQL 전용이다.
+    mysql = "m7g.large" # mysql 전용 (8차 0.83코어 — 관측을 뗀 뒤 진짜 값을 처음 본다)
+    # 🔑 관측 전용. Prometheus(800m) + Grafana(500m) + Alertmanager(200m) + redis-exporter(200m)
+    #    + node-exporter(200m) = 1.9GB 라 4GB/2 vCPU 로 충분하다.
+    #    🪤 redis-exporter 는 **Prometheus 와 같은 노드여야 한다** — prometheus.yml 이
+    #       replacement: localhost:9121 로 부른다(multi-target 이라 Redis 노드일 필요는 없다).
+    obs    = "c7g.large"  # prometheus · grafana · alertmanager · redis-exporter
+    kafka  = "c7g.xlarge" # kafka ×3 (1.09코어) — RF=3 복제가 네트워크로 나간다
+    redis  = "m7g.large"  # redis ×6 (0.34코어) — 싱글스레드라 코어 수보다 코어 성능이다
+    worker = "c7g.large"  # queue-batch + queue-consumer (3.4% — 남아돈다)
     # 🔴 5차에서 c7g.large(2 vCPU) → c7g.2xlarge(8 vCPU). 폴링 목표 25,448 rps 를 재려면
     #    드라이버부터 커야 한다 — 로컬 6코어 천장이 15,500 이었다(그때도 천장은 Platform 이 아니라 CPU).
     k6 = "c7g.2xlarge" # 부하 드라이버
   }
 
   # 루트 볼륨. mysql 은 데이터 + 파티션, kafka 는 로그 세그먼트, app 은 Gradle 빌드 + 이미지.
-  disk = { app = 40, app2 = 40, mysql = 40, kafka = 40, redis = 20, worker = 20, k6 = 20 }
+  # obs 는 Prometheus TSDB 가 쓴다. 170분 판 × 7노드 × 15초면 수백 MB 수준이라 20 으로 충분하다.
+  disk = { app = 40, app2 = 40, mysql = 40, kafka = 40, redis = 20, worker = 20, k6 = 20, obs = 20 }
 }
 
 data "aws_subnet" "this" {
@@ -179,7 +195,9 @@ resource "aws_instance" "node" {
 #     Grafana 접속 주소도 매번 바뀌고, **Slack 알람에 박아 둔 대시보드 링크는 영영 맞지 않는다.**
 #     EIP 를 붙이면 그 노드 주소가 판을 건너 유지되므로 링크를 한 번 박아 두면 된다.
 #
-# 🪤 **왜 mysql 노드 하나뿐인가**: Prometheus·Grafana·Alertmanager 가 거기 있다(deploy.sh).
+# 🪤 **왜 obs 노드 하나뿐인가**: Prometheus·Grafana·Alertmanager 가 거기 있다(deploy.sh).
+#    🔴 2026-09-18 에 mysql → obs 로 **옮겼다.** 관측을 mysql 노드에서 분리했기 때문이다 —
+#       EIP 는 "Grafana 가 사는 노드"를 따라간다. 둘을 따로 움직이면 링크가 죽는다.
 #    나머지 노드는 SSH 로만 닿고 주소를 사람이 기억할 이유가 없다 — EIP 는 붙인 만큼 돈이 든다.
 #
 # ⚠️ **destroy 해도 EIP 는 남는다**(그래야 다음 판에서 같은 주소를 받는다). 안 쓰는 동안
@@ -194,7 +212,7 @@ resource "aws_eip" "monitoring" {
 }
 
 resource "aws_eip_association" "monitoring" {
-  instance_id   = aws_instance.node["mysql"].id
+  instance_id   = aws_instance.node["obs"].id
   allocation_id = aws_eip.monitoring.id
 }
 
@@ -204,11 +222,15 @@ output "monitoring_ip" {
 }
 
 output "ssh" {
-  value = { for k, i in aws_instance.node : k => "ssh -i ~/.ssh/queue-aws ubuntu@${i.public_ip}" }
+  # 🪤 obs 는 EIP 를 읽는다 — public_ip 출력과 **같은 이유**다. EIP 를 붙이면 자동 할당 공인 IP 가
+  #    해제되는데 aws_instance.public_ip 는 그 해제된 주소를 들고 있어, 그대로 쓰면 죽은 주소로
+  #    ssh 를 건다. PR #95 에서 public_ip 만 고치고 이 줄을 놓쳤다(2026-09-18 발견).
+  value = { for k, i in aws_instance.node :
+  k => "ssh -i ~/.ssh/queue-aws ubuntu@${k == "obs" ? aws_eip.monitoring.public_ip : i.public_ip}" }
 }
 
 output "public_ip" {
-  # 🪤 mysql 만 EIP 를 읽는다. EIP 를 붙이면 인스턴스의 자동 할당 공인 IP 가 **해제**되는데
+  # 🪤 obs 만 EIP 를 읽는다. EIP 를 붙이면 인스턴스의 자동 할당 공인 IP 가 **해제**되는데
   #    `aws_instance.public_ip` 는 그 해제된 주소를 그대로 들고 있다 → deploy.sh 가 죽은 IP 로
   #    SSH 를 걸어 [0/5] 에서 무한 대기한다(②와 증상이 똑같아 원인을 헷갈린다).
   value = { for k, i in aws_instance.node :

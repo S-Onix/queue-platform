@@ -20,9 +20,9 @@ pubip()  { $TF output -json public_ip  | python3 -c "import sys,json;print(json.
 privip() { $TF output -json private_ip | python3 -c "import sys,json;print(json.load(sys.stdin)['$1'])"; }
 
 APP=$(pubip app); APP2=$(pubip app2); WORKER=$(pubip worker)
-MYSQL=$(pubip mysql); KAFKA=$(pubip kafka); REDIS=$(pubip redis)
+MYSQL=$(pubip mysql); KAFKA=$(pubip kafka); REDIS=$(pubip redis); OBS=$(pubip obs)
 APP_IP=$(privip app); APP2_IP=$(privip app2); WORKER_IP=$(privip worker)
-MYSQL_IP=$(privip mysql); KAFKA_IP=$(privip kafka); REDIS_IP=$(privip redis)
+MYSQL_IP=$(privip mysql); KAFKA_IP=$(privip kafka); REDIS_IP=$(privip redis); OBS_IP=$(privip obs)
 # 앱 컨테이너가 볼 주소. 셋을 한 덩어리로 넘긴다.
 DATAENV="MYSQL_IP=$MYSQL_IP KAFKA_IP=$KAFKA_IP REDIS_IP=$REDIS_IP"
 
@@ -38,8 +38,8 @@ set -a; . ./.env; set +a
 SEC="MYSQL_ROOT_PASSWORD=$(printf %q "$MYSQL_ROOT_PASSWORD")"
 SEC="$SEC DB_PASSWORD=$(printf %q "$DB_PASSWORD")"
 SEC="$SEC JWT_SECRET_CURRENT=$(printf %q "$JWT_SECRET_CURRENT")"
-echo "app=$APP  worker=$WORKER  mysql=$MYSQL  kafka=$KAFKA  redis=$REDIS"
-echo "  사설: app=$APP_IP worker=$WORKER_IP mysql=$MYSQL_IP kafka=$KAFKA_IP redis=$REDIS_IP"
+echo "app=$APP  worker=$WORKER  mysql=$MYSQL  kafka=$KAFKA  redis=$REDIS  obs=$OBS"
+echo "  사설: app=$APP_IP worker=$WORKER_IP mysql=$MYSQL_IP kafka=$KAFKA_IP redis=$REDIS_IP obs=$OBS_IP"
 
 on() { ssh $SSHOPT "ubuntu@$1" "${@:2}"; }
 push() {
@@ -61,9 +61,10 @@ done
 #    여기서 만든다. rsync 전에 만들어야 그대로 실려 간다.
 echo "[1/5] 관측 설정 생성 (타깃 + 대시보드)"
 mkdir -p infra/aws/monitoring/targets infra/aws/monitoring/dashboards
-python3 - "$APP_IP" "$APP2_IP" "$WORKER_IP" "$MYSQL_IP" "$KAFKA_IP" "$REDIS_IP" <<'PYEOF'
+python3 - "$APP_IP" "$APP2_IP" "$WORKER_IP" "$MYSQL_IP" "$KAFKA_IP" "$REDIS_IP" "$OBS_IP" <<'PYEOF'
 import json, sys
-app, app2, worker, mysql, kafka, redis = sys.argv[1:7]
+# 🪤 인자 개수와 언팩 개수를 **같이** 고쳐라. 하나만 고치면 node.json 에서 NameError 로 배포가 죽는다.
+app, app2, worker, mysql, kafka, redis, obs = sys.argv[1:8]
 d = "infra/aws/monitoring/targets"
 json.dump([{"targets": [f"{h}:{p}" for h in (app, app2) for p in (8080, 8083, 8084)]}], open(f"{d}/api.json", "w"))
 json.dump([{"targets": [f"{worker}:8081"], "labels": {"app": "batch"}},
@@ -74,7 +75,7 @@ json.dump([{"targets": [f"redis://{redis}:{p}"], "labels": {"cluster": c}}
 # 🔑 노드가 5개다. 어느 계층이 먼저 포화하는지가 이 환경의 존재 이유라 하나도 빠뜨리면 안 된다.
 json.dump([{"targets": [f"{ip}:9100"], "labels": {"node": n}}
            for n, ip in (("app", app), ("app2", app2), ("worker", worker), ("mysql", mysql),
-                         ("kafka", kafka), ("redis", redis))], open(f"{d}/node.json", "w"))
+                         ("kafka", kafka), ("redis", redis), ("obs", obs))], open(f"{d}/node.json", "w"))
 
 # 대시보드는 ${DS_PROMETHEUS} 를 쓰는 export 판이다. 프로비저닝에는 실제 uid 가 필요하므로
 # datasource.yml 에서 고정한 uid(prometheus)로 치환하고 import 전용 키를 걷어낸다.
@@ -100,9 +101,12 @@ on "$KAFKA" "cd ~/queue-platform && DATA_IP=$KAFKA_IP $SEC docker compose -f inf
   until docker exec q-kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server $KAFKA_IP:9092 --list >/dev/null 2>&1; do sleep 3; done &&
   KAFKA_IP=$KAFKA_IP ./infra/aws/init.sh kafka" &
 wait
-# 🔑 Prometheus·Grafana·redis-exporter 는 mysql 노드에 얹는다. 셋 중 가장 한가하고
-#    (0.83코어), redis-exporter 는 multi-target 이라 Redis 와 같은 노드일 필요가 없다.
-#    다만 prometheus.yml 이 익스포터를 localhost:9121 로 부르므로 **둘은 같은 노드여야 한다.**
+# 🔴 **관측 4종은 obs 전용 노드로 옮겼다 (2026-09-18).** 예전엔 mysql 노드에 얹었는데
+#    ("셋 중 가장 한가하다"가 근거였다), 8차에서 그 노드가 2 vCPU 인데 쿼리 시간 27,468초 대비
+#    낼 수 있었던 CPU 가 18,360 CPU-s 여서 **최소 33%가 대기**였고 항목별 절대 초를 해석할 수
+#    없게 됐다. Prometheus 가 같은 노드에 있어 **관측이 관측 대상을 오염**시키기도 했다.
+#    🪤 redis-exporter 는 **Prometheus 와 같은 노드**여야 한다 — prometheus.yml 이
+#       localhost:9121 로 부른다(multi-target 이라 Redis 노드일 필요는 없다).
 # 🔴 Slack webhook 은 레포에 없다. .env 값을 노드에 파일로 쓴다 — 설정 파일에 박으면
 #    PUBLIC 레포에 공개된다(2026-09-12 에 실제로 한 번 당했다). 비어 있어도 기동은 된다.
 #
@@ -114,15 +118,18 @@ wait
 #
 # 🔑 **실패해도 배포를 멈추지 않는다**(`|| echo`). set -e 가 걸려 있어 그냥 두면 알림용 파일
 #    하나 때문에 실측 판 전체가 죽는다. 알림이 없는 것과 플랫폼이 안 뜨는 것은 무게가 다르다.
-on "$MYSQL" "mkdir -p ~/queue-platform/infra/aws/monitoring && \
+on "$OBS" "mkdir -p ~/queue-platform/infra/aws/monitoring && \
   printf '%s' '${SLACK_WEBHOOK_URL:-}' > ~/queue-platform/infra/aws/monitoring/slack_url && \
   chmod 600 ~/queue-platform/infra/aws/monitoring/slack_url && \
   sudo chown 65534:65534 ~/queue-platform/infra/aws/monitoring/slack_url" \
   || echo "⚠️  Slack webhook 파일 준비 실패 — 배포는 계속한다. 알림만 안 간다"
 
 on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f infra/aws/data.yml up -d \
-  mysql prometheus grafana alertmanager redis-exporter node-exporter &&
-  until docker exec q-mysql mysqladmin ping -h127.0.0.1 -p$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do sleep 3; done"
+  mysql node-exporter &&
+  until docker exec q-mysql mysqladmin ping -h127.0.0.1 -p$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do sleep 3; done" &
+on "$OBS" "cd ~/queue-platform && DATA_IP=$OBS_IP $SEC docker compose -f infra/aws/data.yml up -d \
+  prometheus grafana alertmanager redis-exporter node-exporter"
+wait
 
 echo "[4/5] 이미지 빌드 (app·worker 병렬. 최초 5~10분)"
 on "$APP"    "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
@@ -147,8 +154,9 @@ cat <<EOF
 완료.
   k6 대상    : $APP_IP · $APP2_IP (각 포트 8080 · 8083 · 8084 = api 6대)
   관측 터널  : ssh -i ~/.ssh/queue-aws -o ExitOnForwardFailure=yes \\
-                 -L 3300:localhost:3000 -L 9390:localhost:9090 -L 9393:localhost:9093 ubuntu@$MYSQL
+                 -L 3300:localhost:3000 -L 9390:localhost:9090 -L 9393:localhost:9093 ubuntu@$OBS
                Grafana http://localhost:3300 (익명 Admin) · Prometheus :9390 · Alertmanager :9393
+               🔑 대상은 **obs 노드**다(2026-09-18 분리). EIP 가 붙은 노드도 obs 라 주소가 고정이다.
                🔑 3000/9090 이 아니라 3300/9390 이다 — 로컬이 그 포트를 이미 쓰고 있어서,
                   Slack 알람 링크도 3300 으로 박혀 있다(alertmanager.yml).
                🪤 ExitOnForwardFailure 가 없으면 포워딩이 실패해도 SSH 는 경고 한 줄만 찍고
