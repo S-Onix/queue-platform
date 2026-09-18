@@ -11,15 +11,13 @@ import org.springframework.stereotype.Component;
 import java.util.Properties;
 
 /**
- * 신규 큐의 Redis 클러스터 배정 (§75 D25 / D27-3).
+ * 이유: 신규 큐의 Redis 클러스터 배정(§75 D25 · D27-3).
+ * 🔑 <b>기준은 메모리 사용률이지 큐 개수가 아니다</b> — 30만 명 큐 1개가 유휴 큐 1000개보다 무겁다.
+ * 해결: <b>cold path 전용</b>이다 — 큐 생성에서만 불리고 호출당 노드 수만큼 {@code INFO memory} 가 붙는다.
+ * 🪤 캐시하지 않는다 — 자주 불리는 경로가 아니고, 캐시가 있으면 <b>방금 넘긴 임계값을 못 본다</b>.
+ * 🪤 큐를 미리 다 만들면 cluster2 가 <b>영원히 안 쓰인다</b>(생성 시점엔 A 가 비어 있다, 실측).
  *
- * <p><b>기준은 메모리 사용률({@code used_memory / maxmemory})이지 큐 개수가 아니다.</b>
- * 30만 명이 든 큐 1개가 유휴 큐 1000개보다 무겁다. 개수로 나누면 정확히 반대로 배정된다.
- *
- * <p><b>cold path 전용이다.</b> 큐 생성에서만 호출되며, 호출당 노드 수만큼의
- * {@code INFO memory} 왕복이 붙는다(로컬 기준 master 4대 = 4회). 캐시하지 않는다 —
- * 캐시가 필요할 만큼 자주 불리는 경로가 아니고, 캐시가 있으면 오히려 방금 넘긴 임계값을
- * 못 본다.
+ * @author sonix
  */
 @Slf4j
 @Component
@@ -62,14 +60,13 @@ public class RedisClusterAssigner {
     }
 
     /**
-     * cluster1 마스터들 중 <b>가장 높은</b> 메모리 사용률.
+     * 이유: cluster1 마스터 중 <b>가장 높은</b> 메모리 사용률.
+     * 원인: <b>용량을 먼저 소진하는 쪽이 한 노드</b>다 — 해시태그로 같은 슬롯에 모여 편차가 남는다.
+     * 🪤 합계로 보면 <b>한 노드가 100%여도 평균은 25%</b> 라 배정이 계속된다.
+     * 해결: 판정 실패 시(연결 불가·{@code maxmemory=0}) 0 을 반환해 cluster1 을 고른다 —
+     *       큐 생성이라는 관리 작업을 Redis 상태 때문에 실패시키지 않는다.
      *
-     * <p>합계가 아니라 최대값을 보는 이유: 클러스터 용량을 먼저 소진시키는 것은 총량이 아니라
-     * <b>한 노드</b>다. 큐 하나의 키는 해시태그 때문에 전부 같은 슬롯 = 같은 노드에 몰리므로,
-     * 노드 간 편차가 그대로 남는다. 합계로 보면 한 노드가 100%여도 평균 40%로 보인다.
-     *
-     * <p>판정에 실패하면(연결 불가, {@code maxmemory=0}) 0을 반환해 cluster1을 유지한다 —
-     * 큐 생성이라는 관리 작업을 Redis 상태 때문에 실패시키지는 않는다.
+     * @author sonix
      */
     private double usedMemoryRatio() {
         try (RedisClusterConnection conn = cluster1.getRequiredConnectionFactory().getClusterConnection()) {
@@ -93,13 +90,11 @@ public class RedisClusterAssigner {
                 worst = Math.max(worst, (double) used / max);
             }
             if (judged == 0) {
-                // 판정할 노드가 하나도 없으면 사용률은 영원히 0이고, 신규 큐는 cluster1에만 쌓인다.
-                // 침묵하면 "임계에 안 닿았다"와 구분되지 않아 §75가 무성으로 죽는다.
-                //
-                // ⚠️ 2026-08-18 실측 기준으로는 이 분기에 들어오지 않는다 — Cluster A/B 16노드가
-                //    전부 maxmemory=1gb + noeviction이다(doc/ROADMAP.md의 "maxmemory 명시 설정"
-                //    항목이 기록하던 충돌은 그래서 해소됐다). 남겨두는 이유는 새 노드를 한도 없이
-                //    추가하는 순간 판정이 조용히 무력화되기 때문이다.
+                // 이유: 판정할 노드가 없으면 사용률이 영원히 0이라 cluster2 로 넘어갈 수 없다.
+                // 문제: 침묵하면 "임계에 안 닿았다"와 구분되지 않아 §75 가 조용히 무성해진다.
+                // 해결: WARN 으로 드러낸다.
+                // ⚠️ 실측 기준으로는 이 분기에 안 들어온다(전 노드 maxmemory=1gb + noeviction) —
+                //    남겨두는 이유는 한도 없는 노드를 <b>추가하는 순간 판정이 조용히 무력화</b>되기 때문이다.
                 log.warn("Redis cluster1에 maxmemory가 설정된 master가 없다. 사용률 판정이 성립하지 않아 "
                         + "신규 큐가 계속 cluster{}로만 배정된다 (DECISIONS §75 D27-3)", CLUSTER1);
             }
