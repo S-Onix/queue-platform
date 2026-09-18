@@ -1,34 +1,14 @@
 package com.sonix.queue.infrastructure.queue;
 
 /**
- * Queue Engine Redis 키 중앙 관리.
+ * 이유: Queue Engine Redis 키 중앙 관리. 캐시가 아니라 <b>Lua 원자 연산으로 다루는 원본</b>이다.
+ * 🔴 <b>해시태그 {@code {queueId}} 필수</b> — 없으면 다중 키 Lua 가 {@code CROSSSLOT} 이다.
+ * 🔑 <b>거부 기준이 둘이다</b>(실측) — 선언한 키는 슬롯이 갈리면 즉시 거부되지만, <b>선언 안 한 키는
+ *    같은 노드면 조용히 성공</b>한다(4대 ≈ 25%). 초록은 증거가 아니다.
+ * 🪤 로컬 Sentinel 로는 원리적으로 못 잡는다(슬롯 개념이 없다) — 그래서 분기를 지웠다(§75 D28).
+ * ❌ 태그를 shard 단위로 옮기지 마라(§75 기각) — 판정이 <b>질문을 만들려면 답을 알아야</b> 하게 된다.
  *
- * <p>캐시 키가 아니므로 {@code cache.RedisKeyFactory}가 아니라 여기서 관리한다.
- * ({@code ratelimit.RateLimitKeys}와 같은 이유 — Lua 원자 연산으로 다루는 원본 데이터)
- *
- * <p>🔴 <b>해시태그 {@code {queueId}} 필수.</b> 다중 키 Lua({@code enqueue_bulk} 등)는 키들이
- * 같은 슬롯이어야 하는데, 태그가 없으면 {@code CRC16(key) % 16384}가 키마다 갈려
- * {@code CROSSSLOT} 에러가 난다. 중괄호 안쪽만 슬롯 계산에 쓰이므로 queueId가 같으면
- * 같은 마스터가 수학적으로 보장된다.
- *
- * <p>🔑 <b>거부 기준이 둘이고, 시끄러운 쪽과 조용한 쪽이 갈린다</b>(2026-09-15 실측, 로컬 Cluster A):
- * <pre>
- *   EVAL ... 2 foo bar        → CROSSSLOT Keys in request don't hash to the same slot   (슬롯 기준)
- *   EVAL ... 1 foo, 스크립트가 bar 를 만짐 → ERR Script attempted to access non local key (노드 기준)
- *   EVAL ... 1 foo, 스크립트가 undeclared_key_x 를 만짐 → OK   ← 슬롯 11481 vs 12182 로 <b>다른데 통과</b>
- * </pre>
- * 즉 {@code KEYS[]}에 <b>선언한</b> 키는 슬롯이 갈리면 즉시 거부되지만(실패가 시끄럽다),
- * <b>선언하지 않은</b> 키는 "이 노드가 소유하는가"만 보므로 <b>슬롯이 달라도 우연히 같은 노드면
- * 조용히 성공</b>한다(마스터 4대 ≈ 25%). 초록은 안전의 증거가 아니다 —
- * 자세한 사례는 {@link #admitByTokenPrefix(String)} 참조.
- *
- * <p>🪤 <b>로컬 Sentinel로는 원리적으로 못 잡는다</b> — Sentinel에는 슬롯 개념 자체가 없다.
- * {@code RedisConfig}에서 Sentinel 분기를 코드에서 지운 이유가 이것이다(§75 D28).
- *
- * <p>🔴 <b>태그를 shard 단위로 옮기지 마라</b>(§75에서 기각된 안). {@code RedisQueueEngine.route}는
- * 소유자를 모를 때 {@code EXISTS queue:&#123;queueId&#125;:seq}를 양쪽 클러스터에 물어 판정하는데,
- * 키 이름에 shard가 들어가면 <b>질문을 만들려면 답을 이미 알아야</b> 한다. queueId는 테넌트에
- * 노출된 영구 식별자라 형식을 바꿀 수도 없다.
+ * @author sonix
  */
 public final class QueueKeys {
     private QueueKeys(){
@@ -45,25 +25,14 @@ public final class QueueKeys {
     }
 
     /**
-     * identifier -> {@code "tokenId|issuedAt"} 매핑 Hash (발급 원장 + EXISTS 재사용).
-     *
-     * <p>🔴 <b>이 Hash의 필드 존재가 중복 게이트다</b>({@code enqueue_bulk.lua}의 {@code HSETNX}).
-     * {@code waiting} ZSet은 게이트가 아니다 — admit되면 거기서 빠지므로 waiting으로 판정하면
-     * admit된 사람의 재-enqueue가 새 tokenId·새 seq를 받는다(폴링 404 · 과금 중복 ·
-     * {@code status=1} 고아 행).
-     *
-     * <p>🔴 <b>사람을 큐에서 빼는 경로는 반드시 이 필드를 마지막에 {@code HDEL}한다.</b> 현재 넷 —
-     * {@code cleanup_completed}(complete <b>와 verify</b>, §92 — 호출자가 둘이다) · {@code admit_expire}(§36) ·
-     * {@code inactive_expire} · {@code waiting_expire}(§82). 안 지우면 영영 재입장 불가, 먼저 지우면
-     * 아직 큐에 있는 사람이 폴링에서 404다.
-     *
-     * <p>🔴 <b>키는 identifier(사람)인데 값은 tokenId(회차)라, 지울 때 값을 봐야 한다.</b>
-     * identifier는 회차 간 재사용되므로 그것만 보고 지우면 <b>다른 회차의 게이트를 지운다</b>
-     * (= "늦은 complete가 재-enqueue한 사용자를 축출"한 결함). 네 경로는 tokenId를 {@code HGET}으로
-     * 대조하거나({@code cleanup_completed}) identifier를 <b>지금 Redis에서</b> 얻어 이를 피한다.
-     * <b>바깥에서 들고 온 identifier를 대조 없이 쓰는 경로를 새로 만들지 마라.</b>
+     * 이유: identifier → {@code "tokenId|issuedAt"} 매핑 Hash(발급 원장 + EXISTS 재사용).
+     * 🔴 <b>이 Hash 의 필드 존재가 중복 게이트다</b>({@code HSETNX}) — {@code waiting} ZSet 은 아니다
+     *    (admit 되면 빠지므로 게이트로 쓰면 재-enqueue 가 신규로 판정돼 <b>과금이 중복</b>된다).
+     * 🔴 사람을 큐에서 빼는 <b>네 경로가 이 필드를 마지막에 {@code HDEL}</b> 한다(안 지우면 영구 락아웃).
+     * 🔴 <b>키는 identifier(사람)인데 값은 tokenId(회차)</b>라 지울 때 값을 대조해야 한다 —
+     *    안 하면 늦은 complete 가 <b>다음 회차를 축출</b>한다(실제 결함이었다).
      */
-    public static String tokens(String queueId) {
+   public static String tokens(String queueId) {
         return "queue:{" + queueId + "}:tokens";
     }
 
@@ -87,27 +56,26 @@ public final class QueueKeys {
     }
 
     /**
-     * 폴링 간격 사다리 오버라이드 (§79). <b>평상시 대부분의 큐에는 이 키가 없다</b> —
-     * 없으면 코드 상수({@code PacingTier.DEFAULT})가 쓰이므로 관리 대상이 0이다.
+     * 이유: 폴링 간격 사다리 오버라이드(§79). <b>평상시 대부분의 큐엔 이 키가 없다.</b>
+     * 해결: 없으면 코드 상수({@code PacingTier.DEFAULT})가 쓰여 관리 대상이 0 이다.
+     * 🔑 존재 이유는 장애 시 <b>"전원 폴링 간격 2배"를 서버가 즉시</b> 할 수 있어야 하기 때문이다.
+     * 🪤 미리 채워두지 않는다 — 폴백 분기는 어차피 못 지운다.
+     *    값 형식은 {@code "50:2,1000:5,*:20"}({@code PacingTier.parse}).
      *
-     * <p>존재 이유는 장애 시 "전원 폴링 간격 2배"를 서버가 즉시 할 수 있다는 것 하나다.
-     * 미리 채워두지 않는 것은 폴백 분기를 어차피 못 지우기 때문이다(§79 D4).
-     *
-     * <p>값 형식은 {@code "50:2,1000:5,5000:10,10000:15,*:20"} — {@code PacingTier.parse} 참조.
-     * {@code admit-watermark}·{@code seq}와 같은 해시태그라 {@code MGET} 한 번에 실린다.
+     * @author sonix
      */
     public static String pacing(String queueId) {
         return "queue:{" + queueId + "}:pacing";
     }
 
     /**
-     * {@code admit-by-token} 접두사 (뒤에 tokenId가 붙는다). Polling 응답용 admitToken 조회.
+     * 이유: {@code admit-by-token} 접두사(뒤에 tokenId 가 붙는다). 폴링 응답용 admitToken 조회.
+     * 🔴 <b>접두사를 {@code .lua} 로 옮기지 마라</b>(§80 ⑥) — tokenId 가 런타임 값이라 {@code KEYS[]} 에
+     *    선언할 수 없고, 선언이 없으면 <b>슬롯 검사가 안 걸린다</b>.
+     * 원인: 남는 검사는 "이 노드가 소유하는가"뿐이라 <b>우연히 소유하면 조용히 성공</b>한다(4대 ≈ 25%).
+     * 해결: {@code QueueKeysSlotTest} 의 리플렉션 전수 단언이 유일한 방어다 — 그래서 접두사를 Java 에 둔다.
      *
-     * <p>🔴 <b>접두사를 {@code .lua} 파일로 옮기지 마라 (§80 ⑥).</b> tokenId가 런타임 값이라
-     * admit.lua는 이 키를 {@code KEYS[]}에 선언할 수 없고, 선언이 없으면 {@code CROSSSLOT} 사전
-     * 검사가 안 걸린다 — 남는 검사는 "이 노드가 그 키를 소유하는가"뿐이라 <b>슬롯이 달라도
-     * 우연히 소유하면 조용히 성공</b>한다(마스터 4대 ≈ 25%). 유일한 방어가
-     * {@code QueueKeysSlotTest}의 리플렉션 전수 단언인데, 접두사가 Java 밖에 있으면 닿지 못한다.
+     * @author sonix
      */
     public static String admitByTokenPrefix(String queueId) {
         return "queue:{" + queueId + "}:admit-by-token:";
