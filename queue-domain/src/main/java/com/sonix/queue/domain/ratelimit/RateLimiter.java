@@ -1,16 +1,13 @@
 package com.sonix.queue.domain.ratelimit;
 
 /**
- * Rate Limit 아웃바운드 포트.
+ * 이유: Rate Limit 아웃바운드 포트 — <b>Token Bucket</b> 계열(버스트를 허용하는 SLA 한도용).
+ * 해결: 코어가 "제한할 수 있는 능력"을 요구하고 어댑터가 제공한다.
+ * 🔧 구현체는 {@code InMemoryTokenBucketRateLimiter}(학습·단일 JVM) 와
+ *    {@code RedisTokenBucketRateLimiter}(운영, Lua 원자 실행)다 — 예전 주석의 FixedWindow 이름은 거짓이었다.
+ * 🪤 인증 전 엔드포인트는 이 포트가 아니라 {@code FixedWindowRateLimiter} 를 쓴다(§60·§61).
  *
- * <p>애플리케이션 코어가 "요청을 제한할 수 있는 능력"을 요구하고,
- * 어댑터(인메모리 / Redis-Lua)가 그 능력을 제공한다.
- *
- * <p>구현체:
- * <ul>
- *   <li>{@code InMemoryFixedWindowRateLimiter} — 학습/비교 전용 (단일 JVM)</li>
- *   <li>{@code RedisFixedWindowRateLimiter} — 운영용 (Step 3, Lua Script 원자 실행)</li>
- * </ul>
+ * @author sonix
  */
 public interface RateLimiter {
 

@@ -5,46 +5,25 @@ import lombok.Getter;
 import java.time.LocalDateTime;
 
 /**
- * Queue
- *  - enqueue 요청시 발급되는 토큰 정보
- *  - admit 요청시 발급되는 토큰 정보
+ * 이유: enqueue·admit 에서 발급되는 토큰. 이 프로젝트의 원장 단위다(토큰 1장 = 청구 1건).
+ * 🔑 <b>이 객체의 시각은 UTC 다</b>(§77) — JVM 기본 TZ 가 UTC 라 이 클래스만 특별하지 않다.
+ * 🔴 상태 전이에서 {@code LocalDateTime.now()} 를 부르지 마라 — <b>호출자가 주입</b>한다(테스트 고정).
+ * 🔧 옛 주석의 "completedAt·cancelledAt·expiredAt 은 전부 NULL"은 <b>거짓이다</b> —
+ *    {@code completed_at} 은 §91 이후 채워지고, cancel 은 §82 에서 폐기돼 존재하지 않는다.
  *
- * <p><b>⚠️ 이 객체의 시각은 UTC다.</b> 이 프로젝트는 2026-08-12부로 <b>전 테이블을 UTC로 통일</b>했다
- * (DECISIONS §77). JVM 기본 TZ가 UTC로 고정돼 있어 {@code LocalDateTime.now()}도 UTC 벽시계를 낸다 —
- * 즉 이 클래스만 특별하지 않고, 다른 도메인 모델과 규약이 같다.
- *
- * <p>그래도 이 클래스에서 지킬 것 둘:
- * <ol>
- *   <li><b>상태 전이 메서드에서 {@code LocalDateTime.now()}를 호출하지 마라.</b>
- *       시각은 <b>호출자에게서 주입받는다</b> — {@code issue()}가 이미 그렇게 돼 있다.
- *       도메인이 시계를 직접 읽으면 테스트에서 고정할 수 없다. TZ와 무관한 이유다.</li>
- *   <li>Kafka 이벤트의 {@code Instant}를 변환할 때는 {@code ZoneOffset.UTC}를 쓴다
- *       ({@code TokenLifecycleConsumer.toToken()} 참조). 고정 오프셋이라 재처리해도 값이 같고,
- *       그 값이 {@code UNIQUE(token_id, issued_at)}의 절반이라 멱등성이 걸려 있다.</li>
- * </ol>
- *
- * <p><b>Sprint 7에서 추가될 {@code completedAt}/{@code cancelledAt}/{@code expiredAt}도 UTC다.</b>
- * DB 컬럼은 이미 있으나 전부 NULL이다. {@code schema.sql}의 [파티션 운영 쿼리]가
- * {@code AVG(TIMESTAMPDIFF(SECOND, issued_at, completed_at))}을 이미 쓰고 있으므로,
- * 규약을 어기면 그 쿼리가 곧바로 틀린 숫자를 낸다.
- *
- * <p>배경과 대안 비교: {@code doc/DECISIONS.md}, DDL 주석: {@code doc/schema.sql}
- * */
+ * @author sonix
+ */
 @Getter
 public class Token {
 
     /**
-     * {@code complete}가 유효한 창(초). <b>이 값이 두 곳에서 쓰인다</b>.
+     * 이유: complete 가 유효한 창(초). <b>두 곳이 이 값을 쓴다</b>.
+     * 해결: {@code QueueEngineService.complete} 의 술어와, reconciliation 의 만료 확정 기준이다 —
+     *       reconcile 은 이 창이 <b>지난 뒤에야</b> 남은 {@code ADMIT_ISSUED} 를 정리한다.
+     * 🔴 <b>숫자를 각자 박지 마라</b> — 갈라지는 순간 정상 complete 가 404 를 받고
+     *    원인은 다른 파일에 있게 된다. 실측: admit 후 98초에도 complete 가 200 을 돌려준다.
      *
-     * <ul>
-     *   <li>{@code QueueEngineService.complete} — {@code admitted_at > now - 이 값}인 토큰만 완료시킨다</li>
-     *   <li>reconciliation — 이 창이 <b>지난 뒤에야</b> 남은 {@code ADMIT_ISSUED}를 만료로 정리한다.
-     *       더 일찍 자르면 정상적인 늦은 통보가 404를 받는다</li>
-     * </ul>
-     *
-     * <p>🔴 <b>숫자를 각자 박지 말 것.</b> 갈라지는 순간 정상 {@code complete}가 404를 받는데
-     * 원인은 다른 파일에 있게 된다. 실측으로 확인된 경로다 — admit 후 98초(= admitToken TTL 60초를
-     * 넘긴 시점)에도 {@code complete}가 200을 돌려준다.
+     * @author sonix
      */
     public static final int COMPLETE_VALID_WINDOW_SECONDS = 300;
 

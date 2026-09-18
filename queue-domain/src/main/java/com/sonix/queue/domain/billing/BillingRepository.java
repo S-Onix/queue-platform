@@ -16,9 +16,7 @@ public interface BillingRepository {
     /**
      * 이유: 한 달치 테넌트별 토큰 수를 {@code billing_snapshots} 에 UPSERT 한다.
      * 해결: <b>멱등하다</b> — 덮어쓰기라 실패한 주기를 다음 주기가 가져가면 된다.
-     * 🪤 <b>월 경계는 UTC 다</b>(§77) — 로컬 시각으로 자르면 월말 9시간분이 어긋난다.
-     * 🪤 <b>반환값이 없다</b> — ODKU 의 UPDATE 는 한 행을 2로 세고 드라이버마다 달라 해석할 수 없다.
-     *    성패는 예외 여부로만 판정한다.
+     * 🪤 월 경계는 UTC 다(§77). 반환값이 없다 — ODKU 는 한 행을 2로 세 성패를 예외로만 판정한다.
      *
      * @author sonix
      * @throws RuntimeException 대상 월 파티션이 없으면 {@code ERROR 1735}. fail-loud 다(§83)
@@ -29,8 +27,7 @@ public interface BillingRepository {
      * 이유: 한 달치를 <b>큐×일</b> 단위로 {@code queue_daily_stats} 에 UPSERT 한다.
      * 문제: {@code tokens} 가 M+2 월에 파티션째 사라지면 "어느 큐에서 얼마나 받았나"를 잃는다.
      *       {@code billing_snapshots} 는 테넌트 합계라 큐가 둘 이상이면 분해가 <b>영구히</b> 불가능하다.
-     * 해결: {@code upsertMonthlySnapshot} 과 <b>같은 주기·같은 월</b>로 돌린다 — 그래야 두 표가
-     *       서로를 감시하는 등식이 성립한다. 전월도 덮어써야 늦은 admit(가장 오래 기다린 토큰)이 산다.
+     * 해결: {@code upsertMonthlySnapshot} 과 <b>같은 주기·같은 월</b>로 돌려 두 표가 서로를 감시하게 한다.
      * 🪤 대기 시간 기준은 {@code admitted_at} 이다 — {@code completed_at} 엔 Tenant 처리 시간이 섞인다.
      *
      * @author sonix
