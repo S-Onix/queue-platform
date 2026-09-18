@@ -402,6 +402,35 @@ CREATE TABLE queue_daily_stats (
 
 
 -- ================================================================
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 🔴 파티션 추가(ADD) — 이 레포에 자동화가 **없다** (2026-09-19 확인)
+-- ═══════════════════════════════════════════════════════════════════════════
+-- DROP 은 BillingSnapshotJob 이 자동으로 하는데 **ADD 하는 코드·절차는 어디에도 없다.**
+-- 위 CREATE TABLE 이 p2026_01 ~ p2027_12 를 하드코딩해 두었고 그 뒤는 전부 p_future 다.
+--
+-- 🪤 **실패 모양이 비대칭이다.** INSERT 는 p_future 가 받아 **조용히 성공**하므로 부하 중에는
+--    아무 신호도 없다. 그러나 집계는 PARTITION (pYYYY_MM) 을 이름으로 지목하므로
+--    **ERROR 1735 Unknown partition 으로 죽는다**(실측 재현). 즉 그날 00:30 에 과금이 멈춘다.
+--
+-- 그래서 **런웨이가 3개월 아래로 내려가면 아래를 돌린다.** 리허설·부하 판의 프리플라이트
+-- (run_5m.sh preflight)가 남은 개수를 찍어 준다.
+--
+--   ALTER TABLE tokens REORGANIZE PARTITION p_future INTO (
+--       PARTITION p2028_01 VALUES LESS THAN (202802),
+--       PARTITION p2028_02 VALUES LESS THAN (202803),
+--       -- … 필요한 만큼 …
+--       PARTITION p_future VALUES LESS THAN MAXVALUE
+--   );
+--
+-- ✅ 위 문장은 실측했다(2026-09-19 로컬): 23 → 24 개로 늘고, 되돌리는 REORGANIZE 도 된다
+--    (p2028_01, p_future INTO p_future). 두 방향 다 확인 후 원복했다.
+-- 🔑 REORGANIZE 를 쓰는 이유: p_future 가 MAXVALUE 를 들고 있어 ADD PARTITION 이 거부된다
+--    (실측 **ERROR 1481** "MAXVALUE can only used in last partition definition").
+--    p_future 를 쪼개는 방식이라야 한다.
+-- ⚠️ 이것도 DROP 과 같은 **테이블 MDL** 이다 — 뒤에 온 INSERT 가 함께 막힌다(실측 3.05초).
+--    lock_wait_timeout 을 짧게 걸고 한가한 시각에 하라(멀티테넌트엔 한가한 시각이 없으니
+--    "덜 바쁜" 시각이다). 지연은 공짜고 블로킹은 사고다.
+
 -- 파티션 운영 쿼리 (1달 유예 — M월 파티션은 M+2월 초 DROP)
 --
 -- 예시: 4월 파티션(p2026_04) → 6월 초 처리
