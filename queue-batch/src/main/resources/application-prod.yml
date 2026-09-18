@@ -3,19 +3,22 @@ spring:
   #    AWS 8차(500만) 전수 집계에서 이 왕복이 **쿼리 1,055만 건 / MySQL CPU 756초(예산 2.8%)** 였다.
   #    🪤 앱이 세션 변수를 직접 바꾸면 드라이버가 그것을 모른다 — 이 레포엔 그런 코드가 없다(전수 확인).
   datasource:
+    # 🔴 socketTimeout=10000 — **API(2,000ms)와 다른 값이다.** 배치는 초 단위가 정상이라
+    #    같은 값을 쓰면 정상 작업을 끊는다(10차 MAX: countWaitingUpTo 598.7ms · MAX(seq) 244.2ms).
+    #    🪤 innodb_lock_wait_timeout(행 락)은 50초라 socketTimeout 이 먼저 끊는다 — 서버는 계속 기다린다.
     # 🔴 이 블록이 없으면 기동 자체가 안 된다 — 베이스 application.yml에 datasource가 없어
     #    프로필이 반드시 제공해야 한다. queue-api·queue-consumer는 갖고 있는데 여기만 빠져
     #    있어서 batch는 local 프로필 밖에서 한 번도 뜬 적이 없었다(2026-08-24 컨테이너 검증에서 발견).
     #    TokenReclaimJob이 queueRepository.findAll()로 큐 목록을 DB에서 읽으므로 필수다.
     master:
-      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&connectTimeout=3000&socketTimeout=10000&sessionVariables=lock_wait_timeout=30
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
       # api(50)·consumer(20)보다 작다. 이 앱은 주기(10초)마다 큐 목록을 한 번 읽고
       # 회수는 Redis EVAL로 끝난다 — 커넥션을 오래 쥐지 않는다.
       maximum-pool-size: ${DB_POOL_SIZE:10}
     replica:
-      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&connectTimeout=3000&socketTimeout=10000&sessionVariables=lock_wait_timeout=30
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
       maximum-pool-size: 5

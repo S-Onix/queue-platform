@@ -13,8 +13,13 @@ spring:
   #    AWS 8차(500만) 전수 집계에서 이 왕복이 **쿼리 1,055만 건 / MySQL CPU 756초(예산 2.8%)** 였다.
   #    🪤 앱이 세션 변수를 직접 바꾸면 드라이버가 그것을 모른다 — 이 레포엔 그런 코드가 없다(전수 확인).
   datasource:
+    # 🔴 socketTimeout=2000 · connectTimeout=3000 · lock_wait_timeout=10 (AWS 10차 실측 근거).
+    #    예전엔 셋 다 없어 Connector/J 기본 0 = **무기한**이었고, 서버 lock_wait_timeout 도 365일이라
+    #    양쪽에 시한이 없었다. 2,000ms 는 API 경로 최댓값 251ms(markCompleted)의 8배 여유다.
+    #    🪤 socketTimeout 은 **서버의 쿼리를 죽이지 않는다** — 그래서 lock_wait_timeout 과 짝이다.
+    #    🪤 innodb_lock_wait_timeout(행 락, 50초)은 그대로다. 여기선 socketTimeout 이 먼저 끊는다.
     master:
-      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      jdbc-url: jdbc:mysql://${DB_MASTER_HOST}:${DB_MASTER_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&connectTimeout=3000&socketTimeout=2000&sessionVariables=lock_wait_timeout=10
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
       # 🔴 **풀 크기는 Little's law 로 정한다 — 크게 잡는 것이 안전한 게 아니다** (AWS 10차 실측).
@@ -26,7 +31,7 @@ spring:
       maximum-pool-size: 20
       minimum-idle: 5
     replica:
-      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true
+      jdbc-url: jdbc:mysql://${DB_REPLICA_HOST}:${DB_REPLICA_PORT:3306}/queue_platform?useSSL=true&requireSSL=true&useLocalSessionState=true&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&connectTimeout=3000&socketTimeout=2000&sessionVariables=lock_wait_timeout=10
       username: ${DB_USERNAME}
       password: ${DB_PASSWORD}
       # replica 는 **앱이 읽는 경로가 0** 이다(master-replica-routing). 그런데 예전엔 50 을 열어
