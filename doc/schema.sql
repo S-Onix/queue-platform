@@ -228,6 +228,14 @@ CREATE TABLE tokens (
     --    🔑 **추가가 아니라 교체인 이유**: 인덱스 총량이 이미 데이터보다 크다(2,719 vs 1,865MB).
     --       버퍼풀 2GB 로는 안 들어가는 상태라, 늘리면 다른 쿼리의 이득을 깎는다.
     INDEX idx_tokens_queue_issued_seq     (queue_id, issued_at, seq),
+    -- 🔴 verify 의 DB 폴백(findAdmittedByAdmitToken)이 **MySQL 시간의 86%** 를 먹고 있었다
+    --    (AWS 9차 실측 2026-09-18: 313,842회 · 60,654초 · **회당 193.3ms** · 반환 0행).
+    --    술어가 (queue_id, tenant_id, admit_token, status, admitted_at) 인데 기존 인덱스는
+    --    (queue_id, status, issued_at) 이라 issued_at 이 술어에 없어 **접두 두 칸에서 멈추고**
+    --    그 큐의 status=1 행을 전부 훑으며 admit_token 을 행마다 비교했다(스캔 추정 319만 행).
+    --    이 인덱스로 type=ref · rows=1 이 된다 — 실측 18.5ms → 1.18ms(덥힌 상태 기준 15배).
+    --    🪤 admit_token 은 랜덤 문자열이라 (queue_id, admit_token) 두 칸이면 사실상 유일하다.
+    INDEX idx_tokens_queue_admit          (queue_id, admit_token),
     INDEX idx_tokens_status_admit         (status, issued_at)          -- ⚠️ 삭제 후보(Sprint 9 확정 후). 이름의 admit은 admit_token과 무관 — 오해를 부른다
 
     -- 🔴 fk_tokens_queue 삭제 (2026-08-17)
@@ -287,6 +295,10 @@ PARTITION BY RANGE (YEAR(issued_at) * 100 + MONTH(issued_at)) (
 --     SET SESSION lock_wait_timeout = 3;
 --     ALTER TABLE tokens DROP INDEX idx_tokens_queue_user_status;
 --     ALTER TABLE tokens ADD  INDEX idx_tokens_queue_issued_seq (queue_id, issued_at, seq);
+--
+--   🔴 2026-09-18 추가분 — verify DB 폴백용. 위 CREATE TABLE 이 이미 갖고 있으므로 **기존 DB 전용**.
+--      AWS 9차에서 실제로 적용했고 **53.7초** 걸렸다(332만 행 · 파티션 26개, 부하를 멈춘 상태).
+--     ALTER TABLE tokens ADD INDEX idx_tokens_queue_admit (queue_id, admit_token);
 
 --   검증 — 교체가 실제로 먹었는지 본다. type=range, key=idx_tokens_queue_issued_seq,
 --   Extra 에 "Using index" 가 있어야 한다(커버링). 행 조회가 남아 있으면 seq 가 인덱스에
