@@ -27,8 +27,8 @@ public class TokenJpaAdapter implements TokenRepository {
     /**
      * 이유: 상태 전이 UPSERT 의 INSERT 부분. ENQUEUED 만은 {@link #ENQUEUE_INSERT} 가 맡는다.
      * 🔴 <b>{@code ?} 를 쓰지 마라</b> — 재작성이 조용히 꺼져 500건 배치가 500왕복이 된다.
-     * 🔴 <b>{@code AS new} 별칭이 필요하다</b> — 컬럼명을 {@code tokens.}·{@code new.} 로 전부 한정해야 한다.
-     * 🔑 {@code admitted_at} 의 {@code ?} 는 §90 의 <b>null 여부 보존</b>용이다.
+     * 🔴 {@code AS new} 별칭이 필요하고, 컬럼명은 {@code tokens.}·{@code new.} 로 전부 한정한다.
+     * 🔑 {@code admitted_at} 의 {@code ?} 는 §90 의 null 여부 보존용이다(값은 MySQL 이 찍는다).
      */
     /**
      * 이유: 신규 적재(ENQUEUED) SQL. {@code TokenEntity.@SQLInsert} 원문을 옮긴 것이다.
@@ -59,10 +59,8 @@ public class TokenJpaAdapter implements TokenRepository {
     private static Map<TokenEventType, String> transitionSql() {
         Map<TokenEventType, String> sql = new EnumMap<>(TokenEventType.class);
         // 이유: admitted_at 은 **이벤트 값이 아니라 MySQL 의 UTC_TIMESTAMP(3)** 이 찍는다(§90).
-        //       이 컬럼이 술어의 좌변이고 우변이 전부 MySQL 시계라, 앱 시계로 쓰면 한 창을 두 시계로 잰다
-        //       (실측 S=398이면 admit 0초 뒤 0행 → 404 가 아니라 **원장 손상**이다).
-        // 🔑 **ADMITTED 에서 값을 정하는 곳은 VALUES 절 하나다** — 여기 `new.admitted_at` 은 그 결과를
-        //    가리킬 뿐이라, 이 줄에 UTC_TIMESTAMP(3) 을 또 쓰면 **무동작**이다(결함 주입 실측).
+        //       앱 시계로 쓰면 한 창을 두 시계로 잰다(실측 S=398 이면 **원장 손상**이다).
+        // 🔑 **값을 정하는 곳은 VALUES 절 하나다** — 이 줄에 또 쓰면 **무동작**이다(결함 주입 실측).
         // 🔧 단 "쓰는 곳은 한 곳뿐"으로 읽지 마라(§91) — COMPLETED ODKU 가 두 번째로 쓰고 거긴 하중을 받는다.
         // ❌ issued_at 은 같이 옮기지 마라 — 멱등 키의 절반이라 재처리마다 새 행이 생긴다.
         sql.put(TokenEventType.ADMITTED, TRANSITION_INSERT + """
@@ -79,13 +77,11 @@ public class TokenJpaAdapter implements TokenRepository {
                 admitted_at  = IF(tokens.status IN (0, 1) AND tokens.admitted_at IS NULL, UTC_TIMESTAMP(3), tokens.admitted_at),
                 completed_at = IF(tokens.status IN (0, 1), UTC_TIMESTAMP(3), tokens.completed_at),
                 status       = IF(tokens.status IN (0, 1), 2, tokens.status)""");
-        // 🔴 출발이 0 뿐인 것은 의도다(§36) — admitToken TTL 만료자는 status=1 이라 여기서 no-op 이고,
-        //    그래야 complete 의 300초 창이 살아남는다. IN (0,1) 로 넓히면 늦은 입장이 거절된다.
-        // 🔴 expired_reason 에도 **같은 가드가 필요하다** — 무조건 쓰면 나중에 complete 되는 토큰에
-        //    "만료됨" 사유가 박혀(status=2 인데 사유가 있다) 통계가 거짓말을 한다.
+        // 🔴 출발이 0 뿐인 것은 의도다(§36) — IN (0,1) 로 넓히면 늦은 입장이 거절된다.
+        // 🔴 expired_reason 에도 **같은 가드가 필요하다** — 무조건 쓰면 complete 된 토큰에 사유가 박힌다.
         // 🪤 값을 '?' 대신 new.expired_reason 으로 받는다 — ODKU SET 절의 '?' 는 재작성을 조용히 끈다.
-        // 🔴 **"ADMIT_TTL 은 DB 에 남지 않는다"는 거짓이었다**(실측 259건) — 랙 구간엔 DB status 가 0 이라
-        //    0→4 가 적용되고 뒤늦은 ADMITTED 가 no-op 이 되어 admit_token·admitted_at 이 영구 NULL 이다.
+        // 🔴 **"ADMIT_TTL 은 DB 에 남지 않는다"는 거짓이었다**(259건) — 랙 구간엔 0→4 가 적용돼
+        //    admit_token·admitted_at 이 영구 NULL 이 된다.
         sql.put(TokenEventType.EXPIRED, TRANSITION_INSERT + """
                 expired_reason = IF(tokens.status = 0, new.expired_reason, tokens.expired_reason),
                 status         = IF(tokens.status = 0, 4, tokens.status)""");
@@ -103,12 +99,10 @@ public class TokenJpaAdapter implements TokenRepository {
 
     /**
      * 이유: 신규 적재(ENQUEUED). 충돌하면 no-op 이다.
-     * 문제: 🔴 <b>JPA 가 아니라 JdbcTemplate 인 것은 같은 트랜잭션 안의 실행 시점을 맞추기 위해서다.</b>
-     *       JPA {@code persist} 는 플러시까지 INSERT 를 미루고 {@code applyTransition} 은 즉시 실행해
-     *       <b>호출 순서와 실행 순서가 갈렸다</b>(2026-09-14 실측).
+     * 문제: 🔴 <b>JPA 가 아니라 JdbcTemplate 인 것은 실행 시점을 맞추기 위해서다</b> — {@code persist} 는
+     *       플러시까지 미루고 raw JDBC 는 즉시 실행해 <b>호출 순서와 실행 순서가 갈렸다</b>(2026-09-14).
      * 원인: COMPLETED 가 먼저 실행되면 <b>completed_at·admitted_at 이 NULL</b> 로 굳는다(영구 404 + 과금 누락).
-     * 🔑 <b>두 경로를 같은 계층으로 맞추면 함정 자체가 사라진다</b> — 플러시를 강제하는 방법은
-     *    "왜 여기 플러시가 있는가"를 주석으로 지켜야 하고, 이 레포는 그래서 같은 함정을 두 번 밟았다.
+     * 🔑 <b>두 경로를 같은 계층으로 맞추면 함정 자체가 사라진다</b>(플러시 강제는 주석으로 지켜야 한다).
      */
    @Override
     public void saveAllIfAbsent(List<Token> tokens) {

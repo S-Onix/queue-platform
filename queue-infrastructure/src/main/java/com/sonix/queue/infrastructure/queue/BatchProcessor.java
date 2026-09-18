@@ -48,8 +48,7 @@ public class BatchProcessor implements SmartLifecycle {
      *           문제: 경계를 안 주면 Micrometer 가 _bucket 을 아예 발행하지 않아 패널이 영구히 빈다(실측).
      *           원인: Timer 기본값은 count/sum/max 뿐이다. 해결: 실측 기준선(redis 0.16ms · mysql 1.34ms ·
      *           tick 10ms · kafka 18ms/콜드 404ms · 틱 20ms)을 덮는 경계를 준다. §4-1
-     * 🪤 {@code QueueEngineService.STAGE_SLO}(kafka 구간)와 <b>같은 값이어야 한다</b> —
-     *    같은 지표 이름이라 버킷이 갈리면 stage 태그 없이 집계할 때 백분위가 깨진다.
+     * 🪤 {@code QueueEngineService.STAGE_SLO} 와 <b>같은 값이어야 한다</b>(버킷이 갈리면 집계가 깨진다).
      */
     private static final Duration[] STAGE_SLO = {
             Duration.ofMillis(1), Duration.ofMillis(5), Duration.ofMillis(10), Duration.ofMillis(20),

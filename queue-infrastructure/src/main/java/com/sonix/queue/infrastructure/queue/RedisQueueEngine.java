@@ -227,8 +227,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     /**
      * 이유: 읽기 경로 — 소유자를 못 찾으면 관찰 메모에 <b>기록하지 않고</b> cluster1 에서 읽는다.
-     * 🪤 <b>이 폴백의 결과는 빈 결과가 아니라 404 다</b>(종료 신호) — 캐시가 데워진 WAS 는 5xx 를 낸다.
-     * 🔑 그래도 상태는 갈라지지 않는다 — {@code poll_verify} 는 불일치 시 아무것도 쓰지 않는다.
+     * 🪤 <b>결과는 빈 결과가 아니라 404 다</b>(종료 신호) — 상태는 갈라지지 않는다(불일치 시 안 쓴다).
      *
      * @author sonix
      */
