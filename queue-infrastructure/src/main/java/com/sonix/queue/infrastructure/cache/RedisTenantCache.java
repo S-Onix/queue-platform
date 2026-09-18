@@ -12,17 +12,14 @@ import java.time.Duration;
 import java.util.Optional;
 
 /**
- * Tenant Cache 구현체
- * >> TTL 60
- * 직렬화: JSON String (Jackson + TenantMixin)
- * 데이터 타입: Redis String
+ * 이유: Tenant 캐시 구현체(TTL 60초 · JSON String + {@code TenantMixin}).
+ * 문제: Redis 가 죽으면 인증·Rate Limit 이 통째로 막힐 수 있다.
+ * 해결: <b>가용성 우선</b> — 예외를 전파하지 않고 로그만 남긴다. 호출자는 <b>캐시 미스</b> 로 보고
+ *       DB 폴백으로 간다. 손상된 값은 자동 삭제한다.
+ * 🪤 그래서 Redis 장애가 <b>조용하다</b> — 지표·로그가 유일한 단서다.
  *
- *
- * 장애 처리 방침 (가용성 우선):
- * Redis 장애 시 예외 전파 X, 로그만 남김
- * 호출자는 캐시 미스로 인식 → DB fallback 진행
- * 손상된 캐시는 자동 삭제
- * */
+ * @author sonix
+ */
 
 @Slf4j
 @Repository
