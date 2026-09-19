@@ -37,7 +37,7 @@ services:
       context: ../..
       dockerfile: Dockerfile
       args: { MODULE: queue-batch, APP_PORT: "8081" }
-    image: queue-batch:local
+    image: queue-batch:${APP_TAG:-local}
     container_name: q-batch
     environment: { <<: *env, SERVER_PORT: "8081" }
 
@@ -47,7 +47,7 @@ services:
       context: ../..
       dockerfile: Dockerfile
       args: { MODULE: queue-consumer, APP_PORT: "8082" }
-    image: queue-consumer:local
+    image: queue-consumer:${APP_TAG:-local}
     container_name: q-consumer
     environment: { <<: *env, SERVER_PORT: "8082" }
 

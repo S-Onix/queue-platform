@@ -59,7 +59,7 @@ services:
       args:
         MODULE: queue-api
         APP_PORT: "8080"
-    image: queue-api:local
+    image: queue-api:${APP_TAG:-local}
     container_name: queue-api
     environment:
       <<: *common-env
@@ -77,7 +77,7 @@ services:
       args:
         MODULE: queue-batch
         APP_PORT: "8081"
-    image: queue-batch:local
+    image: queue-batch:${APP_TAG:-local}
     container_name: queue-batch
     environment:
       <<: *common-env
@@ -91,7 +91,7 @@ services:
       args:
         MODULE: queue-consumer
         APP_PORT: "8082"
-    image: queue-consumer:local
+    image: queue-consumer:${APP_TAG:-local}
     container_name: queue-consumer
     environment:
       <<: *common-env
@@ -115,7 +115,7 @@ services:
       args:
         MODULE: queue-api
         APP_PORT: "8080"
-    image: queue-api:local
+    image: queue-api:${APP_TAG:-local}
     container_name: queue-api-2
     environment:
       <<: *common-env
@@ -136,7 +136,7 @@ services:
       args:
         MODULE: queue-api
         APP_PORT: "8080"
-    image: queue-api:local
+    image: queue-api:${APP_TAG:-local}
     container_name: queue-api-3
     environment:
       <<: *common-env
