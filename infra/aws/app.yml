@@ -12,7 +12,7 @@
 name: queue-app
 
 x-api: &api
-  image: queue-api:local
+  image: queue-api:${APP_TAG:-local}
   restart: unless-stopped
   network_mode: host
   # 🔴 1g 에서 **cgroup OOM 으로 죽었다**(2026-09-15, 100만 투입 중 app1 컨테이너 3개가

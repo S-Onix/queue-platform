@@ -11,6 +11,17 @@
 #    (redis announce-ip · kafka advertised.listeners 가 그 값이라 반드시 자기 IP 여야 한다).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+
+# ── 이미지 태그 = 롤백 수단 ───────────────────────────────────────────────────
+# 🔴 **전에는 태그가 `:local` 고정이라 매 배포가 같은 태그를 덮어썼다** — 즉
+#    되돌릴 이미지가 노드에 **존재하지 않았다**(2026-09-19 확인). 그게 "롤백 수단 없음"의 실체다.
+# 🔑 커밋 SHA 로 태그하면 이전 이미지가 노드에 남는다 = 그게 롤백 수단이다.
+#    ⚠️ rsync 가 `.git` 을 제외하므로 **노드는 SHA 를 모른다** — 여기서 계산해 넘긴다.
+# 🪤 dirty 트리면 `-dirty` 를 붙인다. 안 붙이면 같은 SHA 로 **다른 내용**이 배포되고
+#    롤백 대상이 무엇인지 알 수 없게 된다.
+APP_TAG="${APP_TAG:-$(git rev-parse --short HEAD)$(git diff --quiet || echo -dirty)}"
+export APP_TAG
+TAGENV="APP_TAG=$APP_TAG"
 KEY=~/.ssh/queue-aws
 SSHOPT="-i $KEY -o StrictHostKeyChecking=accept-new"
 TF="terraform -chdir=infra/aws"
@@ -62,6 +73,61 @@ done
 
 # 🔑 Prometheus 는 설정 파일에서 환경변수를 치환하지 않는다. 그래서 타깃을 file_sd 로 빼고
 #    여기서 만든다. rsync 전에 만들어야 그대로 실려 간다.
+# ── 롤백 ─────────────────────────────────────────────────────────────────────
+# 사용:  ./infra/aws/deploy.sh rollback            직전 태그로 되돌린다
+#        ./infra/aws/deploy.sh rollback <tag>      특정 태그로
+#        ./infra/aws/deploy.sh tags                노드에 남은 태그 목록
+#
+# 🔑 **빌드를 하지 않는다.** 노드에 이미 구워진 이미지를 다시 가리키게만 한다 —
+#    그래서 되돌리는 데 5~10분이 아니라 수십 초다. 그게 롤백이 배포와 다른 점이다.
+# 🪤 소스는 그대로 둔다(rsync 하지 않는다). 코드와 도는 이미지가 갈리지만,
+#    **되돌리는 순간에 중요한 것은 도는 것**이다. 다음 배포가 다시 맞춘다.
+if [ "${1:-}" = "tags" ]; then
+  for H in "$APP" "$APP2" "$WORKER"; do
+    echo "── $H"
+    on "$H" "docker images --format '{{.Repository}}:{{.Tag}}\t{{.CreatedSince}}' \
+      | grep -E '^queue-' | sort" || true
+  done
+  exit 0
+fi
+
+if [ "${1:-}" = "rollback" ]; then
+  TARGET="${2:-}"
+  if [ -z "$TARGET" ]; then
+    # 🔴 **직전 태그는 노드가 안다.** 배포마다 기록해 둔 파일에서 읽는다 —
+    #    로컬 git 이력으로 추측하면 "배포된 적 없는 커밋"으로 되돌릴 수 있다.
+    TARGET=$(on "$APP" "tail -2 ~/queue-platform/.deployed 2>/dev/null | head -1 | awk '{print \$2}'" || true)
+    [ -n "$TARGET" ] || { echo "🔴 직전 태그를 못 찾았다. ./deploy.sh tags 로 보고 인자로 줘라"; exit 1; }
+    echo "직전 배포 태그: $TARGET"
+  fi
+  # 🔴 **없는 태그로 되돌리면 compose 가 조용히 이미지를 새로 빌드한다**(실측 2026-09-19).
+  #    실패하지 않는다 — `build:` 절이 있으므로 캐시로 즉시 구워서 **현재 소스가 배포된다.**
+  #    즉 "이전 버전으로 되돌렸다"고 믿는 순간 **방금 문제를 낸 코드가 다시 뜬다.**
+  #    그래서 존재 확인이 선택이 아니라 **가드**다.
+  for H in "$APP" "$APP2"; do
+    on "$H" "docker image inspect queue-api:$TARGET >/dev/null 2>&1" \
+      || { echo "🔴 $H 에 queue-api:$TARGET 이 없다"; exit 1; }
+  done
+  on "$WORKER" "docker image inspect queue-batch:$TARGET >/dev/null 2>&1 && \
+                docker image inspect queue-consumer:$TARGET >/dev/null 2>&1" \
+    || { echo "🔴 worker 에 $TARGET 이미지가 없다"; exit 1; }
+  echo "롤백 → $TARGET"
+  on "$WORKER" "cd ~/queue-platform && APP_TAG=$TARGET $DATAENV $SEC \
+    docker compose -f infra/aws/worker.yml up -d --no-build"
+  for H in "$APP" "$APP2"; do
+    # 🔑 --no-build 를 함께 준다 — 가드를 통과해도 경합으로 빌드가 시작될 여지를 없앤다.
+    on "$H" "cd ~/queue-platform && APP_TAG=$TARGET $DATAENV $SEC \
+      docker compose -f infra/aws/app.yml up -d --no-build && \
+      for p in 9080 9083 9084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; done && \
+      echo \"$(date -u +%FT%TZ) $TARGET rollback\" >> ~/queue-platform/.deployed" &
+  done
+  wait
+  echo "✅ 롤백 완료 → $TARGET  (이력: ~/queue-platform/.deployed)"
+  exit 0
+fi
+
+echo "배포 태그 APP_TAG=$APP_TAG"
+
 echo "[1/5] 관측 설정 생성 (타깃 + 대시보드)"
 mkdir -p infra/aws/monitoring/targets infra/aws/monitoring/dashboards
 python3 - "$APP_IP" "$APP2_IP" "$WORKER_IP" "$MYSQL_IP" "$KAFKA_IP" "$REDIS_IP" "$OBS_IP" <<'PYEOF'
@@ -140,13 +206,13 @@ on "$OBS" "cd ~/queue-platform && DATA_IP=$OBS_IP $SEC docker compose -f infra/a
 wait
 
 echo "[4/5] 이미지 빌드 (app·worker 병렬. 최초 5~10분)"
-on "$APP"    "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
-on "$APP2"   "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
-on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/worker.yml build" &
+on "$APP"    "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
+on "$APP2"   "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
+on "$WORKER" "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/worker.yml build" &
 wait
 
 echo "[5/5] 앱 기동"
-on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/worker.yml up -d"
+on "$WORKER" "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/worker.yml up -d"
 # 🔴 **병렬로 띄운다.** 순차면 app 의 health 대기에서 시간을 다 쓰고 app2 차례가 오지 않는다 —
 #    2026-09-16 에 실제로 그랬다. 새 이미지는 구워졌는데 컨테이너는 옛 것으로 남았고,
 #    겉보기엔 "배포 성공"이었다(앱이 떠 있으니 health 도 200 이다).
@@ -154,10 +220,17 @@ on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/w
 # 🔴 헬스체크를 **관리 포트(9080·9083·9084)** 로 한다 — actuator 를 8080 에서 분리했으므로
 #    8080/actuator/health 는 404 다. 안 고치면 이 루프가 영원히 돌아 **배포가 멈춘다**(§경계).
 for H in "$APP" "$APP2"; do
-  on "$H" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
+  on "$H" "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
     for p in 9080 9083 9084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done" &
 done
 wait
+
+# 🔑 **배포 이력을 노드에 남긴다 — 이게 롤백의 "직전 태그"다.**
+#    로컬 git 이력으로 추측하면 배포된 적 없는 커밋으로 되돌릴 수 있다.
+#    🪤 append 만 한다. 지우면 롤백이 대상을 못 찾는다.
+for H in "$APP" "$APP2" "$WORKER"; do
+  on "$H" "echo \"$(date -u +%FT%TZ) $APP_TAG deploy\" >> ~/queue-platform/.deployed" || true
+done
 
 cat <<EOF
 
