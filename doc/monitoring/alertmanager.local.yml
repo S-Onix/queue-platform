@@ -1,0 +1,74 @@
+# Alertmanager — 로컬(WSL) 판. AWS 판은 infra/aws/monitoring/alertmanager.yml 이다.
+#
+# 이유: 로컬 Prometheus 는 규칙 23개를 평가하면서 `alerting:` 블록이 주석이라
+#       **발화한 알람이 아무 데도 가지 않았다**(2026-09-19 실측: AppInstanceDown 이 firing 중인데
+#       Alertmanager 가 없었다). AWS 판에는 2026-09-17 부터 있다.
+#
+# 🔧 **"AWS 는 통지 구간을 검증할 수 없다"는 거짓이다** — AWS 실측에서 Slack 으로 실제로 왔다.
+#    `.env` 의 SLACK_WEBHOOK_URL 을 deploy.sh 가 노드의 파일로 쓰고 컨테이너가 그것을 읽는다.
+#    그래서 로컬도 **같은 수신처를 쓴다** — 판이 다르면 검증한 것이 다른 것이 된다.
+#
+# 수신처가 둘인 이유:
+#   slack   운영과 같은 경로. 알람 문구·묶음이 실제로 어떻게 보이는지 확인한다.
+#   sink    같은 알람을 파일로 남긴다. **URL 이 없어도 통지 구간이 검증된다**(리허설·CI·새 머신).
+#           🔑 Slack 이 안 왔을 때 "규칙이 안 떴나 / 통지가 실패했나"를 가른다 — 그게 이 싱크의 일이다.
+#
+# 🪤 포트가 9093 이 아니라 **19093** 이다 — 로컬 Kafka 브로커가 9093·9094 를 쓴다(실측).
+#    AWS 는 9093 이다. 두 판의 명령을 복사해 옮기지 마라.
+#
+# 🔴 URL 을 이 파일에 적지 마라. 레포가 PUBLIC 이다. Alertmanager 는 설정에서 환경변수를
+#    치환하지 않으므로(Prometheus 와 다르다) `slack_api_url_file` 로 **파일 참조**를 쓴다.
+#    없으면 기동은 되고 통지만 실패한다 → alertmanager_notifications_failed_total 이 오른다.
+#
+# 확인 수단 셋:
+#   curl -s localhost:19093/api/v2/alerts | jq length        ← Prometheus → Alertmanager
+#   tail -f ~/queue-platform-infra/monitoring/alertmanager/received.log
+#                                                            ← Alertmanager → 수신처
+#   curl -s localhost:9090/api/v1/query --data-urlencode \
+#     'query=alertmanager_notifications_failed_total'         ← 나가다 실패했는가
+
+global:
+  # 해소된 알람을 언제까지 "아직 안 죽었다"로 볼지. AWS 판과 같은 값이다.
+  resolve_timeout: 2m
+  # 🔑 값이 아니라 **경로**다. setup-alertmanager.sh 가 .env 의 SLACK_WEBHOOK_URL 로 채운다.
+  slack_api_url_file: /home/sonix/queue-platform-infra/monitoring/alertmanager/slack_url
+
+route:
+  # 같은 알람이 인스턴스마다 따로 오면 앱 3대면 3통이 된다. 이름·심각도로 묶는다.
+  group_by: ['alertname', 'severity']
+  # 🪤 로컬은 **짧게** 잡는다(AWS 는 30s/5m/4h). 리허설에서 눈으로 확인하는 것이 목적이라,
+  #    4시간 재통지면 한 세션에 한 번도 못 본다. **운영값이 아니다.**
+  group_wait: 5s
+  group_interval: 30s
+  repeat_interval: 10m
+  receiver: default
+
+  routes:
+    # critical 은 묶지 말고 즉시 — AWS 판과 같은 구조를 유지해 라우팅 분기도 함께 검증한다.
+    - matchers: [severity="critical"]
+      receiver: default
+      group_wait: 0s
+
+receivers:
+  - name: default
+    # 🔑 한 receiver 에 둘을 매달면 **같은 알람이 양쪽으로 간다** — 비교가 가능해진다.
+    slack_configs:
+      - channel: '#queue-platform-alerts'
+        send_resolved: true
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}{{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}
+    webhook_configs:
+      # 싱크는 scripts/alert-sink.py 다. 받은 payload 를 그대로 파일에 붙인다.
+      # 🪤 Alertmanager 는 2xx 가 아니면 **재시도한다** — 싱크가 죽으면 실패 카운터가 오른다.
+      - url: 'http://127.0.0.1:19094/alert'
+        send_resolved: true
+
+inhibit_rules:
+  # 🔑 노드가 죽으면 그 노드의 하위 알람이 전부 따라 뜬다 — 원인 하나만 남긴다.
+  #    AWS 판과 같은 의도이고, 로컬에서 실제로 묶이는지 확인하는 대상이다.
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]
+    equal: ['alertname', 'instance']
