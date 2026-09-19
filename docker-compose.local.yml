@@ -64,6 +64,7 @@ services:
     environment:
       <<: *common-env
       SERVER_PORT: "8080"
+      MANAGEMENT_PORT: "9080"  # 🔴 actuator 는 이 포트다(§경계). 8080 은 404
       # prod 프로필이 요구한다. 로컬 검증용 값이며 운영 시크릿이 아니다.
       JWT_ACTIVE_KID: key-local-01
       JWT_SECRET_CURRENT: queue-platform-LOCAL-current-secret-must-be-32-bytes-or-more
@@ -119,6 +120,7 @@ services:
     environment:
       <<: *common-env
       SERVER_PORT: "8083"
+      MANAGEMENT_PORT: "9083"  # 🔴 actuator 는 이 포트다(§경계). 8080 은 404
       JWT_ACTIVE_KID: key-local-01
       JWT_SECRET_CURRENT: queue-platform-LOCAL-current-secret-must-be-32-bytes-or-more
 
@@ -139,5 +141,6 @@ services:
     environment:
       <<: *common-env
       SERVER_PORT: "8084"
+      MANAGEMENT_PORT: "9084"  # 🔴 actuator 는 이 포트다(§경계). 8080 은 404
       JWT_ACTIVE_KID: key-local-01
       JWT_SECRET_CURRENT: queue-platform-LOCAL-current-secret-must-be-32-bytes-or-more

@@ -58,17 +58,17 @@ services:
       dockerfile: Dockerfile
       args: { MODULE: queue-api, APP_PORT: "8080" }
     container_name: q-api-1
-    environment: { <<: *env, SERVER_PORT: "8080" }
+    environment: { <<: *env, SERVER_PORT: "8080", MANAGEMENT_PORT: "9080" }
 
   queue-api-2:
     <<: *api
     container_name: q-api-2
-    environment: { <<: *env, SERVER_PORT: "8083" }
+    environment: { <<: *env, SERVER_PORT: "8083", MANAGEMENT_PORT: "9083" }
 
   queue-api-3:
     <<: *api
     container_name: q-api-3
-    environment: { <<: *env, SERVER_PORT: "8084" }
+    environment: { <<: *env, SERVER_PORT: "8084", MANAGEMENT_PORT: "9084" }
 
   # 노드별 CPU·메모리. data 노드의 Prometheus 가 :9100 을 긁는다.
   node-exporter:
