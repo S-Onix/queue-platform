@@ -126,12 +126,22 @@ HTTP 요청
 ### [증상] WAS가 죽었다 / 재기동했다 — 유실된 요청이 있는가
 
 - **먼저 의심할 것**: `RedisQueueEngine.globalQueue`(`ConcurrentLinkedQueue`, JVM 힙)에 있던 요청. Redis에도 Kafka에도 DB에도 기록이 없다.
-- **1분 안에 확인**: **관측 불가다.** 유실 건수를 알 수 있는 지표·로그가 없다(미노출 — 지표 추가 필요). 유일한 간접 증거는 클라이언트 측 타임아웃/커넥션 리셋 카운트다.
+- **1분 안에 확인**: 🔧 **"관측 불가"는 절반만 참이다**(2026-09-19 정정).
+  - ✅ **쌓이는 중은 보인다** — `queue_pending_size` 게이지가 2026-09-18 에 생겼다.
+    드레인이 밀려 깊이가 0에서 멀어지는 상태는 잡힌다(기준선 0, AWS 10차).
+  - 🔴 **사망 시점의 유실 건수는 여전히 관측 불가다.** 게이지는 프로세스와 함께 사라지고,
+    건수를 남기는 `log.error`는 **정상 종료(SIGTERM) 경로에서만** 돈다 —
+    `kill -9`·cgroup OOM 에서는 아무 기록이 없다(AWS 5차 cgroup OOM 에서 **앱 로그 0건** 실측).
+  - 🪤 게이지로 20ms 창을 표본화할 수는 **없다** — 스크레이프가 5~15s 다(창의 250~750배).
+    간접 증거는 클라이언트 측 타임아웃/커넥션 리셋 카운트다.
   ```bash
-  # 죽기 직전 유입 RPS로 상한을 추정한다 (최대 1초분 + 처리 중이던 청크)
+  # 죽기 직전 유입 RPS로 상한을 추정한다 (최대 한 틱 분량 20ms + 처리 중이던 청크)
   curl -s 'http://localhost:9090/api/v1/query?query=sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens",method="POST"}[1m])offset 2m)' | jq -r '.data.result[0].value[1]'
   ```
-  **유실 상한 ≈ (유입 RPS × 1초) + 5000.** 유입 2,000 RPS였다면 최대 7,000건.
+  **유실 상한 ≈ (유입 RPS × 0.02초) + 5000.** 유입 2,000 RPS였다면 최대 약 5,040건.
+  🔧 **옛 공식은 `× 1초`였고 50배 과대였다**(2026-09-19 정정) — 드레인 주기가 1,000ms 였던 시절의
+  잔재다. 지금은 **20ms**(`queue.enqueue.drain-interval-ms`)라 창도 그만큼 좁다.
+  🪤 주기를 바꾸면 이 공식도 같이 바꿔라 — 상수가 두 곳에 있다.
 - **정상 범위**: 정상 종료(SIGTERM)라면 **0이어야 하고, 실제로 0이다.**
   ✏️ **구 서술 "graceful shutdown 설정이 없다"는 거짓이다**(2026-08-26 정정) — `queue-api/application.yml:131` `shutdown: graceful` + `:35` `timeout-per-shutdown-phase: 20s`가 있고, `BatchProcessor`가 `SmartLifecycle`이라 `stop()`에서 **마지막 drain**을 돈다.
   **유실은 `kill -9`·OOM Kill·LB 미차단 구간에 한정된다.** 롤링 배포마다 테넌트에게 재시도를 공지할 일이 아니다.
