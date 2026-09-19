@@ -15,6 +15,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.time.LocalDateTime;
 import java.time.YearMonth;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -59,11 +61,18 @@ class BillingSnapshotIntegrationTest {
     private static final String TENANT_KEY_B = "t_test_billing_b";
     private static final String QUEUE_ID_B = "q_test_billing_b";
     /**
-     * 🪤 <b>실 데이터가 없는 달로 고정한다.</b> UPSERT는 {@code tokens} 전체를 훑어 대상 월에 토큰이
-     * 있는 <b>모든</b> 테넌트 행을 만든다 — 현재월로 바꾸면 남의 청구 스냅샷을 공유 DB에서 덮어쓰고,
-     * 아래 정리 로직은 자기 테넌트 것만 지우므로 그 흔적이 남는다.
+     * @author sonix
+     * @description 대상 월을 <b>미래월로 상대 지정</b>한다. 고정 월(2026-07)이던 동안 파티션 배치가
+     *              M+2 규칙대로 그 달을 DROP해 17건이 {@code ERROR 1735}로 깨졌다. 원인은 과거월을
+     *              가리킨 것이다 — 미래월은 세 조건을 동시에 만족한다: 실 데이터 없음(현재월로 두면
+     *              남의 청구 스냅샷을 공유 DB에서 덮어쓴다) · 파티션 존재 · 배치가 지우지 않는다.
      */
-    private static final YearMonth TARGET = YearMonth.of(2026, 7);
+    private static final YearMonth TARGET = YearMonth.now(ZoneOffset.UTC).plusMonths(2);
+    private static final DateTimeFormatter YM_FMT = DateTimeFormatter.ofPattern("yyyyMM");
+    private static final int Y = TARGET.getYear();
+    private static final int M = TARGET.getMonthValue();
+    private static final String YM = TARGET.format(YM_FMT);
+    private static final String YM_PREV = TARGET.minusMonths(1).format(YM_FMT);
 
     @Autowired private BillingJdbcAdapter adapter;
     @Autowired private JdbcTemplate jdbc;
@@ -71,8 +80,17 @@ class BillingSnapshotIntegrationTest {
     private long tenantId;
     private long tenantIdB;
 
+    /**
+     * @author sonix
+     * @description 파티션 존재를 먼저 못 박는다. 없으면 17건이 {@code ERROR 1735}로 한꺼번에 깨지고
+     *              메시지가 원인을 안 알려준다 — schema.sql의 파티션은 2027-12에서 끝나므로 상대월도
+     *              언젠가 범위를 넘는다. 해결은 파티션 추가이고, 그 절차는 schema.sql에 있다.
+     */
     @BeforeAll
     void seedFixtures() {
+        assertThat(adapter.countPartitionRows(TARGET))
+                .withFailMessage("tokens에 p%s 파티션이 없다 — schema.sql의 REORGANIZE 절차로 추가하라", TARGET.format(YM_FMT))
+                .isNotEqualTo(-1);
         tenantId = seedTenant(TENANT_KEY, "dev_billing@test.local", QUEUE_ID, "dev-billing-queue");
         tenantIdB = seedTenant(TENANT_KEY_B, "test_billing_b@test.local", QUEUE_ID_B, "test-billing-queue-b");
     }
@@ -102,11 +120,11 @@ class BillingSnapshotIntegrationTest {
     @Test
     @DisplayName("대상 월 안의 토큰만 센다 — 상태는 보지 않고, 경계 밖은 제외한다")
     void countsOnlyTargetMonth() {
-        seed("tok_b1", LocalDateTime.of(2026, 7, 1, 0, 0, 0), 0);          // 시작 경계 = 포함
-        seed("tok_b2", LocalDateTime.of(2026, 7, 15, 12, 0, 0), 4);        // EXPIRED도 과금 대상
-        seed("tok_b3", LocalDateTime.of(2026, 7, 31, 23, 59, 59), 2);      // 끝 경계 = 포함
-        seed("tok_b4", LocalDateTime.of(2026, 8, 1, 0, 0, 0), 0);          // 다음 달 = 제외
-        seed("tok_b5", LocalDateTime.of(2026, 6, 30, 23, 59, 59), 0);      // 지난 달 = 제외
+        seed("tok_b1", TARGET.atDay(1).atStartOfDay(), 0);          // 시작 경계 = 포함
+        seed("tok_b2", LocalDateTime.of(Y, M, 15, 12, 0, 0), 4);        // EXPIRED도 과금 대상
+        seed("tok_b3", TARGET.atEndOfMonth().atTime(23, 59, 59), 2);      // 끝 경계 = 포함
+        seed("tok_b4", TARGET.plusMonths(1).atDay(1).atStartOfDay(), 0);          // 다음 달 = 제외
+        seed("tok_b5", TARGET.minusMonths(1).atEndOfMonth().atTime(23, 59, 59), 0);      // 지난 달 = 제외
 
         adapter.upsertMonthlySnapshot(TARGET);
 
@@ -116,7 +134,7 @@ class BillingSnapshotIntegrationTest {
     @Test
     @DisplayName("재실행은 멱등이다 — 집계값도 updated_at도 안 변한다")
     void rerunIsIdempotent() {
-        seed("tok_b6", LocalDateTime.of(2026, 7, 10, 0, 0, 0), 0);
+        seed("tok_b6", LocalDateTime.of(Y, M, 10, 0, 0, 0), 0);
         adapter.upsertMonthlySnapshot(TARGET);
         LocalDateTime firstWrite = updatedAt();
 
@@ -130,11 +148,11 @@ class BillingSnapshotIntegrationTest {
     @Test
     @DisplayName("늦게 적재된 토큰은 다음 실행이 흡수한다 — 그래서 전월을 다시 돌린다")
     void lateArrivalIsPickedUp() {
-        seed("tok_b7", LocalDateTime.of(2026, 7, 10, 0, 0, 0), 0);
+        seed("tok_b7", LocalDateTime.of(Y, M, 10, 0, 0, 0), 0);
         adapter.upsertMonthlySnapshot(TARGET);
         assertThat(snapshotCount()).isEqualTo(1);
 
-        seed("tok_b8", LocalDateTime.of(2026, 7, 11, 0, 0, 0), 0);
+        seed("tok_b8", LocalDateTime.of(Y, M, 11, 0, 0, 0), 0);
 
         adapter.upsertMonthlySnapshot(TARGET);
         assertThat(snapshotCount()).isEqualTo(2);
@@ -146,25 +164,25 @@ class BillingSnapshotIntegrationTest {
         // 기존 3건은 테넌트가 하나뿐이라 "값이 남의 것과 뒤바뀌는" 결함을 구조적으로 못 잡는다.
         // UPSERT는 GROUP BY 결과 여러 행을 한 문장에 밀어 넣고, ODKU에서 서브쿼리 별칭(agg.cnt)을
         // 참조한다 — 별칭이 "그 행의 cnt"가 아니라 엉뚱한 행에 묶이면 청구서가 통째로 바뀐다.
-        seed("tok_m1", LocalDateTime.of(2026, 7, 5, 0, 0, 0), 0);
-        seed("tok_m2", LocalDateTime.of(2026, 7, 6, 0, 0, 0), 1);
-        seed("tok_m3", LocalDateTime.of(2026, 7, 7, 0, 0, 0), 2);
-        seed("tok_m4", LocalDateTime.of(2026, 7, 5, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_m1", LocalDateTime.of(Y, M, 5, 0, 0, 0), 0);
+        seed("tok_m2", LocalDateTime.of(Y, M, 6, 0, 0, 0), 1);
+        seed("tok_m3", LocalDateTime.of(Y, M, 7, 0, 0, 0), 2);
+        seed("tok_m4", LocalDateTime.of(Y, M, 5, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
 
         adapter.upsertMonthlySnapshot(TARGET);   // 전부 INSERT 경로
 
-        assertThat(snapshotCount(tenantId, "202607")).isEqualTo(3);
-        assertThat(snapshotCount(tenantIdB, "202607")).isEqualTo(1);
+        assertThat(snapshotCount(tenantId, YM)).isEqualTo(3);
+        assertThat(snapshotCount(tenantIdB, YM)).isEqualTo(1);
 
         // 두 번째 실행은 두 행 모두 ODKU(UPDATE) 경로를 탄다. 비대칭적으로 늘려서
         // "값이 서로 바뀌어 들어가는" 실패가 통과로 위장하지 못하게 한다.
-        seed("tok_m5", LocalDateTime.of(2026, 7, 8, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
-        seed("tok_m6", LocalDateTime.of(2026, 7, 9, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_m5", LocalDateTime.of(Y, M, 8, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_m6", LocalDateTime.of(Y, M, 9, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
 
         adapter.upsertMonthlySnapshot(TARGET);
 
-        assertThat(snapshotCount(tenantId, "202607")).isEqualTo(3);
-        assertThat(snapshotCount(tenantIdB, "202607")).isEqualTo(3);
+        assertThat(snapshotCount(tenantId, YM)).isEqualTo(3);
+        assertThat(snapshotCount(tenantIdB, YM)).isEqualTo(3);
     }
 
     @Test
@@ -173,19 +191,19 @@ class BillingSnapshotIntegrationTest {
         // 6월 스냅샷을 미리 넣어 둔다. UNIQUE가 (tenant_id, `year_month`)가 아니라 tenant_id 단독으로
         // 잘못 잡히거나 월 파라미터가 안 먹으면, 7월 집계가 6월 청구서를 덮어쓴다.
         jdbc.update("INSERT INTO billing_snapshots (tenant_id, `year_month`, `count`) VALUES (?, ?, ?)",
-                tenantId, "202606", 999L);
-        seed("tok_z1", LocalDateTime.of(2026, 7, 20, 0, 0, 0), 0);
+                tenantId, YM_PREV, 999L);
+        seed("tok_z1", LocalDateTime.of(Y, M, 20, 0, 0, 0), 0);
         // 테넌트 B는 7월에 토큰이 0건이다
 
         adapter.upsertMonthlySnapshot(TARGET);
 
-        assertThat(snapshotCount(tenantId, "202607")).isEqualTo(1);
-        assertThat(snapshotCount(tenantId, "202606")).isEqualTo(999);
+        assertThat(snapshotCount(tenantId, YM)).isEqualTo(1);
+        assertThat(snapshotCount(tenantId, YM_PREV)).isEqualTo(999);
         // 🔑 0건 테넌트는 GROUP BY 결과에 아예 없다 → 행이 생기지 않는다(-1 = 행 없음).
         //    조회 측이 "행 없음 = 0건"으로 읽어야 한다는 뜻이다. 0을 기대하면 NPE/404가 난다
-        assertThat(snapshotCount(tenantIdB, "202607")).isEqualTo(-1);
+        assertThat(snapshotCount(tenantIdB, YM)).isEqualTo(-1);
 
-        jdbc.update("DELETE FROM billing_snapshots WHERE tenant_id = ? AND `year_month` = ?", tenantId, "202606");
+        jdbc.update("DELETE FROM billing_snapshots WHERE tenant_id = ? AND `year_month` = ?", tenantId, YM_PREV);
     }
 
     @Test
@@ -193,8 +211,8 @@ class BillingSnapshotIntegrationTest {
     void includesLastMillisecondOfMonth() {
         // 기존 경계 fixture는 23:59:59(밀리초 0)라, 상한을 atEndOfMonth().atTime(23,59,59)로
         // 잘못 계산하는 흔한 실수를 통과시킨다. .999가 빠지면 월말 1초분이 통째로 미청구다.
-        seed("tok_e1", LocalDateTime.of(2026, 7, 31, 23, 59, 59, 999_000_000), 0);
-        seed("tok_e2", LocalDateTime.of(2026, 8, 1, 0, 0, 0, 1_000_000), 0);   // 다음 달 첫 밀리초 = 제외
+        seed("tok_e1", TARGET.atEndOfMonth().atTime(23, 59, 59, 999_000_000), 0);
+        seed("tok_e2", TARGET.plusMonths(1).atDay(1).atStartOfDay().plusNanos(1_000_000), 0);   // 다음 달 첫 밀리초 = 제외
 
         adapter.upsertMonthlySnapshot(TARGET);
 
@@ -208,9 +226,9 @@ class BillingSnapshotIntegrationTest {
         // 무충돌 얘기가 아니다 — 같은 행에 ODKU가 동시에 꽂히면 데드락/락 타임아웃이 날 수 있고,
         // 그러면 job의 catch가 그날 집계를 통째로 삼킨다. 그래서 실제로 안 나는지를 확인한다.
         // 스레드는 Virtual Thread다(고정 풀은 출발 신호에서 굶어 교착한다).
-        seed("tok_c1", LocalDateTime.of(2026, 7, 3, 0, 0, 0), 0);
-        seed("tok_c2", LocalDateTime.of(2026, 7, 4, 0, 0, 0), 0);
-        seed("tok_c3", LocalDateTime.of(2026, 7, 3, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_c1", LocalDateTime.of(Y, M, 3, 0, 0, 0), 0);
+        seed("tok_c2", LocalDateTime.of(Y, M, 4, 0, 0, 0), 0);
+        seed("tok_c3", LocalDateTime.of(Y, M, 3, 0, 0, 0), 0, QUEUE_ID_B, tenantIdB);
 
         int n = 8;
         CountDownLatch ready = new CountDownLatch(n);
@@ -235,8 +253,8 @@ class BillingSnapshotIntegrationTest {
         }
 
         assertThat(failures).isEmpty();
-        assertThat(snapshotCount(tenantId, "202607")).isEqualTo(2);
-        assertThat(snapshotCount(tenantIdB, "202607")).isEqualTo(1);
+        assertThat(snapshotCount(tenantId, YM)).isEqualTo(2);
+        assertThat(snapshotCount(tenantIdB, YM)).isEqualTo(1);
     }
 
     // ────────────────────────── queue_daily_stats (§86) ──────────────────────────
@@ -249,19 +267,19 @@ class BillingSnapshotIntegrationTest {
         //    "입장권을 받았다"는 사실은 status가 아니라 admitted_at에만 남는다.
         // 🔑 tok_d1(status=4 + admitted_at 있음)이 이 방어를 혼자 진다. 지우면
         //    SUM(status IN (1,2)) 같은 변이가 나머지 어디에서도 안 잡힌다
-        seedAdmitted("tok_d1", ldt(7, 5, 10), ldt(7, 5, 11), 4);   // 입장권 받고 만료 = 둘 다 잡혀야 한다
-        seedAdmitted("tok_d2", ldt(7, 5, 10), ldt(7, 5, 12), 2);   // 입장권 받고 완료
-        seed("tok_d3", ldt(7, 5, 10), 4);                          // 뽑히기 전에 만료
+        seedAdmitted("tok_d1", ldt(5, 10), ldt(5, 11), 4);   // 입장권 받고 만료 = 둘 다 잡혀야 한다
+        seedAdmitted("tok_d2", ldt(5, 10), ldt(5, 12), 2);   // 입장권 받고 완료
+        seed("tok_d3", ldt(5, 10), 4);                          // 뽑히기 전에 만료
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("total_admit_issued", QUEUE_ID, "2026-07-05")).isEqualTo(2);
-        assertThat(stat("total_expired", QUEUE_ID, "2026-07-05")).isEqualTo(2);
-        assertThat(stat("total_completed", QUEUE_ID, "2026-07-05")).isEqualTo(1);
-        assertThat(stat("total_enqueued", QUEUE_ID, "2026-07-05")).isEqualTo(3);
+        assertThat(stat("total_admit_issued", QUEUE_ID, d(5))).isEqualTo(2);
+        assertThat(stat("total_expired", QUEUE_ID, d(5))).isEqualTo(2);
+        assertThat(stat("total_completed", QUEUE_ID, d(5))).isEqualTo(1);
+        assertThat(stat("total_enqueued", QUEUE_ID, d(5))).isEqualTo(3);
         // 🔑 이 그룹만이 admit 수(2) ≠ 행 수(3)다. 여기서 SUM을 단정하지 않으면
         //    SUM(...)을 AVG(...) * COUNT(*)로 바꿔도 14건 전부 통과한다(90×3=270 vs 정답 180)
-        assertThat(stat("sum_wait_sec", QUEUE_ID, "2026-07-05")).isEqualTo(180);
+        assertThat(stat("sum_wait_sec", QUEUE_ID, d(5))).isEqualTo(180);
         // 🔑 합이 안 맞는 게 정상이다. total_admit_issued는 상태가 아니라 "사건" 카운터라
         //    total_expired와 겹친다. enqueued = admitted + completed + expired 가 아니다
     }
@@ -269,26 +287,26 @@ class BillingSnapshotIntegrationTest {
     @Test
     @DisplayName("대기 시간은 AVG가 아니라 SUM으로 남긴다 — 평균은 여러 날을 다시 합칠 수 없다")
     void storesSumNotAverage() {
-        seedAdmitted("tok_d4", ldt(7, 6, 0), ldt(7, 6, 10), 2);    // 600초
-        seedAdmitted("tok_d5", ldt(7, 6, 0), ldt(7, 6, 30), 2);    // 1800초
+        seedAdmitted("tok_d4", ldt(6, 0), ldt(6, 10), 2);    // 600초
+        seedAdmitted("tok_d5", ldt(6, 0), ldt(6, 30), 2);    // 1800초
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("sum_wait_sec", QUEUE_ID, "2026-07-06")).isEqualTo(2400);
-        assertThat(stat("max_wait_sec", QUEUE_ID, "2026-07-06")).isEqualTo(1800);
+        assertThat(stat("sum_wait_sec", QUEUE_ID, d(6))).isEqualTo(2400);
+        assertThat(stat("max_wait_sec", QUEUE_ID, d(6))).isEqualTo(1800);
         // AVG였다면 1200이 남고, 분모(2)를 모르면 다른 날과 합칠 때 가중을 못 준다
     }
 
     @Test
     @DisplayName("admit이 0건이면 대기 시간은 NULL이다 — \"즉시 입장(0초)\"과 구분돼야 한다")
     void zeroAdmitsLeaveWaitNull() {
-        seed("tok_d6", ldt(7, 7, 0), 4);
+        seed("tok_d6", ldt(7, 0), 4);
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("total_admit_issued", QUEUE_ID, "2026-07-07")).isZero();
-        assertThat(stat("sum_wait_sec", QUEUE_ID, "2026-07-07")).isEqualTo(-1);   // -1 = NULL sentinel
-        assertThat(stat("max_wait_sec", QUEUE_ID, "2026-07-07")).isEqualTo(-1);
+        assertThat(stat("total_admit_issued", QUEUE_ID, d(7))).isZero();
+        assertThat(stat("sum_wait_sec", QUEUE_ID, d(7))).isEqualTo(-1);   // -1 = NULL sentinel
+        assertThat(stat("max_wait_sec", QUEUE_ID, d(7))).isEqualTo(-1);
     }
 
     @Test
@@ -297,24 +315,24 @@ class BillingSnapshotIntegrationTest {
         // 🔑 schema.sql 원안의 `ON DUPLICATE KEY UPDATE id = id`가 정확히 여기서 죽는다.
         //    그리고 늦게 admit되는 토큰이 곧 가장 오래 기다린 토큰이라,
         //    하필 이 표가 남기려던 것만 골라서 버린다.
-        seed("tok_d7", ldt(7, 8, 0), 0);
+        seed("tok_d7", ldt(8, 0), 0);
         adapter.upsertDailyStats(TARGET);
-        assertThat(stat("total_admit_issued", QUEUE_ID, "2026-07-08")).isZero();
+        assertThat(stat("total_admit_issued", QUEUE_ID, d(8))).isZero();
 
         jdbc.update("UPDATE tokens SET admitted_at = ?, status = 2 WHERE token_id = ?",
-                ldt(7, 8, 45), "tok_d7");
+                ldt(8, 45), "tok_d7");
         // 🔑 행도 함께 늘린다. 안 늘리면 나머지 4컬럼이 우연히 같은 값이라
         //    ODKU 목록에서 그것들을 빼도(= id = id와 같은 결함) 테스트가 통과한다
-        seedAdmitted("tok_d7b", ldt(7, 8, 0), ldt(7, 8, 60), 4);
+        seedAdmitted("tok_d7b", ldt(8, 0), ldt(8, 60), 4);
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("total_admit_issued", QUEUE_ID, "2026-07-08")).isEqualTo(2);
-        assertThat(stat("sum_wait_sec", QUEUE_ID, "2026-07-08")).isEqualTo(6300);   // 2700 + 3600
-        assertThat(stat("total_enqueued", QUEUE_ID, "2026-07-08")).isEqualTo(2);
-        assertThat(stat("total_completed", QUEUE_ID, "2026-07-08")).isEqualTo(1);
-        assertThat(stat("total_expired", QUEUE_ID, "2026-07-08")).isEqualTo(1);
-        assertThat(stat("max_wait_sec", QUEUE_ID, "2026-07-08")).isEqualTo(3600);
+        assertThat(stat("total_admit_issued", QUEUE_ID, d(8))).isEqualTo(2);
+        assertThat(stat("sum_wait_sec", QUEUE_ID, d(8))).isEqualTo(6300);   // 2700 + 3600
+        assertThat(stat("total_enqueued", QUEUE_ID, d(8))).isEqualTo(2);
+        assertThat(stat("total_completed", QUEUE_ID, d(8))).isEqualTo(1);
+        assertThat(stat("total_expired", QUEUE_ID, d(8))).isEqualTo(1);
+        assertThat(stat("max_wait_sec", QUEUE_ID, d(8))).isEqualTo(3600);
         assertThat(rowCount(QUEUE_ID)).isEqualTo(1);   // UPDATE지 두 번째 INSERT가 아니다
     }
 
@@ -324,53 +342,53 @@ class BillingSnapshotIntegrationTest {
         // 🔑 admitted_at 기준으로 귀속하면 "한 토큰 = 한 파티션 = 한 stat 행"이 깨진다.
         //    7/31 발행 · 8/1 입장이면 8월 행이 생기고, 8월 집계가 그 키를 덮어쓰며
         //    7월 파티션에서 온 몫을 지운다 — 그때 7월 파티션은 이미 DROP돼 있을 수 있다.
-        seedAdmitted("tok_d8", ldt(7, 9, 23 * 60 + 50), ldt(7, 10, 10), 2);   // 7/9 23:50 → 7/10 00:10
+        seedAdmitted("tok_d8", ldt(9, 23 * 60 + 50), ldt(10, 10), 2);   // 7/9 23:50 → 7/10 00:10
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("total_enqueued", QUEUE_ID, "2026-07-09")).isEqualTo(1);
-        assertThat(stat("sum_wait_sec", QUEUE_ID, "2026-07-09")).isEqualTo(1200);
-        assertThat(stat("total_enqueued", QUEUE_ID, "2026-07-10")).isEqualTo(-1);   // 행 자체가 없다
+        assertThat(stat("total_enqueued", QUEUE_ID, d(9))).isEqualTo(1);
+        assertThat(stat("sum_wait_sec", QUEUE_ID, d(9))).isEqualTo(1200);
+        assertThat(stat("total_enqueued", QUEUE_ID, d(10))).isEqualTo(-1);   // 행 자체가 없다
     }
 
     @Test
     @DisplayName("큐가 여럿이면 큐마다 나뉜다 — billing이 영원히 답할 수 없는 바로 그 분해다")
     void splitsByQueue() {
-        seed("tok_d9", ldt(7, 11, 0), 0);
-        seed("tok_d10", ldt(7, 11, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_d9", ldt(11, 0), 0);
+        seed("tok_d10", ldt(11, 0), 0, QUEUE_ID_B, tenantIdB);
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("total_enqueued", QUEUE_ID, "2026-07-11")).isEqualTo(1);
-        assertThat(stat("total_enqueued", QUEUE_ID_B, "2026-07-11")).isEqualTo(1);
+        assertThat(stat("total_enqueued", QUEUE_ID, d(11))).isEqualTo(1);
+        assertThat(stat("total_enqueued", QUEUE_ID_B, d(11))).isEqualTo(1);
 
         // 2회차는 두 행 모두 ODKU(UPDATE) 경로다. 비대칭으로 늘려서
         // "파생 별칭이 엉뚱한 행에 묶이는" 결함이 통과로 위장하지 못하게 한다.
         // 월별 쪽 aggregatesEachTenantSeparately와 같은 이유이고, 큐×일은 그룹이 훨씬 많다
-        seed("tok_d10b", ldt(7, 11, 0), 0, QUEUE_ID_B, tenantIdB);
-        seed("tok_d10c", ldt(7, 11, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_d10b", ldt(11, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_d10c", ldt(11, 0), 0, QUEUE_ID_B, tenantIdB);
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("total_enqueued", QUEUE_ID, "2026-07-11")).isEqualTo(1);
-        assertThat(stat("total_enqueued", QUEUE_ID_B, "2026-07-11")).isEqualTo(3);
+        assertThat(stat("total_enqueued", QUEUE_ID, d(11))).isEqualTo(1);
+        assertThat(stat("total_enqueued", QUEUE_ID_B, d(11))).isEqualTo(3);
     }
 
     @Test
     @DisplayName("만료 사유별로 나눠 센다 — 셋의 의미가 정반대라 총계로는 조치가 안 나온다")
     void splitsExpiredByReason() {
-        seedExpired("tok_d15", ldt(7, 15, 0), 3);   // INACTIVE   = 정상 이탈
-        seedExpired("tok_d16", ldt(7, 15, 0), 4);   // WAITING_TTL = 용량 부족
-        seedExpired("tok_d17", ldt(7, 15, 0), 4);
-        seedExpired("tok_d18", ldt(7, 15, 0), 2);   // ADMIT_STALE = Tenant 귀책
-        seed("tok_d19", ldt(7, 15, 0), 4);          // 사유 없는 옛 행 → 어느 칸에도 안 들어간다
+        seedExpired("tok_d15", ldt(15, 0), 3);   // INACTIVE   = 정상 이탈
+        seedExpired("tok_d16", ldt(15, 0), 4);   // WAITING_TTL = 용량 부족
+        seedExpired("tok_d17", ldt(15, 0), 4);
+        seedExpired("tok_d18", ldt(15, 0), 2);   // ADMIT_STALE = Tenant 귀책
+        seed("tok_d19", ldt(15, 0), 4);          // 사유 없는 옛 행 → 어느 칸에도 안 들어간다
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("total_expired", QUEUE_ID, "2026-07-15")).isEqualTo(5);
-        assertThat(stat("expired_inactive", QUEUE_ID, "2026-07-15")).isEqualTo(1);
-        assertThat(stat("expired_waiting_ttl", QUEUE_ID, "2026-07-15")).isEqualTo(2);
-        assertThat(stat("expired_admit_stale", QUEUE_ID, "2026-07-15")).isEqualTo(1);
+        assertThat(stat("total_expired", QUEUE_ID, d(15))).isEqualTo(5);
+        assertThat(stat("expired_inactive", QUEUE_ID, d(15))).isEqualTo(1);
+        assertThat(stat("expired_waiting_ttl", QUEUE_ID, d(15))).isEqualTo(2);
+        assertThat(stat("expired_admit_stale", QUEUE_ID, d(15))).isEqualTo(1);
         // 🔑 합(4) ≠ total_expired(5). 사유가 없던 시기의 행이 NULL이라 그렇고, 그 차이가
         //    "언제부터 사유를 남기기 시작했나"다. 억지로 맞추면 그 정보가 사라진다
     }
@@ -388,12 +406,12 @@ class BillingSnapshotIntegrationTest {
         //    "enqueue를 드레인한 서버 하나가 DB보다 앞섬"으로 좁아졌다 — 좁아졌을 뿐 0은 아니다.
         //    (-398초 실측은 §90 이전 데이터다.) schema.sql이 "가리지 않는다"를 결정으로
         //    못박았는데 이 테스트가 없으면 누가 GREATEST를 넣어도 아무것도 안 깨진다
-        seedAdmitted("tok_d13", ldt(7, 13, 10), ldt(7, 13, 5), 4);
+        seedAdmitted("tok_d13", ldt(13, 10), ldt(13, 5), 4);
 
         adapter.upsertDailyStats(TARGET);
 
-        assertThat(stat("max_wait_sec", QUEUE_ID, "2026-07-13")).isEqualTo(-300);
-        assertThat(stat("sum_wait_sec", QUEUE_ID, "2026-07-13")).isEqualTo(-300);
+        assertThat(stat("max_wait_sec", QUEUE_ID, d(13))).isEqualTo(-300);
+        assertThat(stat("sum_wait_sec", QUEUE_ID, d(13))).isEqualTo(-300);
     }
 
     @Test
@@ -409,7 +427,7 @@ class BillingSnapshotIntegrationTest {
     @Test
     @DisplayName("파티션 존재 여부와 원본 건수를 구분해 돌려준다 — DROP 전 마지막 관문이다")
     void reportsPartitionRowsAndAbsence() {
-        seed("tok_d14", ldt(7, 14, 0), 0);
+        seed("tok_d14", ldt(14, 0), 0);
 
         assertThat(adapter.countPartitionRows(YearMonth.of(2025, 1))).isEqualTo(-1);  // 파티션 없음
         assertThat(adapter.countPartitionRows(TARGET)).isEqualTo(1);                  // 있고, 1건
@@ -418,8 +436,8 @@ class BillingSnapshotIntegrationTest {
     @Test
     @DisplayName("대사는 0이다. 그리고 한쪽 표가 통째로 비어도 잡는다 — JOIN이면 조용히 0이 나올 자리다")
     void mismatchDetectsOneSidedLoss() {
-        seed("tok_d11", ldt(7, 12, 0), 0);
-        seed("tok_d12", ldt(7, 12, 0), 0, QUEUE_ID_B, tenantIdB);
+        seed("tok_d11", ldt(12, 0), 0);
+        seed("tok_d12", ldt(12, 0), 0, QUEUE_ID_B, tenantIdB);
         adapter.upsertMonthlySnapshot(TARGET);
         adapter.upsertDailyStats(TARGET);
 
@@ -437,9 +455,14 @@ class BillingSnapshotIntegrationTest {
         assertThat(adapter.countBillingMismatch(TARGET)).isEqualTo(baseline + 2);
     }
 
-    /** {@code TARGET}(2026-07) 안의 시각. {@code minuteOfDay}로 시분을 준다. */
-    private static LocalDateTime ldt(int month, int day, int minuteOfDay) {
-        return LocalDateTime.of(2026, month, day, minuteOfDay / 60, minuteOfDay % 60);
+    /** {@code TARGET} 안의 시각. {@code minuteOfDay}로 시분을 준다. */
+    private static LocalDateTime ldt(int day, int minuteOfDay) {
+        return LocalDateTime.of(Y, M, day, minuteOfDay / 60, minuteOfDay % 60);
+    }
+
+    /** {@code TARGET} 안의 날짜를 {@code queue_daily_stats.stat_date} 형식으로. */
+    private static String d(int day) {
+        return TARGET.atDay(day).toString();
     }
 
     private void seedAdmitted(String tokenId, LocalDateTime issuedAt, LocalDateTime admittedAt, int status) {
@@ -472,7 +495,7 @@ class BillingSnapshotIntegrationTest {
     }
 
     private long snapshotCount() {
-        return snapshotCount(tenantId, "202607");
+        return snapshotCount(tenantId, YM);
     }
 
     /** 행이 없으면 {@code -1}. "행이 아예 안 생긴다"와 "0으로 생긴다"를 구분하기 위해 예외 대신 sentinel을 쓴다. */
@@ -486,6 +509,6 @@ class BillingSnapshotIntegrationTest {
     private LocalDateTime updatedAt() {
         return jdbc.queryForObject(
                 "SELECT updated_at FROM billing_snapshots WHERE tenant_id = ? AND `year_month` = ?",
-                LocalDateTime.class, tenantId, "202607");
+                LocalDateTime.class, tenantId, YM);
     }
 }
