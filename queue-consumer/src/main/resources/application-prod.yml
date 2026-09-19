@@ -35,21 +35,14 @@ management:
   endpoints:
     web:
       exposure:
-        # prometheus는 prod에서 켜지 않는다 — queue-api prod와 같은 판정이다.
-        #
-        # 이 앱은 컨트롤러가 0개라 HTTP 표면이 통째로 actuator다. 그래서 api가 제시한
-        # "관리 포트 분리"가 여기선 성립하지 않는다(분리할 업무 포트가 없다). 남는 경계는
-        # 스크레이퍼 전용 ACL이나 네트워크 정책인데, 배포가 아직 없어 그것도 없다.
-        #
-        # 열어 두면 인증 없이 메트릭 176종이 나간다(실측). 테넌트·큐 식별자는 라벨에 없지만,
-        # Kafka·JVM·Spring 버전과 Hikari 포화도·컨슈머 lag이 나간다 — 무엇을 언제 치면
-        # 아픈지를 알려주는 값들이다.
-        #
-        # 🔑 이건 "보호했다"가 아니라 "경계가 생길 때까지 안 연다"이다. 경계와 **함께** 다시 켠다
-        #    (Sprint 11 배포 PR). local·dev는 그대로 둔다(베이스 yml의 health,info,prometheus).
-        #
-        # ⚠️ "잃는 관측이 없다"가 참인 조건은 **jar를 local 프로필로 띄울 때**다.
-        #    docker-compose.local.yml과 Dockerfile은 프로필이 prod라, 컨테이너로 검증할 때는
-        #    로컬 Prometheus의 8081·8082 타깃이 404가 되어 up=0 → AppInstanceDown이 뜬다.
-        #    그 검증은 lag을 보지 않으므로 조치 대상은 아니지만, 놀라지 마라.
-        include: health, info
+        # ✅ **prometheus 를 켠다 (2026-09-19, 게이트 해소).** 안 켠 이유가 "경계가 없다" 였는데
+        #    두 근거가 다 바뀌었다:
+        #      ① 배포가 생겼다 — Dockerfile·compose·terraform·워크플로가 전부 있다. 옛 주석의
+        #         "레포에 전부 없다 = 외부 미노출을 주장할 근거도 없다"는 **거짓이 됐다.**
+        #      ② 그 terraform 이 **인터넷 ingress 를 하나도 열지 않는다**(SSH /32 만, SG self=true).
+        #         이 포트는 같은 SG 안에서만 닿는다 — 그게 경계다.
+        # 🪤 queue-api 처럼 **관리 포트를 분리하지 않는다** — 이 앱은 컨트롤러가 0개라 HTTP 표면이
+        #    통째로 actuator 다. 분리할 업무 포트가 없어 포트를 하나 더 만드는 것이 경계를 만들지 않는다(§4).
+        # 🔴 인증은 없다 — **네트워크가 유일한 문**이고 그 문은 infra/aws/main.tf 에 있다.
+        #    SG 를 느슨하게 바꾸면 이 노출이 그대로 열린다. 두 파일을 같이 봐라.
+        include: health, info, prometheus

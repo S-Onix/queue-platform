@@ -69,7 +69,9 @@ import json, sys
 # 🪤 인자 개수와 언팩 개수를 **같이** 고쳐라. 하나만 고치면 node.json 에서 NameError 로 배포가 죽는다.
 app, app2, worker, mysql, kafka, redis, obs = sys.argv[1:8]
 d = "infra/aws/monitoring/targets"
-json.dump([{"targets": [f"{h}:{p}" for h in (app, app2) for p in (8080, 8083, 8084)]}], open(f"{d}/api.json", "w"))
+# 🔴 **관리 포트다**(2026-09-19). queue-api 는 actuator 를 8080 에서 분리했다 —
+#    8080 을 긁으면 404 다. 공개 포트에서 actuator 가 사라진 것이 경계이고, 그 대가가 이 줄이다.
+json.dump([{"targets": [f"{h}:{p}" for h in (app, app2) for p in (9080, 9083, 9084)]}], open(f"{d}/api.json", "w"))
 json.dump([{"targets": [f"{worker}:8081"], "labels": {"app": "batch"}},
            {"targets": [f"{worker}:8082"], "labels": {"app": "consumer"}}], open(f"{d}/worker.json", "w"))
 # 🔴 mysqld-exporter 는 mysql 노드에서 돈다(9104). 이 파일이 없으면 alerts 의 mysql_* 규칙이
@@ -149,9 +151,11 @@ on "$WORKER" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/w
 #    2026-09-16 에 실제로 그랬다. 새 이미지는 구워졌는데 컨테이너는 옛 것으로 남았고,
 #    겉보기엔 "배포 성공"이었다(앱이 떠 있으니 health 도 200 이다).
 #    🪤 이 종류의 결함은 **초록으로 보인다** — 두 노드의 컨테이너 생성 시각을 비교해야 드러난다.
+# 🔴 헬스체크를 **관리 포트(9080·9083·9084)** 로 한다 — actuator 를 8080 에서 분리했으므로
+#    8080/actuator/health 는 404 다. 안 고치면 이 루프가 영원히 돌아 **배포가 멈춘다**(§경계).
 for H in "$APP" "$APP2"; do
   on "$H" "cd ~/queue-platform && $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
-    for p in 8080 8083 8084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done" &
+    for p in 9080 9083 9084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done" &
 done
 wait
 
