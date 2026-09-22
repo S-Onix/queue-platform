@@ -158,6 +158,8 @@ services:
     networks: [queuenet]
     ports: ["18080:8080"]
     mem_limit: 700m
+    # 🔴 기본 10초 < 앱이 전제하는 20초. 넘기면 SIGKILL 이라 drain 이 잘린다(app.yml 과 같은 이유).
+    stop_grace_period: 30s
     extra_hosts: ["host.docker.internal:host-gateway"]
     restart: unless-stopped
     environment: &appenv
@@ -186,6 +188,7 @@ services:
     build: { context: ., dockerfile: Dockerfile, args: { MODULE: queue-batch, APP_PORT: "8081" } }
     image: queue-batch:local
     container_name: br-queue-batch
+    stop_grace_period: 30s   # 기본 10초 < 앱 전제 20초 (app.yml 과 같은 이유)
     networks: [queuenet]
     ports: ["18081:8081"]
     mem_limit: 600m
@@ -199,6 +202,7 @@ services:
     build: { context: ., dockerfile: Dockerfile, args: { MODULE: queue-consumer, APP_PORT: "8082" } }
     image: queue-consumer:local
     container_name: br-queue-consumer
+    stop_grace_period: 30s   # 기본 10초 < 앱 전제 20초 (app.yml 과 같은 이유)
     networks: [queuenet]
     ports: ["18082:8082"]
     mem_limit: 600m

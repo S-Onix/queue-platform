@@ -20,6 +20,14 @@ x-api: &api
   #    넘긴 것은 힙이 아니라 **비힙**(메타스페이스·코드캐시·가상스레드 스택·다이렉트 버퍼)이다.
   #    🪤 "컨테이너 한도 = 힙 × 2" 어림이 부하에서 깨진다. 기능 테스트로는 안 나온다.
   mem_limit: 2g
+  # 🔴 **이게 없으면 Docker 기본 10초다** — 앱은 phase 당 20초를 전제한다
+  #    (`spring.lifecycle.timeout-per-shutdown-phase: 20s`. drain 5s + Redis 5s +
+  #    Kafka 발행 최악 12s). 10초를 넘기면 SIGKILL 이라 **drain 이 잘리고, 잘린 요청은
+  #    Redis 에도 DB 에도 흔적이 없다.** 게다가 그 유실을 알리는 `Shutdown drain incomplete`
+  #    로그조차 못 찍고 죽으므로 **사후에 셀 방법이 없다.**
+  # 🪤 평소에는 안 드러난다 — 한가할 때 종료는 0.6초다(로컬 실측). in-flight 가 많은
+  #    순간에 내려야 드러나는 종류라, 하필 **배포가 가장 위험한 순간에** 터진다.
+  stop_grace_period: 30s
   environment: &env
     SPRING_PROFILES_ACTIVE: prod
     DB_MASTER_HOST: ${MYSQL_IP:?MYSQL_IP 필요}

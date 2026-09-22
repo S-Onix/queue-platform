@@ -26,6 +26,10 @@ x-common: &common
     dockerfile: Dockerfile
   network_mode: host
   restart: unless-stopped
+  # 🔴 기본 10초는 앱이 전제하는 20초보다 짧다(`spring.lifecycle.timeout-per-shutdown-phase`).
+  #    넘기면 SIGKILL 이라 drain 이 잘리고, 잘린 요청은 Redis·DB 어디에도 흔적이 없다.
+  #    이 판은 prod 프로파일로 도는 "배포와 같은 경로" 라서 여기도 같이 맞춘다.
+  stop_grace_period: 30s
   environment: &common-env
     # local 프로필이 아니라 prod 프로필 + 환경변수로 돈다.
     # 이미지가 실제 배포와 같은 경로를 타는지 보려는 것이므로 local 로 도망가지 않는다.
