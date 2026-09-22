@@ -5,7 +5,7 @@
 -- KEYS[2]: tokens key     (예: queue:{q_bts}:tokens)          — Hash, identifier -> "tokenId|issuedAt"
 -- KEYS[3]: admitted key   (예: queue:{q_bts}:admitted)        — ZSet, score=만료 epoch ms, member="seq|identifier"
 -- KEYS[4]: watermark key  (예: queue:{q_bts}:admit-watermark) — String, 마지막 admit seq (§79 전광판 원본)
--- ARGV[1]: count (뽑을 인원. 상한 100은 API DTO의 @Max(100)이 강제한다 — 여기서 다시 막지 않는다)
+-- ARGV[1]: count (뽑을 인원. 상한 300은 API DTO의 @Max(300)이 강제한다 — 여기서 다시 막지 않는다)
 -- ARGV[2]: expiresAt (admitToken 만료 epoch ms 문자열) — admitted ZSet의 score
 -- ARGV[3]: admitTtlMillis (admit-by-* 키의 PX. 60000)
 -- ARGV[4]: idemKey     — queue:{q}:admit-idem:{requestId} **완성 키** (QueueKeys.admitIdem)

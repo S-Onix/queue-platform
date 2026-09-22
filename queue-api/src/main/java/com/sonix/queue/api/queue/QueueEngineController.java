@@ -63,7 +63,7 @@ public class QueueEngineController {
 
     /**
      * 이유: 입장 허가(Admit). {@code POST /api/v1/queues/&#123;queueId&#125;/admit}
-     * 해결: {@code count} 상한 100 은 {@link AdmitRequest} 의 {@code @Max} 가 강제한다 —
+     * 해결: {@code count} 상한 300 은 {@link AdmitRequest} 의 {@code @Max} 가 강제한다 —
      *       초과하면 여기 도달하기 전에 400 이다.
      * 🔴 <b>Kafka 발행이 실패해도 200 이다</b> — Lua 가 이미 커밋돼 되돌릴 수 없다
      *    (근거는 {@code QueueEngineService.publishAdmitted}).

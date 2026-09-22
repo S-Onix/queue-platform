@@ -239,7 +239,7 @@ curl -X POST https://<platform>/api/v1/queues/{queueId}/admit \
     { "tokenId":"tk_...", "identifier":"0192f3c1-...", "seq":1042, "admitToken":"at_..." } ] } }
 ```
 
-- `count` **최대 100**. 초과하면 400이다
+- `count` **최대 300**. 초과하면 400이다
 - `requestId`는 **멱등 키**다. 같은 값으로 재시도하면 **같은 목록**이 돌아온다.
   네트워크 타임아웃 때 그냥 같은 `requestId`로 다시 불러라 — 중복 입장이 생기지 않는다
 - **Platform은 admit을 먼저 걸지 않는다.** 빈 좌석이 생겼을 때 **Tenant가 부르는 것**이다

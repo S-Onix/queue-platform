@@ -169,11 +169,11 @@ class AdmitApiTest {
     }
 
     @Test
-    @DisplayName("count 101 → 400. @Max(100)이 서비스 진입 전에 막는다")
+    @DisplayName("count 301 → 400. @Max(300)이 서비스 진입 전에 막는다")
     void admit_countOverLimit() throws Exception {
         mockMvc.perform(post("/api/v1/queues/{q}/admit", QUEUE_ID)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"count\":101,\"requestId\":\"req_1\"}"))
+                        .content("{\"count\":301,\"requestId\":\"req_1\"}"))
                 .andExpect(status().isBadRequest());
 
         verifyNoInteractions(queueEngine);
