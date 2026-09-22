@@ -245,10 +245,17 @@ services:
     network_mode: host
     mem_limit: 500m
     environment:
-      # 터널 안에서만 닿으므로 로그인을 막지 않는다. 익명 뷰어로 바로 보게 한다.
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # 🔴 **전에는 익명 Admin 이었다**(로그인 창도 껐다). 그래서 이 서비스를 네트워크에
+      #    내놓을 수가 없었고, 내놓을 수 없으니 SSH 터널이 전제였고, 터널이 전제라
+      #    Slack 알람의 대시보드 링크가 `localhost:3300` 으로 박혔다. 새벽에 알람을 받은
+      #    운영자가 터널부터 뚫어야 화면을 본다 — 링크가 원인이 아니라 **인증이 원인**이었다.
+      # ⚠️ 자격증명은 admin/admin 이다(사용자 확정). 이 레포는 PUBLIC 이라 비밀이 아니며,
+      #    **보안 그룹을 넓히는 순간 사실상 무인증**이 된다. 지금 전제는 SG 가 운영자 IP
+      #    /32 만 여는 것이고, 그 전제가 깨지면 이 값부터 바꿔야 한다.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
     volumes:
       - ./monitoring/grafana/datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
       - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/db.yml:ro

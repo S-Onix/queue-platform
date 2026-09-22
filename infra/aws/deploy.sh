@@ -23,7 +23,11 @@ APP_TAG="${APP_TAG:-$(git rev-parse --short HEAD)$(git diff --quiet || echo -dir
 export APP_TAG
 TAGENV="APP_TAG=$APP_TAG"
 KEY=~/.ssh/queue-aws
-SSHOPT="-i $KEY -o StrictHostKeyChecking=accept-new"
+# 🔴 **keepalive 가 없으면 반쯤 열린 연결에서 영원히 매달린다**(2026-09-22 실측: 23분).
+#    원격은 멀쩡했고 컨테이너도 다 떠 있었는데 로컬 ssh 만 안 끝났다 — 죽은 연결을 양쪽 다
+#    모르기 때문이다. 같은 노드로 가던 rsync 가 Broken pipe 로 끊긴 것도 같은 판이었다.
+#    15초 × 4 = 60초 침묵이면 끊고 0 이 아닌 값으로 죽는다. waitall 이 그걸 받아 멈춘다.
+SSHOPT="-i $KEY -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 TF="terraform -chdir=infra/aws"
 
 # 🪤 이름을 ip() 로 두지 마라 — /sbin/ip 와 겹쳐 디버깅이 어려워진다(실제로 한 번 밟았다).
