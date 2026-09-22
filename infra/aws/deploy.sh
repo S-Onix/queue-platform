@@ -132,7 +132,8 @@ if [ "${1:-}" = "rollback" ]; then
     || { echo "🔴 worker 에 $TARGET 이미지가 없다"; exit 1; }
   echo "롤백 → $TARGET"
   on "$WORKER" "cd ~/queue-platform && APP_TAG=$TARGET $DATAENV $SEC \
-    docker compose -f infra/aws/worker.yml up -d --no-build"
+    docker compose -f infra/aws/worker.yml up -d --no-build && \
+    echo \"$(date -u +%FT%TZ) $TARGET rollback\" >> ~/queue-platform/.deployed"
   for H in "$APP" "$APP2"; do
     # 🔑 --no-build 를 함께 준다 — 가드를 통과해도 경합으로 빌드가 시작될 여지를 없앤다.
     on "$H" "cd ~/queue-platform && APP_TAG=$TARGET $DATAENV $SEC \
