@@ -5,3 +5,4 @@
 monitoring/targets/
 monitoring/dashboards/
 tfplan
+tfplan*
