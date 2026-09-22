@@ -53,10 +53,29 @@ echo "app=$APP  worker=$WORKER  mysql=$MYSQL  kafka=$KAFKA  redis=$REDIS  obs=$O
 echo "  사설: app=$APP_IP worker=$WORKER_IP mysql=$MYSQL_IP kafka=$KAFKA_IP redis=$REDIS_IP obs=$OBS_IP"
 
 on() { ssh $SSHOPT "ubuntu@$1" "${@:2}"; }
+
+# 🔴 **bare `wait` 는 언제나 0 이다.** 그래서 병렬 단계의 실패가 통째로 사라진다 —
+#    2026-09-22 에 app 노드로 가던 rsync 가 Broken pipe 로 죽었는데 배포는 [3/5] 로 넘어갔고,
+#    그 노드는 **소스가 반만 가서 이미지 0개**인 채로 남았는데 스크립트는 "완료" 를 찍었다.
+#    set -e 도 못 잡는다 — 백그라운드 잡에는 적용되지 않는다.
+# 🪤 초록으로 보이는 종류다: 살아남은 노드의 health 가 200 이라 로그 끝만 보면 정상이다.
+#    구분은 **UP 줄 개수**였다(6줄이어야 하는데 3줄).
+# 🪤 `jobs -p` 로 세지 마라 — **즉시 끝난 잡은 이미 수거돼 목록에 없다**(실측: 빠른 실패를
+#    그대로 통과시켰다). 느린 잡으로만 시험하면 통과해 버리는, 타이밍에 기대는 판정이다.
+#    `wait -n` 은 이미 끝난 자식도 순서대로 돌려주고, 자식이 없으면 127 이다.
+waitall() {
+  local rc=0 st
+  while true; do
+    st=0; wait -n || st=$?
+    if [ "$st" -eq 127 ]; then break; fi
+    if [ "$st" -ne 0 ]; then rc=1; fi
+  done
+  if [ "$rc" -ne 0 ]; then echo "🔴 병렬 단계에서 실패한 작업이 있다 — 여기서 멈춘다"; exit 1; fi
+}
 push() {
   rsync -az --delete -e "ssh $SSHOPT" --exclude '.git' --exclude 'build' \
     --exclude '.gradle' --exclude 'node_modules' --exclude 'infra/aws/.terraform' \
-    --exclude '.env' \
+    --exclude '.env' --exclude '.deployed' \
     ./ "ubuntu@$1:~/queue-platform/"
 }
 
@@ -162,7 +181,7 @@ PYEOF
 echo "  타깃 4종(노드 5개 포함) + 대시보드 1개"
 
 echo "[2/5] 소스 동기화"
-for h in $ALL; do push "$h" & done; wait
+for h in $ALL; do push "$h" & done; waitall
 
 echo "[3/5] 데이터 계층 기동 (redis·kafka 병렬 → mysql)"
 # ⚠️ DATA_IP 는 각 노드가 자기 사설 IP 를 넣는다. announce-ip / advertised.listeners 가
@@ -174,7 +193,7 @@ on "$KAFKA" "cd ~/queue-platform && DATA_IP=$KAFKA_IP $SEC docker compose -f inf
   kafka-1 kafka-2 kafka-3 node-exporter &&
   until docker exec q-kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server $KAFKA_IP:9092 --list >/dev/null 2>&1; do sleep 3; done &&
   KAFKA_IP=$KAFKA_IP ./infra/aws/init.sh kafka" &
-wait
+waitall
 # 🔴 **관측 4종은 obs 전용 노드로 옮겼다 (2026-09-18).** 예전엔 mysql 노드에 얹었는데
 #    ("셋 중 가장 한가하다"가 근거였다), 8차에서 그 노드가 2 vCPU 인데 쿼리 시간 27,468초 대비
 #    낼 수 있었던 CPU 가 18,360 CPU-s 여서 **최소 33%가 대기**였고 항목별 절대 초를 해석할 수
@@ -203,13 +222,13 @@ on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f inf
   until docker exec q-mysql mysqladmin ping -h127.0.0.1 -p$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do sleep 3; done" &
 on "$OBS" "cd ~/queue-platform && DATA_IP=$OBS_IP $SEC docker compose -f infra/aws/data.yml up -d \
   prometheus grafana alertmanager redis-exporter node-exporter"
-wait
+waitall
 
 echo "[4/5] 이미지 빌드 (app·worker 병렬. 최초 5~10분)"
 on "$APP"    "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
 on "$APP2"   "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/app.yml build" &
 on "$WORKER" "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/worker.yml build" &
-wait
+waitall
 
 echo "[5/5] 앱 기동"
 on "$WORKER" "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/worker.yml up -d"
@@ -223,11 +242,15 @@ for H in "$APP" "$APP2"; do
   on "$H" "cd ~/queue-platform && $TAGENV $DATAENV $SEC docker compose -f infra/aws/app.yml up -d &&
     for p in 9080 9083 9084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; echo \"  :\$p UP\"; done" &
 done
-wait
+waitall
 
 # 🔑 **배포 이력을 노드에 남긴다 — 이게 롤백의 "직전 태그"다.**
 #    로컬 git 이력으로 추측하면 배포된 적 없는 커밋으로 되돌릴 수 있다.
 #    🪤 append 만 한다. 지우면 롤백이 대상을 못 찾는다.
+#    🔴 **그런데 rsync --delete 가 매 배포마다 지우고 있었다**(2026-09-22 실측). 이 파일은
+#       동기화 대상 디렉터리 안에 있고 소스에는 없어서다. 이력이 늘 1줄이라
+#       인자 없는 rollback 이 "직전" 으로 **현재 태그**를 집어 자기 자신으로 되돌리면서
+#       성공을 보고했다. push() 의 --exclude '.deployed' 가 그것을 막는다.
 for H in "$APP" "$APP2" "$WORKER"; do
   on "$H" "echo \"$(date -u +%FT%TZ) $APP_TAG deploy\" >> ~/queue-platform/.deployed" || true
 done
