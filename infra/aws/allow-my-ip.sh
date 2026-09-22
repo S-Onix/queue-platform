@@ -30,26 +30,35 @@ PY
 )
 echo "보안 그룹 $SG · 내 IP $IP"
 
-# 이미 열려 있으면 그대로 둔다(중복 호출이 실패하지 않게)
-OPEN=$(aws ec2 describe-security-groups --group-ids "$SG" \
-  --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\`].IpRanges[].CidrIp" --output text)
+# 🔑 포트가 셋이다. 22 는 배포·조사용, 3000·9093 은 **운영자가 알람을 받고 바로 여는 화면**이다
+#    (Grafana · Alertmanager). 터널이 전제이던 때는 22 하나면 됐지만, 그때는 새벽에 알람을 받은
+#    사람이 터널부터 뚫어야 화면을 봤다 — 그게 "운영자가 대시보드를 못 본다" 의 실체였다.
+# 🔴 **/32 가 유일한 방어선이다.** Grafana 자격증명이 admin/admin 이고 이 레포는 PUBLIC 이라,
+#    여기를 조금이라도 넓히면 무인증 Admin 을 인터넷에 내놓는 것과 같다. 0.0.0.0/0 금지.
+PORTS="22 3000 9093"
 
-if grep -qw "$IP/32" <<< "$OPEN"; then
-  echo "  이미 열려 있다"
-else
-  aws ec2 authorize-security-group-ingress --group-id "$SG" \
-    --protocol tcp --port 22 --cidr "$IP/32" > /dev/null
-  echo "  ✅ 22번 열었다"
-fi
+for PORT in $PORTS; do
+  # 이미 열려 있으면 그대로 둔다(중복 호출이 실패하지 않게)
+  OPEN=$(aws ec2 describe-security-groups --group-ids "$SG" \
+    --query "SecurityGroups[0].IpPermissions[?FromPort==\`$PORT\`].IpRanges[].CidrIp" --output text)
 
-# 🔑 예전 IP 는 닫는다. 안 닫으면 내가 쓰던 IP 가 남의 것이 된 뒤에도 열려 있다.
-if [ -z "${KEEP:-}" ]; then
-  for old in $OPEN; do
-    [ "$old" = "$IP/32" ] && continue
-    aws ec2 revoke-security-group-ingress --group-id "$SG" \
-      --protocol tcp --port 22 --cidr "$old" > /dev/null 2>&1 && echo "  🔒 옛 IP 닫음: $old"
-  done
-fi
+  if grep -qw "$IP/32" <<< "$OPEN"; then
+    echo "  $PORT: 이미 열려 있다"
+  else
+    aws ec2 authorize-security-group-ingress --group-id "$SG" \
+      --protocol tcp --port "$PORT" --cidr "$IP/32" > /dev/null
+    echo "  ✅ $PORT 열었다"
+  fi
+
+  # 🔑 예전 IP 는 닫는다. 안 닫으면 내가 쓰던 IP 가 남의 것이 된 뒤에도 열려 있다.
+  if [ -z "${KEEP:-}" ]; then
+    for old in $OPEN; do
+      [ "$old" = "$IP/32" ] && continue
+      aws ec2 revoke-security-group-ingress --group-id "$SG" \
+        --protocol tcp --port "$PORT" --cidr "$old" > /dev/null 2>&1 && echo "  🔒 $PORT 옛 IP 닫음: $old"
+    done
+  fi
+done
 
 # 실제로 붙는지까지 확인한다 — 여기서 끝내면 "열었는데 안 되는" 상태를 못 잡는다
 MYSQL=$(terraform output -json public_ip 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('mysql',''))" 2>/dev/null || true)

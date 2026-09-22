@@ -225,7 +225,9 @@ on "$OBS" "mkdir -p ~/queue-platform/infra/aws/monitoring && \
 on "$MYSQL" "cd ~/queue-platform && DATA_IP=$MYSQL_IP $SEC docker compose -f infra/aws/data.yml up -d \
   mysql mysqld-exporter node-exporter &&
   until docker exec q-mysql mysqladmin ping -h127.0.0.1 -p$MYSQL_ROOT_PASSWORD >/dev/null 2>&1; do sleep 3; done" &
-on "$OBS" "cd ~/queue-platform && DATA_IP=$OBS_IP $SEC docker compose -f infra/aws/data.yml up -d \
+# 🔑 OBS_PUB 은 **퍼블릭** IP(EIP)다. Grafana 의 root_url 과 Alertmanager 의 external-url 이
+#    이 값을 쓴다 — Slack 알람 버튼이 터널 없이 바로 열리게 하는 것이 목적이다(2026-09-22).
+on "$OBS" "cd ~/queue-platform && DATA_IP=$OBS_IP OBS_PUB=$OBS $SEC docker compose -f infra/aws/data.yml up -d \
   prometheus grafana alertmanager redis-exporter node-exporter"
 waitall
 

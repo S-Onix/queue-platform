@@ -231,8 +231,11 @@ services:
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
-      # silence 를 걸 때 쓰는 UI. SG 에서 안 열므로 SSH 터널로 본다.
-      - --web.external-url=http://localhost:9093
+      # 🔑 silence 를 걸 때 쓰는 UI. **SG 가 운영자 IP /32 로 9093 을 연다**(2026-09-22) —
+      #    Slack 알람의 '알람 목록'·'알림 끄기' 버튼이 여기로 직접 온다. 이 값이 localhost 면
+      #    UI 가 자기 링크를 localhost 로 만들어 버튼을 눌러도 되돌아오지 못한다.
+      #    OBS_PUB 은 deploy.sh 가 obs 노드의 퍼블릭 IP(EIP)를 넣어 준다.
+      - --web.external-url=http://${OBS_PUB:-localhost}:9093
       # 🪤 **gossip 을 끈다.** 인스턴스가 하나라 클러스터링이 필요 없는데, 기본값이면 9094 를
       #    연다. 로컬 검증에서 그 포트가 Kafka 브로커와 충돌해 기동이 실패했다(2026-09-17) —
       #    host 네트워크라 노드 안 포트가 전부 같은 공간이다. 안 쓰는 포트는 열지 않는다.
@@ -256,6 +259,9 @@ services:
       GF_AUTH_DISABLE_LOGIN_FORM: "false"
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
+      # 🔑 Slack 링크가 이 주소로 온다. 이 값이 기본값(localhost)이면 로그인 리다이렉트가
+      #    localhost 로 튀어 **로그인 뒤 화면이 안 열린다**. OBS_PUB 은 deploy.sh 가 넣는다.
+      GF_SERVER_ROOT_URL: "http://${OBS_PUB:-localhost}:3000"
     volumes:
       - ./monitoring/grafana/datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
       - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/db.yml:ro
