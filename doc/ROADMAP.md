@@ -483,9 +483,10 @@ flowchart TD
   - **동적 키 3종(`admit-by-token`·`admit-by-admit`·`admit-idem`)의 접두사는 `QueueKeys`가 만들어 ARGV로 넘긴다.**
     Lua는 `prefix .. tokenId`만. `KEYS[]` 선언이 불가능해 **CROSSSLOT 그물이 없는 첫 스크립트**라
     `QueueKeysSlotTest`의 리플렉션 전수 단언이 **유일한 방어**다 — 접두사가 `.lua`에 있으면 안 걸린다 (§80 ⑥)
-  - **`count` 상한 = 100** (`@Max(100)` 한 줄. 전용 검증 클래스 만들지 않는다).
-    올리는 건 하위호환이지만 **내리는 건 파괴적 변경**이라 시작값은 "필요를 채우는 최소"다 —
-    30만/2h = 42/s인데 cap 100 × 10 rps = 1,000/s로 24배다 (§80 ⑦)
+  - **`count` 상한 = ~~100~~ → 300** (`@Max(300)` 한 줄. 전용 검증 클래스 만들지 않는다).
+    2026-09-22 에 올렸다(0082a01). 올리는 건 하위호환이지만 **내리는 건 파괴적 변경**이다 (§80 ⑦)
+    🔴 상한은 **허용치**이고 안전값은 Tenant 의 좌석 회전율이 정한다(`μ × 60 × 안전계수`) —
+    TTL 60초가 발급 순간부터 흐른다. 실측 근거는 FRS §6.4 · doc/TENANT_INTEGRATION.md §5
 - `POST /queues/:queueId/admit-tokens/:admitToken/verify` — DB Fallback 술어는 **`admitted_at`** 기준
   - **DB 직접 쓰기 0회.** 다만 ~~"상태 변경 없음"~~도 ~~"Redis 쓰기 0회"~~도 아니다 — **verify가 완료를 확정하고**(응답 시점에 `COMPLETED` 발행, PR #48) **회차 키 넷을 정리한다**(§92, `admit-by-admit`만 남긴다). DB는 이벤트만 낸다
 - `POST /queues/:queueId/tokens/:tokenId/complete` — **DB 권위** 조건부 UPDATE

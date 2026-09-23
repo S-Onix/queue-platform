@@ -353,7 +353,7 @@ Rate Limit은 `rl:poll:token:{tokenId}` — 토큰 단위라 **한 유저가 탭
 
 | 필드 | 타입 | 필수 | 제약 |
 |---|---|---|---|
-| `count` | int | ✅ | **1 ~ 300**. 상한은 Redis 단일 스레드 보호 (§80 ⑦) |
+| `count` | int | ✅ | **1 ~ 300**. 🔧 상한의 근거는 Redis 가 **아니다**(ZPOPMIN N=20 이 14.7μs, AWS 5차). 300 은 **허용 상한**이고 안전값은 `μ × 60 × 안전계수`(μ = Tenant 가 초당 앉히는 수)다 — TTL 60초가 발급 순간부터 흐르므로 초과분은 앉기 전에 만료된다. 산정법은 `doc/TENANT_INTEGRATION.md` §5 |
 | **`requestId`** | string | ✅ | 최대 100자. **멱등 키** |
 
 🔴 **`requestId`는 "채우면 되는 값"이 아니다.**
