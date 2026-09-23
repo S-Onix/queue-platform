@@ -39,6 +39,26 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private static final int POLL_CAPACITY = 5;
 
     /**
+     * 이유: 폴링 버킷 키가 되는 tokenId 의 길이 상한.
+     * 문제: 경로 마지막 세그먼트를 그대로 키로 써서 <b>요청 1건이 Redis 키 7,272 B</b> 였다(실측 2026-09-23, 7,000자).
+     * 원인: 폴링은 인증이 없고 {@code noeviction} 이라, 종착점이 <b>같은 마스터의 다른 테넌트 enqueue 503</b> 이다.
+     * 해결: 넘는 것은 {@link #OVERSIZE_POLL_TOKEN_ID} 한 키로 <b>합친다</b> — 버리지 않고 묶어 429 로 받는다.
+     * 🔑 정상값은 {@code "tok_"}(4) + UUID(36) = 40 이다. 50 은 {@code CompleteRequest.admitToken} 과 같은 값.
+     *
+     * @author sonix
+     */
+    private static final int MAX_POLL_TOKEN_ID_LENGTH = 50;
+
+    /**
+     * 상한을 넘는 tokenId 가 <b>공유</b>하는 버킷 이름.
+     *
+     * <p>🔑 거부가 아니라 <b>합치기</b>인 이유: 여기서 400 을 내려면 필터에 새 응답 경로가 생기고,
+     * 길이만 정상인 위조 tokenId 는 여전히 키를 하나씩 만든다. 합치면 키가 1개로 묶이고
+     * 정상 폴링과 같은 판정기(429)가 그대로 받는다 — <b>새 장치가 0이다.</b>
+     */
+    private static final String OVERSIZE_POLL_TOKEN_ID = "__oversize__";
+
+    /**
      * 폴링 버킷 회복 속도.
      *
      * <p>0.5/s는 pacing 최저 구간(2초)과 소비 속도가 정확히 같아 앞줄 사용자의 여유가 0이었다 —
@@ -215,7 +235,8 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * 이유: tokenId 기준 Token Bucket. 폴링은 인증이 없어 이 키가 유일한 구분자다.
      * 🪤 <b>없는 tokenId 도 버킷을 만든다</b> — 무작위로 쏘면 한도 대신 <b>요청 1건 = 새 키 1개</b>다
      *    (실측 200건 → +200). 무한 누적은 아니다(TTL 65초라 상주 키 = 유입률 × 65초).
-     * 🔴 종착점은 {@code noeviction} 이라 <b>쓰기 거부</b>다 — <b>같은 마스터의 다른 테넌트가 503</b>. 상한은 아직 없다.
+     * 🔴 종착점은 {@code noeviction} 이라 <b>쓰기 거부</b>다 — <b>같은 마스터의 다른 테넌트가 503</b>.
+     *    그래서 <b>키 길이에 상한을 둔다</b>({@link #MAX_POLL_TOKEN_ID_LENGTH}) — 개수가 아니라 <b>키 하나의 크기</b>를 막는 것이다.
      * ⚠️ 키가 되는 tokenId 는 <b>정규화된 경로</b>에서 뽑아라 — 원문이면 인코딩 변형마다 새 키다.
      *
      * @author sonix
@@ -224,6 +245,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private boolean checkPollRateLimit(String path, HttpServletResponse res)
             throws IOException {
         String tokenId = path.substring(path.lastIndexOf('/') + 1);   // 마지막 세그먼트
+        if (tokenId.length() > MAX_POLL_TOKEN_ID_LENGTH) {
+            tokenId = OVERSIZE_POLL_TOKEN_ID;   // 정상값은 40자다. 넘으면 한 버킷으로 합친다
+        }
         String key = RateLimitKeys.pollToken(tokenId);
 
         boolean allowed = tokenBucketRateLimiter.tryAcquire(key, POLL_CAPACITY, POLL_REFILL_PER_SEC);
