@@ -8,7 +8,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -352,7 +351,35 @@ public class QueueEngineService {
      *
      * @author sonix
      */
-    @Transactional
+    // 🔴 **@Transactional 을 다시 붙이지 마라**(2026-09-23 제거). 이 메서드 안에는 Redis 왕복
+    //    (cleanupCompleted)과 **Kafka 동기 발행**(send-timeout 12초)이 있다 — 트랜잭션 안에 두면
+    //    그 12초 동안 DB 커넥션을 쥔다. 게이트 개방 직후 complete 가 몰리는 구간이라 자해다.
+    //    🔑 위 verify·admit 이 **같은 이유로** 트랜잭션을 안 쓴다 — complete 만 비대칭이었고
+    //       그 비대칭 자체가 결함이었다(dba·code-reviewer 독립 2인 지적).
+    //    🔑 Little: L = λW 다. **평시 이득은 0.1 커넥션으로 무의미하다**(0.70 → 0.60~0.64).
+    //       값은 전부 꼬리에 있다 — Kafka 가 send-timeout 12초까지 늘어지면 예전엔
+    //       108.6 req/s × 12s = **1,303 커넥션**을 요구했다. 실제 풀은 **인스턴스당 20**
+    //       (application-prod.yml) × api 6개 = **합 120** 이라 **10.9배**다. 풀은 enqueue·admit·
+    //       verify 와 공유라 complete 하나가 **API 전체를 고갈**시켰다(9차의 연결 거절 8,296회와 같은 모양).
+    //    🔴 **mysql CPU 가 내려간다고 쓰지 마라** — 커밋 횟수도, COMMIT 평균 5.09ms 도 안 변한다
+    //       (문장 수·내용·격리수준 동일. 락 대기는 잠들기라 CPU 로도 안 나타난다). 재측정의 판정
+    //       지표는 hikaricp_connections_pending · 커넥션 획득 시간 · innodb_row_lock_waits 다.
+    //    🔑 DB 작업은 가드 UPDATE **한 문장**뿐이라 원자성을 잃지 않는다. 그 문장의 트랜잭션은
+    //       TokenJpaAdapter.markCompleted 가 갖는다(@Modifying 은 트랜잭션 없이는 안 돈다).
+    //    🔑 **동시 complete 의 락 대기도 사라졌다.** 예전엔 같은 token_id 의 두 번째 요청이 X 락을
+    //       기다리며 **첫 요청의 Kafka 12초까지 함께 매달렸다**. 지금은 UPDATE 가 즉시 커밋하니
+    //       두 번째는 바로 0행 → findCompletedAt → 200 이다. TokenJpaRepository 의
+    //       "이 UPDATE 한 문장이 동시 complete 의 유일한 조정 수단 — 락 불필요" 가 이제 문자 그대로 참이다.
+    //    🔑 **예외 시 원장이 옳아졌다.** 예전엔 cleanupCompleted(Redis) 예외가 완료를 롤백해
+    //       status=1 로 되돌렸고, 300초 뒤 ReconcileJob 이 그 행을 **status=4 로 확정**했다 —
+    //       사용자는 입장했는데 원장은 만료로 굳는, **Redis 장애가 원장 사실을 지우는** 구조였다.
+    //       지금은 status=2·completed_at 이 남고 재시도는 findCompletedAt 으로 멱등 200 이며,
+    //       중복 게이트가 닫힌 채라 과금은 fail-closed 다(중복 청구 없음).
+    //    🪤 뒤따르는 읽기(findByTokenId·findCompletedAt)는 자기 쓰기를 읽지만 **master 고정**이라
+    //       안전하다 — readOnly 트랜잭션이 없으면 replica 로 가지 않는다(§4-3).
+    //       ❌ 부하를 나누려고 그 둘에 readOnly 를 붙이지 마라 — 즉시 read-after-write 가 깨진다.
+    //    🪤 이 경계를 실 트랜잭션 매니저로 관통하는 자동화 테스트는 **0건**이다(tester 실측).
+    //       근거는 어댑터 쪽 TokenAdmitQueryIntegrationTest 와 수동 REST 검증뿐이다.
     public LocalDateTime complete(long tenantId, String queueId, String tokenId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 

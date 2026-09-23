@@ -260,8 +260,18 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 - 상세: `doc/CONCURRENCY.md`
 
 ### 트랜잭션
-- `@Transactional`은 Service 계층에만
+- `@Transactional`은 Service 계층에만 — ⚠️ **예외 둘이 실재한다**(2026-09-23)
+  - `TokenJpaAdapter.markCompleted` · `TokenJpaAdapter.expireStaleAdmitted` 는 **어댑터에** 붙어 있다.
+    호출자가 트랜잭션을 갖지 않기 때문이다 — `complete()` 와 `ReconcileJob` 둘 다 안에 **Redis 왕복과
+    Kafka 동기 발행(최대 12초)**이 있어, 서비스에 붙이면 그 12초 동안 DB 커넥션을 쥔다
+    (Little: 108.6 req/s × 12s = **1,303 커넥션** vs 실제 풀 인스턴스당 20 · api 6개 합 **120**).
+  - 🔑 기준은 "계층"이 아니라 **"트랜잭션 안에는 DB 작업만"**이다. `verify`·`admit`·`enqueue`·`status`도
+    같은 이유로 트랜잭션을 안 쓴다 — 이 서비스의 `@Transactional` 은 **0개**다.
+  - 🪤 **이 두 어노테이션을 "규칙 위반"으로 지우지 마라** — `@Modifying` UPDATE 는 트랜잭션 없이
+    실행되지 않아 complete 와 회수 배치가 **런타임에 죽는다**(결함 주입 2종으로 실증).
 - 읽기 전용은 `@Transactional(readOnly = true)` → Replica 자동 라우팅
+  - ❌ 단 **complete 경로의 두 읽기**(`findCompletedAt`·`findByTokenId`)에는 붙이지 마라 —
+    방금 master 에 쓴 행을 읽으므로 read-after-write 가 깨진다. 🪤 **테스트로는 안 잡힌다**(§4-3)
 - Domain Model에 트랜잭션 노출 금지
 
 ### Git

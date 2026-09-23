@@ -145,6 +145,36 @@ class TokenAdmitQueryIntegrationTest {
 
     // ── complete ──
 
+    /**
+     * 이유: {@code markCompleted} 가 <b>스스로</b> 트랜잭션을 갖는지 (2026-09-23).
+     * 문제: 예전엔 호출자({@code QueueEngineService.complete}) 의 {@code @Transactional} 에 얹혀 있었고,
+     *       그 트랜잭션이 Redis 왕복과 <b>Kafka 동기 발행(12초)</b>까지 감쌌다.
+     * 원인: 이 파일의 다른 complete 케이스는 <b>테스트 메서드에 {@code @Transactional} 을 붙여</b>
+     *       밖에서 공급한다 — 그래서 어댑터가 트랜잭션을 갖는지 <b>구조적으로 검증하지 못한다</b>.
+     * 해결: 여기만 <b>일부러 붙이지 않는다</b>. 어댑터의 {@code @Transactional} 을 지우면 이 케이스가
+     *       {@code @Modifying} 실행 불가로 빨개진다 — 그것이 이 테스트의 전부다.
+     * 🪤 트랜잭션이 없으므로 이 행은 롤백되지 않는다. tokenId 를 고유하게 두고 뒤에서 지운다.
+     *
+     * @author sonix
+     */
+    @Test
+    @DisplayName("🔴 바깥 트랜잭션 없이도 markCompleted 가 1행을 고친다 — 어댑터가 트랜잭션을 갖는다")
+    void markCompleted_withoutAmbientTransaction() {
+        String tokenId = "tok_notx_" + java.util.UUID.randomUUID();
+        String admitToken = "adm_notx_" + java.util.UUID.randomUUID();
+        seedAdmitted(tokenId, admitToken, 3);
+        try {
+            int updated = adapter.markCompleted(QUEUE_ID, tenantId, tokenId, admitToken,
+                    LocalDateTime.of(2026, 8, 18, 12, 0, 0), 300);
+
+            assertThat(updated).as("어댑터에 @Transactional 이 없으면 여기서 죽는다").isEqualTo(1);
+            assertThat(statusOf(tokenId)).isEqualTo(2);
+        } finally {
+            jdbc.update("DELETE FROM tokens WHERE token_id = ?", tokenId);
+        }
+    }
+
+
     @Test
     @Transactional
     @DisplayName("markCompleted: ADMIT_ISSUED(1) → COMPLETED(2), 1행")

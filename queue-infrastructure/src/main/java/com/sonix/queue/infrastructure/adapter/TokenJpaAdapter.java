@@ -195,7 +195,20 @@ public class TokenJpaAdapter implements TokenRepository {
                 .map(TokenEntity::toDomain);
     }
 
+    /**
+     * 이유: 가드 UPDATE 한 문장. {@code @Modifying} 은 트랜잭션이 <b>없으면 실행되지 않는다</b>.
+     * 문제: 예전엔 호출자({@code QueueEngineService.complete})의 {@code @Transactional} 에 얹혀 있었다.
+     * 원인: 그 트랜잭션이 <b>Redis 왕복과 Kafka 동기 발행(최대 12초)까지 감싸</b> 커넥션을 붙잡았다 —
+     *       verify·admit 은 <b>같은 이유로</b> 트랜잭션을 안 쓴다. complete 만 비대칭이었다.
+     * 해결: 트랜잭션을 <b>DB 작업 하나</b>로 좁혀 여기로 내린다. 아래 {@code expireStaleAdmitted} 가
+     *       같은 형태다(호출자인 배치가 트랜잭션을 안 갖는다).
+     * 🪤 이 어노테이션을 지우면 complete 가 런타임에 죽는다 — 커버는
+     *    {@code TokenAdmitQueryIntegrationTest.markCompleted_withoutAmbientTransaction} 이다.
+     *
+     * @author sonix
+     */
     @Override
+    @Transactional
     public int markCompleted(String queueId, long tenantId, String tokenId, String admitToken,
                              LocalDateTime completedAt, int validWindowSeconds) {
         return tokenJpaRepository.markCompleted(
