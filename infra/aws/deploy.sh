@@ -145,7 +145,9 @@ if [ "${1:-}" = "rollback" ]; then
       for p in 9080 9083 9084; do until curl -sf localhost:\$p/actuator/health >/dev/null; do sleep 3; done; done && \
       echo \"$(date -u +%FT%TZ) $TARGET rollback\" >> ~/queue-platform/.deployed" &
   done
-  wait
+  # 🔴 bare `wait` 를 쓰지 마라 — 배포 경로에서 고친 결함이 롤백 경로에만 남아 있었다(2026-09-23).
+  #    장애 대응 중에 app2 롤백이 실패해도 "✅ 롤백 완료" 를 찍어 **두 노드가 다른 버전으로 갈린다.**
+  waitall
   echo "✅ 롤백 완료 → $TARGET  (이력: ~/queue-platform/.deployed)"
   exit 0
 fi
