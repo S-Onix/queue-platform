@@ -7,9 +7,13 @@ import com.sonix.queue.domain.queue.EnqueueEventPublisher;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -70,5 +74,85 @@ public class KafkaEnqueueEventPublisher implements EnqueueEventPublisher {
                     event.tokenId(), event.queueId(), e.getMessage(), e);
             throw new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE);
         }
+    }
+
+    /**
+     * 이유: 전량 {@code send} 한 뒤 <b>한 번에</b> ack 을 기다린다 (12차 실측 후 도입).
+     * 문제: 예전엔 호출자가 {@link #publish} 를 루프로 돌아 건당 ack 을 기다렸다 — 300건이면
+     *       <b>p50 1.797초</b>(건당 5.99ms)이고, 그 값은 {@code linger.ms}(5ms)를 건마다 전액
+     *       지불한 결과다(모델 6.38ms/건이 관측을 94~110% 덮었다).
+     * 원인: 건별 {@code get()} 은 다음 레코드를 직전 ack 뒤에 넣어 <b>자기 레코드끼리 배치가 안 된다</b>.
+     * 해결: 먼저 다 보내 한 배치에 모이게 하고, 대기는 마지막에 한 번 한다.
+     * 🔑 <b>대기 예산은 전체가 하나를 공유한다</b> — 건별로 주면 브로커 장애 때 300 × 12초(queue-api 의 send-timeout-ms)가 된다.
+     * 🪤 실패는 <b>흩어져 나온다</b> — 첫 실패에서 끊지 않는다. 트랜잭션이 없어 레코드가 서로
+     *    독립이므로, 1건 실패가 나머지를 데려가지 않는 것이 <b>이 메서드의 존재 이유</b>다.
+     * ⚠️ 예외를 올리지 않는다 — 호출 시점에 Lua 가 이미 커밋돼 되돌릴 수 없다(§80 U9).
+     *
+     * @author sonix
+     */
+    @Override
+    public int publishAll(List<EnqueueEvent> events) {
+        List<CompletableFuture<SendResult<String, Object>>> futures = new ArrayList<>(events.size());
+        // 🔴 **데드라인을 send 루프 앞에서 잡는다.** `send()` 는 비동기가 아니다 — 메타데이터 대기·
+        //    버퍼 소진에서 `max.block.ms`(4초) 를 **건당** 전액 쓴다. 뒤에서 잡으면 브로커 전원
+        //    다운 + 메타데이터 캐시 만료에서 count=300 이 300 × 4초 = **20분** 요청 스레드를 잡는다
+        //    (예전 코드는 첫 건에서 break 라 ~16초였다 — 즉 여기를 안 묶으면 최악이 나빠진다).
+        // 🔑 예산 하나를 send·대기 **두 구간이 공유**한다. 정상 경로는 send 가 즉시 반환하므로
+        //    영향이 없고, 병리 경로만 유계가 된다.
+        long deadline = System.nanoTime() + sendTimeout.toNanos();
+        int failed = 0;
+        for (EnqueueEvent event : events) {
+            if (System.nanoTime() - deadline >= 0) {
+                // 예산이 끝났다. 남은 건은 보내지 않고 실패로 센다 — 여기서 더 보내면
+                // 요청 스레드가 예산을 넘겨 매달리고, 그 사이 admit 응답이 나가지 못한다.
+                int remaining = events.size() - futures.size();
+                failed += remaining;
+                log.error("ADMITTED 발행 예산 초과 queueId={} 미발행={}건 (예산 {}ms)",
+                        event.queueId(), remaining, sendTimeout.toMillis());
+                break;
+            }
+            try {
+                futures.add(kafkaTemplate.send(topic, event.tokenId(), event));
+            } catch (RuntimeException e) {
+                // send 가 동기로 던지는 경우: 버퍼 포화(max.block.ms 초과)·직렬화 실패.
+                // 이 건은 브로커에 도달조차 안 했다. 뒤 레코드는 계속 시도한다 — 포화가
+                // 풀릴 수도 있고, 한 건 때문에 나머지를 버리는 것이 이 변경이 없애려는 것이다.
+                log.error("ADMITTED 발행 실패(전송 전) tokenId={} queueId={}: {}",
+                        event.tokenId(), event.queueId(), e.getMessage());
+                failed++;
+                futures.add(null);
+            }
+        }
+
+        for (int i = 0; i < futures.size(); i++) {
+            CompletableFuture<SendResult<String, Object>> future = futures.get(i);
+            if (future == null) {
+                continue;   // 위에서 이미 실패로 센 건
+            }
+            long remainMs = Math.max(1L, (deadline - System.nanoTime()) / 1_000_000L);
+            try {
+                future.get(remainMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // 🪤 **이미 센 건(null 자리)을 다시 세지 않는다** — 그러면 failed 가 events 수를
+                //    넘어 로그의 폭발 반경이 부푼다. 남은 것 중 실제로 보낸 것만 센다.
+                int unknown = 0;
+                for (int j = i; j < futures.size(); j++) {
+                    if (futures.get(j) != null) {
+                        unknown++;
+                    }
+                }
+                failed += unknown;
+                log.error("ADMITTED 발행 대기 중 인터럽트 — 남은 {}건을 실패로 센다", unknown, e);
+                break;
+            } catch (ExecutionException | TimeoutException e) {
+                // 타임아웃은 "모름"이다(브로커가 받았을 수도 있다). 중복은 멱등 적재가
+                // 흡수하지만 유실은 아무도 복구하지 않으므로, 세는 쪽을 보수적으로 잡는다.
+                failed++;
+                log.error("ADMITTED 발행 실패 tokenId={} queueId={}: {}",
+                        events.get(i).tokenId(), events.get(i).queueId(), e.getMessage());
+            }
+        }
+        return failed;
     }
 }

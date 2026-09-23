@@ -159,7 +159,7 @@ flowchart TD
 
     OWN --> LUA["② EVAL admit.lua — 전 구간 원자 (Redis 밖 호출 0회)\n\nqueue:{queueId}:admit-idem:{requestId} 있으면 → REPLAY 반환\n\nZPOPMIN queue:{queueId}:waiting N → (identifier, seq) N쌍\n  ※ ZSet 하나(§66 D2) + score가 INCR 단조증가(§70 D9) → 이미 FIFO\n  ※ 거를 대상이 없어 ZRANGE+ZREM이 ZPOPMIN 한 명령이 됐다\nHGET queue:{queueId}:tokens {identifier} → 'tokenId|issuedAt'\n  ※ 미스/레거시면 ZADD로 원래 seq에 되돌리고 건너뛴다 — 안 되돌리면 대기열에서 사라진다\nSET queue:{queueId}:admit-by-token:{tokenId} PX 60000\nSET queue:{queueId}:admit-by-admit:{admitToken} PX 60000\n  ※ 이 둘과 admit-idem은 KEYS[] 선언 불가 → CROSSSLOT 검사가 안 걸린다\n  ※ 접두사는 Java(QueueKeys)가 만들어 ARGV로. Lua는 prefix .. tokenId 만 (§80)\nZADD queue:{queueId}:admitted {만료 epoch ms} '{seq}|{identifier}'\nwatermark 조건부 갱신 (현재값보다 클 때만, §79)\nqueue:{queueId}:admit-idem:{requestId} = 결과 payload"]
 
-    LUA --> KAFKA["③ Kafka token-lifecycle 발행\nADMITTED × N (key=tokenId)\n→ Consumer: status 0→1, admit_token, admitted_at\n※ 건별 12초 블로킹. 첫 발행 실패면 나머지를 건너뛴다\n※ 건너뛴 분은 자동 복구되지 않는다 — 실패해도 200이라\n   Tenant가 재시도할 이유가 없다. 흔적은 ERROR 로그뿐 (§80)"]
+    LUA --> KAFKA["③ Kafka token-lifecycle 발행\nADMITTED × N (key=tokenId)\n→ Consumer: status 0→1, admit_token, admitted_at\n※ 전량 send 후 일괄 대기(예산 12초를 send·대기가 공유)\n   첫 실패에서 끊지 않아 실패 1건은 1건만 잃는다(2026-09-23)\n※ 실패분은 자동 복구되지 않는다 — 실패해도 200이라\n   Tenant가 재시도할 이유가 없다. 흔적은 ERROR 로그와 result=error 뿐 (§80)"]
     --> ARESP(["④ 200 OK\n{ admitted: [{tokenId, identifier, seq, admitToken}...] }\n\n보장: 대기열에서 빠졌고 admitToken을 쥐었다 (Redis 사실)\n미보장: tokens.status가 이미 1이다"])
 
     ARESP --> POLL["유저 다음 Polling 시\nadmitToken 수신"]

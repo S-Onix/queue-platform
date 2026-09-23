@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -219,16 +220,20 @@ public class QueueEngineService {
      * 이유: ADMITTED 발행 — <b>실패해도 예외를 올리지 않는다</b>(FRS §6.4).
      * 원인: Lua 가 이미 커밋돼 되돌릴 수 없다 — 5xx 를 주면 재시도가 REPLAY 무한 반복이 된다.
      * 해결: REPLAY 도 발행한다 — 중복은 멱등이라 무해하고 <b>첫 발행 실패의 유일한 복구 경로</b>다.
-     * 🔴 <b>첫 발행 실패에서 끊는다</b> — 건별 12초 블로킹이라 count=100 이면 최대 20분을 잡는다.
-     * ⚠️ 건너뛴 분은 자동 복구되지 않는다 — ERROR 로그가 유일한 흔적이다.
+     * 🔑 <b>전량 발행 뒤 한 번에 기다린다</b>({@code publishAll}) — 예전의 건별 ack 루프는
+     *    지연이 건수에 선형이었다(AWS 12차 실측 300건 p50 <b>1.797초</b>, 건당 5.99ms).
+     * 🔴 <b>첫 실패에서 끊지 않는다.</b> Kafka 에 트랜잭션이 없어 레코드가 서로 독립이므로,
+     *    끊으면 재수 없는 1건이 <b>나머지 299건의 원장까지</b> 데려간다(폭발 반경 N → 1).
+     * ⚠️ 실패분은 자동 복구되지 않는다 — ERROR 로그와 {@code result=error} 가 유일한 흔적이다.
+     *    그 토큰은 Redis 엔 admitToken 이 있고 DB 엔 ADMITTED 가 없어 complete 가 영구 404 다(§80 U9).
      *
      * @author sonix
+     * @return 원장을 잃은 건수 (발행 실패 + issuedAt 미확인으로 발행조차 못 한 건)
      */
     private int publishAdmitted(long tenantId, String queueId, AdmitResult result, Instant admittedAt) {
-        List<AdmitResult.AdmitRecord> records = result.records();
+        List<EnqueueEvent> events = new ArrayList<>(result.records().size());
         int skipped = 0;
-        for (int i = 0; i < records.size(); i++) {
-            AdmitResult.AdmitRecord record = records.get(i);
+        for (AdmitResult.AdmitRecord record : result.records()) {
             if (record.issuedAt() == null) {
                 skipped++;
                 // issuedAt이 없으면 발행할 수 없다. 컨슈머의 멱등 키가 (token_id, issued_at)이라
@@ -238,17 +243,28 @@ public class QueueEngineService {
                         record.tokenId(), queueId, record.identifier());
                 continue;
             }
-            boolean published = publishQuietly(new EnqueueEvent(TokenEventType.ADMITTED.name(),
+            events.add(new EnqueueEvent(TokenEventType.ADMITTED.name(),
                     record.tokenId(), queueId, tenantId, record.identifier(), record.seq(),
                     record.issuedAt(), record.admitToken(), admittedAt, null));
-            if (!published) {
-                skipped += records.size() - i;
-                log.error("ADMITTED 발행 중단 queueId={} 건너뜀={}건 첫tokenId={}",
-                        queueId, records.size() - i, record.tokenId());
-                break;
-            }
         }
-        return skipped;
+        if (events.isEmpty()) {
+            return skipped;
+        }
+        // 🔴 **예외를 여기서 잡는다** — 올리면 admit 이 503 이 되고 FRS §6.4 가 깨진다.
+        //    Lua 가 이미 커밋돼 되돌릴 수 없으므로 5xx 는 재시도를 REPLAY 무한 반복으로 만든다.
+        //    🪤 어댑터는 자기 안에서 다 잡지만 **포트 계약이 그걸 보장하지 않는다**(기본 구현·미래의
+        //       두 번째 어댑터). 예전 건별 경로는 publishQuietly 가 감싸 줬는데 그 보호가 사라졌었다.
+        int failed;
+        try {
+            failed = eventPublisher.publishAll(events);
+        } catch (RuntimeException e) {
+            failed = events.size();   // 어디까지 갔는지 모른다 — 전부 잃은 것으로 센다(보수적)
+            log.error("ADMITTED 발행이 예외로 중단됐다 queueId={} 시도={}건", queueId, events.size(), e);
+        }
+        if (failed > 0) {
+            log.error("ADMITTED 발행 실패 queueId={} 실패={}건 / 시도={}건", queueId, failed, events.size());
+        }
+        return skipped + failed;
     }
 
     /**
@@ -399,11 +415,6 @@ public class QueueEngineService {
     }
 
     /**
-     * 발행 실패를 삼키고 로그만 남긴다. 호출자 주석에 "왜 삼켜도 되는가"가 있다.
-     *
-     * @return 성공 여부. 여러 건을 연달아 발행하는 호출자가 <b>첫 실패에서 끊을</b> 근거다
-     */
-    /**
      * 이유: 경로가 갈리는 지점의 **분기 비율**을 남긴다.
      * 문제: 9차에서 verify 폴백 313,842회·complete 0행 97.3% 를 digest 를 떠야 알았다.
      * 원인: 어느 분기로 갔는지는 로그에도 지표에도 없었다 — HTTP 는 전부 200 이다.
@@ -417,6 +428,14 @@ public class QueueEngineService {
         Counter.builder(name).tag(tagKey, tag).register(meterRegistry).increment();
     }
 
+    /**
+     * 발행 실패를 삼키고 로그만 남긴다. 호출자 주석에 "왜 삼켜도 되는가"가 있다.
+     *
+     * <p>🔧 남은 호출자는 <b>전부 단건</b>이다(verify·complete). 여러 건은 {@code publishAll} 이
+     * 맡고, 그쪽은 <b>첫 실패에서 끊지 않는다</b> — 예전의 "끊을 근거" 서술은 2026-09-23에 없앴다.
+     *
+     * @return 성공 여부
+     */
     private boolean publishQuietly(EnqueueEvent event) {
         try {
             eventPublisher.publish(event);

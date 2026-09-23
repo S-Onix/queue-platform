@@ -14,6 +14,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -23,6 +24,10 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -129,12 +134,35 @@ class AdmitRequestMetricTest {
     @DisplayName("ADMITTED 발행이 실패하면 result:error — admit은 200이라 HTTP로는 안 보인다")
     void countsPublishFailureAsError() {
         givenAdmit(false, record("t1"), record("t2"));
-        doThrow(new IllegalStateException("broker down")).when(eventPublisher).publish(any());
+        when(eventPublisher.publishAll(anyList())).thenReturn(2);   // 둘 다 실패
 
         service.admit(TENANT_ID, QUEUE_ID, 2, "req-1");
 
         assertThat(requests("error")).isEqualTo(1.0);
         assertThat(requests("ok")).isZero();
+    }
+
+    /**
+     * 🔴 <b>발행 목록의 내용</b>을 단정한다. legacy 를 하나만 주면 목록이 비어 {@code publishAll} 로
+     * 아무것도 넘어가지 않아, {@code continue} 를 지워도 초록이 된다(2026-09-23 주입 실측).
+     * 그 회귀가 나가면 컨슈머 멱등 키 {@code (token_id, issued_at)} 의 절반이 null 인 이벤트가
+     * 발행돼 <b>같은 토큰의 두 번째 행 + 과금 1건</b>이 생긴다.
+     */
+    @Test
+    @DisplayName("🔴 issuedAt 없는 건은 목록에서 빠진다 — 정상 건만 publishAll로 넘어간다")
+    void legacyRecordIsExcludedFromPublishedList() {
+        givenAdmit(false, legacyRecord("t1"), record("t2"));
+        when(eventPublisher.publishAll(anyList())).thenReturn(0);
+
+        service.admit(TENANT_ID, QUEUE_ID, 2, "req-1");
+
+        ArgumentCaptor<java.util.List<com.sonix.queue.domain.queue.EnqueueEvent>> captor =
+                ArgumentCaptor.forClass(java.util.List.class);
+        verify(eventPublisher).publishAll(captor.capture());
+        assertThat(captor.getValue())
+                .extracting(com.sonix.queue.domain.queue.EnqueueEvent::tokenId)
+                .containsExactly("t2");
+        assertThat(requests("error")).as("건너뛴 건은 여전히 error다").isEqualTo(1.0);
     }
 
     @Test
@@ -163,19 +191,38 @@ class AdmitRequestMetricTest {
         assertThat(requests("error")).isZero();
     }
 
+    /**
+     * 🔑 <b>이 단정이 2026-09-23 에 뒤집혔다.</b> 예전에는 중간 1건이 실패하면 남은 전부를
+     * 건너뛰어(첫 실패에서 break) 3명 전원이 원장을 잃었다. 지금은 {@code publishAll} 이
+     * 전량 보낸 뒤 한 번에 기다리고 <b>실패한 건만</b> 센다 — 폭발 반경이 N → 1 이다.
+     */
     @Test
-    @DisplayName("리스트 중간에서 발행이 끊겨도 요청은 1건 — 남은 전부가 건너뛴 것으로 접힌다")
-    void countsPartialFailureAsSingleErrorRequest() {
+    @DisplayName("🔴 중간 1건이 실패해도 나머지는 발행된다 — 실패 건수만 센다(폭발 반경 N→1)")
+    void countsOnlyActualFailures() {
         givenAdmit(false, record("t1"), record("t2"), record("t3"));
-        doThrow(new IllegalStateException("broker down")).when(eventPublisher)
-                .publish(argThat(e -> "t2".equals(e.tokenId())));
+        // 3건을 한 번에 넘기고, 그중 1건만 실패한 상황
+        when(eventPublisher.publishAll(argThat(list -> list.size() == 3))).thenReturn(1);
 
         service.admit(TENANT_ID, QUEUE_ID, 3, "req-1");
 
         assertThat(requests("error")).isEqualTo(1.0);
-        // 🪤 $value(요청 건수)와 영향 사용자 수는 다르다 — 여기서 1건 대 3명이다.
-        //    알람 summary가 "영향 사용자는 그 이상"이라 쓰는 근거가 이것이다.
+        // 🪤 $value(요청 건수)와 영향 사용자 수는 다르다 — 여기서 1건 대 **1명**이다
+        //    (예전 구조에서는 같은 상황이 3명이었다).
         assertThat(tokensIssued()).isEqualTo(3.0);
+    }
+
+    @Test
+    @DisplayName("발행이 전부 성공하면 error는 0 — 한 번의 publishAll로 끝난다")
+    void publishesOnceForWholeBatch() {
+        givenAdmit(false, record("t1"), record("t2"), record("t3"));
+        when(eventPublisher.publishAll(anyList())).thenReturn(0);
+
+        service.admit(TENANT_ID, QUEUE_ID, 3, "req-1");
+
+        assertThat(requests("error")).isZero();
+        assertThat(requests("ok")).isEqualTo(1.0);
+        verify(eventPublisher, times(1)).publishAll(argThat(list -> list.size() == 3));
+        verify(eventPublisher, never()).publish(any());   // 건별 루프로 돌아가면 빨개진다
     }
 
     @Test

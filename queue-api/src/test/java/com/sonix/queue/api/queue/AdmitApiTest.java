@@ -44,6 +44,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -140,16 +141,21 @@ class AdmitApiTest {
                 .andExpect(jsonPath("$.data.admitted[0].seq").value(10))
                 .andExpect(jsonPath("$.data.admitted[0].admitToken").value("adm_1"));
 
-        ArgumentCaptor<EnqueueEvent> captor = ArgumentCaptor.forClass(EnqueueEvent.class);
-        verify(eventPublisher, org.mockito.Mockito.times(2)).publish(captor.capture());
-        assertThat(captor.getAllValues()).allSatisfy(e -> {
+        // 🔧 2026-09-23: 건별 publish 루프 → publishAll **한 번**(admit 300건이 p50 1.797초였다).
+        //    그래서 단정도 "호출 2회"가 아니라 "한 번에 넘긴 목록 2건"을 본다.
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<java.util.List<EnqueueEvent>> captor =
+                ArgumentCaptor.forClass(java.util.List.class);
+        verify(eventPublisher, org.mockito.Mockito.times(1)).publishAll(captor.capture());
+        assertThat(captor.getValue()).hasSize(2);
+        assertThat(captor.getValue()).allSatisfy(e -> {
             // 판별 필드가 없으면 컨슈머가 조용히 enqueue로 적재한다 (§80).
             assertThat(e.eventType()).isEqualTo("ADMITTED");
             assertThat(e.queueId()).isEqualTo(QUEUE_ID);
             assertThat(e.tenantId()).isEqualTo(TENANT_ID);
             assertThat(e.issuedAt()).isNotNull();
         });
-        assertThat(captor.getAllValues()).extracting(EnqueueEvent::tokenId)
+        assertThat(captor.getValue()).extracting(EnqueueEvent::tokenId)
                 .containsExactly("tok_1", "tok_2");
     }
 
@@ -158,8 +164,11 @@ class AdmitApiTest {
     void admit_publishFails_still200() throws Exception {
         when(queueEngine.admit(QUEUE_ID, "req_1", 1, NOW)).thenReturn(new AdmitResult(false,
                 List.of(new AdmitResult.AdmitRecord("u1", "tok_1", 10L, "adm_1", Instant.ofEpochMilli(1_000L)))));
+        // 🔴 **`publishAll` 을 겨눈다.** admit 은 더 이상 `publish` 를 부르지 않으므로 그쪽을
+        //    스터빙하면 이 테스트는 "아무 실패도 없는 상태에서 200"을 재는 **공허한 통과**가 된다
+        //    (2026-09-23 실측 — 그 상태에서 운영 코드의 try/catch 를 지워도 초록이었다).
         doThrow(new BusinessException(ErrorCode.QUEUE_ENGINE_UNAVAILABLE))
-                .when(eventPublisher).publish(any());
+                .when(eventPublisher).publishAll(anyList());
 
         mockMvc.perform(post("/api/v1/queues/{q}/admit", QUEUE_ID)
                         .contentType(MediaType.APPLICATION_JSON)
