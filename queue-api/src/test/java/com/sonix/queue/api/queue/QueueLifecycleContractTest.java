@@ -173,8 +173,13 @@ class QueueLifecycleContractTest {
             return;
         }
         // 리포지토리에 삭제 메서드가 없어 SQL로 지운다. WHERE는 전부 이 테스트가 만든
-        // tenant_id 하나로 한정된다 — 남의 행에 닿을 수 있는 문장이 없다.
-        deleteByTenantId("DELETE FROM tokens WHERE tenant_id = ?");
+        // queue_id·tenant_id로 한정된다 — 남의 행에 닿을 수 있는 문장이 없다.
+        // 🪤 tokens는 tenant_id가 아니라 queue_id로 지운다 — tokens에 tenant_id 인덱스가 없어
+        //    풀스캔이 되고, 누적 58만 행에서 read timeout으로 전체 스위트가 깨졌다(2026-09-24).
+        //    운영 쿼리엔 tenant_id 단독 조건이 없어 인덱스를 늘리지 않는다(쓰기가 가장 많은 표다).
+        for (String queueId : createdQueueIds) {
+            deleteById("DELETE FROM tokens WHERE queue_id = ?", queueId);
+        }
         deleteByTenantId("DELETE FROM queues WHERE tenant_id = ?");
         deleteByTenantId("DELETE FROM api_keys WHERE tenant_id = ?");
         deleteByTenantId("DELETE FROM refresh_tokens WHERE tenant_id = ?");
@@ -182,9 +187,13 @@ class QueueLifecycleContractTest {
     }
 
     private void deleteByTenantId(String sql) {
+        deleteById(sql, tenantId);
+    }
+
+    private void deleteById(String sql, Object id) {
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, tenantId);
+            ps.setObject(1, id);
             ps.executeUpdate();
         } catch (Exception e) {
             throw new IllegalStateException("정리 실패: " + sql, e);
