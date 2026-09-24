@@ -175,6 +175,55 @@ class TokenAdmitQueryIntegrationTest {
     }
 
 
+    /**
+     * 이유: complete 가 컨슈머 적재와 데드락(1213)으로 500 이던 것의 회귀 방지.
+     * 문제: WHERE 가 유니크키 {@code (token_id, issued_at)} 의 절반만 써 REPEATABLE READ 에서 갭까지 잠근다.
+     *       컨슈머가 한 트랜잭션에서 X 를 넣고 <b>X 바로 앞 키</b>를 넣으면 서로를 기다린다(2026-09-24 실측 24/24).
+     * 해결: 어댑터가 READ COMMITTED 로 돈다 — 갭을 안 잠가 컨슈머 커밋을 기다렸다가 1행을 고친다.
+     * 🪤 1초 대기로 순서를 맞춘다. complete 가 먼저 기다리고 있어야 순환이 생긴다.
+     *
+     * @author sonix
+     */
+    @Test
+    @DisplayName("🔴 컨슈머가 같은 트랜잭션에서 앞 키를 넣어도 markCompleted 가 데드락 없이 1행을 고친다")
+    void markCompleted_doesNotDeadlockWithConsumerInsert() throws Exception {
+        String base = "tok_dl_" + java.util.UUID.randomUUID();
+        String target = base + "_b";
+        String before = base + "_a";                     // 유니크 인덱스에서 target 바로 앞
+        String admitToken = "adm_dl_" + java.util.UUID.randomUUID();
+        String insert = """
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status,
+                                    admit_token, issued_at, admitted_at)
+                VALUES (?, ?, ?, 'u', 1, 1, ?, ?, UTC_TIMESTAMP(3))
+                """;
+        try (java.sql.Connection consumer = jdbc.getDataSource().getConnection();
+             var pool = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            consumer.setAutoCommit(false);
+            try (var ps = consumer.prepareStatement(insert)) {
+                ps.setString(1, target); ps.setString(2, QUEUE_ID); ps.setLong(3, tenantId);
+                ps.setString(4, admitToken); ps.setObject(5, ISSUED_AT);
+                ps.executeUpdate();
+            }
+
+            var complete = pool.submit(() -> adapter.markCompleted(QUEUE_ID, tenantId, target, admitToken,
+                    LocalDateTime.of(2026, 8, 18, 12, 0, 0), 300));
+            Thread.sleep(1000);                          // complete 가 target 락을 기다리는 중
+
+            try (var ps = consumer.prepareStatement(insert)) {
+                ps.setString(1, before); ps.setString(2, QUEUE_ID); ps.setLong(3, tenantId);
+                ps.setString(4, "adm_dl_other"); ps.setObject(5, ISSUED_AT);
+                ps.executeUpdate();
+            }
+            consumer.commit();
+
+            assertThat(complete.get(30, java.util.concurrent.TimeUnit.SECONDS))
+                    .as("REPEATABLE READ 면 여기서 CannotAcquireLockException(1213)").isEqualTo(1);
+            assertThat(statusOf(target)).isEqualTo(2);
+        } finally {
+            jdbc.update("DELETE FROM tokens WHERE token_id IN (?, ?)", target, before);
+        }
+    }
+
     @Test
     @Transactional
     @DisplayName("markCompleted: ADMIT_ISSUED(1) → COMPLETED(2), 1행")

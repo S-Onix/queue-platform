@@ -9,6 +9,7 @@ import com.sonix.queue.infrastructure.repository.TokenJpaRepository;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.PreparedStatement;
@@ -204,11 +205,15 @@ public class TokenJpaAdapter implements TokenRepository {
      *       같은 형태다(호출자인 배치가 트랜잭션을 안 갖는다).
      * 🪤 이 어노테이션을 지우면 complete 가 런타임에 죽는다 — 커버는
      *    {@code TokenAdmitQueryIntegrationTest.markCompleted_withoutAmbientTransaction} 이다.
+     * 🔴 {@code READ COMMITTED} 가 아니면 컨슈머 적재와 <b>데드락(1213)으로 500</b> 이 난다.
+     *    WHERE 가 유니크키 {@code (token_id, issued_at)} 의 절반이라 REPEATABLE READ 에서 갭까지 잠그고,
+     *    컨슈머가 같은 트랜잭션에서 바로 앞 키를 넣으면 서로를 기다린다(2026-09-24 실측 24/24).
+     *    커버는 {@code markCompleted_doesNotDeadlockWithConsumerInsert}. 선례는 {@code BillingJdbcAdapter}.
      *
      * @author sonix
      */
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public int markCompleted(String queueId, long tenantId, String tokenId, String admitToken,
                              LocalDateTime completedAt, int validWindowSeconds) {
         return tokenJpaRepository.markCompleted(
