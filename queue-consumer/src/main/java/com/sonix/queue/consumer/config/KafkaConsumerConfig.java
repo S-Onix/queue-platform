@@ -1,14 +1,22 @@
 package com.sonix.queue.consumer.config;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.kafka.core.KafkaOperations;
+import org.springframework.kafka.listener.BatchInterceptor;
 import org.springframework.kafka.listener.BatchListenerFailedException;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.util.backoff.FixedBackOff;
+
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 이유: 소비 실패를 두 갈래로 나눈다 — 데이터가 잘못됨 vs 일시적 장애.
@@ -62,5 +70,39 @@ public class KafkaConsumerConfig {
 
         handler.setLogLevel(org.springframework.kafka.KafkaException.Level.ERROR);
         return handler;
+    }
+
+    /**
+     * 이유: 발행부터 원장 반영(DB 커밋)까지 걸린 시간을 건별로 잰다.
+     * 문제: lag 는 <b>건수</b>라 "원장이 몇 초 늦나"에 답하지 못한다 — verify 폴백의 60초 창이 그 시간에 밀린다.
+     * 해결: 레코드 timestamp(CreateTime = API 의 send 시각)와 리스너 성공 직후 시각의 차.
+     *       {@code success} 는 리스너가 정상 반환한 뒤에만 불리므로 적재 트랜잭션은 이미 커밋됐다.
+     * 🪤 API·컨슈머 두 호스트의 시계 차가 그대로 섞인다. 음수는 Micrometer 가 버린다.
+     *
+     * @author sonix
+     */
+    @Bean
+    public BatchInterceptor<Object, Object> applyDelayInterceptor(MeterRegistry registry) {
+        Timer timer = Timer.builder("queue.consumer.apply.delay")
+                .description("Kafka 발행 → tokens 커밋. lag(건수)을 시간으로 본 값")
+                // 🪤 상한이 낮으면 p95 가 경계에 붙는다 — 8차 랙은 54분이었다
+                .serviceLevelObjectives(Duration.ofMillis(10), Duration.ofMillis(50), Duration.ofMillis(100),
+                        Duration.ofMillis(500), Duration.ofSeconds(1), Duration.ofSeconds(5),
+                        Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(60),
+                        Duration.ofSeconds(300), Duration.ofSeconds(1800), Duration.ofSeconds(3600))
+                .register(registry);
+        return new BatchInterceptor<>() {
+            @Override
+            public ConsumerRecords<Object, Object> intercept(ConsumerRecords<Object, Object> records,
+                                                              Consumer<Object, Object> consumer) {
+                return records;
+            }
+
+            @Override
+            public void success(ConsumerRecords<Object, Object> records, Consumer<Object, Object> consumer) {
+                long now = System.currentTimeMillis();
+                records.forEach(r -> timer.record(now - r.timestamp(), TimeUnit.MILLISECONDS));
+            }
+        };
     }
 }
