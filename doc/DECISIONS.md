@@ -160,6 +160,7 @@
 | §57 | 동시성 제어 우선순위 정책 | ✅ |
 | §58 | Queue 생성 동시성 처리 (→5) | ✅ |
 | §59 | `@DistributedLock` 도입 및 모듈 배치 | ✅ |
+| §95 | `markCompleted`를 READ COMMITTED로 — 컨슈머 적재와의 데드락(complete 500) 제거 (→9) | ✅ |
 
 **12. 아키텍처 · 모듈 · 기술 스택**
 
@@ -8149,3 +8150,64 @@ admit이 그를 건너뛴다 → **순서를 사려는 변경이 순서를 더 �
   단 **사망 시점 건수는 여전히 불가**(게이지는 프로세스와 함께 사라지고, 건수 로그는 SIGTERM 전용)
 - `queue_pending_size`를 **읽는 경보가 0개**다(§4-1). 다만 기준선이 0이고 20ms 창은 스크레이프로
   표본화할 수 없어 **지금 경보를 만들 근거가 없다** — 대시보드 패널로 남긴다
+
+---
+
+## §95 — `markCompleted`를 READ COMMITTED로: 컨슈머 적재와의 데드락 제거 (2026-09-24)
+
+### Context
+
+complete가 MySQL 데드락(1213)의 **희생자**가 되어 500을 내고 있었다. AWS 8차(500만)의 "500 오류
+34건"이 이것이었는데, 당시 `innodb_print_all_deadlocks=0`이라 33/34건이 흔적 없이 사라져 원인을
+**추론**만 했다("컨슈머 ODKU ↔ `expireStaleAdmitted`"). 그 추론은 틀렸다(아래).
+
+🔴 **원장 영향**: 500을 받은 토큰은 `status=1`로 남는다. 연동사가 재시도하지 않으면 `ReconcileJob`이
+만료로 쓸어 담는다 — **완료 기록 없이 과금**된다.
+
+### 원인 (실측)
+
+하니스 리허설(12,000명)에서 complete 500이 42건 났고, `SHOW ENGINE INNODB STATUS`를 0.1초마다 떠
+24건을 잡았다. **24건 전부 같은 쌍**이었다:
+
+| | 문장 | 잠금 |
+|---|---|---|
+| T1 (희생자) | complete `UPDATE tokens SET status=2 … WHERE queue_id … token_id … status IN (0,1)` | `uq_tokens_token_id` 레코드 **+ 앞 갭**(넥스트키) 대기 |
+| T2 | 컨슈머 ENQUEUED 다중행 `INSERT … ON DUPLICATE KEY UPDATE` | 같은 레코드 보유 + **바로 앞 키 insert intention** 대기 |
+
+1. 유니크키는 `(token_id, issued_at)`인데 complete의 WHERE는 **`token_id`만** 준다(complete는 `issued_at`을
+   모른다). 유일 조회가 아니라 **접두 범위 스캔**이라 REPEATABLE READ가 레코드 앞 갭까지 잠근다
+2. 컨슈머는 한 트랜잭션에서 X를 넣은 뒤 **정렬상 X 바로 앞 키**를 넣는다 — 같은 ms의 UUIDv7끼리는
+   삽입 순서 ≠ 키 순서다
+3. 컨슈머는 X를 쥔 채 X 앞 갭을, complete는 X(+갭)를 기다린다 → 순환. undo가 작은 complete가 희생된다
+
+두 세션 재현(임시 표, 2/2): 현행 🔴 데드락 · **READ COMMITTED ✅** · WHERE에 `issued_at`까지 ✅.
+
+### Decision
+
+**`TokenJpaAdapter.markCompleted`에 `@Transactional(isolation = Isolation.READ_COMMITTED)`.**
+갭을 안 잠그므로 complete는 컨슈머 커밋을 기다렸다가 1행을 고친다. 격리수준은 **이 메서드에만** 건다
+— 선례는 §84 `BillingJdbcAdapter.upsertMonthlySnapshot`(같은 이유: RR의 넥스트키가 적재를 막았다).
+
+| 안 | 기각 이유 |
+|---|---|
+| WHERE에 `issued_at` | complete는 그 값을 모른다 → 요청마다 읽기 1회 추가 |
+| 1213이면 재시도 | 증상만 덮는다. 원인이 남아 부하가 커지면 재시도도 부딪힌다 |
+
+RC로 잃는 것이 없다 — 이 트랜잭션은 **UPDATE 한 문장**이라 반복 읽기 일관성을 쓸 곳이 없다.
+
+### 검증
+
+- 회귀 테스트 `TokenAdmitQueryIntegrationTest.markCompleted_doesNotDeadlockWithConsumerInsert` —
+  **수정 전 1213으로 빨강 확인** 후 초록
+- 같은 리허설: complete 500 **42 → 0**, 포착 데드락 **24 → 0**, 원장 대조(`ledger_check`) 3항목 일치
+- 전체 테스트 537건 · skip 4 · 실패 0
+
+### Consequences
+
+- ⏳ **8차 34건이 전부 이 쌍이었는지는 모른다.** 8차가 추론한 `expireStaleAdmitted` 쌍은 이번 재현에서
+  0건이었다. 다음 AWS 판의 하니스 5xx 집계(2026-09-24 추가)로 0건인지 확인한다
+- 🪤 리허설 빈도(0.35%)는 과장이다 — 줄 선 직후 입장시키는 설정이라 complete가 ENQUEUED 커밋 전에
+  온다. 대기가 긴 실운영은 드물다(8차 34 / 500만)
+- 🪤 **추론으로 판단하지 마라** — 8차 3인 재분석이 합의한 범인이 실측과 달랐다. 데드락은 흔적을 남기게
+  하고(폴링 또는 `innodb_print_all_deadlocks`) 잡힌 쌍으로 판정한다
+- 증거: `~/queue-platform-it/deadlock-20260924/`(비커밋 — 데드락 원문 24건 · 재현 스크립트 · 리허설 결과)

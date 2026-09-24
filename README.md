@@ -542,7 +542,7 @@ Cluster·Kafka를 쓰는 테스트에만 태그를 붙이고, CI 단위 레인�
 
 | | |
 |---|---|
-| [`doc/DECISIONS.md`](doc/DECISIONS.md) | 설계 결정 94건 — 근거와 **번복 이력** 포함 |
+| [`doc/DECISIONS.md`](doc/DECISIONS.md) | 설계 결정 95건 — 근거와 **번복 이력** 포함 |
 | [`doc/reviews/`](doc/reviews/) | 교차 검토가 결론을 뒤집은 기록 |
 | [`doc/API.md`](doc/API.md) | 엔드포인트 18개 필드 단위 명세 |
 | [`doc/TENANT_INTEGRATION.md`](doc/TENANT_INTEGRATION.md) | 연동사가 읽는 계약 8건 |
