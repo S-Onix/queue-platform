@@ -280,7 +280,7 @@ class AdmitApiTest {
     // ── §6.6 Complete ──
 
     @Test
-    @DisplayName("complete → 200 COMPLETED + Redis 정리 + COMPLETED 발행")
+    @DisplayName("complete → 200 COMPLETED + Redis 정리. DB 경로는 COMPLETED 를 발행하지 않는다")
     void complete_success() throws Exception {
         LocalDateTime completedAt = LocalDateTime.now(Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC));
         when(tokenRepository.markCompleted(QUEUE_ID, TENANT_ID, "tok_a", "adm_1", completedAt, 300))
@@ -298,10 +298,8 @@ class AdmitApiTest {
         // admit-by-admit은 TTL 말고 삭제 경로가 여기뿐이다 — 빠지면 60초간 유령이 남는다.
         verify(queueEngine).cleanupCompleted(QUEUE_ID, "0190e2c1-user", "tok_a", "adm_1", 42L);
 
-        ArgumentCaptor<EnqueueEvent> captor = ArgumentCaptor.forClass(EnqueueEvent.class);
-        verify(eventPublisher).publish(captor.capture());
-        assertThat(captor.getValue().eventType()).isEqualTo("COMPLETED");
-        assertThat(captor.getValue().tokenId()).isEqualTo("tok_a");
+        // UPDATE 가 이미 status=2 를 커밋했다 — 컨슈머 UPSERT 는 IN (0,1) 가드라 이 이벤트는 항상 no-op 이었다.
+        verifyNoInteractions(eventPublisher);
     }
 
     @Test

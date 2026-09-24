@@ -137,7 +137,7 @@ Redis (QueueKeys — §8 참조):
 
 ⑨ Tenant → Platform: complete (입장 완료 통보)
    POST /queues/:queueId/tokens/:tokenId/complete { admitToken }
-   Platform: COMPLETED + ZREM + Kafka 발행
+   Platform: COMPLETED(DB 직접) + ZREM. Kafka 발행은 DB가 아직 모르는 Redis 폴백일 때만
    ← { status: COMPLETED, completedAt }
 
 (admitToken TTL 60초 초과 시 → **종료**. 복귀하지 않는다 — §36. 재접속 → 재-enqueue → 맨 뒤)
@@ -235,7 +235,7 @@ Redis (QueueKeys — §8 참조):
 stateDiagram-v2
     [*] --> WAITING : POST /tokens (HSETNX tokens)
     WAITING --> ADMIT_ISSUED : POST /admit\nadmitToken TTL 60초
-    ADMIT_ISSUED --> COMPLETED : POST /complete\nKafka token-lifecycle 발행
+    ADMIT_ISSUED --> COMPLETED : POST /complete\nDB 직접 (Redis 폴백일 때만 Kafka 발행)
     ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\n종료 — 복귀 없음 (§36)\n재접속하면 맨 뒤
     WAITING --> EXPIRED : Batch (waitingTtl · inactiveTtl)\nKafka token-lifecycle 발행
     COMPLETED --> [*]
@@ -684,12 +684,11 @@ Body: { admitToken: "at_xxx" }
         취약 창이 240초다. 피해자는 폴링 404를 받을 뿐 아무 신호가 없다.
      🔴 구분자 없는 레거시 값은 **전체를 tokenId로 본다**(poll_verify.lua와 같은 규약).
         미스 취급하면 롤링 배포 중 게이트가 영영 안 풀려 영구 락아웃이다.
-3. Kafka token-lifecycle 발행 — COMPLETED (key=tokenId)
-   → BillingConsumer: tokens 원본 집계 → billing_snapshots UPSERT
-   ⚠️ 발행 실패는 삼킨다(로그만). DB는 이미 status=2로 확정됐고, 여기서 5xx를 주면 Tenant
-      재시도가 status IN (0,1)에 걸려 404를 받는다 — 더 나쁘다.
-   ⚠️ admittedAt은 싣지 않는다 — COMPLETED UPSERT는 status만 만지고 admitted_at은 ADMITTED가
-      이미 채운 값이다(§7 가드 표).
+3. ~~Kafka token-lifecycle 발행 — COMPLETED~~ → **발행하지 않는다**(2026-09-24).
+   1단계 UPDATE가 이미 status=2를 커밋했고, 컨슈머의 COMPLETED UPSERT는 `status IN (0,1)` 가드라
+   이 행에선 항상 no-op이다. 응답 경로에 동기 ack 대기만 얹고 있었다.
+   ⚠️ 0행 → Redis 폴백 경로는 **여전히 발행한다** — DB가 아직 모르는 완료라 이벤트가 유일한 기록이다.
+   (옛 서술의 "BillingConsumer"는 존재하지 않는다 — 과금 집계는 `BillingSnapshotJob`이 tokens를 직접 센다, §84)
 
    ⛔ 구 4단계 "avgWaitingTime 직접 갱신(HINCRBYFLOAT)"은 **폐기**됐다 (DECISIONS §81).
       ETA와 `queue-stats` 키도 함께 폐기다 — 한 줄도 구현된 적이 없다.

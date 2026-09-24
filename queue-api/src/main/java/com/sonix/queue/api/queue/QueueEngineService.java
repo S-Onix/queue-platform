@@ -352,7 +352,7 @@ public class QueueEngineService {
      * @author sonix
      */
     // 🔴 **@Transactional 을 다시 붙이지 마라**(2026-09-23 제거). 이 메서드 안에는 Redis 왕복
-    //    (cleanupCompleted)과 **Kafka 동기 발행**(send-timeout 12초)이 있다 — 트랜잭션 안에 두면
+    //    (cleanupCompleted)과 폴백 경로의 **Kafka 동기 발행**(send-timeout 12초)이 있다 — 트랜잭션 안에 두면
     //    그 12초 동안 DB 커넥션을 쥔다. 게이트 개방 직후 complete 가 몰리는 구간이라 자해다.
     //    🔑 위 verify·admit 이 **같은 이유로** 트랜잭션을 안 쓴다 — complete 만 비대칭이었고
     //       그 비대칭 자체가 결함이었다(dba·code-reviewer 독립 2인 지적).
@@ -424,20 +424,16 @@ public class QueueEngineService {
             return completedAt;
         }
 
-        // 정리·발행에 identifier·seq·issuedAt이 필요하다. UPDATE가 1행을 갱신했으므로 반드시 있다.
+        // 정리에 identifier·seq가 필요하다. UPDATE가 1행을 갱신했으므로 반드시 있다.
         Token token = tokenRepository.findByTokenId(queueId, tenantId, tokenId)
                 .orElseThrow(() -> new IllegalStateException("completed row vanished: " + tokenId));
 
         queueEngine.cleanupCompleted(queueId, token.getUserId(), tokenId, admitToken, token.getSeq());
 
-        // COMPLETED도 admit과 같은 이유로 조용히 실패한다. DB는 이미 status=2로 확정됐고,
-        // 여기서 5xx를 주면 Tenant 재시도가 status IN (0,1)에 걸려 404를 받는다(더 나쁘다).
-        // admittedAt은 싣지 않는다 — COMPLETED의 UPSERT는 status만 만지고, admitted_at은
-        // ADMITTED가 이미 채운 값이다(§80 가드 표).
-        publishQuietly(new EnqueueEvent(TokenEventType.COMPLETED.name(), tokenId, queueId, tenantId,
-                token.getUserId(), token.getSeq(), token.getIssuedAt().toInstant(ZoneOffset.UTC),
-                admitToken, null, null));
-
+        // 🔑 **여기선 COMPLETED 를 발행하지 않는다**(2026-09-24). 위 UPDATE 가 이미 status=2 를 커밋했고,
+        //    컨슈머의 COMPLETED UPSERT 는 네 줄 전부 `status IN (0,1)` 가드라 이 행에선 **항상 no-op** 이다.
+        //    발행하면 응답 경로에 동기 ack 대기(꼬리 send-timeout 12초)만 얹고 컨슈머에 헛일을 준다.
+        // ❌ 위 폴백 경로와 verify 의 발행은 지우지 마라 — 거긴 DB 가 아직 모르는 완료라 이벤트가 유일한 기록이다.
         return completedAt;
     }
 

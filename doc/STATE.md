@@ -12,7 +12,7 @@ stateDiagram-v2
 
     WAITING --> ADMIT_ISSUED : POST /admit\nTenant 서버 — N명 입장토큰 발급\nZPOPMIN + admitToken TTL 60초\nKafka ADMITTED 발행 (key=tokenId)
 
-    ADMIT_ISSUED --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\nKafka token-lifecycle 발행 (key=tokenId)
+    ADMIT_ISSUED --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\n(Kafka 발행 없음 — DB가 이미 확정. Redis 폴백일 때만 발행)
 
     WAITING --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nDB 적재 지연으로 아직 status=0인 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
 
@@ -90,7 +90,7 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 | 복구 | **완료 토큰의 ZREM을 재시도하는 코드는 없다.** 잔류분은 `inactiveTtl` 배치가 결국 걷어간다 |
 | seq 저장 | DB `tokens.seq` 컬럼 — **Redis 전손 시 DB 재구성**(§71). ~~복귀 시 score 복원~~은 §36이 폐기 |
 | admit_token 컬럼 | DB 저장 → Redis 미스 시 Fallback용 + verify DB Fallback |
-| Kafka 발행 | **모든 상태 변경**에서 발행 (ENQUEUED/ADMITTED/COMPLETED/EXPIRED). 단일 토픽 `token-lifecycle`, key=`tokenId`. ~~RETURNED~~는 §36이 폐기 |
+| Kafka 발행 | 상태 변경을 발행한다 (ENQUEUED/ADMITTED/COMPLETED/EXPIRED). **예외 둘** — complete의 DB 경로는 이미 `status=2`를 커밋해 이벤트가 no-op이라 발행하지 않고(2026-09-24), `expireStaleAdmitted`(1→4)는 직접 UPDATE다. 단일 토픽 `token-lifecycle`, key=`tokenId`. ~~RETURNED~~는 §36이 폐기 |
 
 ### expiredReason
 
