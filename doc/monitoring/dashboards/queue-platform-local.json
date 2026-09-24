@@ -1209,6 +1209,77 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka 반영 지연 — 발행 → 원장 커밋 (queue.consumer.apply.delay)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "lag(건수)를 **시간**으로 본 값이다. verify 폴백의 60초 창은 **반영 시각부터** 재므로 이만큼 밀린다.\n📏 기준선(로컬 2026-09-24): 평균 68ms · 99.86% ≤ 500ms.\n🔴 **60초 선을 넘으면** 원장 창이 입장권 수명보다 늦게 열린다 — lag 패널과 같이 본다.\n🪤 발행·반영 두 호스트의 시계 차가 섞인다.",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      },
+      "id": 309,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(queue_consumer_apply_delay_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(queue_consumer_apply_delay_seconds_bucket[1m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(queue_consumer_apply_delay_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
     }
   ],
   "description": "로컬 검증용. 위에서 아래로 '정합성 → 서비스 흐름 → 인프라' 순이다.\n맨 윗줄 3개가 0이 아니면 사람이 봐야 한다 — 나머지는 맥락이다."
