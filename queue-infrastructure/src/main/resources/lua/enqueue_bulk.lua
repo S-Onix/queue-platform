@@ -4,7 +4,8 @@
 -- KEYS[1]: queue key (예: queue:{q_bts}:waiting)
 -- KEYS[2]: seq key   (예: queue:{q_bts}:seq) — 큐별 전역 순번 카운터
 -- KEYS[3]: token key (예: queue:{q_bts}:tokens) — identifier -> "tokenId|issuedAt" 매핑 Hash
---   {q_bts} 중괄호는 Cluster 해시태그다 — 세 키가 같은 슬롯이어야 실행된다(없으면 CROSSSLOT). score 는 KEYS[2] INCR 로 발급(단조·유일).
+--   {q_bts} 중괄호는 Cluster 해시태그다 — 세 키가 같은 슬롯이어야 실행된다(없으면 CROSSSLOT).
+--   score 는 KEYS[2] 의 INCR 로 발급한다(단조증가·유일).
 --   🔴 **중복 게이트는 이 Hash 다**(waiting ZSet 이 아니다). admit 되면 waiting 에서 빠지므로 그걸로 판정하면
 --   재-enqueue 가 새 tokenId·새 seq 를 받아 과금이 중복된다. HDEL 은 완료(cleanupCompleted·cleanupVerified)와 회수 배치만 한다. §96-15
 -- ARGV[1]: maxCapacity (Queue 최대 인원)
