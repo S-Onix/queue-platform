@@ -18,7 +18,7 @@ public record AdmitResult(boolean replay, List<AdmitRecord> records) {
     /**
      * admit된 대기자 한 명.
      *
-     * @param seq        대기 당시 순번. WAITING 복귀 시 score 복원에 쓰인다(§80).
+     * @param seq        대기 당시 순번. ADMITTED 이벤트와 admit 응답에 실린다(DB 의 seq 컬럼은 §71 재구성용).
      * @param admitToken 입장 자격 그 자체. verify가 이 값 하나로 통과하므로 UUIDv7이다(FRS §6.4).
      * @param issuedAt   줄 선 시각. ADMITTED 이벤트의 멱등 키가 {@code UNIQUE(token_id, issued_at)}라
      *                   필요하다. <b>null일 수 있다</b> — 멱등 payload(TTL 300초)에 이 값이 없던

@@ -54,7 +54,7 @@ public class QueueEngineService {
     /**
      * 이유: 구간별 소요 버킷. 경계가 없으면 {@code _bucket} 미발행이라 p95 패널이 빈다.
      * 🪤 상한은 <b>가능한 최대</b>에 맞춘다 — kafka 구간은 {@code send-timeout} 12초까지 갈 수 있어
-     *    1초에서 끊으면 부하 중에 p95 가 1초에 포화한다(§admission-wait 와 같은 결함).
+     *    1초에서 끊으면 부하 중에 p95 가 1초에 포화한다(바로 위 ADMISSION_WAIT_SLO 가 3600초에서 겪은 것과 같은 결함).
      */
     private static final Duration[] STAGE_SLO = {
             Duration.ofMillis(1), Duration.ofMillis(5), Duration.ofMillis(10), Duration.ofMillis(20),
@@ -116,9 +116,9 @@ public class QueueEngineService {
 
     /**
      * 이유: 대기열 앞에서 count 명을 꺼내 admitToken 을 발급한다(FRS §6.4).
-     * 해결: {@code admit.lua} 하나로 전 구간이 원자다 — <b>중간에 DB 를 보지 않는다</b>.
-     * 원인: 순번은 Redis 가 먼저 쓰고 DB 엔 Kafka 로 나중에 들어간다 — 그 창의 정상 대기자를
-     *       유령으로 지우면 복구 근거까지 사라진다(§71 D11 · §80).
+     * 원인: 순번은 Redis 가 먼저 쓰고 DB 엔 Kafka 로 나중에 들어간다. 중간에 DB 를 확인하면 아직 적재 전인
+     *       정상 대기자를 없는 사람으로 보고 지우고, 복구 근거까지 사라진다(§71 D11 · §80).
+     * 해결: {@code admit.lua} 하나로 전 구간을 원자로 처리한다 — <b>중간에 DB 를 보지 않는다</b>.
      * 🪤 {@code @Transactional} 금지 — Redis EVAL 과 Kafka 발행이 통째로 커넥션을 잡는다.
      *
      * @author sonix
@@ -418,8 +418,7 @@ public class QueueEngineService {
     /**
      * 발행 실패를 삼키고 로그만 남긴다. 호출자 주석에 "왜 삼켜도 되는가"가 있다.
      *
-     * <p>🔧 남은 호출자는 <b>전부 단건</b>이다(verify·complete). 여러 건은 {@code publishAll} 이
-     * 맡고, 그쪽은 <b>첫 실패에서 끊지 않는다</b> — 예전의 "끊을 근거" 서술은 2026-09-23에 없앴다.
+     * <p>호출자는 <b>전부 단건</b>이다(verify·complete). 여러 건은 {@code publishAll} 이 맡고 첫 실패에서 끊지 않는다.
      *
      * @return 성공 여부
      */
@@ -461,13 +460,13 @@ public class QueueEngineService {
      * @author sonix
      */
     public PollResult poll(String queueId, String tokenId, long seq, boolean keepalive){
-        // 존재(seq)만이 아니라 소유권(tokenId)까지 검증한다. seq는 큐별 INCR이라 추측이 자명해서,
-        // 존재 판정만 하면 남의 대기 항목에 ka=1로 keepalive를 걸 수 있다.
-        // keepalive 갱신도 이 호출 안에서 원자적으로 처리된다(poll_verify.lua).
+        // 존재(seq)만이 아니라 소유권(tokenId)까지 검증한다. seq는 큐별 INCR이라 추측하기 쉬워서,
+        // 존재만 보면 남의 대기 항목 생존 시각(last-active)을 대신 갱신할 수 있다(poll_verify.lua).
+        // keepalive 인자는 하위 호환용 자리일 뿐 무시된다 — 폴링이 오면 언제나 갱신한다(§82 F안).
         String admitToken = null;
         if(!queueEngine.verifyWaiting(queueId, seq, tokenId, keepalive, clock.millis())) {
             // admitted ZSet이 아니라 admit-by-token을 본다. 유효 창은 admitToken의 PX 60초인데
-            // admitted는 복귀 배치가 집어갈 때까지 더 오래 남고, 돌려줄 admitToken도 여기에만 있다.
+            // admitted는 회수 배치가 집어갈 때까지 더 오래 남고, 돌려줄 admitToken도 여기에만 있다.
             admitToken = queueEngine.findAdmitTokenByTokenId(queueId, tokenId)
                     .orElseThrow(() -> new BusinessException(ErrorCode.TOKEN_NOT_FOUND));
         }

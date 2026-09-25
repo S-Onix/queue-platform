@@ -451,8 +451,8 @@ public class RedisQueueEngine implements QueueEngine {
     /**
      * 좀비 탐지가 한 번에 훑는 {@code waiting} 앞부분 크기.
      *
-     * <p>고아는 admit이 지나가지 못해 앞에 쌓이므로 앞만 보면 된다. admit {@code count} 상한이
-     * 100이라 그 10배면 한 주기에 새로 생길 수 있는 양을 덮는다. 넘으면 이 값에서 포화하는데,
+     * <p>고아는 admit이 지나가지 못해 앞에 쌓이므로 앞만 보면 된다. admit {@code count} 상한
+     * 300({@code AdmitRequest @Max})의 약 3배라 한 주기에 새로 생길 수 있는 양을 덮는다. 넘으면 이 값에서 포화하는데,
      * 포화한 시점이면 이미 알람이 울고 남았을 값이라 정확한 숫자가 의미를 갖지 않는다.
      */
     private static final int ORPHAN_HEAD_SCAN = 1000;

@@ -30,7 +30,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * 이유: Global Queue 배치 처리 Consumer. <b>SmartLifecycle 인 것은 종료 시 유실 방지다.</b>
- * 문제: 메모리에만 있어 남은 채 내려가면 <b>3자 대조로도 검출되지 않는 유실</b>이 된다.
+ * 문제: 메모리에만 있어 남은 채 내려가면 <b>Redis·DB·Kafka 3자 대조로도 검출되지 않는 유실</b>이 된다.
  * 해결: 종료 시 마지막 drain 을 돌려 대기 중인 Future 를 전부 완결시킨다({@link #stop()}).
  * ⚠️ 운영 전제: <b>LB deregistration 이 SIGTERM 보다 먼저</b>여야 한다 — 늦으면 롤링 배포마다
  *    인스턴스당 ≈10초 동안 새 enqueue 를 100% 503 으로 거절하면서 커넥션은 계속 받는다.
@@ -64,7 +64,6 @@ public class BatchProcessor implements SmartLifecycle {
     /**
      * 이유: 종료 시 마지막 drain 에 허용하는 시간. <b>목표치이며 하드 상한이 아니다.</b>
      * 원인: 청크 <b>사이</b>에서만 검사돼 실질 상한이 <b>이 값 + Redis commandTimeout 5s ≈ 10s</b> 다.
-     * 🔧 옛 주석의 "socketTimeout 이 없어 상한이 없다"는 <b>거짓이 됐다</b>(PR #96 에서 전 프로필에 넣었다).
      * 🪤 이 값은 enqueue 대기(30s)보다 충분히 작아야 "drain 이 먼저 끝난다"는 순서가 고정된다.
      */
     private static final long SHUTDOWN_DRAIN_TIMEOUT_MS = 5_000L;
@@ -164,8 +163,8 @@ public class BatchProcessor implements SmartLifecycle {
 
     /**
      * 이유: 종료 훅의 실행 시점(phase). 웹 graceful shutdown 단계보다 <b>1 큰</b> 값이다.
-     * 해결: phase 내림차순 stop 이라 이 훅이 <b>웹이 in-flight 를 기다리기 직전</b>에 돈다.
      * 문제: phase 를 낮추면 웹 대기가 <b>먼저</b> 시작돼 in-flight 가 30초 뒤 503 이 된다(실패가 느려질 뿐).
+     * 해결: phase 내림차순 stop 이라 이 훅이 <b>웹이 in-flight 를 기다리기 직전</b>에 돈다.
      * 🔴 {@code @Scheduled} 에 기대면 안 된다 — 스케줄러가 {@code ContextClosedEvent} 에서 닫히는데,
      *    끊기는 것은 <b>새 틱뿐이고 실행 중인 틱은 안 끊긴다</b>(근거는 {@link #stop()}).
      *
@@ -263,7 +262,7 @@ public class BatchProcessor implements SmartLifecycle {
         // 1. Global Queue에서 최대 MAX_DRAIN 건 drain
         long tickStart = System.nanoTime();
         List<PendingEnqueue> drained = drainGlobalQueue();
-        // 계기판: 몇 건을 빼갔고, 각자 얼마나 기다렸나. "틱 대기"가 지연의 정체였던 적이 있다(§enqueue-drain-interval).
+        // 계기판: 몇 건을 빼갔고, 각자 얼마나 기다렸나. "틱 대기"가 지연의 정체였던 적이 있다(그래서 drain 주기를 1000→20ms 로 줄였다).
         // 🪤 빈 틱은 기록하지 않는다 — 20ms 주기라 초당 50건의 0이 분포를 덮어 백분위가 무의미해진다(실측).
         if (!drained.isEmpty()) {
             drainBatchSize.record(drained.size());
@@ -318,7 +317,7 @@ public class BatchProcessor implements SmartLifecycle {
      * 문제: 사이클 바깥에서만 보면 사이클 하나가 통째로 시한을 넘기는데 아무도 끊어주지 못한다.
      * 해결: <b>청크마다 + 그룹 진입 시</b> 확인한다 — 진입 검사가 없으면 {@code stop()} 경과가 <b>그룹 수에 선형 비례</b>한다(실측: 그룹 3개 → 9,016ms). 남은 청크는 예외로 완결시킨다.
      * 🪤 DB 호출이 <b>2회</b>인 것은 §75 라우팅 때문이다 — 용량 조회(캐시 TTL당 1회)와
-     *    {@code redis_cluster_no} 조회((WAS, queueId)당 평생 1회)다.
+     *    {@code redis_cluster_no} 조회(WAS 프로세스 하나에서 queueId 당 1회)다.
      *
      * @author sonix
      */

@@ -8,8 +8,7 @@ import java.time.LocalDateTime;
  * 이유: enqueue·admit 에서 발급되는 토큰. 이 프로젝트의 원장 단위다(토큰 1장 = 청구 1건).
  * 🔑 <b>이 객체의 시각은 UTC 다</b>(§77) — JVM 기본 TZ 가 UTC 라 이 클래스만 특별하지 않다.
  * 🔴 상태 전이에서 {@code LocalDateTime.now()} 를 부르지 마라 — <b>호출자가 주입</b>한다(테스트 고정).
- * 🔧 옛 주석의 "completedAt·cancelledAt·expiredAt 은 전부 NULL"은 <b>거짓이다</b> —
- *    {@code completed_at} 은 §91 이후 채워지고, cancel 은 §82 에서 폐기돼 존재하지 않는다.
+ * 🔑 {@code completed_at} 은 §91 이후 채워진다. cancel 은 §82 에서 폐기돼 없다.
  *
  * @author sonix
  */

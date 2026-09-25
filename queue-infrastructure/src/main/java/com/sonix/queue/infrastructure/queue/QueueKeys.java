@@ -42,7 +42,8 @@ public final class QueueKeys {
     /**
      * admit된 토큰의 만료 시각 ZSet (score = 만료 epoch ms, member = {@code "seq|identifier"}).
      *
-     * <p>TTL 만료 → WAITING 복귀 배치가 {@code ZRANGEBYSCORE 0 now}로 claim하는 대상이다 (§80).
+     * <p>입장권 만료를 회수하는 배치({@code admit_expire.lua})가 {@code ZRANGEBYSCORE 0 now}로 집어 가는 대상이다.
+     * 대기열로 되돌리지 않는다(§36).
      */
     public static String admitted(String queueId) {
         return "queue:{" + queueId + "}:admitted";

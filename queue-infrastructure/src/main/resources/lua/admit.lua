@@ -70,7 +70,7 @@ for i = 1, #popped, 2 do
 		-- HGET 미스 또는 레거시(구분자 없는 값) → 원래 seq로 되돌리고 건너뛴다.
 		-- 되돌리지 않으면 그 사람은 대기열에서 빠진 채 admitToken도 못 받아 사라진다
 		-- (§80이 ②중간 DB 확인을 폐기한 이유가 바로 그 사고다). admitted에도 안 넣으므로
-		-- Kafka 발행 대상도 아니다 — TTL 만료 복귀와는 다른 경로다.
+		-- Kafka 발행 대상도 아니다 — 입장권 만료 회수와는 다른 경로다.
 		redis.call('ZADD', waitingKey, seq, identifier)
 	else
 		local tokenId = string.sub(stored, 1, sep - 1)

@@ -27,8 +27,8 @@ public class TokenJpaAdapter implements TokenRepository {
 
     /**
      * 이유: 신규 적재(ENQUEUED) SQL. {@code saveAllIfAbsent} 의 파라미터 인덱스가 <b>이 컬럼 순서</b>에 붙어 있다.
-     * 🔑 ODKU 가 완전 no-op 인 것이 핵심 — 뒤늦은 ENQUEUED 가 전이된 행을 되돌리지 않는다.
-     * 🪤 SET 절에 {@code ?} 를 쓰면 다중행 재작성이 조용히 꺼진다.
+     * 🔑 ODKU(ON DUPLICATE KEY UPDATE)가 완전 no-op 인 것이 핵심 — 뒤늦은 ENQUEUED 가 전이된 행을 되돌리지 않는다.
+     * 🪤 SET 절에 {@code ?} 를 쓰면 다중행 재작성({@code rewriteBatchedStatements} — 배치를 INSERT 한 문장으로 바꾸는 드라이버 옵션)이 조용히 꺼진다.
      *
      * @author sonix
      */
@@ -64,8 +64,8 @@ public class TokenJpaAdapter implements TokenRepository {
         Map<TokenEventType, String> sql = new EnumMap<>(TokenEventType.class);
         // 이유: admitted_at 은 **이벤트 값이 아니라 MySQL 의 UTC_TIMESTAMP(3)** 이 찍는다(§90).
         //       앱 시계로 쓰면 한 창을 두 시계로 잰다(실측 S=398 이면 **원장 손상**이다).
-        // 🔑 **값을 정하는 곳은 VALUES 절 하나다** — 이 줄에 또 쓰면 **무동작**이다(결함 주입 실측).
-        // 🔧 단 "쓰는 곳은 한 곳뿐"으로 읽지 마라(§91) — COMPLETED ODKU 가 두 번째로 쓰고 거긴 하중을 받는다.
+        // 🔑 **ADMITTED 의 admitted_at 은 VALUES 절이 정한다** — ODKU SET 에 또 쓰면 new.admitted_at 이 그 값을 가리켜 **무동작**이다(결함 주입 실측).
+        //    COMPLETED 는 admitted_at 이 비어 있으면 SET 절에서 직접 찍는다(§91).
         // ❌ issued_at 은 같이 옮기지 마라 — 멱등 키의 절반이라 재처리마다 새 행이 생긴다.
         sql.put(TokenEventType.ADMITTED, TRANSITION_INSERT + """
                 admit_token = IF(tokens.status = 0, new.admit_token, tokens.admit_token),
@@ -84,8 +84,7 @@ public class TokenJpaAdapter implements TokenRepository {
         // 🔴 출발이 0 뿐인 것은 의도다(§36) — IN (0,1) 로 넓히면 늦은 입장이 거절된다.
         // 🔴 expired_reason 에도 **같은 가드가 필요하다** — 무조건 쓰면 complete 된 토큰에 사유가 박힌다.
         // 🪤 값을 '?' 대신 new.expired_reason 으로 받는다 — ODKU SET 절의 '?' 는 재작성을 조용히 끈다.
-        // 🔴 **"ADMIT_TTL 은 DB 에 남지 않는다"는 거짓이었다**(259건) — 랙 구간엔 0→4 가 적용돼
-        //    admit_token·admitted_at 이 영구 NULL 이 된다.
+        // 🔴 적재가 밀린 구간엔 ADMIT_TTL 도 0→4 로 적용돼 admit_token·admitted_at 이 영구 NULL 이 된다(실측 259건).
         sql.put(TokenEventType.EXPIRED, TRANSITION_INSERT + """
                 expired_reason = IF(tokens.status = 0, new.expired_reason, tokens.expired_reason),
                 status         = IF(tokens.status = 0, 4, tokens.status)""");

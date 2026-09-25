@@ -127,7 +127,7 @@ public class KafkaEnqueueEventPublisher implements EnqueueEventPublisher {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 // 🪤 **이미 센 건(null 자리)을 다시 세지 않는다** — 그러면 failed 가 events 수를
-                //    넘어 로그의 폭발 반경이 부푼다. 남은 것 중 실제로 보낸 것만 센다.
+                //    넘어 로그의 실패 건수가 부푼다. 남은 것 중 실제로 보낸 것만 센다.
                 int unknown = 0;
                 for (int j = i; j < futures.size(); j++) {
                     if (futures.get(j) != null) {

@@ -53,9 +53,8 @@ public interface TokenRepository {
      * complete의 원자 상태 전이 (FRS §6.6). <b>탐색 키는 {@code token_id}</b>이고
      * {@code admit_token}은 입장 자격을 증명하는 술어다.
      *
-     * <p>{@code status IN (0, 1)}로 관대하게 잡는다 — admitToken TTL이 만료돼 WAITING으로
-     * 복귀했는데 Tenant는 이미 유저를 입장시킨 경우가 실재하고, 그때 거절하면 그 자리가
-     * 영원히 안 빠진다. 무한 소급은 {@code validWindowSeconds}가 막는다.
+     * <p>{@code status IN (0, 1)}로 관대하게 잡는다 — 컨슈머가 ADMITTED 를 아직 적재하지 않아
+     * status 가 0 인 정상 입장자가 complete 를 먼저 부를 수 있다(§91). 무한 소급은 {@code validWindowSeconds}가 막는다.
      *
      * @return 갱신된 행 수. 0이면 대상 없음(404).
      */

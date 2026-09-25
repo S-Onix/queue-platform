@@ -20,10 +20,9 @@
 --   ※ "모름"은 반드시 "" 로 — nil/false 는 RESP 변환에서 배열 뒤를 끊는다(Java 의 size() < 7 검사가 전제). §96-16
 
 -- issuedAt을 Hash에 함께 저장하는 이유:
---   tokens 테이블의 UNIQUE KEY가 (token_id, issued_at)이라 issuedAt이 다르면 같은
---   토큰도 다른 row가 된다(= @SQLInsert의 ON DUPLICATE KEY가 흡수하지 못함).
---   outbox 항목을 놓쳤을 때 Redis만 보고 복구하려면 issuedAt을 정확히 되살릴 수
---   있어야 하므로, 발급 시점에 Redis에도 남긴다.
+--   tokens 테이블의 UNIQUE KEY가 (token_id, issued_at)이라 issuedAt이 다르면 같은 토큰도 다른 행이 된다
+--   (ENQUEUE_INSERT 의 ODKU 가 흡수하지 못한다). 뒤의 ADMITTED(admit.lua)·EXPIRED(회수 배치) 발행이
+--   ENQUEUED 와 같은 issuedAt 을 실어야 같은 행을 갱신하므로, 발급 시점에 Redis에도 남긴다.
 
 -- Step 1: 인자 파싱
 local queueKey = KEYS[1]

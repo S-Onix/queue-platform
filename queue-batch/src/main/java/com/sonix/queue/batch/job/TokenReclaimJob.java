@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 문제: 회수하지 않으면 그 사람은 재-enqueue 에서 EXISTS(rank -1)를 받아 <b>영구 락아웃</b>된다.
  * 원인: {@code tokens} Hash 필드가 {@code enqueue_bulk.lua} 의 HSETNX 중복 게이트다.
  * 해결: 그 필드를 지운다. 대기열로 <b>되돌리지 않는다</b>(§36). 셋을 한 잡에 둬 큐 목록 조회를 아낀다.
- * 🔴 ShedLock·분산 락을 쓰지 않는다 — EVAL 자체가 claim 이다(§80 ⑧). 큐 목록은 DB 에서 읽는다.
+ * 🔴 ShedLock·분산 락을 쓰지 않는다 — 조회와 삭제가 한 EVAL 이라 그 자체가 선점(claim)이다(§80 ⑧). 큐 목록은 DB 에서 읽는다.
  *
  * @author sonix
  */
@@ -32,8 +32,8 @@ public class TokenReclaimJob {
 
     /**
      * 이유: 한 큐에서 한 주기에 집어올 최대 건수.
-     * 문제: 만료가 몰리면 Redis 단일 스레드를 오래 붙잡아 같은 노드의 폴링이 함께 밀린다.
-     * 원인: Lua 가 ZREM 에 unpack 으로 인자를 펴므로 Lua 스택 상한(약 8000) 아래여야 한다.
+     * 문제 둘: 만료가 몰리면 Redis 단일 스레드를 오래 붙잡아 같은 노드의 폴링이 함께 밀린다.
+     *        또 Lua 가 ZREM 에 unpack 으로 인자를 펴므로 Lua 스택 상한(약 8000)을 넘을 수 없다.
      * 해결: 500 으로 끊고 남은 몫은 다음 주기(10초)가 가져간다. admit count 상한 300 의 5회분이다.
      * 🪤 만료량이 이 값을 계속 넘으면 처리가 뒤처지는 것이다 — 그때 올릴 값이다.
      *
@@ -217,7 +217,7 @@ public class TokenReclaimJob {
 
     /**
      * 큐 하나를 처리한다. <b>예외를 삼키는 이유</b>: 한 큐(=한 클러스터)의 장애가 나머지 큐의
-     * 복귀까지 막으면 안 된다. 다음 주기가 다시 시도하며, 그 사이 만료분은 {@code admitted}
+     * 회수까지 막으면 안 된다. 다음 주기가 다시 시도하며, 그 사이 만료분은 {@code admitted}
      * ZSet에 그대로 남아 있으므로 유실되지 않는다.
      */
     private int reclaimExpiredAdmits(Queue queue, long now) {
