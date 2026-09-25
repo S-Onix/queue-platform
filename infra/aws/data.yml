@@ -62,7 +62,7 @@ services:
     #    ⚠️ CLI 로 볼 때는 SET time_zone='+00:00' 또는 UTC_* 함수를 써라 (doc/schema.sql:118).
     command: >
       --max_connections=500
-      --innodb_buffer_pool_size=2G
+      --innodb_buffer_pool_size=5G
       --innodb_flush_log_at_trx_commit=1
       --default-time-zone=+09:00
     volumes:
@@ -70,7 +70,9 @@ services:
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
       # 이름 있는 볼륨. down 은 데이터 유지(3일치 누적용), down -v 는 전부 삭제(빈 DB 시작).
       - mysql-data:/var/lib/mysql
-    mem_limit: 4g
+    # 🔑 버퍼풀 5G(14차) — 8차 tokens 4,584MB 가 2G 를 넘어 판 후반이 IO 판이 됐다.
+    #    한도는 버퍼풀 + 연결 버퍼 여유. 노드(m7g.large 8GB)엔 mysql·exporter(200m)뿐이다.
+    mem_limit: 6500m
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
