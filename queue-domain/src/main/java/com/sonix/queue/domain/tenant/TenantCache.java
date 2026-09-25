@@ -3,15 +3,12 @@ package com.sonix.queue.domain.tenant;
 import java.util.Optional;
 
 /**
- * Redis 구현
- * @code infrastructure.cache.RedisTenantCache
+ * 이유: Rate Limit 이 매 인증 요청마다 테넌트를 찾는다 — 버킷 키에 tenantId 문자열이 필요하다.
+ * 해결: Cache Aside(캐시에 있으면 캐시, 없으면 DB). 구현은 {@code infrastructure.cache.RedisTenantCache}.
+ * ⚠️ 한도 자체는 상수라 캐시가 한도를 바꾸지는 않는다(§88 — 등급제 제거).
  *
- * 주 사용처 : Rate Limit이 매 인증 요청마다 테넌트를 찾을 때 (버킷 키에 tenantId 문자열이 필요하다).
- * ⚠️ 한도 자체는 상수라 캐시가 한도를 바꾸지는 않는다 (§88 — 등급제 제거).
- *
- * 사용 패턴 : Cache Aside (캐시에 존재? 캐시에서 가져오기 아니면 DB에서 가져오기)
- *
- * */
+ * @author sonix
+ */
 public interface TenantCache {
 
     /**
