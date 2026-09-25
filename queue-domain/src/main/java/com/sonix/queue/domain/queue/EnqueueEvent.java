@@ -10,8 +10,8 @@ import java.time.Instant;
  * @author sonix
  * @param eventType  {@link TokenEventType} 이름. 아래 정규화 규칙 참조
  * @param admitToken ADMITTED에서 발급된 입장 자격. 그 외 타입은 null일 수 있다
- * @param admittedAt 🔴 <b>값은 적재되지 않는다</b>(§90) — null 여부만 쓰이고 시각은 MySQL 이 찍는다.
- *                   "그대로 적재된다"고 되돌리지 마라. 근거 §96-6
+ * @param admittedAt 🔴 <b>값은 적재되지 않는다</b>(§90) — 시각은 MySQL 이 찍고, 이 필드의 null 여부만 쓰인다.
+ *                   그 null 여부가 입장권 개수({@code SUM(admitted_at IS NOT NULL)})를 만든다. 되돌리지 마라. §96-6
  */
 public record EnqueueEvent(
                 String eventType,

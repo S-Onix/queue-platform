@@ -162,7 +162,7 @@ public class RedisQueueEngine implements QueueEngine {
 
     /**
      * 이유: queueId → 소유 클러스터 판정(§75 이중 라우팅). ①맵 hit ②miss 면 {@code EXISTS ...:seq} 에 응답한 쪽 ③둘 다 없으면 폴백.
-     * 🔑 미스 비용은 (WAS, queueId)당 평생 1회 — seq 키는 INCR 로만 생기고 지워지지 않아 계속 소유권을 증명한다.
+     * 🔑 미스 비용은 (WAS, queueId)당 1회 — seq 키는 INCR 로만 생기고 큐 삭제(purgeDeleted) 전엔 지워지지 않아 소유권을 증명한다.
      * 🪤 읽기 오배송은 안전하다 — 대조 실패 시 아무것도 쓰지 않아 최악이 "빈 결과 1회"다.
      *
      * @author sonix

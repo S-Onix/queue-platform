@@ -108,7 +108,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * 이유: 테넌트 한도 — <b>모든 테넌트에 동일</b>(§88 에서 등급제를 걷어냈다). 유입(enqueue) 지갑이다(§92).
+     * 이유: 테넌트 한도 — <b>모든 테넌트에 동일</b>(§88). 유입 버킷이다 — §92 3분할 중 제어·배출을 뺀 인증 요청 전부가 쓴다.
      * 문제: 100,000 에서는 리미터가 한 건도 막지 않았다(3,000rps × 30초가 capacity 안, 429 0건).
      * 해결: 50,000 으로 내렸다(§89) — 같은 공격이 23.1초에 개입해 15,000건을 막는다.
      * 🪤 refill 은 <b>833.34</b> 다(833.33 이면 TTL 이 121초로 어긋나는데 테스트가 못 잡는다, §89).
@@ -234,8 +234,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /**
      * 이유: tokenId 기준 Token Bucket. 폴링은 인증이 없어 이 키가 유일한 구분자다.
      * 문제: 없는 tokenId 도 버킷을 만든다 — 무작위로 쏘면 요청 1건 = 새 키 1개다(실측 200건 → +200, TTL 65초).
-     * 원인: 종착점이 {@code noeviction} 이라 <b>같은 마스터의 다른 테넌트가 503</b> 을 받는다.
-     * 해결: 키 하나의 크기에 상한을 둔다({@link #MAX_POLL_TOKEN_ID_LENGTH}). tokenId 는 <b>정규화된 경로</b>에서 뽑는다. §96-5
+     * 원인: Redis 가 {@code noeviction}(가득 차면 키를 버리지 않고 쓰기를 거부)이라 <b>같은 마스터의 다른 테넌트가 503</b>.
+     * 해결: 개수는 TTL 65초가 묶는다(상주 키 = 유입률 × 65초). 여기선 <b>키 하나의 크기</b>만 막는다
+     *       ({@link #MAX_POLL_TOKEN_ID_LENGTH}). tokenId 는 정규화된 경로에서 뽑는다 — 정규화 전 경로(%2F 등)면 인코딩 변형마다 새 키다. §96-5
      *
      * @author sonix
      * @return true=통과, false=거부(429 완료).

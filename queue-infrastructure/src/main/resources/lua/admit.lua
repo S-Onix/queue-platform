@@ -21,12 +21,13 @@
 --     "없음"은 반드시 ""/{} 로 표현할 것 (enqueue_bulk.lua와 같은 규약).
 
 -- ⚠️ 동적 키(admit-by-token / admit-by-admit / admit-idem)의 **접두사를 이 파일에 박지 않는다** (§80 ⑥).
---   KEYS[] 로 선언할 수 없는 키라 Redis 의 CROSSSLOT 사전 검사가 걸리지 않는다 — 슬롯이 달라도 같은 노드면 조용히 성공한다.
---   남는 방어는 QueueKeys 를 전수 열거하는 QueueKeysSlotTest 뿐이라 접두사는 Java(QueueKeys)가 만든다. §96-11
+--   어느 tokenId 가 뽑힐지(ZPOPMIN 결과)가 스크립트 안에서야 정해져 KEYS[] 로 선언할 수 없고, 그래서 CROSSSLOT 사전 검사가
+--   걸리지 않는다(슬롯이 달라도 같은 노드면 조용히 성공). 남는 방어는 QueueKeys 를 전수 열거하는 QueueKeysSlotTest 인데,
+--   접두사가 이 파일에 있으면 그 테스트가 닿지 못한다 — 그래서 접두사는 Java(QueueKeys)가 만든다. §96-11
 
 -- ⚠️ admitToken과 시각을 Lua에서 만들지 않는 이유:
---   admitToken은 UUIDv7(랜덤)이라 스크립트가 비결정적이 되고, 만료 시각은 DB(tokens.admitted_at)에
---   저장될 값이라 포맷을 Java가 통제해야 한다 (enqueue_bulk.lua ARGV[3]과 같은 이유).
+--   admitToken은 UUIDv7(랜덤)이라 스크립트가 비결정적이 되고, 만료 시각은 admitted ZSet 의 score 라
+--   테스트가 Clock 을 고정할 수 있게 Java 가 넘긴다. DB 의 admitted_at 은 이 값이 아니라 MySQL 이 찍는다(§90).
 
 local waitingKey = KEYS[1]
 local tokensKey = KEYS[2]

@@ -184,7 +184,7 @@ class TokenJpaAdapterIntegrationTest {
 
     /**
      * <b>도착 순서 역전.</b> enqueue Lua의 ZADD가 Kafka 발행보다 먼저라 ADMITTED가 ENQUEUED보다
-     * 먼저 도착할 수 있고, 프로듀서가 여러 WAS라 브로커 도착 순서도 뒤집힌다.
+     * 먼저 도착할 수 있다 — Redis 커밋과 발행 사이의 틈이라 WAS 1대여도 생긴다(§91).
      * 뒤늦은 ENQUEUED가 status를 0으로 되감으면 그 사람은 <b>입장 자격을 쥔 채 대기자가</b> 된다.
      */
     @Test

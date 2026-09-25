@@ -35,7 +35,7 @@ sequenceDiagram
 
     T->>A: POST /admit {count, requestId}
     A->>R: admit.lua (ZPOPMIN + 입장권 60초)
-    A->>K: ADMITTED 발행
+    A->>K: ADMITTED 발행 (응답 전, 실패해도 200)
     A-->>T: 200 {admitted[]}
     B->>T: admitToken 전달
     T->>A: verify 또는 complete (둘 중 하나)
@@ -108,12 +108,15 @@ sequenceDiagram
 
     T->>A: POST /admit {count ≤ 300, requestId}
     A->>R: admit.lua — 멱등 확인 → ZPOPMIN N → 입장권 SET PX 60s
-    A-->>T: 200 {admitted[]} (ADMITTED 발행은 뒤에서)
+    A-->>T: 200 {admitted[]} (응답 전에 ADMITTED 동기 발행, 실패해도 200)
 
     alt verify (identifier가 필요하면)
         T->>A: POST /admit-tokens/{admitToken}/verify
         A->>R: admit-by-admit 조회 (60초)
-        Note over A: 히트 = 완료 확정 · COMPLETED 발행
+        opt Redis 에 없으면
+            A->>M: admitted_at 60초 안의 행 조회 (폴백)
+        end
+        Note over A: 찾으면 = 완료 확정 · COMPLETED 발행
     else complete (입장 처리가 60초를 넘길 수 있으면)
         T->>A: POST /tokens/{tokenId}/complete
         A->>M: UPDATE status=2 (창 300초, 원장 적재 시점부터)
@@ -129,7 +132,7 @@ sequenceDiagram
 | | verify | complete |
 |---|---|---|
 | 창 | **60초** (Redis 입장권) | **300초** (원장의 `admitted_at`부터) |
-| 권위 | Redis — 원장을 안 읽는다 | **MySQL 먼저**, 모르면 Redis 폴백 |
+| 권위 | **Redis 먼저**, 없으면 원장에서 `admitted_at` 60초 안의 행(9차에 DB 시간 80%를 먹던 그 조회 — 인덱스로 해결) | **MySQL 먼저**, 모르면 Redis 폴백 |
 | 완료 기록 | COMPLETED 이벤트 → 컨슈머 | DB 경로는 직접 `UPDATE`, 폴백만 이벤트 |
 | 둘 다 부르면 | 답은 맞지만 DB 일이 두 배 — **하나만 불러라**(계약 ①) | |
 
@@ -188,7 +191,7 @@ flowchart LR
 
 - **키가 `tokenId`인 이유**: `queueId`로 잡으면 한 큐 30만 명이 한 파티션에 몰린다(§73 D16)
 - **토픽을 안 나누는 이유**: 순서는 같은 토픽·같은 파티션 안에서만 성립한다(§73 D18)
-- 🔑 **그래도 순서에 기대지 않는다** — 프로듀서가 N대라 같은 키도 도착이 뒤집힌다. 가드가 순서와 무관하게 같은 결과를 내도록 짜여 있다([`STATE.md`](STATE.md) T3~T5)
+- 🔑 **그래도 순서에 기대지 않는다** — 입장권은 Redis 커밋 즉시 보이는데 ADMITTED 발행은 그 뒤라, 사용자가 그 틈(로컬 실측 67~128ms)에 완료하면 COMPLETED가 먼저 도착한다(WAS 1대여도 생긴다, §91). 가드가 순서와 무관하게 같은 결과를 내도록 짜여 있다([`STATE.md`](STATE.md) T3~T5)
 
 ---
 

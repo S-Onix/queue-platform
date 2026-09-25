@@ -4,7 +4,7 @@ import java.util.List;
 
 /**
  * 이유: 큐 전광판 — {@code GET /status} 의 응답 원본(§79). <b>30만 명 전원에게 같은 값</b>이다.
- * 문제: 구 {@code frontSeq} 는 단조가 아니어서 화면 순번이 거꾸로 늘었고, {@code total}(ZCARD)은 30만 ZSet 접근이었다.
+ * 문제: 구 {@code frontSeq}·{@code total}(ZCARD)은 30만 ZSet 접근이었다(§36 복귀가 있던 시절엔 만료자가 돌아와 순번이 후퇴도 했다).
  * 해결: {@code lastAdmittedSeq} 는 클 때만 올라가 후퇴하지 않고, 한 키 O(1) 이라 MGET 한 번이다.
  * ⚠️ 캐시가 아니라 원본이다 — Redis 유실 시 0으로 돌아가 전원 순번이 폭증한다(복구는 §71·§79).
  *

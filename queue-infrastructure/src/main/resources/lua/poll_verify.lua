@@ -42,9 +42,9 @@ if sep then storedTokenId = string.sub(stored, 1, sep - 1) end
 
 if storedTokenId ~= tokenId then return 0 end
 
--- 🔴 keepalive 분기를 두지 않는다 (§82 F안). 폴링이 오면 **언제나** 갱신한다 — ka 를 안 붙이는 클라이언트가
---    2초마다 폴링해도 inactive 회수에 걸려 죽던 조용한 사고를 막는다.
---    member 는 ARGV[1] 원문 그대로 — tostring(tonumber()) 는 %.14g 를 거쳐 Java 문자열과 어긋날 수 있다.
+-- 🔴 keepalive 분기를 두지 않는다 (§82 F안). 폴링이 오면 **언제나** 갱신한다 — 예전엔 클라이언트가 ka=true 를
+--    붙여야만 생존으로 쳐서, 안 붙이면 2초마다 폴링해도 inactive 회수에 걸렸다.
+--    member 는 ARGV[1] 원문 그대로 — 배치가 이 member 로 seq 를 되읽는데 tonumber 를 거치면 %.14g 로 어긋날 수 있다.
 redis.call('ZADD', KEYS[3], nowMillis, ARGV[1])
 
 return 1

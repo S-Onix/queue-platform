@@ -778,7 +778,7 @@ Response: { "status": "COMPLETED", "completedAt": "..." }
 | `COMPLETED` | **0 · 1** | `IF(status IN (0,1), 2, status)` + `admit_token`·`admitted_at`·`completed_at` 보정 (§91) |
 | `EXPIRED` | 0 | `IF(status = 0, 4, status)` |
 
-> 🔴 **순서를 파티션에 기대지 않는다.** 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있고,
+> 🔴 **순서를 파티션에 기대지 않는다.** Redis 커밋과 Kafka 발행 사이의 틈 때문에 WAS 1대여도 도착 순서가 뒤집힌다(§91),
 > 특히 `ZADD`(enqueue Lua)가 Kafka 발행보다 먼저라 **`ENQUEUED`보다 `ADMITTED`가 먼저 도착**할 수 있다.
 > `ENQUEUED`의 no-op upsert가 그 역전을 흡수한다.
 >

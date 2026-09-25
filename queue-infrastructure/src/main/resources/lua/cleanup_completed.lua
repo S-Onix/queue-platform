@@ -7,7 +7,8 @@
 -- KEYS[4]: admit-by-token key (예: queue:{q_bts}:admit-by-token:tok_x) — String
 -- KEYS[5]: admit-by-admit key (예: queue:{q_bts}:admit-by-admit:adm_x) — String  **선택(§92)**
 --   🔴 KEYS[5] 는 complete 만 넘긴다. verify 는 admit-by-admit 을 **일부러 남긴다** — verify 재시도와
---   complete 폴백의 유일한 근거라서다(PX 60s 가 거둔다). 나머지 넷은 완료 경로 둘 다 지운다(§92).
+--   complete 폴백의 유일한 근거라서다(PX 60s 가 거둔다). 나머지 넷은 verify·complete 둘 다 지운다 — 남기면 완료자가
+--   옛 토큰으로 재입장하고 과금이 경로마다 갈린다(§92).
 --   다섯 키를 Java 가 실행 전에 다 알아 KEYS 로 선언한다 → CROSSSLOT 사전 검사가 실제로 걸린다. §96-13
 -- ARGV[1]: identifier
 -- ARGV[2]: seq (문자열 원문. Java가 Long.toString으로 넘긴다)
@@ -17,9 +18,9 @@
 --          0  🔴 이미 **다른 회차**가 자리를 차지하고 있어 건드리지 않았다 (가드가 막은 것)
 --         -1  정리할 게 애초에 없었다 (이미 정리됐거나 고아)
 --   ⚠️ 0과 -1을 합치지 마라 — 합치면 "축출을 막았다" WARN 이 아무 일 없던 경우에도 찍혀 빈도가 의미를 잃는다.
---      이 카운트가 §36(60초)과 complete 창(300초)의 240초 모순이 얼마나 열리는지 재는 유일한 수단이다.
+--      이 카운트가 아래 "240초 창"(입장권 60초 vs complete 300초)이 실제로 얼마나 열리는지 재는 유일한 수단이다.
 
--- 🔴 **왜 회차 대조가 필요한가.** identifier 는 회차 간에 재사용된다. 입장권이 만료되면(60초) 게이트가 풀려
+-- 🔴 **왜 회차 대조가 필요한가.** identifier 는 회차 간에 재사용된다. 입장권이 만료되면(60초) 중복 게이트(tokens Hash 필드)가 풀려
 --   곧바로 **새 회차**를 받는데, complete 창은 300초다 — 그 240초 안에 옛 회차의 늦은 complete 가 오면
 --   identifier 만 보고 지울 경우 **새 회차의 자리와 게이트를 지운다**(피해자에게 신호도 없다).
 -- 🔴 **왜 Lua 인가.** Java 에서 HGET → 비교 → HDEL 로 쪼개면 같은 결함이 TOCTOU 로 재발하고, 중간에 죽으면

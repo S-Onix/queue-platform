@@ -200,11 +200,11 @@ public class TokenJpaAdapter implements TokenRepository {
     }
 
     /**
-     * 이유: 가드 UPDATE 한 문장. {@code @Modifying} 은 트랜잭션이 없으면 실행되지 않아 여기서 연다.
-     * 문제: 호출자의 트랜잭션에 얹혀 있던 때는 Redis 왕복과 Kafka 동기 발행(12초)까지 커넥션을 쥐었다.
-     * 해결: 트랜잭션을 DB 작업 하나로 좁혔다. 🔴 지우면 complete 가 런타임에 죽는다(markCompleted_withoutAmbientTransaction).
-     * 🔴 {@code READ COMMITTED} 여야 한다 — WHERE 가 유니크키 절반이라 RR 에선 갭락 ↔ 컨슈머 INSERT 데드락(1213)으로 500
-     *    (실측 24/24, 커버 markCompleted_doesNotDeadlockWithConsumerInsert). §95 · §96-8
+     * 이유: 가드 UPDATE 한 문장. {@code @Modifying} 은 트랜잭션이 없으면 실행되지 않아 여기서 연다 — 지우면 complete 가 죽는다.
+     * 해결: 호출자 트랜잭션에 얹혀 Redis 왕복·Kafka 동기 발행(12초)까지 커넥션을 쥐던 것을 DB 작업 하나로 좁혔다.
+     * 🔴 {@code READ COMMITTED} 여야 한다 — WHERE 가 유니크키 (token_id, issued_at)의 앞 절반뿐이라 REPEATABLE READ 에선
+     *    빈 구간(갭)까지 잠그고, 컨슈머가 그 구간에 INSERT 하면 서로 기다려 데드락(1213) → 500 이다(실측 24/24,
+     *    커버 markCompleted_doesNotDeadlockWithConsumerInsert). §95 · §96-8
      *
      * @author sonix
      */

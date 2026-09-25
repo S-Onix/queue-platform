@@ -85,7 +85,7 @@ public class TokenReclaimJob {
 
     /**
      * 이유: 주기 10초(FRS §10). 설정 키가 {@code reclaim} 인 이유 — admit 만료와 inactive 이탈을 <b>둘 다</b> 회수한다.
-     * 문제: {@code fixedRate} 는 한 바퀴가 10초를 넘으면 틱을 겹쳐 쌓는다(정합성은 claim 이 지키지만 Redis 왕복이 배).
+     * 문제: {@code fixedRate} 는 한 바퀴가 10초를 넘으면 틱을 겹쳐 쌓는다(정합성은 Lua 의 선점 claim 이 지키지만 Redis 왕복이 두 배가 된다).
      * 해결: {@code fixedDelay}. 키를 admit-expiry 로 두면 "admit 만 늦춘다"고 오해해 이탈 회수까지 늦춘다.
      *
      * @author sonix

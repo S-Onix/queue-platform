@@ -216,11 +216,11 @@ public class QueueEngineService {
     }
 
     /**
-     * 이유: ADMITTED 발행 — 실패해도 예외를 올리지 않는다(Lua 가 이미 커밋돼 5xx 면 REPLAY 가 무한 반복, FRS §6.4).
+     * 이유: ADMITTED 발행 — 실패해도 예외를 올리지 않는다. Lua 가 이미 커밋돼 5xx 를 주면 Tenant 재시도가
+     *       같은 requestId 의 저장된 결과(REPLAY)만 끝없이 받는다(FRS §6.4).
      * 문제: 건별 ack 대기는 지연이 건수에 선형이었다(AWS 12차 300건 p50 1.797초).
-     * 해결: 전량 보낸 뒤 한 번에 기다린다(publishAll). 첫 실패에서 끊지 않는다 — 폭발 반경 N → 1.
-     *       REPLAY 도 발행한다(멱등이라 무해, 첫 실패의 유일한 복구 경로).
-     * ⚠️ 실패분은 복구되지 않는다 — 흔적은 ERROR 로그와 result=error 뿐이고 60초 뒤 complete 는 404 다. §96-1 · §80 U9
+     * 해결: 전량 보낸 뒤 한 번에 기다리고 첫 실패에서 끊지 않는다. REPLAY 도 다시 발행한다(적재가 멱등 — 같은 requestId 재시도가 유일한 복구 경로). §96-1
+     * ⚠️ 재시도가 없으면 실패분은 Redis 입장권(60초)만 있고 DB 엔 없어 60초 뒤 complete 가 404 다. 흔적은 ERROR 로그와 result=error.
      *
      * @author sonix
      * @return 원장을 잃은 건수 (발행 실패 + issuedAt 미확인으로 발행조차 못 한 건)
@@ -264,7 +264,7 @@ public class QueueEngineService {
 
     /**
      * 이유: Verify — admitToken 이 지금 유효한지 답하고, <b>그 응답이 곧 완료다</b>(FRS §6.5 · PR #48).
-     * 해결: DB 쓰기 0회 — COMPLETED 를 발행하고, Redis 는 admit-by-admit 만 남긴다(60초 안 재-verify 통과, §92).
+     * 해결: DB 쓰기 0회 — COMPLETED 를 발행하고, Redis 는 입장권→토큰 역조회 키(admit-by-admit)만 남긴다(60초 안 재-verify 통과, §92).
      * 🔴 @Transactional 을 걸지 마라 — Kafka 동기 발행(최대 12초) 동안 커넥션을 쥔다. 폴백 조회는 master 로 간다(§4-3). §96-2
      *
      * @author sonix
@@ -338,7 +338,7 @@ public class QueueEngineService {
     /**
      * 이유: Complete — Tenant 가 입장 완료를 통보한다(FRS §6.6). 판정은 DB 먼저, 0행이면 Redis 폴백이다(§93).
      * 문제: 0행에는 ①자격 없음 ②컨슈머가 ADMITTED 를 아직 적재 안 함이 섞인다 — ②를 404 로 돌리면 정상 입장자가 거절된다.
-     * 🔴 폴백은 입장 후 60초까지만 덮는다. 적재가 L>60초 밀리면 (60, L) 은 TK002 다 — 일시적이라 재시도하면 200(eb57107).
+     * 🔴 폴백은 입장 후 60초까지만 덮는다. 적재가 60초 넘게(L초) 밀리면 입장 후 60~L초의 complete 는 404(TK002)이고, 적재가 따라잡으면 재시도로 200이다.
      * 🔴 @Transactional 을 다시 붙이지 마라 — Redis 왕복과 폴백의 Kafka 동기 발행(12초) 동안 커넥션을 쥔다.
      *    DB 작업은 markCompleted 한 문장이고 트랜잭션은 어댑터가 갖는다. 근거·실측 §96-3 · §95
      *

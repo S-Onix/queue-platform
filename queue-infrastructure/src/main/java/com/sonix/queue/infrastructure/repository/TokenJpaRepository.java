@@ -118,11 +118,11 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
                             @Param("limit") int limit);
 
     /**
-     * 이유: 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq(없으면 NULL → 호출자가 0).
+     * 이유: 대사 기준선 — 발급 후 정착 시간(5분, 적재가 끝났다고 보는 여유)이 지난 것 중 가장 큰 seq(없으면 NULL → 호출자가 0).
      * 문제: 커버링 인덱스(FORCE INDEX — 옵티마이저가 안 골랐다)로도 큐의 전체 이력을 훑었다(14차 35만 행 463ms, 계속 는다).
-     * 해결: 경계에서 거꾸로 {@value #SETTLED_SCAN_ROWS}행만 읽는다 — 상수 비용(로컬 45,923행 35ms → 1.32ms).
-     * 🪤 LIMIT 1 로 줄이지 마라 — issued_at 은 N대의 앱 시계라 seq 와 역전된다. K행의 MAX 는 역전이 K행 밖이면
-     *    <b>더 작게만</b> 틀린다(양쪽이 같은 경계를 세므로 오탐 없음). 인덱스 이름이 바뀌면 에러로 죽는다. §96-10
+     * 해결: 그 기준 시각(경계)에서 거꾸로 {@value #SETTLED_SCAN_ROWS}행만 읽는다 — 상수 비용(로컬 45,923행 35ms → 1.32ms).
+     * 🪤 LIMIT 1 로 줄이지 마라 — issued_at 은 N대의 앱 시계라 seq 와 역전된다. {@value #SETTLED_SCAN_ROWS}행의 MAX 는 역전이 그 밖이면
+     *    <b>더 작게만</b> 틀리고, Redis ZCOUNT·DB COUNT 가 같은 기준선으로 세므로 경계 근처가 다음 주기로 밀릴 뿐이다. §96-10
      *
      * @author sonix
      */
