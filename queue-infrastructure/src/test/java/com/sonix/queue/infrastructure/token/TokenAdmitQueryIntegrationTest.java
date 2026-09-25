@@ -4,6 +4,7 @@ import com.sonix.queue.domain.queue.Token;
 import com.sonix.queue.domain.queue.TokenEventType;
 import com.sonix.queue.domain.queue.TokenStatus;
 import com.sonix.queue.infrastructure.adapter.TokenJpaAdapter;
+import com.sonix.queue.infrastructure.repository.TokenJpaRepository;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -17,6 +18,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -462,6 +464,35 @@ class TokenAdmitQueryIntegrationTest {
         // 🪤 status를 보지 않는다 — 대사 기준선은 "발행된 것 중 가장 큰 seq"라야 한다.
         jdbc.update("UPDATE tokens SET status = 2 WHERE token_id = ?", "tok_dev_r9");
         assertThat(adapter.findSettledMaxSeq(QUEUE_ID, cutoff)).isEqualTo(30L);
+    }
+
+    @Test
+    @Transactional
+    @DisplayName("findSettledMaxSeq: 경계에서 거꾸로 K행만 본다 — 시계 역전이 K행 안이면 전수와 같고, 밖이면 더 작은 값을 준다")
+    void findSettledMaxSeq_readsOnlyRecentRowsAndFailsLow() {
+        // 앞선 앱 시계가 찍은 토큰: seq 는 가장 크지만 issued_at 은 가장 이르다(역전).
+        LocalDateTime base = ISSUED_AT;
+        jdbc.update("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, "tok_skew", QUEUE_ID, tenantId, "u-skew", 5_000L, base);
+        int k = TokenJpaRepository.SETTLED_SCAN_ROWS;
+        List<Object[]> rows = new ArrayList<>();
+        for (int i = 1; i <= k; i++) {
+            rows.add(new Object[]{"tok_k" + i, QUEUE_ID, tenantId, "u-k" + i, (long) i, base.plusNanos(i * 1_000_000L)});
+        }
+        jdbc.batchUpdate("""
+                INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """, rows);
+        LocalDateTime cutoff = base.plusMinutes(1);
+
+        // 역전된 행이 K행 밖(issued_at 순 K+1번째) → 보지 않는다. 더 작은 쪽으로만 틀린다 = 경계가 안쪽으로 줄 뿐이다.
+        assertThat(adapter.findSettledMaxSeq(QUEUE_ID, cutoff)).isEqualTo(k);
+
+        // 한 행을 빼 역전을 K행 안으로 들이면 전수와 같다.
+        jdbc.update("DELETE FROM tokens WHERE token_id = ?", "tok_k1");
+        assertThat(adapter.findSettledMaxSeq(QUEUE_ID, cutoff)).isEqualTo(5_000L);
     }
 
     private int statusOf(String tokenId) {
