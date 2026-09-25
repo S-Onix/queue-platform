@@ -650,7 +650,7 @@ mysql -u root -p -P 3307  # Replica
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
 | `doc/API.md` | ⭐ **엔드포인트 18개 필드 단위 명세** — 요청/응답/에러/인증. 코드에서 추출 |
 | `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 8건 + 흔한 실수 |
-| `doc/DECISIONS.md` | 95개 설계 결정 + 근거 + 면접 포인트 (최신 §95 — markCompleted READ COMMITTED, complete 데드락 제거) |
+| `doc/DECISIONS.md` | 96개 설계 결정 + 근거 + 면접 포인트 (최신 §96 — 주석에서 옮긴 근거 원문, 2026-09-25) |
 | `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (§79 분할은 **반영 완료**) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |
 | `doc/FLOW.md` | Enqueue, Polling, Admit, Complete, Batch 흐름도 |

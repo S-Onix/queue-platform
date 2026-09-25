@@ -1058,7 +1058,7 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 - [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis Sentinel/Cluster/Kafka/k6/Prometheus/Grafana)
 - `AWS_LEARNING_PATH.md` — **미작성.** Sprint 11 대비 AWS 병렬 학습 경로 (파일 없음, 링크 걸지 말 것)
 - [FRS v1.16](FRS_final.md) — 기능 정의
-- [DECISIONS](DECISIONS.md) — 95개 설계 결정 (최신 §95) (기능별 목차는 문서 맨 앞)
+- [DECISIONS](DECISIONS.md) — 96개 설계 결정 (최신 §96) (기능별 목차는 문서 맨 앞)
 - [FLOW](FLOW.md) — 상세 흐름도
 - [STATE](STATE.md) — 상태 머신
 - [CONCURRENCY](CONCURRENCY.md) — 동시성 제어
