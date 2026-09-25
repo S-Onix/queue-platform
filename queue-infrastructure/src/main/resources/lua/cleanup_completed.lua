@@ -6,24 +6,9 @@
 -- KEYS[3]: tokens key         (예: queue:{q_bts}:tokens)               — Hash, identifier -> "tokenId|issuedAt"
 -- KEYS[4]: admit-by-token key (예: queue:{q_bts}:admit-by-token:tok_x) — String
 -- KEYS[5]: admit-by-admit key (예: queue:{q_bts}:admit-by-admit:adm_x) — String  **선택(§92)**
---   🔴 KEYS[5]는 complete만 넘긴다. verify는 KEYS 4개로 부른다 — admit-by-admit을 **일부러 남긴다**.
---   그 키 하나가 두 재시도의 근거라서다: ① Tenant가 verify 응답을 못 받고 다시 부르는 verify
---   (§22가 verify를 비소비로 둔 이유), ② verify → complete를 둘 다 부르는 Tenant의 complete가
---   컨슈머 백로그·§91 발행 지연 구간에서 DB 0행일 때 타는 Redis 폴백. 지우면 둘 다 404가 되고,
---   막으려면 §80이 폐기한 verified-token 표식이 다시 필요하다. PX 60s가 알아서 거둔다.
---   반대로 complete는 자기 재시도가 DB(status=2 + admit_token 대조)로 답하므로 지워도 된다.
---   나머지 넷은 "이 사람이 아직 회차 안"이라는 뜻이라 완료 경로 둘 다 지운다 — 안 지우면
---   verify-only 완료자가 60초 동안 옛 토큰으로 무료 재입장하고, 과금이 경로에 따라 1 vs 2로
---   갈리며, 회수 배치가 완료자를 admit 만료자로 세어 헛 EXPIRED를 발행한다(2026-09-11 실측).
---   다섯 모두 QueueKeys의 정적 팩토리가 {queueId} 해시태그를 붙인다 = 같은 슬롯.
---   ⚠️ admit-by-* 를 admit.lua처럼 ARGV 접두사로 받지 않는다. 여기서는 tokenId·admitToken이 둘 다
---   호출자 손에 있어 **Java가 다섯 키 이름을 실행 전에 전부 안다** — 그러면 KEYS로 선언할 수 있고,
---   선언하면 Redis의 CROSSSLOT 사전 검사가 **실제로 걸린다**(실증: 태그가 다른 키를 섞으면
---   "CROSSSLOT Keys in request don't hash to the same slot"). admit.lua가 경고하는 "선언 없는
---   동적 키는 슬롯이 달라도 같은 노드면 조용히 성공"(마스터 4대 = 약 25%)이 여기선 원천 차단된다.
---   🪤 admit.lua가 왜 ARGV를 쓰는지는 여기서 단정하지 마라 — 그 파일의 admit-by-*는 tokenId가
---   스크립트 안 HGET 결과라 Java가 미리 모르지만, admit-idem은 완성 키인데도 ARGV다(admit.lua:12).
---   근거가 하나로 정리돼 있지 않으니, 이 파일의 선택은 이 파일 사정으로만 정당화한다.
+--   🔴 KEYS[5] 는 complete 만 넘긴다. verify 는 admit-by-admit 을 **일부러 남긴다** — verify 재시도와
+--   complete 폴백의 유일한 근거라서다(PX 60s 가 거둔다). 나머지 넷은 완료 경로 둘 다 지운다(§92).
+--   다섯 키를 Java 가 실행 전에 다 알아 KEYS 로 선언한다 → CROSSSLOT 사전 검사가 실제로 걸린다. §96-13
 -- ARGV[1]: identifier
 -- ARGV[2]: seq (문자열 원문. Java가 Long.toString으로 넘긴다)
 -- ARGV[3]: tokenId (완료를 신청한 회차)
@@ -31,27 +16,14 @@
 -- Returns: 1  자기 회차를 정리했다
 --          0  🔴 이미 **다른 회차**가 자리를 차지하고 있어 건드리지 않았다 (가드가 막은 것)
 --         -1  정리할 게 애초에 없었다 (이미 정리됐거나 고아)
---   ⚠️ 0과 -1을 합치지 마라. 늦은 complete는 -1로도 오는데(TTL 만료 뒤 재-enqueue 없이 complete),
---      합치면 Java의 WARN이 "축출을 막았다"를 아무 일도 없던 경우에까지 찍어 **빈도 자체가
---      의미를 잃는다**. 이 카운트는 §36(60초)과 complete 창(300초)의 240초 모순이 실제로 얼마나
---      열리는지를 재는 유일한 수단이라, 오탐이 섞이면 재는 의미가 없다.
+--   ⚠️ 0과 -1을 합치지 마라 — 합치면 "축출을 막았다" WARN 이 아무 일 없던 경우에도 찍혀 빈도가 의미를 잃는다.
+--      이 카운트가 §36(60초)과 complete 창(300초)의 240초 모순이 얼마나 열리는지 재는 유일한 수단이다.
 
--- 🔴 **왜 회차 대조가 필요한가.**
---   identifier는 사람 이름표라 회차 간에 재사용된다(같은 사용자 = 같은 UUIDv7). 반면 이 정리는
---   한 회차를 끝내는 일이다. §36이 admitToken TTL 만료 시 tokens Hash를 HDEL해 중복 게이트를
---   풀어주므로, 만료된 사람은 곧바로 재-enqueue해 **새 회차**를 받는다. 그런데 complete의
---   유효 창은 Token.COMPLETE_VALID_WINDOW_SECONDS(300초)이고 admitToken TTL은 60초다 —
---   그 **240초 차이** 동안 옛 회차의 늦은 complete가 도착하면, identifier만 보고 지울 경우
---   **새 회차의 자리(waiting)와 게이트(tokens)를 지운다.** 피해자는 이미 만료로 한 번 손해 본
---   사람이고, 폴링이 조용히 404가 될 뿐 아무 신호가 없다(§4번 항목의 상용 차단 결함).
---
--- 🔴 **왜 Lua여야 하는가 (원자성).**
---   Java에서 HGET → 비교 → HDEL로 쪼개면 그 사이에 admit_expire + 재-enqueue가 끼어들어
---   **같은 결함이 TOCTOU로 재발**한다. 240초 창이 마이크로초 창으로 줄 뿐 사라지지 않는다.
---   부수 효과가 하나 더 있다: 명령 4개 시절에는 ZREM들만 성공하고 HDEL 직전에 프로세스가 죽으면
---   (seq, identifier) 쌍을 아는 자료구조가 **0**이 되어(admitted·waiting 모두 삭제됨) 세 회수
---   배치 어디도 그 사람에게 닿지 못했다 — **해소 경로 없는 영구 락아웃**이었다. EVAL 1회면
---   그 중간 상태 자체가 생기지 않는다.
+-- 🔴 **왜 회차 대조가 필요한가.** identifier 는 회차 간에 재사용된다. 입장권이 만료되면(60초) 게이트가 풀려
+--   곧바로 **새 회차**를 받는데, complete 창은 300초다 — 그 240초 안에 옛 회차의 늦은 complete 가 오면
+--   identifier 만 보고 지울 경우 **새 회차의 자리와 게이트를 지운다**(피해자에게 신호도 없다).
+-- 🔴 **왜 Lua 인가.** Java 에서 HGET → 비교 → HDEL 로 쪼개면 같은 결함이 TOCTOU 로 재발하고, 중간에 죽으면
+--   어느 회수 배치도 닿지 못하는 영구 락아웃이 된다. EVAL 1회면 그 중간 상태가 없다. §96-14
 
 local identifier = ARGV[1]
 local seq = ARGV[2]   -- 문자열 그대로 쓴다. tonumber를 거치면 Lua 숫자 포맷(%.14g)이 섞여
@@ -59,12 +31,8 @@ local seq = ARGV[2]   -- 문자열 그대로 쓴다. tonumber를 거치면 Lua �
 local tokenId = ARGV[3]
 
 -- ── 회차 고유 키는 무조건 지운다 ──────────────────────────────────────────────
--- member에 seq가, 키 뒷조각에 tokenId/admitToken이 박혀 있다. 셋 다 회차마다 유일하므로
--- (seq=INCR, tokenId·admitToken=UUIDv7) 남의 회차를 지울 수 없다. 대조가 필요 없다.
--- 🔴 반대로 여기에 회차 가드를 걸면 안 된다 — 걸 이유가 없고(남의 회차를 지울 수 없다), 걸면
---    HGET 미스인 경로에서 이 셋이 남는다. admit-by-admit(KEYS[5])은 verify가 넘기지 않아
---    verify 뒤 60초 안 같은 admitToken의 verify는 계속 통과한다 — 결함이 아니라 재시도 계약이다
---    (머리말 KEYS[5] 참조, API.md "admitToken을 소비하지 않는다").
+-- member 의 seq, 키의 tokenId/admitToken 은 회차마다 유일해(INCR · UUIDv7) 남의 회차를 지울 수 없다 — 대조가 필요 없다.
+-- 🔴 여기에 회차 가드를 걸면 HGET 미스 경로에서 이 셋이 남는다. admit-by-admit(KEYS[5])은 verify 가 안 넘긴다(재시도 계약).
 redis.call('ZREM', KEYS[2], seq .. '|' .. identifier)
 redis.call('DEL', KEYS[4])
 if KEYS[5] then redis.call('DEL', KEYS[5]) end
@@ -79,11 +47,8 @@ if not stored then
 end
 
 -- 🔴 구분자가 없으면 **값 전체를 tokenId로 본다** (poll_verify.lua·enqueue_bulk.lua와 같은 규약).
---    "미스 취급"으로 두면 롤링 배포 중 남은 구 포맷 값에서 완료자의 게이트가 영영 안 풀려
---    영구 락아웃이 된다 — 현행 무조건 HDEL보다 나빠지는 유일한 지점이라 반드시 이쪽이다.
---    (issuedAt이 필요한 admit_expire.lua·inactive_expire.lua는 반대 규약을 쓴다. 거긴 멱등 키
---     (token_id, issued_at)이 성립하지 않아 발행 자체가 불가능하기 때문이고, 여기선 이벤트
---     재료가 이미 AdmitRef/Token에 있어 issuedAt이 필요 없다.)
+--    "미스 취급"이면 구 포맷 값에서 완료자의 게이트가 영영 안 풀려 영구 락아웃이 된다.
+--    (admit_expire·inactive_expire 는 반대 규약 — issuedAt 없이는 멱등 키가 안 서서 발행 자체가 불가능하다)
 local sep = string.find(stored, '|', 1, true)
 local storedTokenId = stored
 if sep then storedTokenId = string.sub(stored, 1, sep - 1) end

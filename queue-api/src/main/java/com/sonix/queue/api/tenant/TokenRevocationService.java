@@ -8,15 +8,11 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 
 /**
- * Refresh Token 폐기 전용 서비스
+ * 이유: Refresh Token 폐기 전용 서비스 — {@code REQUIRES_NEW} 로 별도 트랜잭션에서 커밋한다.
+ * 문제: 재사용 공격을 감지한 요청은 예외로 끝나 호출 측 트랜잭션이 롤백된다.
+ * 해결: 폐기만 따로 커밋해 롤백과 무관하게 남긴다. 호출처는 refresh 의 재사용 감지 두 곳뿐이다(TenantService).
  *
- * @Transactional(propagation = REQUIRES_NEW)로 별도 트랜잭션에서 실행.
- * 호출 측 트랜잭션이 ROLLBACK되어도 폐기는 영구 커밋됨.
- *
- * 사용 시점:
- *   - 재사용 공격 감지 시 (refresh() 안에서 호출)
- *   - 관리자 강제 폐기 (운영 도구)
- *   - 비밀번호 변경 시 (선택)
+ * @author sonix
  */
 @Service
 public class TokenRevocationService {

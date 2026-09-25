@@ -8211,3 +8211,652 @@ RC로 잃는 것이 없다 — 이 트랜잭션은 **UPDATE 한 문장**이라 �
 - 🪤 **추론으로 판단하지 마라** — 8차 3인 재분석이 합의한 범인이 실측과 달랐다. 데드락은 흔적을 남기게
   하고(폴링 또는 `innodb_print_all_deadlocks`) 잡힌 쌍으로 판정한다
 - 증거: `~/queue-platform-it/deadlock-20260924/`(비커밋 — 데드락 원문 24건 · 재현 스크립트 · 리허설 결과)
+
+---
+
+## §96 — 주석에서 옮긴 근거 (주석 5줄 규칙 적용, 2026-09-25)
+
+> 코드 주석은 **5줄 이내 + 이 절 참조**로 줄였다. 아래는 줄이기 전 원문 그대로다 — 이력·실측·함정이
+> 들어 있어 버리지 않는다(사용자 확정 2026-09-18). 원문의 줄 번호는 이관 시점(dev `dfcc54f`) 기준이다.
+
+### §96-1 `QueueEngineService.java:218`
+
+```java
+    /**
+     * 이유: ADMITTED 발행 — <b>실패해도 예외를 올리지 않는다</b>(FRS §6.4).
+     * 원인: Lua 가 이미 커밋돼 되돌릴 수 없다 — 5xx 를 주면 재시도가 REPLAY 무한 반복이 된다.
+     * 해결: REPLAY 도 발행한다 — 중복은 멱등이라 무해하고 <b>첫 발행 실패의 유일한 복구 경로</b>다.
+     * 🔑 <b>전량 발행 뒤 한 번에 기다린다</b>({@code publishAll}) — 예전의 건별 ack 루프는
+     *    지연이 건수에 선형이었다(AWS 12차 실측 300건 p50 <b>1.797초</b>, 건당 5.99ms).
+     * 🔴 <b>첫 실패에서 끊지 않는다.</b> Kafka 에 트랜잭션이 없어 레코드가 서로 독립이므로,
+     *    끊으면 재수 없는 1건이 <b>나머지 299건의 원장까지</b> 데려간다(폭발 반경 N → 1).
+     * ⚠️ 실패분은 자동 복구되지 않는다 — ERROR 로그와 {@code result=error} 가 유일한 흔적이다.
+     *    그 토큰은 Redis 엔 admitToken 이 있고 DB 엔 ADMITTED 가 없어 complete 가 영구 404 다(§80 U9).
+     *
+     * @author sonix
+     * @return 원장을 잃은 건수 (발행 실패 + issuedAt 미확인으로 발행조차 못 한 건)
+     */
+```
+
+### §96-2 `QueueEngineService.java:269`
+
+```java
+    /**
+     * Verify — admitToken이 지금 유효한지 답하고, <b>그 응답이 곧 완료다</b> (FRS §6.5 · PR #48).
+     * <b>DB 쓰기 0회.</b> Redis는 회차 키 넷을 정리하되 {@code admit-by-admit}은 남긴다(§92) — 그래서
+     * 같은 admitToken의 verify는 60초 안에 계속 통과한다(재시도 계약). {@code COMPLETED}는 응답과 함께 발행한다.
+     *
+     * @return identifier (Tenant가 어느 사용자인지 알아야 하므로)
+     * @throws BusinessException 유효하지 않으면 404 {@code INVALID_ADMIT_TOKEN}
+     */
+    // 이유: **트랜잭션을 걸지 않는다.** verify 는 Kafka 를 동기로 기다린다(send-timeout 12초).
+    // 문제: 트랜잭션 안이면 커넥션을 그 끝까지 쥔다 — 게이트 개방 순간 입장자 수만큼 몰리는 곳이라 자해다.
+    // 🪤 **폴백 조회는 master 로 간다** — 가르는 것은 메서드가 아니라 readOnly 트랜잭션 여부다(§4-3).
+    //    안 거는 판단은 유지한다. 대가가 replica 풀이 아니라 **master 풀 점유**일 뿐이다.
+```
+
+### §96-3 `QueueEngineService.java:345`
+
+```java
+    /**
+     * 이유: Complete — Tenant 가 입장 완료를 통보한다(FRS §6.6).
+     * 문제: <b>판정 권위는 DB 가 먼저, 그 다음이 Redis 다.</b> {@code markCompleted} 가 0행일 때
+     *       거기엔 둘이 섞여 있다 — ①자격 없음 ②<b>컨슈머가 ADMITTED 를 아직 적재 안 함</b>.
+     * 해결: ②까지 404 로 돌리면 <b>정상 입장자가 거절된다</b>. 그래서 0행일 때만 Redis 로 폴백한다.
+     * 🔑 근거는 <b>불변식</b>이다 — Redis 창(60초) ⊂ DB 창(300초)이다(§93).
+     *
+     * @author sonix
+     */
+    // 🔴 **@Transactional 을 다시 붙이지 마라**(2026-09-23 제거). 이 메서드 안에는 Redis 왕복
+    //    (cleanupCompleted)과 폴백 경로의 **Kafka 동기 발행**(send-timeout 12초)이 있다 — 트랜잭션 안에 두면
+    //    그 12초 동안 DB 커넥션을 쥔다. 게이트 개방 직후 complete 가 몰리는 구간이라 자해다.
+    //    🔑 위 verify·admit 이 **같은 이유로** 트랜잭션을 안 쓴다 — complete 만 비대칭이었고
+    //       그 비대칭 자체가 결함이었다(dba·code-reviewer 독립 2인 지적).
+    //    🔑 Little: L = λW 다. **평시 이득은 0.1 커넥션으로 무의미하다**(0.70 → 0.60~0.64).
+    //       값은 전부 꼬리에 있다 — Kafka 가 send-timeout 12초까지 늘어지면 예전엔
+    //       108.6 req/s × 12s = **1,303 커넥션**을 요구했다. 실제 풀은 **인스턴스당 20**
+    //       (application-prod.yml) × api 6개 = **합 120** 이라 **10.9배**다. 풀은 enqueue·admit·
+    //       verify 와 공유라 complete 하나가 **API 전체를 고갈**시켰다(9차의 연결 거절 8,296회와 같은 모양).
+    //    🔴 **mysql CPU 가 내려간다고 쓰지 마라** — 커밋 횟수도, COMMIT 평균 5.09ms 도 안 변한다
+    //       (문장 수·내용·격리수준 동일. 락 대기는 잠들기라 CPU 로도 안 나타난다). 재측정의 판정
+    //       지표는 hikaricp_connections_pending · 커넥션 획득 시간 · innodb_row_lock_waits 다.
+    //    🔑 DB 작업은 가드 UPDATE **한 문장**뿐이라 원자성을 잃지 않는다. 그 문장의 트랜잭션은
+    //       TokenJpaAdapter.markCompleted 가 갖는다(@Modifying 은 트랜잭션 없이는 안 돈다).
+    //    🔑 **동시 complete 의 락 대기도 사라졌다.** 예전엔 같은 token_id 의 두 번째 요청이 X 락을
+    //       기다리며 **첫 요청의 Kafka 12초까지 함께 매달렸다**. 지금은 UPDATE 가 즉시 커밋하니
+    //       두 번째는 바로 0행 → findCompletedAt → 200 이다. TokenJpaRepository 의
+    //       "이 UPDATE 한 문장이 동시 complete 의 유일한 조정 수단 — 락 불필요" 가 이제 문자 그대로 참이다.
+    //    🔑 **예외 시 원장이 옳아졌다.** 예전엔 cleanupCompleted(Redis) 예외가 완료를 롤백해
+    //       status=1 로 되돌렸고, 300초 뒤 ReconcileJob 이 그 행을 **status=4 로 확정**했다 —
+    //       사용자는 입장했는데 원장은 만료로 굳는, **Redis 장애가 원장 사실을 지우는** 구조였다.
+    //       지금은 status=2·completed_at 이 남고 재시도는 findCompletedAt 으로 멱등 200 이며,
+    //       중복 게이트가 닫힌 채라 과금은 fail-closed 다(중복 청구 없음).
+    //    🪤 뒤따르는 읽기(findByTokenId·findCompletedAt)는 자기 쓰기를 읽지만 **master 고정**이라
+    //       안전하다 — readOnly 트랜잭션이 없으면 replica 로 가지 않는다(§4-3).
+    //       ❌ 부하를 나누려고 그 둘에 readOnly 를 붙이지 마라 — 즉시 read-after-write 가 깨진다.
+    //    🪤 이 경계를 실 트랜잭션 매니저로 관통하는 자동화 테스트는 **0건**이다(tester 실측).
+    //       근거는 어댑터 쪽 TokenAdmitQueryIntegrationTest 와 수동 REST 검증뿐이다.
+```
+
+### §96-4 `AdmitRequest.java:8`
+
+```java
+/**
+ * Admit 요청 (FRS §6.4).
+ *
+ * @param count     이번에 받을 인원. <b>상한 300</b> — Redis는 단일 스레드라 N이 크면 스크립트 하나가
+ *                  master를 수십~100ms 잡고 그동안 폴링을 포함한 모든 명령이 밀린다.
+ *                  올리는 건 하위호환이지만 내리는 건 파괴적 변경이라 시작값은
+ *                  "견딜 수 있는 최대"가 아니라 "필요를 채우는 최소"였다 (§80 ⑦).
+ *                  <p>🔧 위 문단의 "수십~100ms"는 <b>실측의 1000배 과대평가</b>다(AWS 5차):
+ *                  {@code ZPOPMIN} N=20 이 14.7μs, 토큰당 0.7μs 였다. <b>막는 것이 Redis 가
+ *                  아니라는 것은 확정</b>이고, 그래서 2026-09-22 에 100 → 300 으로 올렸다.
+ *                  <p>🔴 <b>진짜 상한은 Redis 가 아니라 "당신이 초당 몇 명을 앉히는가"다.</b>
+ *                  admitToken TTL 60초는 <b>발급 순간부터</b> 흐른다 — 앉히는 속도보다 많이 받으면
+ *                  꼬리는 앉기 전에 만료된다(5만 판의 {@code issuedButUnclaimed} 49,920 이 그 모습).
+ *                  <p>🔑 <b>산정식(Little, L = λW)</b>:
+ *                  <pre>  count ≤ μ × 60초 × 안전계수     (μ = 초당 앉히는 사람 수)</pre>
+ *                  받은 N 장을 한 명씩 앉히면 꼬리는 {@code N/μ} 초 뒤에 앉는다. 그 값이 60을
+ *                  넘는 만큼이 그대로 만료분이다.
+ *                  <p>실측(2026-09-23 로컬, N=300 · μ=2~4/s → 꼬리 75~150초): 발급의 <b>29%</b>가
+ *                  TTL 을 넘겨 앉았고 verify·complete 가 <b>404 로 373건</b> 거절됐다. 같은 하니스가
+ *                  페이싱 없이 돌던 판에서는 만료가 발급의 2.0% 뿐이라 <b>이 결함이 보이지 않았다</b>.
+ *                  <p>🪤 그래서 <b>300 은 "안전한 값"이 아니라 "허용 상한"이다.</b> μ=3/s 인 Tenant 의
+ *                  안전값은 186 이고, μ=9/s 면 564 까지 가능하다(상한 300 에 걸린다).
+ *                  값을 정할 때 서버 상한이 아니라 <b>자기 μ</b>를 봐라.
+ * @param requestId Tenant가 정하는 멱등 키. 같은 값으로 다시 부르면 대기열을 건드리지 않고
+ *                  저장된 결과를 그대로 돌려준다(REPLAY).
+ */
+```
+
+### §96-5 `RateLimitFilter.java:234`
+
+```java
+    /**
+     * 이유: tokenId 기준 Token Bucket. 폴링은 인증이 없어 이 키가 유일한 구분자다.
+     * 🪤 <b>없는 tokenId 도 버킷을 만든다</b> — 무작위로 쏘면 한도 대신 <b>요청 1건 = 새 키 1개</b>다
+     *    (실측 200건 → +200). 무한 누적은 아니다(TTL 65초라 상주 키 = 유입률 × 65초).
+     * 🔴 종착점은 {@code noeviction} 이라 <b>쓰기 거부</b>다 — <b>같은 마스터의 다른 테넌트가 503</b>.
+     *    그래서 <b>키 길이에 상한을 둔다</b>({@link #MAX_POLL_TOKEN_ID_LENGTH}) — 개수가 아니라 <b>키 하나의 크기</b>를 막는 것이다.
+     * ⚠️ 키가 되는 tokenId 는 <b>정규화된 경로</b>에서 뽑아라 — 원문이면 인코딩 변형마다 새 키다.
+     *
+     * @author sonix
+     * @return true=통과, false=거부(429 완료).
+     */
+```
+
+### §96-6 `EnqueueEvent.java:5`
+
+```java
+/**
+ * 이유: 토큰 생명주기 이벤트 — 토픽 {@code token-lifecycle} 의 <b>유일한 스키마</b>.
+ * 원인: 토픽을 나누면 같은 토큰의 상태 전이 순서가 깨진다(§73 D18).
+ * 해결: 한 토픽·한 스키마에 {@code eventType} 을 <b>본문 판별 필드</b>로 둔다(§80).
+ *       현재 넷 — ENQUEUED · ADMITTED · COMPLETED · EXPIRED.
+ * 🪤 null 검증을 생성자에 넣지 마라 — <b>역직렬화 경로</b>라 인덱스도 모른 채 터져 격리가 막힌다.
+ *
+ * @author sonix
+ * @param eventType {@link TokenEventType} 이름. 아래 정규화 규칙 참조
+ * @param admitToken ADMITTED에서 발급된 입장 자격. 그 외 타입은 null일 수 있다
+ * @param admittedAt admit 시각(UTC). 🔴 <b>이 값은 {@code tokens.admitted_at}에 적재되지 않는다</b>(§90).
+ *                   적재기가 쓰는 것은 <b>null 여부뿐</b>이고, 값은 MySQL의 {@code UTC_TIMESTAMP(3)}가
+ *                   찍는다 — 그 컬럼은 verify·complete·reconcile 술어의 <b>좌변</b>인데 우변이 전부
+ *                   MySQL 시계라, 앱 시계로 쓰면 한 창을 두 시계로 재게 되기 때문이다.
+ *                   그래서 이 필드는 <b>"admit이 일어났다"는 표지</b>로만 쓰인다 —
+ *                   {@code EXPIRED}·{@code COMPLETED}가 null을 실어 보내면 컬럼도 NULL로 남고,
+ *                   그 NULL 여부가 {@code SUM(admitted_at IS NOT NULL)}(= 입장권 개수의 유일한 근거)을 만든다.
+ *                   🪤 <b>"그대로 적재된다"고 되돌리지 마라</b> — 그 한 문장이 §90을 되돌리게 만든다
+ */
+```
+
+### §96-7 `EnqueueEventPublisher.java:12`
+
+```java
+    /**
+     * 이유: 여러 건을 <b>한 번에</b> 발행한다 — admit 한 번이 최대 300건을 낸다.
+     * 문제: {@link #publish} 를 루프로 부르면 건당 ack 을 기다려 <b>지연이 건수에 선형</b>이다
+     *       (AWS 12차 실측: 300건에 p50 <b>1.797초</b>, 건당 5.99ms).
+     * 원인: 건별 ack 대기는 자기 레코드끼리 같은 배치에 못 묶이게 만들어 배칭 대기(linger)를
+     *       <b>건마다 전액</b> 지불한다.
+     * 해결: 전량 보낸 뒤 <b>한 번에</b> 기다린다. 실패 1건이 나머지를 데려가지 않는다 —
+     *       Kafka 에 트랜잭션이 없어 레코드는 서로 독립이다(폭발 반경 N → 1).
+     * ⚠️ 실패한 건은 <b>복구되지 않는다</b>. 호출자가 그 수를 세어 관측에 남겨야 한다.
+     *
+     * 🪤 기본 구현은 <b>건별 발행</b>이다 — 테스트 페이크가 람다 하나로 남을 수 있게 둔 것이고
+     *    (이 포트를 함수형으로 쓰는 곳이 있다), <b>운영 어댑터는 반드시 재정의한다</b>.
+     *    기본 구현도 첫 실패에서 끊지 않는다 — 폭발 반경 성질은 여기서도 같다.
+     *
+     * @author sonix
+     * @return 발행에 실패한 건수 (0 = 전부 성공)
+     */
+```
+
+### §96-8 `TokenJpaAdapter.java:199`
+
+```java
+    /**
+     * 이유: 가드 UPDATE 한 문장. {@code @Modifying} 은 트랜잭션이 <b>없으면 실행되지 않는다</b>.
+     * 문제: 예전엔 호출자({@code QueueEngineService.complete})의 {@code @Transactional} 에 얹혀 있었다.
+     * 원인: 그 트랜잭션이 <b>Redis 왕복과 Kafka 동기 발행(최대 12초)까지 감싸</b> 커넥션을 붙잡았다 —
+     *       verify·admit 은 <b>같은 이유로</b> 트랜잭션을 안 쓴다. complete 만 비대칭이었다.
+     * 해결: 트랜잭션을 <b>DB 작업 하나</b>로 좁혀 여기로 내린다. 아래 {@code expireStaleAdmitted} 가
+     *       같은 형태다(호출자인 배치가 트랜잭션을 안 갖는다).
+     * 🪤 이 어노테이션을 지우면 complete 가 런타임에 죽는다 — 커버는
+     *    {@code TokenAdmitQueryIntegrationTest.markCompleted_withoutAmbientTransaction} 이다.
+     * 🔴 {@code READ COMMITTED} 가 아니면 컨슈머 적재와 <b>데드락(1213)으로 500</b> 이 난다.
+     *    WHERE 가 유니크키 {@code (token_id, issued_at)} 의 절반이라 REPEATABLE READ 에서 갭까지 잠그고,
+     *    컨슈머가 같은 트랜잭션에서 바로 앞 키를 넣으면 서로를 기다린다(2026-09-24 실측 24/24).
+     *    커버는 {@code markCompleted_doesNotDeadlockWithConsumerInsert}. 선례는 {@code BillingJdbcAdapter}.
+     *
+     * @author sonix
+     */
+```
+
+### §96-9 `KafkaEnqueueEventPublisher.java:79`
+
+```java
+    /**
+     * 이유: 전량 {@code send} 한 뒤 <b>한 번에</b> ack 을 기다린다 (12차 실측 후 도입).
+     * 문제: 예전엔 호출자가 {@link #publish} 를 루프로 돌아 건당 ack 을 기다렸다 — 300건이면
+     *       <b>p50 1.797초</b>(건당 5.99ms)이고, 그 값은 {@code linger.ms}(5ms)를 건마다 전액
+     *       지불한 결과다(모델 6.38ms/건이 관측을 94~110% 덮었다).
+     * 원인: 건별 {@code get()} 은 다음 레코드를 직전 ack 뒤에 넣어 <b>자기 레코드끼리 배치가 안 된다</b>.
+     * 해결: 먼저 다 보내 한 배치에 모이게 하고, 대기는 마지막에 한 번 한다.
+     * 🔑 <b>대기 예산은 전체가 하나를 공유한다</b> — 건별로 주면 브로커 장애 때 300 × 12초(queue-api 의 send-timeout-ms)가 된다.
+     * 🪤 실패는 <b>흩어져 나온다</b> — 첫 실패에서 끊지 않는다. 트랜잭션이 없어 레코드가 서로
+     *    독립이므로, 1건 실패가 나머지를 데려가지 않는 것이 <b>이 메서드의 존재 이유</b>다.
+     * ⚠️ 예외를 올리지 않는다 — 호출 시점에 Lua 가 이미 커밋돼 되돌릴 수 없다(§80 U9).
+     *
+     * @author sonix
+     */
+```
+
+### §96-10 `TokenJpaRepository.java:120`
+
+```java
+    /**
+     * 이유: 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq(없으면 NULL, 호출자가 0 으로 바꾼다).
+     * 문제: 🔑 <b>인덱스만 만들어도 옵티마이저가 안 쓴다</b> — AWS 8차에서 이 쿼리가 MySQL CPU <b>예산 6.1%</b> 를 먹고 판 안에서 372ms → 1,776ms 로 5배 악화했다.
+     * 해결: {@code FORCE INDEX} 로 커버링을 강제한다(43ms → 24ms. <b>버퍼풀 &lt; 테이블</b>이면 더 커진다).
+     * 🔴 그래도 <b>큐의 전체 이력</b>을 훑었다(14차: 35만 행 463ms — 파티션 DROP 전까지 늘기만 한다). 그래서 경계에서
+     *    거꾸로 {@value #SETTLED_SCAN_ROWS}행만 읽는다 — 큐 크기와 무관하게 상수다(로컬 45,923행: 35ms → 1.32ms).
+     * 🪤 LIMIT 1 로 줄이지 마라 — issued_at 은 <b>N대의 앱 시계</b>라 seq 와 역전된다. K행의 MAX 는 역전이 K행 안이면
+     *    전수와 같고, 밖이면 <b>더 작은</b> 값을 준다(양쪽이 같은 경계를 세므로 오탐 없이 경계 근처만 이번 주기에서 빠진다).
+     * 🪤 인덱스 이름이 바뀌면 이 쿼리는 <b>에러로 죽는다</b> — 조용히 느려지는 것보다 낫다.
+     */
+```
+
+### §96-11 `admit.lua:23`
+
+```lua
+-- ⚠️ 동적 키(admit-by-token / admit-by-admit / admit-idem)의 **접두사를 이 파일에 박지 않는다** (§80 ⑥).
+--   두 번째 조각이 런타임 값이라 KEYS[] 선언이 원리적으로 불가능하고, 선언이 없으면
+--   Redis의 CROSSSLOT 사전 검사가 아예 걸리지 않는다(선언 없는 접근은
+--   "ERR Script attempted to access a non local key" — 노드 소유 여부만 본다).
+--   즉 **슬롯이 달라도 같은 노드면 조용히 성공**한다(마스터 4대 = 약 25%). 남는 방어는
+--   QueueKeys를 리플렉션 전수 열거하는 QueueKeysSlotTest뿐이라, 접두사가 여기 있으면 그 단언이 닿지 못한다.
+```
+
+### §96-12 `admit.lua:88`
+
+```lua
+		-- 값이 "tokenId|seq|issuedAt|identifier"인 이유: verify가 이 네 값만으로 답과 완료 처리를
+		-- 모두 끝내 **DB를 한 번도 읽지 않게** 하기 위해서다.
+		--   identifier — Tenant에게 돌려줄 신원. DB에서만 얻으면 컨슈머 백로그 구간(= Kafka 적재가
+		--                아직 안 끝난 정상 토큰)에 404가 난다
+		--   seq·issuedAt — verify가 COMPLETED 이벤트를 만들 때 필요하다. 없으면 verify가 DB를
+		--                읽어야 하고, verify는 @Transactional(readOnly)라 그 읽기가 Replica로 간다
+		-- 넷 다 지금 이 자리에 이미 있다 — 새로 조회하는 값이 하나도 없다.
+		--
+		-- ⚠️ **identifier가 맨 뒤인 것이 규약이다.** identifier는 Tenant 자유 문자열이라 '|'가
+		--    들어올 수 있다. 앞 세 값(tokenId='tok_'+UUID, seq=숫자, issuedAt=숫자)에는 '|'가
+		--    없으므로, 읽는 쪽은 **앞에서 세 번만 쪼개고 나머지 전부를 identifier로 본다.**
+		--    가변 필드를 중간에 두면 경계가 무너진다.
+```
+
+### §96-13 `cleanup_completed.lua:4`
+
+```lua
+-- KEYS[1]: waiting key        (예: queue:{q_bts}:waiting)              — ZSet, score=seq, member=identifier
+-- KEYS[2]: admitted key       (예: queue:{q_bts}:admitted)             — ZSet, member="seq|identifier"
+-- KEYS[3]: tokens key         (예: queue:{q_bts}:tokens)               — Hash, identifier -> "tokenId|issuedAt"
+-- KEYS[4]: admit-by-token key (예: queue:{q_bts}:admit-by-token:tok_x) — String
+-- KEYS[5]: admit-by-admit key (예: queue:{q_bts}:admit-by-admit:adm_x) — String  **선택(§92)**
+--   🔴 KEYS[5]는 complete만 넘긴다. verify는 KEYS 4개로 부른다 — admit-by-admit을 **일부러 남긴다**.
+--   그 키 하나가 두 재시도의 근거라서다: ① Tenant가 verify 응답을 못 받고 다시 부르는 verify
+--   (§22가 verify를 비소비로 둔 이유), ② verify → complete를 둘 다 부르는 Tenant의 complete가
+--   컨슈머 백로그·§91 발행 지연 구간에서 DB 0행일 때 타는 Redis 폴백. 지우면 둘 다 404가 되고,
+--   막으려면 §80이 폐기한 verified-token 표식이 다시 필요하다. PX 60s가 알아서 거둔다.
+--   반대로 complete는 자기 재시도가 DB(status=2 + admit_token 대조)로 답하므로 지워도 된다.
+--   나머지 넷은 "이 사람이 아직 회차 안"이라는 뜻이라 완료 경로 둘 다 지운다 — 안 지우면
+--   verify-only 완료자가 60초 동안 옛 토큰으로 무료 재입장하고, 과금이 경로에 따라 1 vs 2로
+--   갈리며, 회수 배치가 완료자를 admit 만료자로 세어 헛 EXPIRED를 발행한다(2026-09-11 실측).
+--   다섯 모두 QueueKeys의 정적 팩토리가 {queueId} 해시태그를 붙인다 = 같은 슬롯.
+--   ⚠️ admit-by-* 를 admit.lua처럼 ARGV 접두사로 받지 않는다. 여기서는 tokenId·admitToken이 둘 다
+--   호출자 손에 있어 **Java가 다섯 키 이름을 실행 전에 전부 안다** — 그러면 KEYS로 선언할 수 있고,
+--   선언하면 Redis의 CROSSSLOT 사전 검사가 **실제로 걸린다**(실증: 태그가 다른 키를 섞으면
+--   "CROSSSLOT Keys in request don't hash to the same slot"). admit.lua가 경고하는 "선언 없는
+--   동적 키는 슬롯이 달라도 같은 노드면 조용히 성공"(마스터 4대 = 약 25%)이 여기선 원천 차단된다.
+--   🪤 admit.lua가 왜 ARGV를 쓰는지는 여기서 단정하지 마라 — 그 파일의 admit-by-*는 tokenId가
+--   스크립트 안 HGET 결과라 Java가 미리 모르지만, admit-idem은 완성 키인데도 ARGV다(admit.lua:12).
+--   근거가 하나로 정리돼 있지 않으니, 이 파일의 선택은 이 파일 사정으로만 정당화한다.
+-- ARGV[1]: identifier
+-- ARGV[2]: seq (문자열 원문. Java가 Long.toString으로 넘긴다)
+-- ARGV[3]: tokenId (완료를 신청한 회차)
+```
+
+### §96-14 `cleanup_completed.lua:39`
+
+```lua
+-- 🔴 **왜 회차 대조가 필요한가.**
+--   identifier는 사람 이름표라 회차 간에 재사용된다(같은 사용자 = 같은 UUIDv7). 반면 이 정리는
+--   한 회차를 끝내는 일이다. §36이 admitToken TTL 만료 시 tokens Hash를 HDEL해 중복 게이트를
+--   풀어주므로, 만료된 사람은 곧바로 재-enqueue해 **새 회차**를 받는다. 그런데 complete의
+--   유효 창은 Token.COMPLETE_VALID_WINDOW_SECONDS(300초)이고 admitToken TTL은 60초다 —
+--   그 **240초 차이** 동안 옛 회차의 늦은 complete가 도착하면, identifier만 보고 지울 경우
+--   **새 회차의 자리(waiting)와 게이트(tokens)를 지운다.** 피해자는 이미 만료로 한 번 손해 본
+--   사람이고, 폴링이 조용히 404가 될 뿐 아무 신호가 없다(§4번 항목의 상용 차단 결함).
+--
+-- 🔴 **왜 Lua여야 하는가 (원자성).**
+--   Java에서 HGET → 비교 → HDEL로 쪼개면 그 사이에 admit_expire + 재-enqueue가 끼어들어
+--   **같은 결함이 TOCTOU로 재발**한다. 240초 창이 마이크로초 창으로 줄 뿐 사라지지 않는다.
+--   부수 효과가 하나 더 있다: 명령 4개 시절에는 ZREM들만 성공하고 HDEL 직전에 프로세스가 죽으면
+--   (seq, identifier) 쌍을 아는 자료구조가 **0**이 되어(admitted·waiting 모두 삭제됨) 세 회수
+--   배치 어디도 그 사람에게 닿지 못했다 — **해소 경로 없는 영구 락아웃**이었다. EVAL 1회면
+--   그 중간 상태 자체가 생기지 않는다.
+```
+
+### §96-15 `enqueue_bulk.lua:4`
+
+```lua
+-- KEYS[1]: queue key (예: queue:{q_bts}:waiting)
+-- KEYS[2]: seq key   (예: queue:{q_bts}:seq) — 큐별 전역 순번 카운터
+-- KEYS[3]: token key (예: queue:{q_bts}:tokens) — identifier -> "tokenId|issuedAt" 매핑 Hash
+--   중괄호는 Redis Cluster 해시태그(QueueKeys 참조). 세 키가 같은 슬롯에 놓여야
+--   Lua가 실행된다 — 없으면 CROSSSLOT 에러.
+--   🔴 **중복 게이트는 이 Hash다** (waiting ZSet이 아니다). 사람은 admit되면 waiting에서
+--   빠지지만(admit.lua의 ZPOPMIN) 아직 큐를 떠난 게 아니므로, waiting 존재 여부로 신규를
+--   판정하면 admit된 사람의 재-enqueue가 새 tokenId·새 seq를 받는다 → 폴링 404, 과금 중복
+--   (billing_snapshots가 tokens 행을 COUNT한다), status=1 고아 행. 그래서 게이트는
+--   HSETNX이고, 사람을 큐에서 빼는 경로(cleanupCompleted·cleanupVerified — §92로 둘이다)가
+--   HDEL로 이 필드를 지운다.
+-- ARGV[1]: maxCapacity (Queue 최대 인원)
+-- ARGV[2]: requestCount (Bulk 요청 개수)
+-- ARGV[3]: issuedAt (이 청크의 발급 시각, epoch millis 문자열)
+--   Lua에서 시각을 만들지 않는 이유는 TIME이 비결정적이어서가 아니다. Redis 5+의
+--   effects replication 하에서는 write 스크립트에서 TIME을 써도 안전하다.
+--   DB에 저장될 포맷(tokens 테이블의 issued_at)을 Java가 통제해야 하기 때문이다.
+-- ARGV[4..]: identifier1, tokenId1, identifier2, tokenId2, ...   (아이템당 2개)
+--   score는 Lua가 INCR로 발급. tokenId는 Java에서 발급한 후보로,
+--   OK일 때만 채택되고 EXISTS/FULL이면 버려진다.
+```
+
+### §96-16 `enqueue_bulk.lua:25`
+
+```lua
+-- Returns: {{identifier, tokenId, status, rank, total, seq, issuedAt}, ...}   (원소 7개 고정)
+--   score는 KEYS[2] INCR로 발급 (단조증가, 유일) → Redis 도달 순서 = rank 순서
+--   OK: 정상 추가 (rank 0-based, total 추가 후 크기, issuedAt = ARGV[3])
+--   EXISTS: 이미 존재 (기존 rank + 현재 total, tokenId·issuedAt은 Hash의 최초 값)
+--     ※ admit됐지만 **아직 완료하지 않은** 사람이 재-enqueue하면 EXISTS이면서 waiting에는
+--       없다 → rank·seq는 -1이다. 그 사람은 폴링에서 admit-by-token으로 입장권을 돌려받는다
+--       (seq로 찾지 않는다).
+--       🔑 **완료한 사람은 여기 해당하지 않는다 (§92).** verify든 complete든 완료 시점에
+--       게이트와 admit-by-token이 지워지므로 그 사람의 재-enqueue는 EXISTS가 아니라 OK다
+--       (새 tokenId·맨 뒤·과금 +1). 이 문장을 완료자까지 포함해 읽으면 반대로 구현하게 된다.
+--   FULL: Capacity 초과 (rank -1, 현재 total, tokenId·issuedAt = "")
+--   ※ 빈 문자열은 배열을 자르지 않는다. nil/false만 RESP 변환에서 뒤를 끊으므로
+--     "모름"은 반드시 ""로 표현할 것 (Java의 size() < 7 검사가 이를 전제한다).
+```
+
+### §96-17 `fixed-window.lua:1`
+
+```lua
+-- KEYS[1]: 카운터 키 (예: "rl:signup:ip:127.0.0.1:29222190") — 윈도우 번호까지 포함된 최종 키
+-- ARGV[1]: limit (윈도우당 허용 요청 수)
+-- ARGV[2]: windowSizeMillis (윈도우 크기, ms 단위 — TTL 계산용)
+--
+-- 반환: 1 = 허용, 0 = 거부
+--
+-- 동작:
+--   1. INCR (카운터 증가)
+--   2. 첫 증가면 EXPIRE 설정 (윈도우 종료 시 자동 정리)
+--   3. 카운터 ≤ limit이면 허용
+-- 목적 : tenantId 인증 전 분당 횟수로 과도한 요청 방지 (burst되어도 상관 없음)
+--
+-- ⚠️ 키를 이 스크립트 안에서 조립하지 마라. 예전에는 여기서
+--    `local key = KEYS[1] .. ':' .. windowNo` 로 윈도우 번호를 이어붙여 INCR했는데,
+--    선언한 KEYS와 실제 접근 키가 달라 Redis Cluster가 거부한다:
+--      ERR Script attempted to access a non local key in a cluster node
+--    Sentinel에는 슬롯 개념이 없어 드러나지 않았고, Cluster 전환 즉시 signup/login/refresh가
+--    전부 죽었다. 윈도우 번호 조립은 RateLimitKeys.fixedWindow가 한다.
+--
+-- TTL 계산은 여기 남긴다 — "첫 증가일 때만 EXPIRE"는 INCR과 원자적으로 묶여야 한다.
+```
+
+### §96-18 `token-bucket.lua:45`
+
+```lua
+-- TTL: 버킷이 가득 회복된 뒤의 상태는 키가 없을 때(= capacity로 시작)와 결과가 같다.
+-- 그래서 full refill 시간만 버티면 되고, 그 위 60초는 경계 여유다.
+-- 3600 고정은 폴링 키(rl:poll:token:*)를 토큰 하나당 1시간씩 남겼다. 폴링은 토큰 수만큼
+-- 키가 생기므로 이 상수가 곧 Redis 메모리 상한이 된다 — 큐 비종속 키라 Cluster 전환 시
+-- cluster1 한 곳에 전부 몰린다(DECISIONS §75 D27-4).
+--   폴링(cap 5, refill 1/s)      → 65초
+--   Tenant plan(cap = refill×60) → 120초
+--
+-- 60~3600으로 조인다. capacity/refillRate는 호출자가 넘기는 값이라 이 스크립트가 통제하지 못한다.
+--   refillRate = 0  → inf    → 상한 3600. 클램프가 없으면 EXPIRE 인자 오류로 스크립트가 죽는데,
+--                              위 HMSET은 이미 커밋된 뒤라 TTL 없는 키가 영구히 남는다
+--   refillRate 극소 → 수만 초 → 상한 3600. 줄이려던 메모리가 도리어 늘어나는 것을 막는다
+--   refillRate < 0  → 음수   → 하한 60. 음수 EXPIRE는 키를 즉시 지워 한도를 리셋시킨다
+```
+### §96 부록 — 참조 번호 없이 줄인 블록의 원문
+
+> 요약만으로 충분해 주석에 번호를 달지 않은 블록이다. 파일명·줄로 찾는다.
+
+#### `RateLimitFilter.java:72`
+
+```java
+    /**
+     * 이유: 테넌트 한도 — <b>모든 테넌트에 동일</b>(§88 에서 등급제를 걷어냈다).
+     * 문제: 100,000 에서는 <b>리미터가 한 건도 막지 않았다</b>(3,000rps × 30초가 capacity 안, 429 가 0건).
+     * 해결: 50,000 으로 내렸다(§89) — 같은 공격이 23.1초에 개입해 15,000건을 막는다.
+     * 🪤 <b>enqueue 전용이 아니다</b> — 인증 요청 전부가 공유하므로 내리면 <b>입장까지</b> 조인다.
+     * 🪤 refill 은 <b>833.34</b> 다(833.33 이면 TTL 이 121초로 어긋나는데 테스트가 못 잡는다, §89).
+     */
+    /**
+     * 큐 상태 제어와 API Key 관리의 한도. <b>분당 60회</b>다.
+     *
+     * <p>큐를 멈추고 재개하는 일은 하루에 몇 번이다. 실사용에는 사실상 무제한이고, 남용은 여전히
+     * 막힌다. 🔑 중요한 건 숫자가 아니라 <b>데이터 평면과 지갑이 다르다는 사실</b>이다 —
+     * enqueue 가 아무리 몰려도 이 버킷은 줄지 않는다.
+     */
+```
+
+#### `TokenRevocationService.java:10`
+
+```java
+/**
+ * Refresh Token 폐기 전용 서비스
+ *
+ * @Transactional(propagation = REQUIRES_NEW)로 별도 트랜잭션에서 실행.
+ * 호출 측 트랜잭션이 ROLLBACK되어도 폐기는 영구 커밋됨.
+ *
+ * 사용 시점:
+ *   - 재사용 공격 감지 시 (refresh() 안에서 호출)
+ *   - 관리자 강제 폐기 (운영 도구)
+ *   - 비밀번호 변경 시 (선택)
+ */
+```
+
+#### `TokenReclaimJob.java:86`
+
+```java
+    /**
+     * 주기 10초 (FRS §10).
+     *
+     * <p>{@code fixedDelay}인 이유: 큐가 많아 한 바퀴가 10초를 넘으면 {@code fixedRate}는 틱을
+     * 겹쳐 쌓는다. 이 잡은 늦어도 되지만 겹치면 안 된다 — 겹쳐도 정합성은 claim이 지키지만
+     * Redis 왕복만 배로 늘어난다.
+     */
+    // 키가 reclaim인 이유: 이 잡은 admit 만료와 inactive 이탈 **둘 다** 회수한다.
+    //   admit-expiry로 두면 운영자가 "admit만 늦춘다"고 생각하고 값을 키워 이탈 회수까지 늦춘다.
+```
+
+#### `Queue.java:56`
+
+```java
+        /*
+         * 🔴 여기서 보는 것은 **상태뿐이다.** 정원(maxCapacity) 판정은 하지 않는다.
+         *
+         * 용량은 enqueue_bulk.lua 가 ZCARD 로 본다(§66 D6) — 그래야 확인과 삽입이 한 EVAL 안에서
+         * 원자적이다. 여기서 미리 세면 그 사이에 남이 들어와 정원을 넘긴다(TOCTOU).
+         *
+         * 구 주석은 "현재 인원과 maxCapacityCount 비교 후 반환"이라고 적혀 있었다 —
+         * 그걸 믿고 여기에 용량 검사를 넣으면 Lua 판정을 중복 구현하게 된다.
+         */
+```
+
+#### `QueueBoard.java:5`
+
+```java
+/**
+ * 이유: 큐 전광판 — {@code GET /status} 의 응답 원본(§79). <b>30만 명 전원에게 같은 값</b>이다.
+ * 문제: 구 {@code frontSeq} 는 <b>단조가 아니었다</b> — admitToken TTL 만료로 맨 앞 seq 가
+ *       작아지면 사용자 화면의 순번이 거꾸로 늘어난다. {@code total}(ZCARD)은 30만 ZSet 접근이었다.
+ * 해결: {@code lastAdmittedSeq} 는 클 때만 올라가 후퇴하지 않고, 한 키 O(1) 이라 MGET 한 번이다.
+ * ⚠️ <b>캐시가 아니라 원본이다</b> — Redis 유실 시 0으로 돌아가 전원 순번이 폭증한다(복구는 §71·§79).
+ *
+ * @author sonix
+ * @param lastAdmittedSeq 마지막으로 admit된 seq. 아무도 입장하지 않았으면 {@code 0}이며 그게 맞는
+ *                        값이다({@code rank = mySeq − 0 = mySeq}). 콜드 스타트 폴백이 따로 없는 이유다.
+ * @param pacing          폴링 간격 사다리. Redis 오버라이드가 있으면 그 값, 없으면 {@link PacingTier#DEFAULT}
+ */
+```
+
+#### `TokenRepository.java:78`
+
+```java
+    /**
+     * 이유: complete 유효 창이 지나도록 {@code ADMIT_ISSUED} 에 남은 토큰을 만료로 확정한다.
+     * 문제: Tenant 가 verify·complete 를 둘 다 안 부르면 그 행이 <b>영원히 1 로 남는다</b>(실서버 재현).
+     * 원인: EXPIRED 가드가 {@code IF(status = 0, ...)} 라 1 에서 no-op 이다 — 늦은 complete 를 살리는 §36 의 의도다.
+     * 해결: 이것만 <b>직접 UPDATE</b> 다(도메인 전이가 아니라 원장 교정). 큐 단위로 끊어 한 큐가 상한을 독식하지 않게 한다.
+     * 🔴 <b>기준 시각을 호출자가 정하지 않는다</b>(§90) — 창의 길이만 넘기고 "지금"은 DB 가 정한다.
+     *
+     * @author sonix
+     * @param validWindowSeconds complete 유효 창의 길이. 이만큼 <b>지난</b> 것이 대상이다
+     *                           (= {@link Token#COMPLETE_VALID_WINDOW_SECONDS}).
+     *                           더 짧게 주면 정상적인 늦은 통보가 404를 받는다
+     * @param limit              한 번에 고칠 최대 행 수. Gap Lock을 피하려면 작게 끊는다
+     * @return 실제로 만료 처리된 행 수
+     */
+```
+
+#### `TokenJpaAdapter.java:28`
+
+```java
+    /**
+     * 이유: 상태 전이 UPSERT 의 INSERT 부분. ENQUEUED 만은 {@link #ENQUEUE_INSERT} 가 맡는다.
+     * 🔴 <b>{@code ?} 를 쓰지 마라</b> — 재작성이 조용히 꺼져 500건 배치가 500왕복이 된다.
+     * 🔴 {@code AS new} 별칭이 필요하고, 컬럼명은 {@code tokens.}·{@code new.} 로 전부 한정한다.
+     * 🔑 {@code admitted_at} 의 {@code ?} 는 §90 의 null 여부 보존용이다(값은 MySQL 이 찍는다).
+     */
+    /**
+     * 이유: 신규 적재(ENQUEUED) SQL. {@code TokenEntity.@SQLInsert} 원문을 옮긴 것이다.
+     * 🔴 <b>컬럼 순서까지 같아야 한다</b> — {@code saveAllIfAbsent} 의 파라미터 인덱스가 이 순서에 붙어 있다.
+     * 🔑 ODKU 가 완전 no-op 인 것이 핵심 — 뒤늦은 ENQUEUED 가 전이된 행을 <b>되돌리지 않는다</b>.
+     * 🪤 SET 절에 {@code ?} 를 쓰면 다중행 재작성이 조용히 꺼진다({@link #TRANSITION_INSERT} 참조).
+     */
+```
+
+#### `BatchProcessor.java:43`
+
+```java
+    /**
+     * 구간별 소요의 버킷 경계.
+     *
+     * @author sonix
+     * @implNote 작성이유: 대시보드가 histogram_quantile(_bucket) 로 p95 를 뽑는다.
+     *           문제: 경계를 안 주면 Micrometer 가 _bucket 을 아예 발행하지 않아 패널이 영구히 빈다(실측).
+     *           원인: Timer 기본값은 count/sum/max 뿐이다. 해결: 실측 기준선(redis 0.16ms · mysql 1.34ms ·
+     *           tick 10ms · kafka 18ms/콜드 404ms · 틱 20ms)을 덮는 경계를 준다. §4-1
+     * 🪤 {@code QueueEngineService.STAGE_SLO} 와 <b>같은 값이어야 한다</b>(버킷이 갈리면 집계가 깨진다).
+     */
+```
+
+#### `KafkaEnqueueEventPublisher.java:96`
+
+```java
+        // 🔴 **데드라인을 send 루프 앞에서 잡는다.** `send()` 는 비동기가 아니다 — 메타데이터 대기·
+        //    버퍼 소진에서 `max.block.ms`(4초) 를 **건당** 전액 쓴다. 뒤에서 잡으면 브로커 전원
+        //    다운 + 메타데이터 캐시 만료에서 count=300 이 300 × 4초 = **20분** 요청 스레드를 잡는다
+        //    (예전 코드는 첫 건에서 break 라 ~16초였다 — 즉 여기를 안 묶으면 최악이 나빠진다).
+        // 🔑 예산 하나를 send·대기 **두 구간이 공유**한다. 정상 경로는 send 가 즉시 반환하므로
+        //    영향이 없고, 병리 경로만 유계가 된다.
+```
+
+#### `RedisQueueEngine.java:163`
+
+```java
+    /**
+     * 이유: queueId → 소유 클러스터 판정(§75 이중 라우팅).
+     * 해결: ①맵 hit ②miss 면 {@code EXISTS ...:seq} 를 물어 응답한 쪽이 소유자 ③둘 다 없으면 폴백.
+     * 🔑 <b>미스 비용은 (WAS, queueId)당 평생 1회</b> — seq 키는 INCR 로만 생기고 지워지지 않아
+     *    한 번 enqueue 된 큐는 비어도 계속 소유권을 증명한다.
+     * 🪤 읽기 오배송은 안전하다 — 대조 실패 시 아무것도 쓰지 않아 최악이 "빈 결과 1회"다.
+     *
+     * @author sonix
+     * @param fallbackForNewQueue 양쪽 모두 키가 없을 때의 목적지 결정. 읽기는 cluster1로
+     *                            떨어뜨려도 무해하지만(위 참조), 쓰기는 DB 배정 기록을 따라야 한다.
+     */
+```
+
+#### `RateLimitKeys.java:12`
+
+```java
+    /**
+     * 이유: 큐 상태 제어(생성·수정·삭제·pause·resume)와 API Key 관리 전용 버킷(§92).
+     * 문제: 데이터 평면과 같은 지갑을 쓰면 enqueue 가 한도를 다 쓴 순간 {@code pause} 가 429 가 된다.
+     * 원인: 🔑 <b>멈춰야 하는 순간이 곧 부하가 몰린 순간</b>이다(AWS 실측에서 실제로 났다).
+     * 해결: <b>면제가 아니라 분리</b>다 — 이 호출들도 공짜가 아니라 한도는 남기되 <b>굶지 않게</b> 한다.
+     */
+    /**
+     * 이유: 입장 처리(admit · verify · complete) 전용 버킷(§92).
+     * 문제: <b>배출이 유입에 굶으면 안 된다</b> — admit 이 429 면 줄이 안 빠지고 폴링이 늘어 더 나빠진다(<b>자기 강화 악순환</b>).
+     * 해결: 셋을 <b>한 버킷에</b> 둔다 — admit 만 빼면 <b>돈은 청구되고 입장은 못 하는</b> 상태가 된다.
+     * ⚠️ 나누면 테넌트 총량 한도가 올라간다(§89 의 절반을 되돌린다) — 받아들이는 근거는
+     *    <b>배출량이 발급된 입장권 수에 묶여</b> 유입과 달리 무한정 늘 수 없다는 것이다.
+     */
+```
+
+#### `cleanup_completed.lua:31`
+
+```lua
+-- Returns: 1  자기 회차를 정리했다
+--          0  🔴 이미 **다른 회차**가 자리를 차지하고 있어 건드리지 않았다 (가드가 막은 것)
+--         -1  정리할 게 애초에 없었다 (이미 정리됐거나 고아)
+--   ⚠️ 0과 -1을 합치지 마라. 늦은 complete는 -1로도 오는데(TTL 만료 뒤 재-enqueue 없이 complete),
+--      합치면 Java의 WARN이 "축출을 막았다"를 아무 일도 없던 경우에까지 찍어 **빈도 자체가
+--      의미를 잃는다**. 이 카운트는 §36(60초)과 complete 창(300초)의 240초 모순이 실제로 얼마나
+--      열리는지를 재는 유일한 수단이라, 오탐이 섞이면 재는 의미가 없다.
+```
+
+#### `cleanup_completed.lua:61`
+
+```lua
+-- ── 회차 고유 키는 무조건 지운다 ──────────────────────────────────────────────
+-- member에 seq가, 키 뒷조각에 tokenId/admitToken이 박혀 있다. 셋 다 회차마다 유일하므로
+-- (seq=INCR, tokenId·admitToken=UUIDv7) 남의 회차를 지울 수 없다. 대조가 필요 없다.
+-- 🔴 반대로 여기에 회차 가드를 걸면 안 된다 — 걸 이유가 없고(남의 회차를 지울 수 없다), 걸면
+--    HGET 미스인 경로에서 이 셋이 남는다. admit-by-admit(KEYS[5])은 verify가 넘기지 않아
+--    verify 뒤 60초 안 같은 admitToken의 verify는 계속 통과한다 — 결함이 아니라 재시도 계약이다
+--    (머리말 KEYS[5] 참조, API.md "admitToken을 소비하지 않는다").
+```
+
+#### `cleanup_completed.lua:81`
+
+```lua
+-- 🔴 구분자가 없으면 **값 전체를 tokenId로 본다** (poll_verify.lua·enqueue_bulk.lua와 같은 규약).
+--    "미스 취급"으로 두면 롤링 배포 중 남은 구 포맷 값에서 완료자의 게이트가 영영 안 풀려
+--    영구 락아웃이 된다 — 현행 무조건 HDEL보다 나빠지는 유일한 지점이라 반드시 이쪽이다.
+--    (issuedAt이 필요한 admit_expire.lua·inactive_expire.lua는 반대 규약을 쓴다. 거긴 멱등 키
+--     (token_id, issued_at)이 성립하지 않아 발행 자체가 불가능하기 때문이고, 여기선 이벤트
+--     재료가 이미 AdmitRef/Token에 있어 issuedAt이 필요 없다.)
+```
+
+#### `enqueue_bulk.lua:85`
+
+```lua
+	-- 🔴 정원이 찼어도 **이미 발급받은 사람은 FULL이 아니다.** 새로고침·재시도로 같은
+	--    identifier가 다시 오는 것은 정상 경로인데(계약: identifier 재사용), 정원만 보고
+	--    FULL을 주면 **줄 맨 앞에서 기다리던 사람에게 마감 페이지가 뜬다.** 자리는 waiting에
+	--    그대로 있는데 응답의 tokenId가 빈 문자열이라 폴링조차 못 한다(실측으로 재현했다).
+	--
+	-- 🪤 순서를 통째로 뒤집어 HSETNX를 먼저 부르면 안 된다 — 정원이 찬 상태에서 **신규**
+	--    사용자까지 tokens에 심어져 중복 게이트(=과금 게이트)가 오염된다. 여기서는 쓰지 않는
+	--    HGET으로 **읽기만** 한다. 이 왕복은 정원이 찬 큐에서만 붙는다.
+```
+
+#### `poll_verify.lua:45`
+
+```lua
+-- 🔴 keepalive 분기를 두지 않는다 (§82 F안). 폴링이 오면 **언제나** 갱신한다.
+--    분기가 있던 시절엔 "이 사람이 살아 있다"의 유일한 근거가 클라이언트가 자발적으로 붙이는
+--    ka 쿼리 파라미터였다(@RequestParam(defaultValue="false")). ka를 안 붙이는 클라이언트는
+--    2초마다 폴링해도 inactive 회수에 걸려 죽는다 — 그 회수가 생긴 순간 이건 조용한 사고다.
+--    member는 ARGV[1] 원문을 그대로 쓴다. tostring(tonumber(...))는 Lua의 숫자 포맷(%.14g)을
+--    거치므로 Java가 만든 문자열과 어긋날 수 있다 — 배치 스캔이 이 member로 seq를 되읽는다.
+```
+
+#### `waiting_expire.lua:75`
+
+```lua
+	-- 🔴 HGET 미스 = **고아**다 (admit.lua가 되돌려 놓은 자). 여기서 건드리지 않는다.
+	--   ① issuedAt을 모르므로 만료 판정 자체가 성립하지 않는다.
+	--   ② 고아를 이 잡이 조용히 치우면 U9 gauge(queue_waiting_orphans)가 영원히 0이 되어
+	--      **탐지 수단이 무력화**된다. 고아는 사람이 보고 판단할 대상이지 sweep이 삼킬 것이 아니다.
+	--   ⚠️ 대가: 고아가 head를 점유하면 그 뒤의 진짜 만료 대상이 이 상한 안에 안 들어온다.
+	--      바로 그 상황을 U9 gauge가 0이 아닌 값으로 알려준다 — 그게 그 메트릭의 존재 이유다.
+```

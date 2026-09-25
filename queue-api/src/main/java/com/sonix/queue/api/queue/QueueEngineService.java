@@ -216,15 +216,11 @@ public class QueueEngineService {
     }
 
     /**
-     * 이유: ADMITTED 발행 — <b>실패해도 예외를 올리지 않는다</b>(FRS §6.4).
-     * 원인: Lua 가 이미 커밋돼 되돌릴 수 없다 — 5xx 를 주면 재시도가 REPLAY 무한 반복이 된다.
-     * 해결: REPLAY 도 발행한다 — 중복은 멱등이라 무해하고 <b>첫 발행 실패의 유일한 복구 경로</b>다.
-     * 🔑 <b>전량 발행 뒤 한 번에 기다린다</b>({@code publishAll}) — 예전의 건별 ack 루프는
-     *    지연이 건수에 선형이었다(AWS 12차 실측 300건 p50 <b>1.797초</b>, 건당 5.99ms).
-     * 🔴 <b>첫 실패에서 끊지 않는다.</b> Kafka 에 트랜잭션이 없어 레코드가 서로 독립이므로,
-     *    끊으면 재수 없는 1건이 <b>나머지 299건의 원장까지</b> 데려간다(폭발 반경 N → 1).
-     * ⚠️ 실패분은 자동 복구되지 않는다 — ERROR 로그와 {@code result=error} 가 유일한 흔적이다.
-     *    그 토큰은 Redis 엔 admitToken 이 있고 DB 엔 ADMITTED 가 없어 complete 가 영구 404 다(§80 U9).
+     * 이유: ADMITTED 발행 — 실패해도 예외를 올리지 않는다(Lua 가 이미 커밋돼 5xx 면 REPLAY 가 무한 반복, FRS §6.4).
+     * 문제: 건별 ack 대기는 지연이 건수에 선형이었다(AWS 12차 300건 p50 1.797초).
+     * 해결: 전량 보낸 뒤 한 번에 기다린다(publishAll). 첫 실패에서 끊지 않는다 — 폭발 반경 N → 1.
+     *       REPLAY 도 발행한다(멱등이라 무해, 첫 실패의 유일한 복구 경로).
+     * ⚠️ 실패분은 복구되지 않는다 — 흔적은 ERROR 로그와 result=error 뿐이고 60초 뒤 complete 는 404 다. §96-1 · §80 U9
      *
      * @author sonix
      * @return 원장을 잃은 건수 (발행 실패 + issuedAt 미확인으로 발행조차 못 한 건)
@@ -267,17 +263,14 @@ public class QueueEngineService {
     }
 
     /**
-     * Verify — admitToken이 지금 유효한지 답하고, <b>그 응답이 곧 완료다</b> (FRS §6.5 · PR #48).
-     * <b>DB 쓰기 0회.</b> Redis는 회차 키 넷을 정리하되 {@code admit-by-admit}은 남긴다(§92) — 그래서
-     * 같은 admitToken의 verify는 60초 안에 계속 통과한다(재시도 계약). {@code COMPLETED}는 응답과 함께 발행한다.
+     * 이유: Verify — admitToken 이 지금 유효한지 답하고, <b>그 응답이 곧 완료다</b>(FRS §6.5 · PR #48).
+     * 해결: DB 쓰기 0회 — COMPLETED 를 발행하고, Redis 는 admit-by-admit 만 남긴다(60초 안 재-verify 통과, §92).
+     * 🔴 @Transactional 을 걸지 마라 — Kafka 동기 발행(최대 12초) 동안 커넥션을 쥔다. 폴백 조회는 master 로 간다(§4-3). §96-2
      *
+     * @author sonix
      * @return identifier (Tenant가 어느 사용자인지 알아야 하므로)
      * @throws BusinessException 유효하지 않으면 404 {@code INVALID_ADMIT_TOKEN}
      */
-    // 이유: **트랜잭션을 걸지 않는다.** verify 는 Kafka 를 동기로 기다린다(send-timeout 12초).
-    // 문제: 트랜잭션 안이면 커넥션을 그 끝까지 쥔다 — 게이트 개방 순간 입장자 수만큼 몰리는 곳이라 자해다.
-    // 🪤 **폴백 조회는 master 로 간다** — 가르는 것은 메서드가 아니라 readOnly 트랜잭션 여부다(§4-3).
-    //    안 거는 판단은 유지한다. 대가가 replica 풀이 아니라 **master 풀 점유**일 뿐이다.
     public String verify(long tenantId, String queueId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 
@@ -343,43 +336,14 @@ public class QueueEngineService {
     }
 
     /**
-     * 이유: Complete — Tenant 가 입장 완료를 통보한다(FRS §6.6).
-     * 문제: <b>판정 권위는 DB 가 먼저, 그 다음이 Redis 다.</b> {@code markCompleted} 가 0행일 때
-     *       거기엔 둘이 섞여 있다 — ①자격 없음 ②<b>컨슈머가 ADMITTED 를 아직 적재 안 함</b>.
-     * 해결: ②까지 404 로 돌리면 <b>정상 입장자가 거절된다</b>. 그래서 0행일 때만 Redis 로 폴백한다.
-     * 🔑 근거는 <b>불변식</b>이다 — Redis 창(60초) ⊂ DB 창(300초)이다(§93).
+     * 이유: Complete — Tenant 가 입장 완료를 통보한다(FRS §6.6). 판정은 DB 먼저, 0행이면 Redis 폴백이다(§93).
+     * 문제: 0행에는 ①자격 없음 ②컨슈머가 ADMITTED 를 아직 적재 안 함이 섞인다 — ②를 404 로 돌리면 정상 입장자가 거절된다.
+     * 🔴 폴백은 입장 후 60초까지만 덮는다. 적재가 L>60초 밀리면 (60, L) 은 TK002 다 — 일시적이라 재시도하면 200(eb57107).
+     * 🔴 @Transactional 을 다시 붙이지 마라 — Redis 왕복과 폴백의 Kafka 동기 발행(12초) 동안 커넥션을 쥔다.
+     *    DB 작업은 markCompleted 한 문장이고 트랜잭션은 어댑터가 갖는다. 근거·실측 §96-3 · §95
      *
      * @author sonix
      */
-    // 🔴 **@Transactional 을 다시 붙이지 마라**(2026-09-23 제거). 이 메서드 안에는 Redis 왕복
-    //    (cleanupCompleted)과 폴백 경로의 **Kafka 동기 발행**(send-timeout 12초)이 있다 — 트랜잭션 안에 두면
-    //    그 12초 동안 DB 커넥션을 쥔다. 게이트 개방 직후 complete 가 몰리는 구간이라 자해다.
-    //    🔑 위 verify·admit 이 **같은 이유로** 트랜잭션을 안 쓴다 — complete 만 비대칭이었고
-    //       그 비대칭 자체가 결함이었다(dba·code-reviewer 독립 2인 지적).
-    //    🔑 Little: L = λW 다. **평시 이득은 0.1 커넥션으로 무의미하다**(0.70 → 0.60~0.64).
-    //       값은 전부 꼬리에 있다 — Kafka 가 send-timeout 12초까지 늘어지면 예전엔
-    //       108.6 req/s × 12s = **1,303 커넥션**을 요구했다. 실제 풀은 **인스턴스당 20**
-    //       (application-prod.yml) × api 6개 = **합 120** 이라 **10.9배**다. 풀은 enqueue·admit·
-    //       verify 와 공유라 complete 하나가 **API 전체를 고갈**시켰다(9차의 연결 거절 8,296회와 같은 모양).
-    //    🔴 **mysql CPU 가 내려간다고 쓰지 마라** — 커밋 횟수도, COMMIT 평균 5.09ms 도 안 변한다
-    //       (문장 수·내용·격리수준 동일. 락 대기는 잠들기라 CPU 로도 안 나타난다). 재측정의 판정
-    //       지표는 hikaricp_connections_pending · 커넥션 획득 시간 · innodb_row_lock_waits 다.
-    //    🔑 DB 작업은 가드 UPDATE **한 문장**뿐이라 원자성을 잃지 않는다. 그 문장의 트랜잭션은
-    //       TokenJpaAdapter.markCompleted 가 갖는다(@Modifying 은 트랜잭션 없이는 안 돈다).
-    //    🔑 **동시 complete 의 락 대기도 사라졌다.** 예전엔 같은 token_id 의 두 번째 요청이 X 락을
-    //       기다리며 **첫 요청의 Kafka 12초까지 함께 매달렸다**. 지금은 UPDATE 가 즉시 커밋하니
-    //       두 번째는 바로 0행 → findCompletedAt → 200 이다. TokenJpaRepository 의
-    //       "이 UPDATE 한 문장이 동시 complete 의 유일한 조정 수단 — 락 불필요" 가 이제 문자 그대로 참이다.
-    //    🔑 **예외 시 원장이 옳아졌다.** 예전엔 cleanupCompleted(Redis) 예외가 완료를 롤백해
-    //       status=1 로 되돌렸고, 300초 뒤 ReconcileJob 이 그 행을 **status=4 로 확정**했다 —
-    //       사용자는 입장했는데 원장은 만료로 굳는, **Redis 장애가 원장 사실을 지우는** 구조였다.
-    //       지금은 status=2·completed_at 이 남고 재시도는 findCompletedAt 으로 멱등 200 이며,
-    //       중복 게이트가 닫힌 채라 과금은 fail-closed 다(중복 청구 없음).
-    //    🪤 뒤따르는 읽기(findByTokenId·findCompletedAt)는 자기 쓰기를 읽지만 **master 고정**이라
-    //       안전하다 — readOnly 트랜잭션이 없으면 replica 로 가지 않는다(§4-3).
-    //       ❌ 부하를 나누려고 그 둘에 readOnly 를 붙이지 마라 — 즉시 read-after-write 가 깨진다.
-    //    🪤 이 경계를 실 트랜잭션 매니저로 관통하는 자동화 테스트는 **0건**이다(tester 실측).
-    //       근거는 어댑터 쪽 TokenAdmitQueryIntegrationTest 와 수동 REST 검증뿐이다.
     public LocalDateTime complete(long tenantId, String queueId, String tokenId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 

@@ -10,22 +10,24 @@ public final class RateLimitKeys {
     }
 
     /**
-     * 이유: 큐 상태 제어(생성·수정·삭제·pause·resume)와 API Key 관리 전용 버킷(§92).
-     * 문제: 데이터 평면과 같은 지갑을 쓰면 enqueue 가 한도를 다 쓴 순간 {@code pause} 가 429 가 된다.
-     * 원인: 🔑 <b>멈춰야 하는 순간이 곧 부하가 몰린 순간</b>이다(AWS 실측에서 실제로 났다).
-     * 해결: <b>면제가 아니라 분리</b>다 — 이 호출들도 공짜가 아니라 한도는 남기되 <b>굶지 않게</b> 한다.
-     */
-    /**
-     * 이유: 입장 처리(admit · verify · complete) 전용 버킷(§92).
-     * 문제: <b>배출이 유입에 굶으면 안 된다</b> — admit 이 429 면 줄이 안 빠지고 폴링이 늘어 더 나빠진다(<b>자기 강화 악순환</b>).
-     * 해결: 셋을 <b>한 버킷에</b> 둔다 — admit 만 빼면 <b>돈은 청구되고 입장은 못 하는</b> 상태가 된다.
-     * ⚠️ 나누면 테넌트 총량 한도가 올라간다(§89 의 절반을 되돌린다) — 받아들이는 근거는
-     *    <b>배출량이 발급된 입장권 수에 묶여</b> 유입과 달리 무한정 늘 수 없다는 것이다.
+     * 이유: 입장 처리(admit · verify · complete) 전용 버킷(§92). 배출이 유입에 굶으면 줄이 안 빠져 악순환이 된다.
+     * 해결: 셋을 한 버킷에 둔다 — admit 만 빼면 <b>청구는 되고 입장은 못 하는</b> 상태가 된다.
+     * ⚠️ 나누면 테넌트 총량이 올라간다 — 받아들이는 근거는 배출량이 발급된 입장권 수에 묶여 무한정 늘 수 없다는 것이다.
+     *
+     * @author sonix
      */
     public static String tenantDrain(String tenantId) {
         return "rl:tenant:" + tenantId + ":drain";
     }
 
+    /**
+     * 이유: 큐 상태 제어(생성·수정·삭제·pause·resume)와 API Key 관리 전용 버킷(§92).
+     * 문제: 데이터 평면과 같은 지갑이면 enqueue 가 한도를 다 쓴 순간 {@code pause} 가 429 다.
+     * 원인: 🔑 <b>멈춰야 하는 순간이 곧 부하가 몰린 순간</b>이다(AWS 실측에서 실제로 났다).
+     * 해결: 면제가 아니라 <b>분리</b>다 — 한도는 남기되 굶지 않게 한다.
+     *
+     * @author sonix
+     */
     public static String tenantControl(String tenantId) {
         return "rl:tenant:" + tenantId + ":control";
     }

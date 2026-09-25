@@ -41,14 +41,12 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 @Component
 public class BatchProcessor implements SmartLifecycle {
     /**
-     * 구간별 소요의 버킷 경계.
+     * 이유: 구간별 소요의 버킷 경계 — 대시보드가 {@code histogram_quantile(_bucket)} 로 p95 를 뽑는다.
+     * 문제: 경계를 안 주면 Micrometer 가 {@code _bucket} 을 아예 발행하지 않아 패널이 영구히 빈다(Timer 기본은 count/sum/max, 실측).
+     * 해결: 실측 기준선(redis 0.16ms · mysql 1.34ms · 틱 20ms · kafka 18ms/콜드 404ms)을 덮는 경계를 준다(§4-1).
+     * 🪤 {@code QueueEngineService.STAGE_SLO} 와 같은 값이어야 한다 — 버킷이 갈리면 집계가 깨진다.
      *
      * @author sonix
-     * @implNote 작성이유: 대시보드가 histogram_quantile(_bucket) 로 p95 를 뽑는다.
-     *           문제: 경계를 안 주면 Micrometer 가 _bucket 을 아예 발행하지 않아 패널이 영구히 빈다(실측).
-     *           원인: Timer 기본값은 count/sum/max 뿐이다. 해결: 실측 기준선(redis 0.16ms · mysql 1.34ms ·
-     *           tick 10ms · kafka 18ms/콜드 404ms · 틱 20ms)을 덮는 경계를 준다. §4-1
-     * 🪤 {@code QueueEngineService.STAGE_SLO} 와 <b>같은 값이어야 한다</b>(버킷이 갈리면 집계가 깨진다).
      */
     private static final Duration[] STAGE_SLO = {
             Duration.ofMillis(1), Duration.ofMillis(5), Duration.ofMillis(10), Duration.ofMillis(20),

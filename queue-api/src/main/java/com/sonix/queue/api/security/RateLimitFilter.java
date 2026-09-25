@@ -70,18 +70,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private static final double POLL_REFILL_PER_SEC = 1.0;
 
     /**
-     * 이유: 테넌트 한도 — <b>모든 테넌트에 동일</b>(§88 에서 등급제를 걷어냈다).
-     * 문제: 100,000 에서는 <b>리미터가 한 건도 막지 않았다</b>(3,000rps × 30초가 capacity 안, 429 가 0건).
-     * 해결: 50,000 으로 내렸다(§89) — 같은 공격이 23.1초에 개입해 15,000건을 막는다.
-     * 🪤 <b>enqueue 전용이 아니다</b> — 인증 요청 전부가 공유하므로 내리면 <b>입장까지</b> 조인다.
-     * 🪤 refill 은 <b>833.34</b> 다(833.33 이면 TTL 이 121초로 어긋나는데 테스트가 못 잡는다, §89).
-     */
-    /**
-     * 큐 상태 제어와 API Key 관리의 한도. <b>분당 60회</b>다.
+     * 이유: 큐 상태 제어와 API Key 관리의 한도 — 분당 60회. 실사용엔 사실상 무제한이고 남용은 막힌다.
+     * 🔑 숫자보다 <b>데이터 평면과 지갑이 다르다는 사실</b>이 중요하다 — enqueue 가 몰려도 이 버킷은 줄지 않는다(§92).
      *
-     * <p>큐를 멈추고 재개하는 일은 하루에 몇 번이다. 실사용에는 사실상 무제한이고, 남용은 여전히
-     * 막힌다. 🔑 중요한 건 숫자가 아니라 <b>데이터 평면과 지갑이 다르다는 사실</b>이다 —
-     * enqueue 가 아무리 몰려도 이 버킷은 줄지 않는다.
+     * @author sonix
      */
     static final int CONTROL_CAPACITY = 60;
     static final double CONTROL_REFILL_PER_SEC = 1.0;
@@ -115,6 +107,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
         return path != null && DRAIN_PLANE.matcher(path).matches();
     }
 
+    /**
+     * 이유: 테넌트 한도 — <b>모든 테넌트에 동일</b>(§88 에서 등급제를 걷어냈다). 유입(enqueue) 지갑이다(§92).
+     * 문제: 100,000 에서는 리미터가 한 건도 막지 않았다(3,000rps × 30초가 capacity 안, 429 0건).
+     * 해결: 50,000 으로 내렸다(§89) — 같은 공격이 23.1초에 개입해 15,000건을 막는다.
+     * 🪤 refill 은 <b>833.34</b> 다(833.33 이면 TTL 이 121초로 어긋나는데 테스트가 못 잡는다, §89).
+     *
+     * @author sonix
+     */
     static final int TENANT_CAPACITY = 50_000;
     static final double TENANT_REFILL_PER_SEC = 833.34;
 
@@ -233,11 +233,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
     /**
      * 이유: tokenId 기준 Token Bucket. 폴링은 인증이 없어 이 키가 유일한 구분자다.
-     * 🪤 <b>없는 tokenId 도 버킷을 만든다</b> — 무작위로 쏘면 한도 대신 <b>요청 1건 = 새 키 1개</b>다
-     *    (실측 200건 → +200). 무한 누적은 아니다(TTL 65초라 상주 키 = 유입률 × 65초).
-     * 🔴 종착점은 {@code noeviction} 이라 <b>쓰기 거부</b>다 — <b>같은 마스터의 다른 테넌트가 503</b>.
-     *    그래서 <b>키 길이에 상한을 둔다</b>({@link #MAX_POLL_TOKEN_ID_LENGTH}) — 개수가 아니라 <b>키 하나의 크기</b>를 막는 것이다.
-     * ⚠️ 키가 되는 tokenId 는 <b>정규화된 경로</b>에서 뽑아라 — 원문이면 인코딩 변형마다 새 키다.
+     * 문제: 없는 tokenId 도 버킷을 만든다 — 무작위로 쏘면 요청 1건 = 새 키 1개다(실측 200건 → +200, TTL 65초).
+     * 원인: 종착점이 {@code noeviction} 이라 <b>같은 마스터의 다른 테넌트가 503</b> 을 받는다.
+     * 해결: 키 하나의 크기에 상한을 둔다({@link #MAX_POLL_TOKEN_ID_LENGTH}). tokenId 는 <b>정규화된 경로</b>에서 뽑는다. §96-5
      *
      * @author sonix
      * @return true=통과, false=거부(429 완료).

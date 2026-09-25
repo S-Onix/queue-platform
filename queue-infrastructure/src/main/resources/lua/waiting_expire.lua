@@ -73,11 +73,8 @@ for i = 1, #head, 2 do
 	end
 
 	-- 🔴 HGET 미스 = **고아**다 (admit.lua가 되돌려 놓은 자). 여기서 건드리지 않는다.
-	--   ① issuedAt을 모르므로 만료 판정 자체가 성립하지 않는다.
-	--   ② 고아를 이 잡이 조용히 치우면 U9 gauge(queue_waiting_orphans)가 영원히 0이 되어
-	--      **탐지 수단이 무력화**된다. 고아는 사람이 보고 판단할 대상이지 sweep이 삼킬 것이 아니다.
-	--   ⚠️ 대가: 고아가 head를 점유하면 그 뒤의 진짜 만료 대상이 이 상한 안에 안 들어온다.
-	--      바로 그 상황을 U9 gauge가 0이 아닌 값으로 알려준다 — 그게 그 메트릭의 존재 이유다.
+	--   issuedAt 을 몰라 만료 판정이 성립하지 않고, 조용히 치우면 U9 gauge(queue_waiting_orphans)가 영원히 0 이 된다.
+	--   ⚠️ 대가: 고아가 head 를 점유하면 뒤의 진짜 만료 대상이 상한 안에 안 들어온다 — 그걸 U9 gauge 가 알린다.
 end
 
 return records

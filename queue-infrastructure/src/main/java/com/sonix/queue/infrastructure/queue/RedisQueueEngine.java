@@ -161,15 +161,12 @@ public class RedisQueueEngine implements QueueEngine {
     }
 
     /**
-     * 이유: queueId → 소유 클러스터 판정(§75 이중 라우팅).
-     * 해결: ①맵 hit ②miss 면 {@code EXISTS ...:seq} 를 물어 응답한 쪽이 소유자 ③둘 다 없으면 폴백.
-     * 🔑 <b>미스 비용은 (WAS, queueId)당 평생 1회</b> — seq 키는 INCR 로만 생기고 지워지지 않아
-     *    한 번 enqueue 된 큐는 비어도 계속 소유권을 증명한다.
+     * 이유: queueId → 소유 클러스터 판정(§75 이중 라우팅). ①맵 hit ②miss 면 {@code EXISTS ...:seq} 에 응답한 쪽 ③둘 다 없으면 폴백.
+     * 🔑 미스 비용은 (WAS, queueId)당 평생 1회 — seq 키는 INCR 로만 생기고 지워지지 않아 계속 소유권을 증명한다.
      * 🪤 읽기 오배송은 안전하다 — 대조 실패 시 아무것도 쓰지 않아 최악이 "빈 결과 1회"다.
      *
      * @author sonix
-     * @param fallbackForNewQueue 양쪽 모두 키가 없을 때의 목적지 결정. 읽기는 cluster1로
-     *                            떨어뜨려도 무해하지만(위 참조), 쓰기는 DB 배정 기록을 따라야 한다.
+     * @param fallbackForNewQueue 양쪽 모두 키가 없을 때의 목적지. 읽기는 cluster1 로 떨어져도 무해하고 쓰기는 DB 배정을 따른다
      */
     private StringRedisTemplate route(String queueId, Supplier<StringRedisTemplate> fallbackForNewQueue) {
         // 단일 클러스터 구성이면 라우팅할 대상이 없다. 불필요한 EXISTS 왕복도 하지 않는다.

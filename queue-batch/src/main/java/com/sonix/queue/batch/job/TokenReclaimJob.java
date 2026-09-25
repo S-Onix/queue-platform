@@ -84,14 +84,12 @@ public class TokenReclaimJob {
     }
 
     /**
-     * 주기 10초 (FRS §10).
+     * 이유: 주기 10초(FRS §10). 설정 키가 {@code reclaim} 인 이유 — admit 만료와 inactive 이탈을 <b>둘 다</b> 회수한다.
+     * 문제: {@code fixedRate} 는 한 바퀴가 10초를 넘으면 틱을 겹쳐 쌓는다(정합성은 claim 이 지키지만 Redis 왕복이 배).
+     * 해결: {@code fixedDelay}. 키를 admit-expiry 로 두면 "admit 만 늦춘다"고 오해해 이탈 회수까지 늦춘다.
      *
-     * <p>{@code fixedDelay}인 이유: 큐가 많아 한 바퀴가 10초를 넘으면 {@code fixedRate}는 틱을
-     * 겹쳐 쌓는다. 이 잡은 늦어도 되지만 겹치면 안 된다 — 겹쳐도 정합성은 claim이 지키지만
-     * Redis 왕복만 배로 늘어난다.
+     * @author sonix
      */
-    // 키가 reclaim인 이유: 이 잡은 admit 만료와 inactive 이탈 **둘 다** 회수한다.
-    //   admit-expiry로 두면 운영자가 "admit만 늦춘다"고 생각하고 값을 키워 이탈 회수까지 늦춘다.
     @Scheduled(fixedDelayString = "${queue.batch.reclaim.interval-ms:10000}")
     public void reclaim() {
         // Clock 빈을 두지 않는다 — 이 값은 Lua에 넘길 "지금"일 뿐이고, 테스트는 만료 score를

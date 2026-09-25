@@ -77,15 +77,10 @@ public class KafkaEnqueueEventPublisher implements EnqueueEventPublisher {
     }
 
     /**
-     * 이유: 전량 {@code send} 한 뒤 <b>한 번에</b> ack 을 기다린다 (12차 실측 후 도입).
-     * 문제: 예전엔 호출자가 {@link #publish} 를 루프로 돌아 건당 ack 을 기다렸다 — 300건이면
-     *       <b>p50 1.797초</b>(건당 5.99ms)이고, 그 값은 {@code linger.ms}(5ms)를 건마다 전액
-     *       지불한 결과다(모델 6.38ms/건이 관측을 94~110% 덮었다).
-     * 원인: 건별 {@code get()} 은 다음 레코드를 직전 ack 뒤에 넣어 <b>자기 레코드끼리 배치가 안 된다</b>.
-     * 해결: 먼저 다 보내 한 배치에 모이게 하고, 대기는 마지막에 한 번 한다.
-     * 🔑 <b>대기 예산은 전체가 하나를 공유한다</b> — 건별로 주면 브로커 장애 때 300 × 12초(queue-api 의 send-timeout-ms)가 된다.
-     * 🪤 실패는 <b>흩어져 나온다</b> — 첫 실패에서 끊지 않는다. 트랜잭션이 없어 레코드가 서로
-     *    독립이므로, 1건 실패가 나머지를 데려가지 않는 것이 <b>이 메서드의 존재 이유</b>다.
+     * 이유: 전량 {@code send} 한 뒤 <b>한 번에</b> ack 을 기다린다(AWS 12차 실측 후 도입).
+     * 문제: 건별 {@code get()} 은 자기 레코드끼리 배치가 안 돼 linger(5ms)를 건마다 지불했다 — 300건 p50 1.797초.
+     * 해결: 먼저 다 보내 한 배치에 모으고 대기는 마지막에 한 번. <b>대기 예산은 전체가 공유</b>한다(건별이면 300 × 12초).
+     * 🪤 첫 실패에서 끊지 않는다 — 레코드가 독립이라 1건 실패가 나머지를 데려가지 않는 것이 존재 이유다. §96-9
      * ⚠️ 예외를 올리지 않는다 — 호출 시점에 Lua 가 이미 커밋돼 되돌릴 수 없다(§80 U9).
      *
      * @author sonix
@@ -93,12 +88,9 @@ public class KafkaEnqueueEventPublisher implements EnqueueEventPublisher {
     @Override
     public int publishAll(List<EnqueueEvent> events) {
         List<CompletableFuture<SendResult<String, Object>>> futures = new ArrayList<>(events.size());
-        // 🔴 **데드라인을 send 루프 앞에서 잡는다.** `send()` 는 비동기가 아니다 — 메타데이터 대기·
-        //    버퍼 소진에서 `max.block.ms`(4초) 를 **건당** 전액 쓴다. 뒤에서 잡으면 브로커 전원
-        //    다운 + 메타데이터 캐시 만료에서 count=300 이 300 × 4초 = **20분** 요청 스레드를 잡는다
-        //    (예전 코드는 첫 건에서 break 라 ~16초였다 — 즉 여기를 안 묶으면 최악이 나빠진다).
-        // 🔑 예산 하나를 send·대기 **두 구간이 공유**한다. 정상 경로는 send 가 즉시 반환하므로
-        //    영향이 없고, 병리 경로만 유계가 된다.
+        // 🔴 데드라인을 send 루프 앞에서 잡는다 — send() 는 메타데이터 대기·버퍼 소진에서 max.block.ms(4초)를
+        //    건당 전액 쓴다. 뒤에서 잡으면 브로커 전원 다운 때 300 × 4초 = 20분 요청 스레드를 잡는다.
+        //    예산 하나를 send·대기 두 구간이 공유한다 — 정상 경로엔 영향이 없고 병리 경로만 유계가 된다.
         long deadline = System.nanoTime() + sendTimeout.toNanos();
         int failed = 0;
         for (EnqueueEvent event : events) {

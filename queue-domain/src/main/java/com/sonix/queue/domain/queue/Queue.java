@@ -54,13 +54,8 @@ public class Queue {
 
     public boolean isEnqueueable(){
         /*
-         * 🔴 여기서 보는 것은 **상태뿐이다.** 정원(maxCapacity) 판정은 하지 않는다.
-         *
-         * 용량은 enqueue_bulk.lua 가 ZCARD 로 본다(§66 D6) — 그래야 확인과 삽입이 한 EVAL 안에서
-         * 원자적이다. 여기서 미리 세면 그 사이에 남이 들어와 정원을 넘긴다(TOCTOU).
-         *
-         * 구 주석은 "현재 인원과 maxCapacityCount 비교 후 반환"이라고 적혀 있었다 —
-         * 그걸 믿고 여기에 용량 검사를 넣으면 Lua 판정을 중복 구현하게 된다.
+         * 🔴 여기서 보는 것은 **상태뿐이다.** 정원(maxCapacity)은 enqueue_bulk.lua 가 ZCARD 로 본다(§66 D6).
+         * 확인과 삽입이 한 EVAL 안이어야 원자적이다 — 여기서 미리 세면 그 사이 남이 들어와 정원을 넘긴다(TOCTOU).
          */
         return this.status == QueueStatus.ACTIVE;
     }

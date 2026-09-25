@@ -118,14 +118,13 @@ public interface TokenJpaRepository extends JpaRepository<TokenEntity, TokenEnti
                             @Param("limit") int limit);
 
     /**
-     * 이유: 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq(없으면 NULL, 호출자가 0 으로 바꾼다).
-     * 문제: 🔑 <b>인덱스만 만들어도 옵티마이저가 안 쓴다</b> — AWS 8차에서 이 쿼리가 MySQL CPU <b>예산 6.1%</b> 를 먹고 판 안에서 372ms → 1,776ms 로 5배 악화했다.
-     * 해결: {@code FORCE INDEX} 로 커버링을 강제한다(43ms → 24ms. <b>버퍼풀 &lt; 테이블</b>이면 더 커진다).
-     * 🔴 그래도 <b>큐의 전체 이력</b>을 훑었다(14차: 35만 행 463ms — 파티션 DROP 전까지 늘기만 한다). 그래서 경계에서
-     *    거꾸로 {@value #SETTLED_SCAN_ROWS}행만 읽는다 — 큐 크기와 무관하게 상수다(로컬 45,923행: 35ms → 1.32ms).
-     * 🪤 LIMIT 1 로 줄이지 마라 — issued_at 은 <b>N대의 앱 시계</b>라 seq 와 역전된다. K행의 MAX 는 역전이 K행 안이면
-     *    전수와 같고, 밖이면 <b>더 작은</b> 값을 준다(양쪽이 같은 경계를 세므로 오탐 없이 경계 근처만 이번 주기에서 빠진다).
-     * 🪤 인덱스 이름이 바뀌면 이 쿼리는 <b>에러로 죽는다</b> — 조용히 느려지는 것보다 낫다.
+     * 이유: 대사 기준선 — 정착 시간이 지난 것 중 가장 큰 seq(없으면 NULL → 호출자가 0).
+     * 문제: 커버링 인덱스(FORCE INDEX — 옵티마이저가 안 골랐다)로도 큐의 전체 이력을 훑었다(14차 35만 행 463ms, 계속 는다).
+     * 해결: 경계에서 거꾸로 {@value #SETTLED_SCAN_ROWS}행만 읽는다 — 상수 비용(로컬 45,923행 35ms → 1.32ms).
+     * 🪤 LIMIT 1 로 줄이지 마라 — issued_at 은 N대의 앱 시계라 seq 와 역전된다. K행의 MAX 는 역전이 K행 밖이면
+     *    <b>더 작게만</b> 틀린다(양쪽이 같은 경계를 세므로 오탐 없음). 인덱스 이름이 바뀌면 에러로 죽는다. §96-10
+     *
+     * @author sonix
      */
     @Query(value = """
             SELECT MAX(seq) FROM (

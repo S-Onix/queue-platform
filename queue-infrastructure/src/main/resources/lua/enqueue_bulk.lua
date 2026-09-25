@@ -4,37 +4,18 @@
 -- KEYS[1]: queue key (예: queue:{q_bts}:waiting)
 -- KEYS[2]: seq key   (예: queue:{q_bts}:seq) — 큐별 전역 순번 카운터
 -- KEYS[3]: token key (예: queue:{q_bts}:tokens) — identifier -> "tokenId|issuedAt" 매핑 Hash
---   중괄호는 Redis Cluster 해시태그(QueueKeys 참조). 세 키가 같은 슬롯에 놓여야
---   Lua가 실행된다 — 없으면 CROSSSLOT 에러.
---   🔴 **중복 게이트는 이 Hash다** (waiting ZSet이 아니다). 사람은 admit되면 waiting에서
---   빠지지만(admit.lua의 ZPOPMIN) 아직 큐를 떠난 게 아니므로, waiting 존재 여부로 신규를
---   판정하면 admit된 사람의 재-enqueue가 새 tokenId·새 seq를 받는다 → 폴링 404, 과금 중복
---   (billing_snapshots가 tokens 행을 COUNT한다), status=1 고아 행. 그래서 게이트는
---   HSETNX이고, 사람을 큐에서 빼는 경로(cleanupCompleted·cleanupVerified — §92로 둘이다)가
---   HDEL로 이 필드를 지운다.
+--   🔴 **중복 게이트는 이 Hash 다**(waiting ZSet 이 아니다). admit 되면 waiting 에서 빠지므로 그걸로 판정하면
+--   재-enqueue 가 새 tokenId·새 seq 를 받아 과금이 중복된다. 사람을 큐에서 빼는 경로만 HDEL 한다. §96-15
 -- ARGV[1]: maxCapacity (Queue 최대 인원)
 -- ARGV[2]: requestCount (Bulk 요청 개수)
--- ARGV[3]: issuedAt (이 청크의 발급 시각, epoch millis 문자열)
---   Lua에서 시각을 만들지 않는 이유는 TIME이 비결정적이어서가 아니다. Redis 5+의
---   effects replication 하에서는 write 스크립트에서 TIME을 써도 안전하다.
---   DB에 저장될 포맷(tokens 테이블의 issued_at)을 Java가 통제해야 하기 때문이다.
--- ARGV[4..]: identifier1, tokenId1, identifier2, tokenId2, ...   (아이템당 2개)
---   score는 Lua가 INCR로 발급. tokenId는 Java에서 발급한 후보로,
---   OK일 때만 채택되고 EXISTS/FULL이면 버려진다.
+-- ARGV[3]: issuedAt (이 청크의 발급 시각, epoch millis — DB 포맷을 Java 가 통제하려고 Lua 에서 만들지 않는다)
+-- ARGV[4..]: identifier1, tokenId1, identifier2, tokenId2, ...   (아이템당 2개. tokenId 는 OK 일 때만 채택)
 
 -- Returns: {{identifier, tokenId, status, rank, total, seq, issuedAt}, ...}   (원소 7개 고정)
---   score는 KEYS[2] INCR로 발급 (단조증가, 유일) → Redis 도달 순서 = rank 순서
---   OK: 정상 추가 (rank 0-based, total 추가 후 크기, issuedAt = ARGV[3])
---   EXISTS: 이미 존재 (기존 rank + 현재 total, tokenId·issuedAt은 Hash의 최초 값)
---     ※ admit됐지만 **아직 완료하지 않은** 사람이 재-enqueue하면 EXISTS이면서 waiting에는
---       없다 → rank·seq는 -1이다. 그 사람은 폴링에서 admit-by-token으로 입장권을 돌려받는다
---       (seq로 찾지 않는다).
---       🔑 **완료한 사람은 여기 해당하지 않는다 (§92).** verify든 complete든 완료 시점에
---       게이트와 admit-by-token이 지워지므로 그 사람의 재-enqueue는 EXISTS가 아니라 OK다
---       (새 tokenId·맨 뒤·과금 +1). 이 문장을 완료자까지 포함해 읽으면 반대로 구현하게 된다.
---   FULL: Capacity 초과 (rank -1, 현재 total, tokenId·issuedAt = "")
---   ※ 빈 문자열은 배열을 자르지 않는다. nil/false만 RESP 변환에서 뒤를 끊으므로
---     "모름"은 반드시 ""로 표현할 것 (Java의 size() < 7 검사가 이를 전제한다).
+--   OK: 정상 추가 · EXISTS: 이미 있음(tokenId·issuedAt 은 Hash 의 최초 값) · FULL: 정원 초과(tokenId·issuedAt = "")
+--   ※ admit 됐지만 완료하지 않은 사람의 재-enqueue 는 EXISTS 이면서 rank·seq = -1(폴링이 입장권을 돌려준다).
+--     완료한 사람은 게이트가 지워져 OK(새 tokenId·맨 뒤·과금 +1)다 — §92.
+--   ※ "모름"은 반드시 "" 로 — nil/false 는 RESP 변환에서 배열 뒤를 끊는다(Java 의 size() < 7 검사가 전제). §96-16
 
 -- issuedAt을 Hash에 함께 저장하는 이유:
 --   tokens 테이블의 UNIQUE KEY가 (token_id, issued_at)이라 issuedAt이 다르면 같은
@@ -82,14 +63,9 @@ for i = 1, requestCount do
 	local tokenId = ARGV[2 * i + 3]
 
 	if currentSize >= maxCapacity then
-	-- 🔴 정원이 찼어도 **이미 발급받은 사람은 FULL이 아니다.** 새로고침·재시도로 같은
-	--    identifier가 다시 오는 것은 정상 경로인데(계약: identifier 재사용), 정원만 보고
-	--    FULL을 주면 **줄 맨 앞에서 기다리던 사람에게 마감 페이지가 뜬다.** 자리는 waiting에
-	--    그대로 있는데 응답의 tokenId가 빈 문자열이라 폴링조차 못 한다(실측으로 재현했다).
-	--
-	-- 🪤 순서를 통째로 뒤집어 HSETNX를 먼저 부르면 안 된다 — 정원이 찬 상태에서 **신규**
-	--    사용자까지 tokens에 심어져 중복 게이트(=과금 게이트)가 오염된다. 여기서는 쓰지 않는
-	--    HGET으로 **읽기만** 한다. 이 왕복은 정원이 찬 큐에서만 붙는다.
+	-- 🔴 정원이 찼어도 **이미 발급받은 사람은 FULL이 아니다** — 새로고침으로 같은 identifier 가 오는 것은 정상이다.
+	--    FULL 을 주면 줄 맨 앞에서 기다리던 사람에게 마감 페이지가 뜬다(실측 재현).
+	-- 🪤 HSETNX 를 먼저 부르면 안 된다 — 정원이 찬 상태에서 신규까지 게이트(=과금 게이트)에 심긴다. 여기선 HGET 으로 읽기만 한다.
 		local existingValue = redis.call('HGET', tokenKey, identifier)
 		if existingValue then
 			table.insert(enqueueResults, existsResult(identifier, existingValue))

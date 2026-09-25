@@ -26,22 +26,25 @@ import java.util.Optional;
 public class TokenJpaAdapter implements TokenRepository {
 
     /**
-     * 이유: 상태 전이 UPSERT 의 INSERT 부분. ENQUEUED 만은 {@link #ENQUEUE_INSERT} 가 맡는다.
-     * 🔴 <b>{@code ?} 를 쓰지 마라</b> — 재작성이 조용히 꺼져 500건 배치가 500왕복이 된다.
-     * 🔴 {@code AS new} 별칭이 필요하고, 컬럼명은 {@code tokens.}·{@code new.} 로 전부 한정한다.
-     * 🔑 {@code admitted_at} 의 {@code ?} 는 §90 의 null 여부 보존용이다(값은 MySQL 이 찍는다).
-     */
-    /**
-     * 이유: 신규 적재(ENQUEUED) SQL. {@code TokenEntity.@SQLInsert} 원문을 옮긴 것이다.
-     * 🔴 <b>컬럼 순서까지 같아야 한다</b> — {@code saveAllIfAbsent} 의 파라미터 인덱스가 이 순서에 붙어 있다.
-     * 🔑 ODKU 가 완전 no-op 인 것이 핵심 — 뒤늦은 ENQUEUED 가 전이된 행을 <b>되돌리지 않는다</b>.
-     * 🪤 SET 절에 {@code ?} 를 쓰면 다중행 재작성이 조용히 꺼진다({@link #TRANSITION_INSERT} 참조).
+     * 이유: 신규 적재(ENQUEUED) SQL. {@code saveAllIfAbsent} 의 파라미터 인덱스가 <b>이 컬럼 순서</b>에 붙어 있다.
+     * 🔑 ODKU 가 완전 no-op 인 것이 핵심 — 뒤늦은 ENQUEUED 가 전이된 행을 되돌리지 않는다.
+     * 🪤 SET 절에 {@code ?} 를 쓰면 다중행 재작성이 조용히 꺼진다.
+     *
+     * @author sonix
      */
     private static final String ENQUEUE_INSERT =
             "INSERT INTO tokens (queue_id, seq, status, tenant_id, user_id, issued_at, token_id) "
             + "VALUES (?, ?, ?, ?, ?, ?, ?) "
             + "ON DUPLICATE KEY UPDATE token_id = token_id";
 
+    /**
+     * 이유: 상태 전이 UPSERT 의 INSERT 부분(ENQUEUED 는 {@link #ENQUEUE_INSERT} 가 맡는다).
+     * 🔴 SET 절에 {@code ?} 를 쓰지 마라 — 재작성이 조용히 꺼져 500건 배치가 500왕복이 된다.
+     * 🔴 {@code AS new} 별칭이 필요하고 컬럼명은 {@code tokens.}·{@code new.} 로 전부 한정한다.
+     * 🔑 {@code admitted_at} 의 {@code ?} 는 §90 의 null 여부 보존용이다(값은 MySQL 이 찍는다).
+     *
+     * @author sonix
+     */
     private static final String TRANSITION_INSERT = """
             INSERT INTO tokens (token_id, queue_id, tenant_id, user_id, seq, status, issued_at, admit_token, admitted_at, expired_reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, IF(? IS NULL, NULL, UTC_TIMESTAMP(3)), ?) AS new
@@ -197,18 +200,11 @@ public class TokenJpaAdapter implements TokenRepository {
     }
 
     /**
-     * 이유: 가드 UPDATE 한 문장. {@code @Modifying} 은 트랜잭션이 <b>없으면 실행되지 않는다</b>.
-     * 문제: 예전엔 호출자({@code QueueEngineService.complete})의 {@code @Transactional} 에 얹혀 있었다.
-     * 원인: 그 트랜잭션이 <b>Redis 왕복과 Kafka 동기 발행(최대 12초)까지 감싸</b> 커넥션을 붙잡았다 —
-     *       verify·admit 은 <b>같은 이유로</b> 트랜잭션을 안 쓴다. complete 만 비대칭이었다.
-     * 해결: 트랜잭션을 <b>DB 작업 하나</b>로 좁혀 여기로 내린다. 아래 {@code expireStaleAdmitted} 가
-     *       같은 형태다(호출자인 배치가 트랜잭션을 안 갖는다).
-     * 🪤 이 어노테이션을 지우면 complete 가 런타임에 죽는다 — 커버는
-     *    {@code TokenAdmitQueryIntegrationTest.markCompleted_withoutAmbientTransaction} 이다.
-     * 🔴 {@code READ COMMITTED} 가 아니면 컨슈머 적재와 <b>데드락(1213)으로 500</b> 이 난다.
-     *    WHERE 가 유니크키 {@code (token_id, issued_at)} 의 절반이라 REPEATABLE READ 에서 갭까지 잠그고,
-     *    컨슈머가 같은 트랜잭션에서 바로 앞 키를 넣으면 서로를 기다린다(2026-09-24 실측 24/24).
-     *    커버는 {@code markCompleted_doesNotDeadlockWithConsumerInsert}. 선례는 {@code BillingJdbcAdapter}.
+     * 이유: 가드 UPDATE 한 문장. {@code @Modifying} 은 트랜잭션이 없으면 실행되지 않아 여기서 연다.
+     * 문제: 호출자의 트랜잭션에 얹혀 있던 때는 Redis 왕복과 Kafka 동기 발행(12초)까지 커넥션을 쥐었다.
+     * 해결: 트랜잭션을 DB 작업 하나로 좁혔다. 🔴 지우면 complete 가 런타임에 죽는다(markCompleted_withoutAmbientTransaction).
+     * 🔴 {@code READ COMMITTED} 여야 한다 — WHERE 가 유니크키 절반이라 RR 에선 갭락 ↔ 컨슈머 INSERT 데드락(1213)으로 500
+     *    (실측 24/24, 커버 markCompleted_doesNotDeadlockWithConsumerInsert). §95 · §96-8
      *
      * @author sonix
      */

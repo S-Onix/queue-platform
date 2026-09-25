@@ -3,23 +3,15 @@ package com.sonix.queue.domain.queue;
 import java.time.Instant;
 
 /**
- * 이유: 토큰 생명주기 이벤트 — 토픽 {@code token-lifecycle} 의 <b>유일한 스키마</b>.
- * 원인: 토픽을 나누면 같은 토큰의 상태 전이 순서가 깨진다(§73 D18).
- * 해결: 한 토픽·한 스키마에 {@code eventType} 을 <b>본문 판별 필드</b>로 둔다(§80).
- *       현재 넷 — ENQUEUED · ADMITTED · COMPLETED · EXPIRED.
- * 🪤 null 검증을 생성자에 넣지 마라 — <b>역직렬화 경로</b>라 인덱스도 모른 채 터져 격리가 막힌다.
+ * 이유: 토큰 생명주기 이벤트 — 토픽 {@code token-lifecycle} 의 <b>유일한 스키마</b>. 토픽을 나누면 전이 순서가 깨진다(§73 D18).
+ * 해결: {@code eventType} 을 본문 판별 필드로 둔다(§80) — ENQUEUED · ADMITTED · COMPLETED · EXPIRED.
+ * 🪤 null 검증을 생성자에 넣지 마라 — 역직렬화 경로라 인덱스도 모른 채 터져 격리가 막힌다.
  *
  * @author sonix
- * @param eventType {@link TokenEventType} 이름. 아래 정규화 규칙 참조
+ * @param eventType  {@link TokenEventType} 이름. 아래 정규화 규칙 참조
  * @param admitToken ADMITTED에서 발급된 입장 자격. 그 외 타입은 null일 수 있다
- * @param admittedAt admit 시각(UTC). 🔴 <b>이 값은 {@code tokens.admitted_at}에 적재되지 않는다</b>(§90).
- *                   적재기가 쓰는 것은 <b>null 여부뿐</b>이고, 값은 MySQL의 {@code UTC_TIMESTAMP(3)}가
- *                   찍는다 — 그 컬럼은 verify·complete·reconcile 술어의 <b>좌변</b>인데 우변이 전부
- *                   MySQL 시계라, 앱 시계로 쓰면 한 창을 두 시계로 재게 되기 때문이다.
- *                   그래서 이 필드는 <b>"admit이 일어났다"는 표지</b>로만 쓰인다 —
- *                   {@code EXPIRED}·{@code COMPLETED}가 null을 실어 보내면 컬럼도 NULL로 남고,
- *                   그 NULL 여부가 {@code SUM(admitted_at IS NOT NULL)}(= 입장권 개수의 유일한 근거)을 만든다.
- *                   🪤 <b>"그대로 적재된다"고 되돌리지 마라</b> — 그 한 문장이 §90을 되돌리게 만든다
+ * @param admittedAt 🔴 <b>값은 적재되지 않는다</b>(§90) — null 여부만 쓰이고 시각은 MySQL 이 찍는다.
+ *                   "그대로 적재된다"고 되돌리지 마라. 근거 §96-6
  */
 public record EnqueueEvent(
                 String eventType,

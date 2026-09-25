@@ -76,16 +76,12 @@ public interface TokenRepository {
     // ── reconciliation (Sprint 9) ──
 
     /**
-     * 이유: complete 유효 창이 지나도록 {@code ADMIT_ISSUED} 에 남은 토큰을 만료로 확정한다.
-     * 문제: Tenant 가 verify·complete 를 둘 다 안 부르면 그 행이 <b>영원히 1 로 남는다</b>(실서버 재현).
-     * 원인: EXPIRED 가드가 {@code IF(status = 0, ...)} 라 1 에서 no-op 이다 — 늦은 complete 를 살리는 §36 의 의도다.
-     * 해결: 이것만 <b>직접 UPDATE</b> 다(도메인 전이가 아니라 원장 교정). 큐 단위로 끊어 한 큐가 상한을 독식하지 않게 한다.
-     * 🔴 <b>기준 시각을 호출자가 정하지 않는다</b>(§90) — 창의 길이만 넘기고 "지금"은 DB 가 정한다.
+     * 이유: complete 창이 지나도록 {@code ADMIT_ISSUED} 에 남은 토큰을 만료로 확정한다 — 안 하면 영원히 1 로 남는다.
+     * 원인: EXPIRED 가드가 {@code IF(status = 0, ...)} 라 1 에서 no-op 이다(늦은 complete 를 살리는 §36 의 의도).
+     * 해결: 이것만 <b>직접 UPDATE</b> 다. 큐 단위로 끊고, 기준 시각은 호출자가 아니라 DB 가 정한다(§90).
      *
      * @author sonix
-     * @param validWindowSeconds complete 유효 창의 길이. 이만큼 <b>지난</b> 것이 대상이다
-     *                           (= {@link Token#COMPLETE_VALID_WINDOW_SECONDS}).
-     *                           더 짧게 주면 정상적인 늦은 통보가 404를 받는다
+     * @param validWindowSeconds complete 창의 길이(= {@link Token#COMPLETE_VALID_WINDOW_SECONDS}). 짧게 주면 늦은 통보가 404 다
      * @param limit              한 번에 고칠 최대 행 수. Gap Lock을 피하려면 작게 끊는다
      * @return 실제로 만료 처리된 행 수
      */
