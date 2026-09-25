@@ -56,7 +56,7 @@
 - HTTP 요청 수를 실제로 깎는 것은 **CDN뿐**이다(Sprint 11). WAS-local 캐시는 **일부러 안 만들었다**(§79 D1).
 
 **이 경로에서 가장 위험한 세 가지**
-1. `queue:{q}:last-active` ZSet에 **`ZREM`도 `EXPIRE`도 전 소스에 0건**이다(`poll_verify.lua`가 `ZADD`만 한다). 읽는 코드도 0건 — 즉 지금은 쓰기만 하고 아무도 안 쓰는 데이터가 무한히 쌓인다.
+1. `queue:{q}:last-active` ZSet은 `poll_verify.lua`가 `ZADD`하고 **`inactive_expire.lua`가 읽고 `ZREM`한다**(회수 배치 10초). 커지고만 있다면 회수 배치가 그 큐를 못 돌고 있는 것이다 — batch `up`과 `queue_waiting_orphans`를 먼저 본다.
 2. ② permitAll + Rate Limit 키가 요청자 통제값(tokenId) → 요청 1건이 Redis master EVAL 2회를 확정 유발한다.
 3. **① 은 인증도 Rate Limit도 없다.** L7 flood은 **CDN·WAF 소관**이고 앱에서 막을 수단이 없다.
    🔴 예전에 적혀 있던 "미지 queueId는 Redis 1왕복에서 끝난다"는 방어 근거는 **거짓이다**
@@ -106,15 +106,15 @@
 - **정상 범위**: `used_memory` ≤ 800MB (1GB의 80%). `zcard last-active` ≤ 해당 큐의 `zcard waiting` — **이 관계가 깨지면(last-active > waiting) 이미 좀비 멤버가 쌓인 것이다.**
 - **원인별 분기**:
   - `zcard last-active` > `zcard waiting` → 삭제 경로 부재로 인한 누적. 확정.
-  - `used_memory`가 크지만 `last-active`가 작다 → `waiting`/`tokens`가 큰 것. 이 셋도 삭제 경로가 없다(admit·TTL 미구현).
+  - `used_memory`가 크지만 `last-active`가 작다 → `waiting`/`tokens`가 큰 것. 이 셋은 admit(`ZPOPMIN`)과 회수 배치 3경로가 줄인다 — 줄지 않으면 그 둘을 의심한다.
   - `rl:poll:token:*` 키가 수백만 개 → Rate Limit 키 폭증. [`runbook/rate-limit.md`](rate-limit.md) 로.
 - **조치** — **`noeviction`이라 상한에 닿는 순간 모든 쓰기가 `OOM command not allowed` 로 실패한다. enqueue도 폴링도 동시에 죽는다.** 상한에 닿기 전에:
   1. 종료된 이벤트의 `last-active`를 지운다 (**진행 중 큐에는 쓰지 마라**):
      ```bash
-     # last-active를 읽는 코드가 0건이므로 이 키만 지우는 것은 현재 기능에 영향이 없다
+     # 🔴 진행 중인 큐에선 지우지 마라 — inactive_expire.lua 가 읽는다. 종료된(DELETED) 큐만 대상이다
      redis-cli -c -p 7001 del 'queue:{q_종료된큐}:last-active'
      ```
-     되돌리기: 없다. 다만 아무도 읽지 않는 데이터라 손실이 없다. **inactive_ttl 배치(미구현)가 들어온 뒤에는 이 판단이 뒤집힌다** — 그때는 지우면 안 된다.
+     되돌리기: 없다. **진행 중인 큐의 `last-active`를 지우면 그 대기자들은 이탈 회수 대상에서 빠진다**(waitingTtl로만 회수). 삭제는 DELETED 큐에만.
   2. 그래도 부족하면 종료된 큐의 `waiting`/`tokens`도 지운다. `seq`는 남긴다(순번 재사용 방지). → [`runbook/enqueue.md`](enqueue.md) 의 FULL 항목 참조.
   3. 임시로 `maxmemory`를 올린다 (물리 메모리 여유가 있을 때만):
      ```bash
@@ -123,7 +123,7 @@
      ```
 - **하면 안 되는 것**:
   - `maxmemory-policy`를 `allkeys-lru` 등으로 바꾸는 것. **대기열 ZSet이 evict 대상이 되어 사용자의 순번이 조용히 사라진다.** `noeviction`은 의도된 선택이다 — 쓰기 실패가 데이터 증발보다 낫다.
-  - `KEYS queue:*` 로 얼마나 쌓였는지 세는 것. 단일 스레드를 막는다. `SCAN`은 쓰되 `COUNT`를 100 이하로 하고 replica(6380)에서 한다.
+  - `KEYS queue:*` 로 얼마나 쌓였는지 세는 것. 단일 스레드를 막는다. `SCAN`은 쓰되 `COUNT`를 100 이하로 하고, 그 큐가 있는 클러스터의 replica 노드에서 한다(`cluster nodes`에서 slave 확인).
   - `FLUSHALL` — Rate Limit·캐시·대기열이 전부 날아간다. 복구 경로 미구현.
 
 ---
@@ -159,14 +159,14 @@
 - **하면 안 되는 것**:
   - Redis를 재기동해 CPU를 "리셋"하는 것. 대기열이 통째로 사라진다.
   - `DEBUG SLEEP`, `KEYS`, 큰 `SCAN COUNT` — 단일 스레드를 더 막는다.
-  - master에 진단용 조회를 붙이는 것. 조회는 replica 6380/6381.
+  - master에 진단용 조회를 붙이는 것. 조회는 해당 클러스터의 replica 노드로(`cluster nodes`에서 slave 확인). 6380/6381은 Sentinel이라 큐 키가 없다.
 
 ---
 
 ### [증상] 폴링이 404(TK001 TOKEN_NOT_FOUND)를 반환한다
 
 - **먼저 의심할 것**: `poll_verify.lua`가 0을 반환하고 **`admit-by-token`도 비어 있는** 경우다. 검증 실패 경로는 셋(① seq에 해당하는 멤버 없음 ② tokens Hash에 항목 없음 ③ 저장된 tokenId와 불일치)인데, **셋 중 어느 것이든 admit된 사람일 수 있어** 곧바로 404를 주지 않는다 — `admit-by-token:{tokenId}`가 있으면 `ready:true`다.
-- ⚠️ **404가 뭉개는 두 상황이 있다 (미해결, §79 404 계약).** 진짜 소멸(취소·만료)과 **admitToken TTL 만료 후 WAITING 복귀 대기 중**(복귀 배치 반영 전)이 둘 다 `TK001`이다. 후자는 백오프 후 재시도해야 하는데 SDK는 404를 종료 신호로 받는다. **Tenant가 admitToken을 대량으로 소비하지 못하는 사고 중에는 이 창의 404가 급증한다** — 그때의 404는 "잘못된 요청"이 아니다.
+- `TK001`은 **종료**다 — 복귀가 없으므로(§36) 입장권 만료도 회수도 결과가 같다: 재접속 → 맨 뒤. **Tenant가 admitToken을 대량으로 소비하지 못하는 사고 중에는 입장권 만료 404가 급증한다** — 그때의 404는 "잘못된 요청"이 아니다.
 - **1분 안에 확인**:
   ```bash
   Q=q_xxx; SEQ=12345; TOK=tok_019...
@@ -174,7 +174,7 @@
   ID=$(redis-cli -c -p 7001 zrangebyscore "queue:{$Q}:waiting" $SEQ $SEQ)
   redis-cli -c -p 7001 hget "queue:{$Q}:tokens" "$ID"                          # ② 비면 Hash 없음 / ③ 값이 "tokenId|issuedAt"
   redis-cli -c -p 7001 get "queue:{$Q}:admit-by-token:$TOK"                     # 값이 있으면 404가 아니라 ready:true여야 한다
-  redis-cli -c -p 7001 zscore "queue:{$Q}:admitted" "$SEQ|$ID"                  # 있는데 위가 비었다 = 복귀 대기 중(위 ⚠️)
+  redis-cli -c -p 7001 zscore "queue:{$Q}:admitted" "$SEQ|$ID"                  # 있는데 위가 비었다 = 입장권 만료(종료), 회수 배치가 곧 걷는다
   ```
   **② 결과의 `|` 앞부분이 요청의 tokenId와 다르면 ③ 불일치(= 남의 seq를 조회한 것). 정상 거절이다.**
 - **정상 범위**: 404 비율 < 전체 폴링의 1%. **정확한 임계값은 기준선 수집 필요** — 정상 이탈(브라우저 새로고침 후 옛 seq 재사용)이 얼마나 되는지 데이터가 없다. **3일치 404 비율을 먼저 재라.**
@@ -205,7 +205,7 @@
   ```bash
   sudo systemctl restart systemd-timesyncd   # 되돌리기 불필요
   ```
-  **현재는 `last-active`를 읽는 코드가 없어 실질 영향이 없다.** inactive_ttl 배치(미구현)가 들어오면 시계 오차가 곧 조기 EXPIRE(대기자 강제 이탈)로 직결된다 — 그 전에 NTP를 확실히 해둘 것.
+  `inactive_expire.lua`가 이 score로 이탈을 판정하므로 **시계 오차가 곧 조기 EXPIRE(대기자 강제 이탈)로 직결된다** — NTP 동기(`HostClockNotSynchronized`)를 확실히 해둘 것.
 - **하면 안 되는 것**: `date -s`로 수동 보정. 시계가 뒤로 점프하면 `last-active` score가 역행해 판정이 뒤집힌다. NTP에 맡겨라.
 
 ---
@@ -219,7 +219,7 @@
 | `/status` 요청 수·지연 | `http_server_requests_seconds{uri="/api/v1/queues/{queueId}/status"}` — **기본 메트릭으로 관측 가능** |
 | `/status` 404(미지 queueId) 비율 | 위 메트릭의 `status="404"` 로 관측 가능. **인증 없는 경로라 flood 탐지의 유일한 앱 측 신호다** |
 | `pacing` 오버라이드 적용 여부 | **미노출.** 형식 오류가 조용히 기본값으로 떨어지므로(로그 없음) `/status` 응답을 직접 봐야 한다 |
-| 404(TK001)의 두 상황 구분 | **불가.** 진짜 소멸과 WAITING 복귀 대기가 같은 코드다 (§79 404 계약 — ErrorCode 미분리) |
+| 404(TK001)의 원인 구분 | 필요 없다 — 복귀가 없어(§36) 입장권 만료·회수 모두 결과가 같다(재접속 → 맨 뒤) |
 | `last-active` 크기 | **미노출.** ZCARD 직접 조회만 |
 | keepalive 비율 | **의미 없음** — `ka` 분기가 사라져 모든 폴링이 keepalive다(§82 F안) |
 | Redis 메모리 (PromQL) | **관측 가능** — `redis_memory_used_bytes` / `redis_memory_max_bytes`. redis_exporter는 멀티타깃 1프로세스로 설치돼 있고 job은 `redis`(3) · `redis-cluster`(16) · `redis-sentinel`(3) 셋이다 (2026-08-28 실측: 타깃 22개 전부 up, 시계열 19개) |

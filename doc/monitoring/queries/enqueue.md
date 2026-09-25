@@ -62,11 +62,11 @@ RR zcard "queue:{$Q}:last-active"   # keepalive 기록 수
 
 | 관계 | 정상 | 이상일 때 |
 |---|---|---|
-| `hlen tokens` == `zcard waiting` | **항상 같다** | 다르면 Lua 계약 파손 또는 부분 삭제 → 즉시 에스컬레이션 |
+| `hlen tokens` ≥ `zcard waiting` | admit된 사람은 `waiting`에서 빠지고 `tokens`엔 남는다(입장권 만료·완료까지) — **같지 않은 게 정상** | 갭 판정은 이 표가 아니라 `queue_reconcile_ghosts`(ReconcileJob)로 한다 |
 | `get seq` ≥ `zcard waiting` | 차이 = 중복 identifier(EXISTS) 횟수 | `seq` < `zcard`는 불가능. 나오면 `seq` 키가 삭제·재설정된 것 |
-| `zcard last-active` ≤ `zcard waiting` | 정상 | **초과하면 좀비 누적**(삭제 경로 0건). [`runbook/polling.md`](../runbook/polling.md) 메모리 항목으로 |
+| `zcard last-active` ≤ `zcard waiting` | 정상 | 초과가 지속되면 회수 배치가 그 큐를 못 돌고 있다(`inactive_expire.lua`가 걷는다). [`runbook/polling.md`](../runbook/polling.md) 메모리 항목으로 |
 
-> `waiting`·`seq`·`tokens`·`last-active` **넷 다 삭제·만료 경로가 코드에 없다.** 이 값들은 단조증가한다 — "며칠 뒤 얼마여야 정상"이라는 기준을 세울 수 없고, 세워도 안 된다.
+> `waiting`·`tokens`·`last-active`는 admit과 회수 배치가 줄인다. `seq`만 단조증가한다(순번이라 줄면 안 된다).
 
 ---
 
@@ -143,11 +143,11 @@ sum by (status) (rate(http_server_requests_seconds_count{uri="/api/v1/queues/{qu
 ```promql
 # 커넥션 풀 (배치가 매 사이클 queues 테이블을 읽는다 — 캐시 없음)
 hikaricp_connections_pending          # 정상 0. > 0 지속이면 배치가 막힌다
-hikaricp_connections_active           # pool size(local 10 / prod 50)의 80% 미만
+hikaricp_connections_active           # pool size(local 10 / prod master 20)의 80% 미만
 jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"}   # 0.85 초과 시 globalQueue 적체 의심
 ```
 
-**`globalQueue` 깊이·배치 소요시간·drain 건수를 노출하는 지표는 없다(미노출 — 지표 추가 필요).**
+`globalQueue` 깊이·배치 소요시간·drain 건수는 `queue_pending_size` · `queue_drain_duration_seconds` · `queue_drain_batch_size` · `queue_stage_duration_seconds{stage}`로 본다(2026-09-18 신설).
 
 ---
 

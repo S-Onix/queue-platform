@@ -2,7 +2,7 @@
 
 > Queue Platform의 동시성 제어 전략과 `@DistributedLock` 사용 가이드.
 > CLAUDE.md "동시성 제어" 섹션의 상세 문서.
-> **최종 업데이트**: 2026-09-04 (코드 대조)
+> **최종 업데이트**: 2026-09-25 (코드 대조 — §92 요청 한도 3분할 반영)
 
 ---
 
@@ -308,7 +308,7 @@ public class DistributedLockAspect {
 - `lock:tenant:{tenantId}:queue-create`
 - `lock:tenant:{tenantId}:apikey-rotate`
 - `lock:queue:{queueId}:partition-drop`
-- `lock:tenant:{tenantId}:plan-change`
+- `lock:tenant:{tenantId}:apikey-issue`
 
 **규칙**:
 - Tenant 단위 이하로 좁힘 (전역 락 금지)
@@ -564,7 +564,7 @@ t=1-10 사이 요청:
 - Failover 감지 시간 단축 (cluster-node-timeout 조정, 기본 5000ms)
 
 **Queue Platform 관점**:
-- Enqueue 실패 시 클라이언트 SDK가 재시도
+- Enqueue 실패(QE001 503) 재시도는 Tenant 서버 몫이다 — JS SDK는 폴링 전용이다(§78)
 - 실제 서비스 영향 최소화 (사용자 관점 5-10초 지연은 무관)
 
 ### 6.7 Cluster 환경에서 분산 락 위치
@@ -604,14 +604,14 @@ class QueueCreationConcurrencyTest {
     
     @Test
     void 동일_tenant_동시_createQueue_정확히_quota만큼만_생성() throws Exception {
-        Long tenantId = createTenantWithPlan(maxQueues = 3);
+        Long tenantId = createTenant();   // 큐 상한은 테넌트당 상수 20 (§87 · 등급제는 §88에서 철회)
         int threads = 10;
         CountDownLatch start = new CountDownLatch(1);
         CountDownLatch end = new CountDownLatch(threads);
         AtomicInteger success = new AtomicInteger();
         AtomicInteger failure = new AtomicInteger();
         
-        ExecutorService es = Executors.newFixedThreadPool(threads);
+        ExecutorService es = Executors.newVirtualThreadPerTaskExecutor();   // 고정 풀은 start.await() 에서 교착한다
         for (int i = 0; i < threads; i++) {
             int idx = i;
             es.submit(() -> {
@@ -649,7 +649,7 @@ class QueueCreationConcurrencyTest {
 ## 8. 관련 결정 (DECISIONS.md)
 
 - §57: 동시성 제어 우선순위 정책
-- §58: Queue 생성 동시성 처리 방식 (비관적 락 + UNIQUE 제약)
+- §58: Queue 생성 동시성 처리 방식 (비관적 락은 채택 안 됨 — UNIQUE + 비잠금 COUNT)
 - §59: `@DistributedLock` 도입 및 모듈 배치
 - §66: Redis Cluster 도입 결정 (~~Sprint 10+~~ → **§75로 확정·구현 완료**)
 - §75: 독립 2 Cluster + 큐 단위 이중 라우팅 (**현행 구성**)
@@ -677,7 +677,7 @@ class QueueCreationConcurrencyTest {
   → **`enqueue_bulk.lua`는 3-key(waiting + seq + tokens)이므로 Hash Tag 필수** (§70)
   → Hash Tag 선제 적용 완료(`queue/QueueKeys.java`) → **이제 Cluster 무변경 작동**
 - `@DistributedLock` key 패턴 (`lock:{domain}:{id}:{action}`) → Cluster 무변경
-- Rate Limiter Lua Script → 단일 key 사용, 무변경 (`rl:tenant:{id}`, `rl:{action}:ip{ip}:{windowNo}` — `ip` 뒤에 콜론이 없다)
+- Rate Limiter Lua Script → 단일 key 사용, 무변경 (테넌트 3종 `rl:tenant:{id}` · `:drain` · `:control`(§92), 공개 `rl:{action}:ip{ip}:{windowNo}` — `ip` 뒤에 콜론이 없다)
 
 **남은 변경 예상**:
 - ~~Lua Script Hash Tag~~ → **Sprint 5-E에서 도입 완료**

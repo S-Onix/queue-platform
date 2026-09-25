@@ -63,7 +63,7 @@ RW zscore "queue:{$Q}:admitted" "$SEQ|$ID"
 | ② 비었다 | ZSet엔 있는데 Hash엔 없다 → **Lua 계약 파손. 에스컬레이션** (정상 경로에서는 발생 불가) |
 | ③ 불일치 | 남의 seq를 조회한 것. **정상 거절이다** |
 | ④ `admit-by-token`에 값이 있다 | **404가 아니라 `ready:true`가 나가야 정상이다.** 404가 나왔다면 회귀다 |
-| ④ `admit-by-token`은 비었는데 `admitted`에 score가 있다 | **admitToken TTL 만료 → WAITING 복귀 대기 중.** 복귀 배치가 아직 안 집었다. 지금은 이것도 `TK001`이라 SDK가 종료해버린다 (§79 404 계약 — ErrorCode 미분리, **미해결**) |
+| ④ `admit-by-token`은 비었는데 `admitted`에 score가 있다 | **입장권 만료(종료).** 회수 배치가 아직 안 집었다. `TK001` → 재접속하면 맨 뒤(§36) |
 
 ---
 
@@ -189,7 +189,7 @@ histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{u
 
 | 지표 | 정상 | 이상 |
 |---|---|---|
-| 404 비율(개인) | < 0.05 | > 0.50 → 랜덤 tokenId 공격 의심 ([`runbook/rate-limit.md`](../runbook/rate-limit.md)). **단, Tenant가 admitToken을 못 쓰는 사고 중에는 정상 대기자의 복귀 대기 404가 섞인다** (§1 ④) |
+| 404 비율(개인) | < 0.05 | > 0.50 → 랜덤 tokenId 공격 의심 ([`runbook/rate-limit.md`](../runbook/rate-limit.md)). **단, Tenant가 admitToken을 못 쓰는 사고 중에는 입장권 만료 404가 섞인다** (§1 ④) |
 | `/status` 404 비율 | < 0.01 | 급증 = 미지 queueId 스캔. DB는 안전하지만 🔴 **Redis는 요청당 3왕복(EXISTS×2 + MGET)이고 8개 마스터 전체로 퍼진다**(2026-08-28 실측 — "1왕복"은 거짓이었다). 앱 측 제한이 없다 → CDN·WAF |
 | p99 | **기준선 수집 필요.** 폴링 단독 부하 실측이 없다. 실사용 3일치 p99를 재라 (`doc/ROADMAP.md`의 "p99 < 50ms"는 **목표치이지 실측이 아니다**) | |
 
@@ -221,7 +221,7 @@ RR zrevrangebyscore "queue:{$Q}:last-active" "+inf" "$NOW" WITHSCORES LIMIT 0 5
 ```
 **출력이 있으면 이상.** 정상은 무출력(모든 score가 현재보다 과거).
 
-> 현재 `last-active`를 **읽는 코드는 0건**이라 실질 영향이 없다. inactive_ttl 배치(**미구현**)가 들어오면 시계 오차가 곧 조기 EXPIRE(대기자 강제 이탈)로 직결된다.
+> `inactive_expire.lua`가 `last-active`를 읽어 이탈을 판정하므로 **시계 오차가 곧 조기 EXPIRE(대기자 강제 이탈)로 직결된다.**
 
 ---
 

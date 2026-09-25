@@ -62,8 +62,8 @@ curl -X POST https://<platform>/api/v1/queues/{queueId}/tokens \
 ```
 
 ```json
-{ "isSuccess": true,
-  "data": { "queueId":"q1", "identifier":"0192f3c1-...", "tokenId":"tk_...",
+{ "success": true,
+  "data": { "queueId":"q1", "identifier":"0192f3c1-...", "tokenId":"tok_...",
             "seq": 1042, "rank": 37, "total": 1042, "already": false } }
 ```
 
@@ -203,7 +203,7 @@ const waitMs = (base + Math.random() * Math.max(1, base / 4)) * 1000;
 GET /api/v1/queues/{queueId}/tokens/{tokenId}?seq={mySeq}     인증 없음
 ```
 ```json
-{ "ready": true, "admitToken": "at_xxx" }     // ready=false면 admitToken은 null
+{ "ready": true, "admitToken": "adm_xxx" }    // ready=false면 admitToken 필드 자체가 없다
 ```
 
 `rank <= 0`이 되면(= 내 차례가 됐을 수 있으면) 이쪽을 부른다. **평상시에 이걸 부르면 안 된다** —
@@ -234,9 +234,9 @@ curl -X POST https://<platform>/api/v1/queues/{queueId}/admit \
 ```
 
 ```json
-{ "isSuccess": true,
+{ "success": true,
   "data": { "admitted": [
-    { "tokenId":"tk_...", "identifier":"0192f3c1-...", "seq":1042, "admitToken":"at_..." } ] } }
+    { "tokenId":"tok_...", "identifier":"0192f3c1-...", "seq":1042, "admitToken":"adm_..." } ] } }
 ```
 
 - `count` **최대 300**. 초과하면 400이다
@@ -280,8 +280,8 @@ curl -X POST .../api/v1/queues/{queueId}/admit-tokens/{admitToken}/verify -H "X-
 # complete — 입장 완료를 통보한다
 curl -X POST .../api/v1/queues/{queueId}/tokens/{tokenId}/complete \
   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"admitToken": "at_..."}'
-# → { "data": { "status": "COMPLETED", "completedAt": "2026-08-25T10:00:03.412Z" } }
+  -d '{"admitToken": "adm_..."}'
+# → { "data": { "status": "COMPLETED", "completedAt": "2026-08-25T10:00:03.412" }   ← UTC, 오프셋 표기 없음 }
 ```
 
 ### 🔑 **하나만 골라라 — 둘 다 부르지 마라**
@@ -290,13 +290,8 @@ curl -X POST .../api/v1/queues/{queueId}/tokens/{tokenId}/complete \
 두 배로 만든다**: `verify`가 이미 완료를 확정했으므로 뒤따르는 `complete`의 `UPDATE`는 **0행**이고,
 그 0행을 확인하려고 `SELECT`가 한 번 더 나간다.
 
-실측 근거(AWS 8차, 500만 명):
-
-```
-complete UPDATE  454만 회 / MySQL CPU 5,662초   ← 그중 97.3% 가 0행이었다
-complete SELECT  442만 회 / MySQL CPU 4,196초   ← 그 0행을 확인하는 조회
-                          합계 9,858초 = 쿼리 예산의 35.9%
-```
+실측 근거(AWS 8차, 500만 명 — 하니스가 둘 다 부르던 판): complete `UPDATE`의 **97.3%가 0행**이었고,
+그 `UPDATE`와 확인 `SELECT`가 합쳐 **MySQL 쿼리 예산의 35.9%**였다. (판 직후 요약값이다 — 회수·초 단위 원본은 보관하지 않았다)
 
 DB 노드 CPU 가 판 내내 85~95% 였고, **그 3분의 1이 "이미 끝난 일을 다시 확인하는" 비용**이었다.
 서버는 거절하지 않는다 — 거절할 근거가 없다. 그래서 **계약으로 요청한다.**
@@ -357,7 +352,7 @@ AWS 500만 판: 적재 지연 구간에서 이 404가 30.8만 건 났다 — 재
 | `complete`만 | ✅ **권장.** 완료 확정. **`verify`를 건너뛴 호출을 서버가 거절하지 않는다** — `complete` 자체가 `admitToken`을 검증하므로 거절할 근거가 없다 |
 | 둘 다 | 🟠 **틀리지는 않지만 하지 마라.** 답은 맞다(두 번째는 처음 완료 시각). 대가는 `UPDATE` 0행 + 확인 `SELECT`이고, AWS 8차에서 그게 **DB 쿼리 예산의 35.9%** 였다 (§6) |
 | `verify` → **404 `TK002`** → `complete` | ✅ **이것은 예외다 — 이어 불러야 한다.** `verify`의 창(60초)만 지난 것이고 `complete`의 창(300초)은 살아 있다 (§6 · 계약 ⑤) |
-| **아무것도 안 부름** | 🔴 원장에 `ADMIT_ISSUED`로 남고, **대사 배치가 300초 뒤 만료로 정리**한다 |
+| **아무것도 안 부름** | 🔴 원장에 `ADMIT_ISSUED`로 남고, **대사 배치가 300~600초 안에 만료로 정리**한다(창 300초 + 배치 주기 5분) |
 
 > 마지막 줄이 요금을 바꾸지는 않는다(과금은 상태를 보지 않는다). 다만 **Tenant의 완료율 지표가
 > 통째로 틀어진다.**
@@ -443,7 +438,7 @@ SDK는 리더 선출에 **Web Locks(`navigator.locks`)** 를 쓴다. 탭이 닫�
 | 호출 | 유효 창 | 기준 시각 |
 |---|---|---|
 | `verify` | **60초** | `admit` 응답 시점 |
-| `complete` | **300초** | `admit` 응답 시점 |
+| `complete` | **300초** | 원장 적재 시점 — 평시엔 `admit` 직후, 적재가 L초 밀리면 [L, L+300] |
 
 `verify`는 `admitToken`의 Redis 키(PX 60초)에 기대고, `complete`는 DB의 `admitted_at`을 300초까지
 소급해 받아 준다. **비대칭은 의도한 것이다** — 좌석 배정이 오래 걸린 Tenant의 **늦은 완료 통보**를
@@ -555,20 +550,17 @@ setTimeout(tick, (base + Math.random() * Math.max(1, base / 4)) * 1000);   // �
 >
 > 🪤 **큐를 여러 개 써도 한도는 하나다** — 큐당 한도가 필요하면 **테넌트를 나눠야 한다.**
 
-버킷 키가 `rl:tenant:{테넌트}` 하나다. **`queueId`가 키에 없다.** 큐를 20개 만들어도 한도는
-그 20개가 **나눠 쓴다.**
+세 지갑 모두 키에 **`queueId`가 없다.** 큐를 20개 만들어도 유입 한도는 그 20개가 **나눠 쓴다.**
 
-| 테넌트의 큐 수 | 큐당 지속 `enqueue` rps |
+| 테넌트의 큐 수 | 큐당 지속 `enqueue` rps (= 833 ÷ 큐 수) |
 |---|---|
-| 1개 | 277 |
-| 2개 | 138 |
-| 5개 | 55 |
-| 20개 (계약 ⑦ 상한) | 14 |
+| 1개 | 833 |
+| 2개 | 416 |
+| 5개 | 166 |
+| 20개 (계약 ⑦ 상한) | 41 |
 
-🔑 **버킷을 먹는 것은 `enqueue`만이 아니다.** `verify`·`complete`·`admit`도 같은 버킷을 쓴다.
-유저 1명이 끝까지 가면 **3.01건**을 소비한다(`enqueue` 1 + `verify` 1 + `complete` 1 +
-`admit` 1/20). 위 표는 그걸 반영한 값이다. 중간에 이탈하는 유저는 `enqueue` 1건만 먹으므로,
-이탈률이 높으면 실제 수용은 표보다 늘어난다.
+유입 지갑에는 **`enqueue`만** 들어간다 — `admit`·`verify`·`complete`는 배출 지갑(`:drain`)을 쓰므로
+유입 속도를 깎지 않는다.
 
 **브라우저 폴링은 여기 안 들어간다** — 계약 ③의 별도 버킷(`tokenId` 단위)을 쓴다. 큐에 30만 명이
 서 있어도 이 한도와 무관하다. 제한되는 것은 **문을 새로 통과하는 속도**뿐이다.
@@ -588,7 +580,7 @@ setTimeout(tick, (base + Math.random() * Math.max(1, base / 4)) * 1000);   // �
 | | 신규 유저 | **이미 줄 선 유저** | `admit` | `verify`·`complete` |
 |---|---|---|---|---|
 | `pause` | ❌ `503 Q004` | ✅ 그대로 유지 · 새로고침해도 **자리 보존** | ✅ | ✅ |
-| `delete` | ❌ | ❌ **줄이 사라진다** | ❌ `404 Q001` | ✅ **300초간 허용** |
+| `delete` | ❌ | ❌ **줄이 사라진다** | ❌ `404 Q001` | ✅ verify **60초** · complete **300초**간 허용 |
 
 ### 🪤 멈춰도 시간은 흐른다
 
@@ -679,7 +671,8 @@ SDK가 대신 지켜 주는 것은 **직접 짜면 틀리기 쉬운 넷**이다:
 
 | 문서 | 내용 |
 |---|---|
-| [`FRS_final.md`](FRS_final.md) | API 필드·에러 코드·Redis 키의 **정본** |
+| [`API.md`](API.md) | API 필드·에러 코드의 **정본** |
+| [`FRS_final.md`](FRS_final.md) | 설계 시점 요구사항 원본 · Redis 키 |
 | [`FLOW.md`](FLOW.md) | Enqueue·Polling·Admit·Complete 흐름도 |
 | [`STATE.md`](STATE.md) | Token 상태 머신 |
 | [`DECISIONS.md`](DECISIONS.md) | §79(폴링 분할) · §80(admit) · §82(이탈 회수) · §84(과금) |

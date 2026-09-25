@@ -46,8 +46,8 @@ Grafana(`http://localhost:3000`) → **Dashboards → New → Import → Upload 
 ## 전제
 
 앱을 **local 프로필**로 띄우면 `management.endpoints.web.exposure.include: '*'`라 지표가 다 나온다.
-prod 프로필은 `health, info`만 노출한다 — 그건 누락이 아니라 **의도된 결정**이며 이유가
-`application-prod.yml` 주석에 있다(공개 포트 8080 + actuator가 Rate Limit 면제 + 관리 포트 미분리).
+prod 프로필은 2026-09-19부터 prometheus 를 연다 — api 는 **관리 포트 9080**(업무 포트 8080 에선 404),
+batch 8081 · consumer 8082 다. dev 만 prometheus 가 없다(`health, info, metrics`).
 
 ```bash
 java -jar queue-{api,batch,consumer}/build/libs/*.jar --spring.profiles.active=local

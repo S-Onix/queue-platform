@@ -184,7 +184,7 @@ histogram_quantile(0.95, rate(http_server_requests_seconds_bucket[5m]))
 → p95 응답 시간
 
 [Top N]
-topk(10, sum by (tenant_id) (rate(tenant_api_calls_total[5m])))
+topk(10, sum by (tenant_id) (rate(tenant_api_calls_total[5m])))   # ⬜ 설계안 — tenant_api_calls_total 은 미구현
 → Top 10 Tenant
 ```
 
@@ -312,7 +312,7 @@ URL: http://localhost:9090
 $tenant_id 변수:
 - 드롭다운에서 "t-001", "t-002" 등 선택
 - 패널 쿼리에서 활용:
-  sum by (tenant_id) (rate(tenant_api_calls_total{tenant_id="$tenant_id"}[5m]))
+  sum by (tenant_id) (rate(tenant_api_calls_total{tenant_id="$tenant_id"}[5m]))   # ⬜ 미구현 메트릭
 - "All" 옵션으로 전체 보기 가능
 
 [활용]
@@ -482,7 +482,7 @@ rate(http_server_requests_seconds_count[5m])
 
 ## 위기감지 카테고리
 
-4개 카테고리로 분류 (보안 카테고리는 Rate Limiter 구축 후 추가 예정).
+4개 카테고리로 분류 (보안 카테고리는 ⬜ 미구현 — Rate Limiter 는 구축됐지만 전용 메트릭이 없다).
 
 | # | 카테고리 | 핵심 메트릭 | 대응 시점 |
 |---|---------|------------|----------|
@@ -706,7 +706,7 @@ rate(http_server_requests_seconds_count[5m])
     - Broker 디스크 사용량
 - 이슈
   - 모니터링 리소스 부담은?
-    - Queue Platform 토픽 규모: 4-10개
+    - Queue Platform 토픽 규모: `token-lifecycle` 1개 (+ DLT)
     - 파티션: 토픽당 4-10개
     - Cardinality: 수십 시계열
     - 결정: 운영 부담 거의 없음, 부담 없이 도입 가능
@@ -827,7 +827,7 @@ rate(http_server_requests_seconds_count[5m])
     - VT가 Pinning 되어도 인지 못 함
 - 대안
   - Custom 메트릭 작성
-    - VirtualThreadMetrics 클래스
+    - VirtualThreadMetrics 클래스 (⬜ 미구현 — 코드 0건)
     - Thread.getAllStackTraces()에서 isVirtual() 필터링
   - 주요 메트릭
     - jvm.threads.virtual.live: VT 수
@@ -997,7 +997,7 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
 - 이슈
   - 대기 시간 측정 시점은?
     - 결정: Token enqueue 시점 ~ admit 시점 차이
-      - Token 도메인에 enqueued_at, admitted_at 컬럼 활용
+      - ✅ 구현: `queue_admission_wait_seconds` — admit 응답 경로에서 issuedAt → admit 시각을 잰다(DB 컬럼을 읽지 않는다)
   - 대기 시간 임계치?
     - 결정:
       - p95 대기 시간 1분 → 경고
@@ -1019,7 +1019,7 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
 - 측정 이유
   - Token lifecycle 전체 추적
     - WAITING → ADMIT_ISSUED → COMPLETED (정상 흐름)
-    - WAITING → CANCELLED (사용자 취소)
+    - WAITING → EXPIRED(사유 3 INACTIVE) — 이탈. Cancel API 는 없다(§82, status 3 결번)
     - ADMIT_ISSUED → EXPIRED → WAITING (TTL 만료, 재대기)
   - 비정상 전이 감지
     - COMPLETED 후 변경 (절대 안 됨)
@@ -1046,7 +1046,7 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
   - 상태 전이 정상성 검증
   - EXPIRED 빈도 추적 (TTL 적정성 검증)
   - 비즈니스 로직 버그 조기 감지
-  - 사용자 행동 패턴 분석 (CANCELLED 비율 등)
+  - 사용자 행동 패턴 분석 (이탈 = INACTIVE 만료 비율 등)
 
 ---
 
@@ -1056,14 +1056,14 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
   - Token 발급에서 종료까지 결과 추적
     - 정상 완료 (COMPLETED)
     - 만료 (EXPIRED)
-    - 취소 (CANCELLED)
+    - 이탈 (EXPIRED 사유 3)
   - 사용자 경험 KPI
     - 완료율 = 정상 큐 사용 비율
 - 문제
   - 만료율이 너무 높으면 사용자 경험 저하
     - 입장 받았지만 시간 내 사용 못 함
     - TTL 너무 짧은가? Tenant 서비스 느린가?
-  - 취소율이 너무 높으면 이탈 의심
+  - 이탈률(INACTIVE 만료)이 너무 높으면 대기 경험을 의심
     - 대기 시간 너무 길어서?
 - 대안
   - 4-4의 상태 전이 메트릭으로 계산 가능
@@ -1076,7 +1076,7 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
     - 결정:
       - 완료율 < 80% → 점검 필요
       - 만료율 > 10% → TTL 또는 Tenant 응답 속도 점검
-      - 취소율 > 20% → 대기 시간 너무 긴지 점검
+      - 이탈률 > 20% → 대기 시간 너무 긴지 점검
 - 활용방안
   - Queue 서비스 품질 측정
   - admitToken TTL 적정성 검증
@@ -1099,7 +1099,7 @@ Queue Platform의 핵심 비즈니스인 Queue의 전체 lifecycle을 추적.
   - 장기 누적 시 데이터 신뢰성 저하
 - 대안
   - 정기 검증 잡 (예: 매시간)
-    - Queue.current_waiting vs COUNT(*) FROM tokens WHERE status=WAITING
+    - ✅ 구현: ReconcileJob — Redis `ZCOUNT waiting` vs `COUNT(status=0)`, 5분 주기 (`queue_reconcile_ghosts`·`_stale`)
     - 불일치 시 카운터 증가
   - Custom 메트릭
     - data_consistency_mismatch_total{type}
@@ -1155,19 +1155,10 @@ Queue의 lifecycle을 한 카테고리에 모아서 보면
 - Rate Limit 초과
 ```
 
-### 시스템 리소스 카테고리 (선택)
+### 시스템 리소스 카테고리 — ✅ 구현
 
-```
-- CPU 사용률 (node_exporter)
-- Memory 사용률
-- Disk 사용률
-- Network I/O
-```
+node_exporter(로컬 1대 · AWS 7노드) + `DiskWillFill` 알람(`alerts/infra.yml`).
 
-### AlertManager 통합
+### AlertManager 통합 — ✅ 구현
 
-```
-- 임계치 기반 자동 알림
-- Slack/Discord Webhook
-- 우선순위 분류 (Critical / Warning)
-```
+AWS 9093 · 로컬 19093. 규칙 24개 → severity 라우팅 → Slack(#alerts). 로컬은 Slack + sink(19094).

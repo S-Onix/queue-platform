@@ -40,11 +40,10 @@
 #              (로컬은 앱을 안 띄운 시간이 대부분이라 상시 firing이 정상이다.
 #               이걸 warning에 섞으면 warning 등급 전체가 오염된다 → 등급으로 격리한다)
 #
-# ⚠️ Alertmanager는 **AWS에만 설치돼 있다**(2026-09-17, infra/aws/data.yml). severity는 거기서
-#    실제로 라우팅한다 — critical은 group_wait 10s·repeat 1h, warning은 상위 알람에 억제된다
-#    (inhibit_rules). **로컬은 여전히 미설치**라 firing 확인이 http://localhost:9090/alerts 눈이다.
-#    🔑 그리고 AWS에서도 **사람에게 가는 마지막 구간은 비어 있다** — receiver가 채널 없이
-#    비어 있어 알람은 Alertmanager까지만 모인다. 확인: `curl -s localhost:9093/api/v2/alerts`
+# Alertmanager: **AWS 9093 · 로컬 19093**(로컬 9093은 Kafka가 쓴다). severity로 라우팅한다 — critical은
+#    group_wait 10s·repeat 1h, warning은 상위 알람에 억제된다(inhibit_rules). 수신처는 Slack(#alerts),
+#    로컬은 Slack + sink(19094)다 — 둘인 이유는 "규칙이 안 떴나 / 통지가 실패했나"를 가르려고.
+#    확인: `curl -s localhost:9093/api/v2/alerts` (로컬은 19093)
 #
 # ⚠️ 전제: evaluation_interval=15s, scrape_interval=15s (실가동 prometheus.yml 실측)
 #    `for:` 값은 전부 "스크레이프 N회 연속"으로 환산해 근거를 각 규칙에 적었다.
@@ -77,7 +76,7 @@ groups:
         annotations:
           summary: "{{ $labels.job }} ({{ $labels.instance }}) 스크레이프 실패 2분"
           impact: "그 인스턴스로 가던 요청이 전부 실패한다. 남은 인스턴스가 부하를 나눠 받으므로 **다음 인스턴스가 연쇄로 넘어질 수 있다.**"
-          action: "① `docker ps -a --filter name=q-api` 로 컨테이너가 떠 있는지 본다. 로컬이면 앱을 안 띄운 것이 원인이니 여기서 끝이다 → ② 떠 있는데 스크레이프가 안 되면 포트를 본다: `ss -lnt | grep -E ':808[0-4]'` (api 8080/8083/8084 · batch 8081 · consumer 8082). 포트가 열려 있으면 네트워크/방화벽 문제이므로 ④ 로 간다 → ③ 죽어 있으면 되살린다: `docker start <① 에서 본 이름>`. 2분 안에 이 알람이 해소되면 끝이다. 바로 또 죽으면 `docker logs --tail 50 <① 에서 본 이름>` 와 `docker inspect <① 에서 본 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'` 를 본다 — **true / 137 이면 메모리 한도 초과**이고 JvmMemoryNearContainerLimit 조치로 넘어간다 → ④ 그래도 안 되면 인프라 담당에게 넘긴다. 넘길 것: 컨테이너 상태 · 로그 50줄 · OOMKilled 값 ⚠️ 남은 인스턴스가 부하를 나눠 받으므로 **연쇄로 넘어질 수 있다** — 하나 살린 뒤 나머지도 함께 확인해라"
+          action: "① `docker ps -a --filter name=q-api` 로 컨테이너가 떠 있는지 본다. 로컬이면 앱을 안 띄운 것이 원인이니 여기서 끝이다 → ② 떠 있는데 스크레이프가 안 되면 포트를 본다: `ss -lnt | grep -E ':90(80|83|84)|:808[12]'` (api 관리 포트 9080/9083/9084 — 업무 포트 8080/8083/8084 는 actuator 404 · batch 8081 · consumer 8082). 포트가 열려 있으면 네트워크/방화벽 문제이므로 ④ 로 간다 → ③ 죽어 있으면 되살린다: `docker start <① 에서 본 이름>`. 2분 안에 이 알람이 해소되면 끝이다. 바로 또 죽으면 `docker logs --tail 50 <① 에서 본 이름>` 와 `docker inspect <① 에서 본 이름> | grep -E '\"OOMKilled\"|\"ExitCode\"'` 를 본다 — **true / 137 이면 메모리 한도 초과**이고 JvmMemoryNearContainerLimit 조치로 넘어간다 → ④ 그래도 안 되면 인프라 담당에게 넘긴다. 넘길 것: 컨테이너 상태 · 로그 50줄 · OOMKilled 값 ⚠️ 남은 인스턴스가 부하를 나눠 받으므로 **연쇄로 넘어질 수 있다** — 하나 살린 뒤 나머지도 함께 확인해라"
 
       # Redis 인스턴스가 죽었다.
       #
@@ -121,7 +120,7 @@ groups:
         annotations:
           summary: "익스포터 응답 없음 — {{ $labels.job }} {{ $labels.instance }} (해당 인프라 지표 전체 소실)"
           impact: "해당 인프라 지표가 통째로 빈다. 그러면 그 위의 알람들이 **전부 조용해지는데, 그 침묵이 정상과 구분되지 않는다.**"
-          action: "🔑 이 알람이 떠 있는 동안 그 계층의 알람이 **전부 조용해진다.** 침묵이 정상과 구분되지 않으므로 우선순위가 높다. ① 어느 익스포터인지는 라벨 job 으로 안다(redis / node / mysql). `docker ps -a --filter name=exporter` 와 `docker ps -a --filter name=q-node-exporter` 로 상태를 본다 → ② 죽어 있으면 되살린다: `docker start q-redis-exporter` (또는 q-node-exporter). 2분 안에 해소되면 끝이다 → ③ 떠 있는데 스크레이프가 안 되면 대상 포트를 확인한다: redis-exporter 9121 · node-exporter 9100. `curl -s localhost:9121/metrics | head -3` 가 응답하는지 본다 → ④ 그래도 안 되면 인프라 담당에게 넘긴다. 넘길 것: job 라벨 · 컨테이너 상태 · curl 응답 · **그동안 침묵 중인 알람 목록** ⚠️ mysqld-exporter 는 **원래 안 띄운다** — MySQL 계열이면 MysqlExporterCannotConnect 조치를 보라"
+          action: "🔑 이 알람이 떠 있는 동안 그 계층의 알람이 **전부 조용해진다.** 침묵이 정상과 구분되지 않으므로 우선순위가 높다. ① 어느 익스포터인지는 라벨 job 으로 안다(redis / node / mysql). `docker ps -a --filter name=exporter` 와 `docker ps -a --filter name=q-node-exporter` 로 상태를 본다 → ② 죽어 있으면 되살린다: `docker start q-redis-exporter` (또는 q-node-exporter). 2분 안에 해소되면 끝이다 → ③ 떠 있는데 스크레이프가 안 되면 대상 포트를 확인한다: redis-exporter 9121 · node-exporter 9100. `curl -s localhost:9121/metrics | head -3` 가 응답하는지 본다 → ④ 그래도 안 되면 인프라 담당에게 넘긴다. 넘길 것: job 라벨 · 컨테이너 상태 · curl 응답 · **그동안 침묵 중인 알람 목록** ⚠️ MySQL 계열이면 MysqlExporterCannotConnect 조치를 보라 (AWS 는 q-mysqld-exporter 9104 를 mysql 노드에 띄운다)"
 
       # mysqld_exporter는 살아 있는데 MySQL에 붙지 못한다.
       #
@@ -139,7 +138,7 @@ groups:
         annotations:
           summary: "mysqld_exporter가 {{ $labels.application }}에 접속 못 함 — MySQL 지표 전체가 비어 있다"
           impact: "MySQL 지표가 전부 빈다 — 복제 정지·지연 알람이 **영원히 안 뜬다.** 서비스는 멀쩡해 보인다."
-          action: "에스컬레이션 필요 — 모니터링 계정 생성은 DB 권한 작업이라 당직 범위가 아니다. ① 수집: `docker ps -a --filter name=mysqld-exporter` 로 가른다. 🔑 판단: **출력이 비어 있으면** 익스포터를 안 띄운 것이라 **이 알람은 설정 누락이지 장애가 아니다**(현재 AWS 가 그 상태다). **떠 있는데 Exited 면** 접속 실패이므로 `docker logs --tail 50 <이름>` 을 함께 적는다 → ② 임시 조치: 없다. 🔑 이 알람이 떠 있는 동안 MySQL 복제 알람 3개가 통째로 침묵한다는 사실을 기록해 둔다 → ③ DBA 담당에게 넘긴다. 넘길 것: 익스포터 존재 여부 · 오류 로그 · 침묵 중인 알람 목록 ⚠️ 계정을 임의로 만들지 마라(PROCESS·REPLICATION CLIENT·SELECT 권한 결정이 필요하다)"
+          action: "에스컬레이션 필요 — 모니터링 계정 생성은 DB 권한 작업이라 당직 범위가 아니다. ① 수집: `docker ps -a --filter name=mysqld-exporter` 로 가른다. 🔑 판단: AWS 는 q-mysqld-exporter 를 띄운다 — **출력이 비어 있으면 배포 누락이라 장애다**(로컬은 systemd mysqld-exporter-master/replica). **떠 있는데 Exited 면** 접속 실패이므로 `docker logs --tail 50 <이름>` 을 함께 적는다 → ② 임시 조치: 없다. 🔑 이 알람이 떠 있는 동안 MySQL 복제 알람 3개가 통째로 침묵한다는 사실을 기록해 둔다 → ③ DBA 담당에게 넘긴다. 넘길 것: 익스포터 존재 여부 · 오류 로그 · 침묵 중인 알람 목록 ⚠️ 계정을 임의로 만들지 마라(PROCESS·REPLICATION CLIENT·SELECT 권한 결정이 필요하다)"
 
   # ===========================================================================
   # 2. 이진 상태가 뒤집혔다 / 구성 사고
@@ -280,8 +279,7 @@ groups:
       #
       # 절대값 임계(예: 90%)를 안 쓴 이유:
       #   증가 속도를 모른다(기준선 없음). 90%가 "3시간 뒤"인지 "3초 뒤"인지
-      #   모르는 상태에서 90%는 아무 정보가 아니다. 게다가 지금 이 시스템은 admit 미구현이라
-      #   `waiting` ZSet에 ZREM 경로가 없다 = 메모리가 **단조 증가**한다. 수준이 아니라 추세가 맞다.
+      #   모르는 상태에서 90%는 아무 정보가 아니다. 수준이 아니라 추세가 맞다.
       #
       # 6h는 임계값이 아니라 "얼마나 미리 알고 싶은가"(리드타임)다. 새벽에 깨우지 않고
       # 아침에 조치할 수 있는 여유로 잡았다. 재시작·FLUSH로 메모리가 줄면 기울기가 음수라
@@ -372,7 +370,7 @@ groups:
       #    두 호스트가 각각 0.9초씩 반대 방향이면 실효 차 1.8초인데 둘 다 미발화다.
       #    직접 재는 장치를 새로 만드는 것은 과설계라 대리 신호로 둔다 — 한계를 알고 써라.
       #
-      # 🪤 **지금 node 타깃은 127.0.0.1:9100 한 대뿐이다.** API 서버·MySQL이 여러 호스트로
+      # 🪤 **로컬 node 타깃은 127.0.0.1:9100 한 대뿐이다**(AWS 는 7노드 전부 등록). API 서버·MySQL이 여러 호스트로
       #    흩어지면 **호스트마다** node_exporter를 붙이고 이 job에 등록해야 한다 — 안 붙이면
       #    그 호스트의 시계는 **아무도 안 본다**(규칙은 에러 없이 조용히 통과한다).
       #
@@ -494,8 +492,8 @@ groups:
 #        §75로 앱이 붙는 곳이 **Cluster다**. 그리고 RedisInstanceDown·RedisClusterDegraded·
 #        ExporterDown·RedisMemoryWillHitMaxmemory 가 **이미 job=~"redis|redis-cluster"를 보고 있었다.**
 #        규칙은 이미 있는데 보류 문구만 남아 있었다. 항목 통째로 삭제.
-#        ⚠️ 반대로 job="redis"(6379-6381)·job="redis-sentinel"은 §75로 코드에서 제거된
-#           학습 자산이다. **새 규칙을 그쪽에 걸지 마라** — 런북이 다른 Redis를 가리키던 전례가 있다.
+#        ⚠️ job="redis" 는 **환경마다 대상이 다르다** — 로컬은 Sentinel(6379-6381, 학습 자산),
+#           AWS 는 운영 Cluster(7001-7003/8001-8003)다. 로컬에서 그쪽에 규칙을 걸지 마라 — 런북이 다른 Redis를 가리키던 전례가 있다.
 #     3. "admit 계열은 대상 메트릭이 미구현이라 전부 못 쓴다" → **절반이 거짓이었다.**
 #        admit 5xx 비율과 B2는 Spring Boot 기본 `http_server_requests`로 **구현 0으로 쓸 수 있다.**
 #        (실측 2026-09-04: uri="/api/v1/queues/{queueId}/admit" 시계열 실재, 24h 표본 66)

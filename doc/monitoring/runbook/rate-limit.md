@@ -29,7 +29,7 @@
 | 경로 | 알고리즘 | 키 | 한도 | 코드 |
 |---|---|---|---|---|
 | 폴링 `GET /queues/*/tokens/*` | Token Bucket | `rl:poll:token:{tokenId}` | **cap 5, refill 1.0/s** (하드코딩) | `RateLimitFilter.java:121-134` |
-| 인증 후 (X-API-Key / JWT) | Token Bucket | `rl:tenant:{tenantId}` | **상수** `TENANT_CAPACITY`/`TENANT_REFILL_PER_SEC` (전 테넌트 동일, §88). 🪤 부하 실측 판은 `queue.ratelimit.tenant.*` 로 올려 둘 수 있다 — **기동 로그의 오버라이드 WARN 이 실제 값의 정본이다** | `RateLimitFilter` |
+| 인증 후 (X-API-Key / JWT) | Token Bucket × 3 (§92) | 유입 `rl:tenant:{tenantId}` · 배출(admit·verify·complete) `:drain` · 제어(큐 관리·API Key) `:control` | **상수** `TENANT_CAPACITY`/`TENANT_REFILL_PER_SEC` (전 테넌트 동일, §88). 🪤 부하 실측 판은 `queue.ratelimit.tenant.*` 로 올려 둘 수 있다 — **기동 로그의 오버라이드 WARN 이 실제 값의 정본이다** | `RateLimitFilter` |
 | 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip{ip}` | SIGNUP 5/분, LOGIN 10/분, REFRESH 30/분 | `:185-219` |
 | `/actuator/**` | 적용 제외 | — | — | `:139-142` |
 
@@ -125,7 +125,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
   ```
   **`Tenant not found` 로그가 있는데 429가 0이면 확정.**
   `rl:tenant:*` 키 수는 이 판정에 쓰지 마라 — TTL이 120s라 **키 수가 활성 테넌트 수보다 적은 것이 정상**이다.
-- **정상 범위**: `Tenant not found for rate limit` 로그 0건. `rl:tenant:*` 키 수 = **최근 2분 내** 요청한 테넌트 수(TTL 120s).
+- **정상 범위**: `Tenant not found for rate limit` 로그 0건. `rl:tenant:*` 키 수 = **최근 2분 내** 요청한 테넌트 수 × 최대 3(지갑 셋, TTL 120s).
 
   > ⚠️ **관측 창이 1시간 → 2분으로 줄었다.** TTL이 한도에서 계산되도록 바뀌면서 생긴 대가다.
   > 이 키 수는 이제 "오늘 활동한 테넌트"가 아니라 **"지금 트래픽이 흐르는 테넌트"**를 뜻한다.
@@ -212,7 +212,7 @@ fixed-window는 `윈도우+1s`(`fixed-window.lua:33`).
 | 관측 대상 | 현재 상태 |
 |---|---|
 | 429 발생 수 (경로별) | ✅ **관측 가능.** `http_server_requests_seconds_count{status="429"}` 에 `uri` 라벨이 정상으로 붙는다(2026-08-28 실측) |
-| 429 발생 수 (테넌트별/IP별) | **미노출.** 테넌트·IP 라벨이 없고 초과 로그가 `log.debug`라 **prod(INFO)에선 흔적이 안 남는다** |
+| 429 발생 수 (테넌트별/IP별) | **미노출.** 테넌트·IP 라벨이 없고 초과 로그가 `log.debug`라 **prod(root WARN)에선 흔적이 안 남는다** |
 | 429 사유 구분 (RL001 vs Q005) | **불가.** 둘 다 HTTP 429. 응답 본문으로만 구분 |
 | Tenant별 Rate Limit 소진율 | **미노출** |
 | `Tenant not found for rate limit` 발생 | 로그만(WARN). 메트릭 없음 |

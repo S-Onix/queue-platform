@@ -59,10 +59,9 @@ queue-platform/
 - `queue-batch`와 **합치지 않는다**: 소비는 파티션 수만큼 늘리고, 스케줄 작업은 늘릴수록 중복 실행 방지가 필요하다 (확장 방향이 반대)
 - `@EnableScheduling`을 붙이지 않는다 — 붙이면 infra의 `@Scheduled` 빈까지 돌아 이중 적재
 - **actuator + micrometer-registry-prometheus 보유**. 레지스트리 빈이 없으면 `/actuator/prometheus` 엔드포인트 자체가 생기지 않아 **컨슈머 lag을 PromQL로 볼 수단이 사라진다**
-  - ⚠️ **의존성은 유지하되 prod에서는 노출을 끈다**(2026-09-02). `batch`·`consumer`는 컨트롤러가 0개라
-    HTTP 표면이 통째로 actuator인데 경계(스크레이퍼 ACL·네트워크 정책)가 아직 없다 — 열어 두면
-    인증 없이 메트릭 176종이 나간다(실측). `queue-api` prod와 같은 판정이며, 경계와 **함께** 다시 켠다.
-    **local·dev는 그대로**라 로컬 관측은 안 바뀐다
+  - prod 도 prometheus 를 연다(2026-09-19, `82f9ae5`). `batch`·`consumer`는 컨트롤러가 0개라 HTTP 표면이
+    통째로 actuator이고 **인증이 없다** — 경계는 네트워크(SG)뿐이다. `queue-api`는 관리 포트 9080으로 분리했다.
+    dev 만 prometheus 가 없다(`health, info, metrics`)
 
 ### 의존성 방향 (절대 위반 금지)
 ```
@@ -80,9 +79,9 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 > **일정의 정본은 `doc/ROADMAP.md`다.** 여기엔 "지금 어디인지"만 둔다 — 두 곳에 적으면 갈라진다.
 
 ```
-현재 위치: Sprint 7(Admit) 완료 + Sprint 9 회수 배치 완료.  다음 = reconciliation · U9 메트릭
+현재 위치: Sprint 7(Admit)·9(회수·대사) 완료 · AWS 500만(14차)·게이트(15차) 실측 완료.  다음 = doc/ROADMAP.md
 
-코드로 확인되는 상태 (2026-08-20, dev 기준 재실측):
+코드로 확인되는 상태 (2026-09-25, dev 기준 재대조):
   구현됨  Redis 독립 2 Cluster + 큐 단위 라우팅                            (§75)
   구현됨  Rate Limiter(Lua 2종) · ApiKey 캐시 · Token 도메인               (Sprint 5)
   구현됨  Enqueue · Polling · Kafka 적재(token-lifecycle + queue-consumer)  (Sprint 6·8)
@@ -90,7 +89,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
   구현됨  admit.lua · admit_expire.lua · 상태 전이 가드 UPSERT              (§80)
   구현됨  queue-batch: TokenReclaimJob — 회수 3경로                   (§36 · §82 · PR #48)
           ├ admitToken TTL 만료 → ZREM admitted + HDEL tokens + EXPIRED (복귀 안 함)
-          │                       ⚠️ DB status는 1에 머문다 — 소비 가드가 1에서 no-op
+          │                       ⚠️ DB status는 보통 1에 머문다(소비 가드가 1에서 no-op).
+          │                          단 적재가 밀린 구간엔 0→4(사유 1)로 남는다 — 실측 259건
           ├ inactiveTtl 초과   → ZREM waiting/last-active + HDEL + EXPIRED
           └ waitingTtl 초과    → 앞부분 스캔(seq가 시간과 단조증가) → 같은 정리 + EXPIRED
   구현됨  queue-batch: ReconcileJob — Redis↔DB 대사 + status=1 잔류 정리   (PR #48)
@@ -134,7 +134,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 **5-C 완료**: Rate Limiter (Token Bucket + Fixed Window)
 - 알고리즘 분리 적용 (DECISIONS §60, §61)
     - Tenant SLA (인증 후) → Token Bucket (`rl:tenant:{id}`)
-    - 인증 전 (signup/login/refresh) → Fixed Window (`rl:{action}:ip:{ip}`)
+    - 인증 전 (signup/login/refresh) → Fixed Window (`rl:{action}:ip{ip}:{windowNo}` — ip 앞에 콜론이 없다)
 - RateLimiter / FixedWindowRateLimiter 도메인 포트
 - Redis Lua Script 2개 (token-bucket.lua, fixed-window.lua)
 - ~~Tenant Plan 도입 (FREE/STARTER/PRO/ENTERPRISE, DECISIONS §62)~~ → **§88에서 철회.** 한도는 모든 테넌트 동일 상수 (등급제가 하던 일은 "SaaS 약속"이 아니라 독식 방어 하나였다)
@@ -215,8 +215,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 **CI 레인이 둘이고 가르는 기준은 모듈이 아니라 `@Tag`다.**
 ```
-./gradlew test              전부 536건 (로컬 기본, skipped 4 = 벤치마크)
-./gradlew test -PunitOnly   346건 (CI 단위 레인) — mysql/redis/kafka 태그 제외
+./gradlew test              전부 538건 (로컬 기본, skipped 4 = 벤치마크 · 2026-09-25)
+./gradlew test -PunitOnly   346건 (CI 단위 레인, 미재측정) — mysql/redis/kafka 태그 제외
 ```
 - 실 MySQL을 쓰면 `@Tag("mysql")`, 실 Redis Cluster를 쓰면 `@Tag("redis")`,
   실 Kafka 브로커를 쓰면 `@Tag("kafka")`
@@ -582,7 +582,7 @@ working tree는 **하나**다. 수정 에이전트가 잠깐 넣었다 뺀 코�
 - 테스트를 돌려야 하는 에이전트만 `isolation: "worktree"` 로 격리한다
 - 건드리는 파일이 서로 겹치지 않는 작업(예: 코드 수정 + 인프라 조작)은 병렬로 돌려도 된다
 
-§1~§4는 `.claude/agents/*.md` 14개 전부에도 "절대 규칙 (모든 에이전트 공통)" 절로 들어가 있다.
+§1~§4는 `.claude/agents/*.md` 15개 전부에도 "절대 규칙 (모든 에이전트 공통)" 절로 들어가 있다.
 §5는 에이전트를 **태우는 쪽**의 규칙이라 에이전트 정의에는 넣지 않는다.
 다만 `.claude/`는 `.gitignore` 대상이라 **에이전트 정의는 로컬 전용**이다 — 이 문서가 정본이고,
 새 머신·새 참여자는 여기를 보고 에이전트 정의에 같은 절을 넣어야 한다.
@@ -618,12 +618,8 @@ working tree는 **하나**다. 수정 에이전트가 잠깐 넣었다 뺀 코�
 ## 자주 쓰는 명령
 
 ```bash
-# Redis Sentinel 클러스터 관리 (~/.bashrc 함수)
-redis_start    # 6개 프로세스 일괄 기동
-redis_stop     # 종료
-redis_status   # 상태 확인
-redis_logs master         # Master 로그 실시간
-redis_logs sentinel-1     # Sentinel 로그 실시간
+# Redis Sentinel (학습 자산 — 앱은 안 쓴다) — systemd
+sudo systemctl start redis-master redis-slave-{1,2} redis-sentinel-{1,2,3}
 
 # Redis Cluster A/B (Sprint 8+ 학습 환경, doc/INFRA_SETUP.md §6.5)
 sudo systemctl start redis-cluster-a-{1..8}    # Cluster A 8 노드 시작
@@ -653,7 +649,7 @@ mysql -u root -p -P 3307  # Replica
 | `doc/ROADMAP.md` | 11개 Sprint 상세 일정 + DoD |
 | `doc/FRS_final.md` | 기능 요구사항, API 명세, Redis Key, Kafka 토픽 |
 | `doc/API.md` | ⭐ **엔드포인트 18개 필드 단위 명세** — 요청/응답/에러/인증. 코드에서 추출 |
-| `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 7건 + 흔한 실수 |
+| `doc/TENANT_INTEGRATION.md` | ⭐ **Tenant가 읽는 통합 가이드** — 순서 + 계약 8건 + 흔한 실수 |
 | `doc/DECISIONS.md` | 95개 설계 결정 + 근거 + 면접 포인트 (최신 §95 — markCompleted READ COMMITTED, complete 데드락 제거) |
 | `doc/monitoring/` | 운영 런북 + PromQL 쿼리 (§79 분할은 **반영 완료**) |
 | `doc/reviews/` | 에이전트 교차 검토 기록 (후속 과제 목록 포함) |

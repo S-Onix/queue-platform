@@ -3,7 +3,8 @@
 > 작성일: 2026-06-10 (Sprint 5-C 완료 시점)
 >
 > ⚠️ **이 문서는 그 시점의 설계·구현 노트다.** 이후 폴링 전용 버킷이 추가됐다
-> (`rl:poll:token:{tokenId}`, cap 5 · refill 1.0/s — §74·PR #23).
+> (`rl:poll:token:{tokenId}`, cap 5 · refill 1.0/s — §74·PR #23). 그리고 테넌트 한도는 **유입·배출·제어 세 버킷**으로
+> 나뉘었다(`rl:tenant:{id}` · `:drain` · `:control` — §92).
 > **운영 수치의 정본은 `doc/monitoring/runbook/rate-limit.md`다**(코드 줄 번호까지 대조돼 있다).
 >
 > 🔴 **이 문서의 "Plan별 차등 한도"는 2026-09-03에 폐기됐다 (§88).** `Plan` enum을 걷어내고

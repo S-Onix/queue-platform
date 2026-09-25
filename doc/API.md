@@ -49,8 +49,9 @@
 
 ### 인증
 
-인증 수단이 **경로가 아니라 헤더로 정해진다.** `ApiKeyAuthenticationFilter`에는 경로 화이트리스트가
-없고, `X-API-Key` 헤더가 있으면 그것으로 인증한다. 없으면 `JwtAuthFilter`가 `Authorization`을 본다.
+`X-API-Key`는 **엔진 4경로**(enqueue·admit·verify·complete)에서만 읽는다(`ApiKeyAuthenticationFilter.shouldNotFilter`).
+관리 API(큐 생성·조회·pause·resume·delete·api-keys)는 **JWT만** 받는다. 반대로 JWT(`JwtAuthenticationFilter`)는
+엔진 4경로에서도 통과한다.
 
 | 인증 | 헤더 | 용도 |
 |---|---|---|
@@ -58,7 +59,7 @@
 | API Key | `X-API-Key: {rawKey}` | 런타임 작업 (enqueue, admit, verify, complete) |
 | 없음 | — | 아래 permitAll 목록 |
 
-**permitAll (인증 불필요)** — `SecurityConfig:36-59`
+**permitAll (인증 불필요)** — `SecurityConfig.filterChain`
 
 ```
 POST /api/v1/tenants/signup
@@ -67,6 +68,7 @@ POST /api/v1/tenants/refresh
 GET  /api/v1/queues/*/tokens/*      ← 폴링. 유저 브라우저가 직접 부른다
 GET  /api/v1/queues/*/status        ← 대기열 현황. 공개
 GET  /actuator/{health,info,prometheus}
+/error                              ← 검증 실패(400)를 401 로 가리지 않으려고 연다
 ```
 그 외 `/actuator/**`는 `denyAll`, 나머지 전부 `authenticated`.
 
@@ -93,10 +95,10 @@ GET  /actuator/{health,info,prometheus}
 | `QE001` | 503 | 대기열 처리 중 일시적 오류 — **재시도하라** |
 | `TK001` | 404 | 대기 토큰을 찾을 수 없음 |
 | `TK002` | 404 | 유효하지 않은 입장 토큰 |
-| `AK001` | 401 | 인증 필요 |
-| `AK002` | 403 | 권한 없음 |
-| `RL001` | 429 | 요청 한도 초과 — `Retry-After` 헤더를 보라 |
-| `I004` | 500 | 서버 오류 |
+| `RL001` | 429 | 요청 한도 초과 — `Retry-After` 헤더를 보라 (봉투 없음, 아래) |
+
+> `AK001`·`AK002`·`I004` 는 `ErrorCode` 에 정의만 있고 **던지는 코드가 없다**. 401·403 은 Security 가
+> `{"error":"UNAUTHORIZED"|"FORBIDDEN","message":…}` 로 직접 쓰고, 500 은 Boot `/error` 본문이다.
 
 검증 실패(`@NotBlank` 등)는 위 코드가 아니라 **Spring의 `MethodArgumentNotValidException`이 400**으로
 나간다. 🔴 **필드명도 사유도 담기지 않는다** — 위 [응답 봉투]의 `/error` 형태이고 `message`가 빠져 있다.
@@ -126,16 +128,17 @@ GET  /actuator/{health,info,prometheus}
 | 경로 | 나오는 상태 | 봉투 |
 |---|---|---|
 | 컨트롤러 정상 반환 | 200 | ✅ `{data, success:true, errorResponse:null}` |
-| `GlobalExceptionHandler` (`BusinessException`) | 400·401·403·404·409·429·500·503 | ✅ `{data:null, success:false, errorResponse:{code,message}}` |
+| `GlobalExceptionHandler` (`BusinessException`) | 401·403·404·409·429·503 | ✅ `{data:null, success:false, errorResponse:{code,message}}` |
 | `RateLimitFilter` (필터라 핸들러 이전) | **429 `RL001`** | 🔴 **없음** — `{error, message, retryAfter}` |
-| Security·검증 → `/error` 디스패치 | **401**·**400** | 🔴 **없음** — Boot 표준 에러 본문, `message`도 빠진다 |
+| Security 인증·인가 실패 | **401**·**403** | 🔴 **없음** — `{"error":"UNAUTHORIZED"\|"FORBIDDEN","message":…}` |
+| 검증 실패 → `/error` 디스패치 | **400** | 🔴 **없음** — Boot 표준 에러 본문, `message`도 빠진다 |
 
 🔴 **429가 두 모양이다.** `Q005`(정원 참)는 봉투가 있고 **`Retry-After`가 없다**(재시도 금지).
 `RL001`(요청 한도)은 봉투가 없고 **`Retry-After`가 있다**(재시도 대상). `errorCode`로 갈라라.
 
 ### 엔드포인트별
 
-`AK001`(401 인증 필요)·`RL001`(429 한도)·`I004`(500)는 **인증이 필요한 전 엔드포인트 공통**이라
+401(인증 필요)·`RL001`(429 한도)·500 은 **인증이 필요한 전 엔드포인트 공통**이라
 아래 표에서 생략한다. 공개 엔드포인트 둘은 그 자리에 따로 적었다.
 
 | # | 엔드포인트 | 인증 | 성공 | 에러 |
@@ -461,7 +464,7 @@ POST /queues/{q}/tokens/{t}/complete               (Key)  → 선택
 |---|---|---|---|
 | `rawKey` | api-keys 발급 | 모든 런타임 호출 | 🔴 **복구 불가.** 재발급뿐 |
 | `accessToken` | login | 관리 API | refresh로 재발급 |
-| `queueId` | 큐 생성 | 전부 | `GET /queues`로 조회 |
+| `queueId` | 큐 생성 | 전부 | 🔴 **목록 API가 없다** — 생성 응답에서 보관하라 |
 | `tokenId` | enqueue | 폴링·complete | 재-enqueue (같은 identifier면 자리 유지) |
 | `seq` | enqueue | **폴링 쿼리 필수** | 폴링이 400 |
 | `admitToken` | admit 또는 폴링 | verify·complete | 60초 지나면 만료 |

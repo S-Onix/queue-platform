@@ -20,7 +20,7 @@
 ├── MySQL 8.0 (Master 3306 + Replica 3307)
 ├── Redis Cluster A (7001-7008)   ★ 앱이 실제로 붙는 곳 — 4 Master + 4 Replica
 ├── Redis Cluster B (8001-8008)   ★ A와 완전히 독립. 큐 단위로 둘 중 하나에 배정된다
-├── Kafka KRaft (9092)            token-lifecycle 적재
+├── Kafka KRaft 3브로커 (9092/9094/9096)  token-lifecycle 적재
 ├── Prometheus (9090)
 ├── Grafana (3000)
 └── Redis Sentinel (6379-6381 + 26379-26381)   ← 학습·로컬 자산. 앱은 안 붙는다
@@ -955,7 +955,7 @@ management:
       exposure:
         include: health, info, prometheus
   # ⚠️ 프로필이 이 값을 덮는다 — dev는 `health, info, metrics`(prometheus 없음),
-  #    prod는 3개 앱 모두 `health, info`다(§85 — 스크레이퍼 경계가 생길 때까지 닫는다).
+  #    prod 도 prometheus 를 연다(2026-09-19 `82f9ae5`) — api 는 관리 포트 9080, 경계는 네트워크(SG).
   #    로컬(`application-local.yml`)만 `'*'`다.
   prometheus:
     metrics:
@@ -1036,9 +1036,9 @@ global:
   evaluation_interval: 15s
 
 rule_files:                                                 # 정본은 레포 안 (§7-12)
-  - /home/sonix/projects/queue-platform/doc/monitoring/alerts/*.yml   # app 4 · infra 12 · kafka 3 = 19 규칙
+  - /home/sonix/projects/queue-platform/doc/monitoring/alerts/*.yml   # app 7 · infra 14 · kafka 3 = 24 규칙
 
-# Alertmanager는 의도적으로 미설치 (§7-12). alerting 블록은 주석 처리돼 있다.
+# Alertmanager 는 19093 (9093 은 Kafka 가 쓴다) — scripts/setup-alertmanager.sh, PR #116
 
 scrape_configs:
   - job_name: 'prometheus'
@@ -1071,7 +1071,7 @@ scrape_configs:
   # 🔧 옛 주석은 "queue-batch는 actuator 의존성이 없어 노출하지 않는다 / job을 넣으면 항상
   #    DOWN이다"였는데 **3중으로 거짓**이었다(2026-09-02 정정) — 의존성이 있고(`6647ca5`),
   #    노출되며, 실가동 Prometheus에 queue-batch job이 이미 등록돼 있다.
-  # ⚠️ 단 prod 프로필은 prometheus를 노출하지 않는다(경계가 없는 동안은 열지 않는다).
+  # prod 도 prometheus 를 노출한다(2026-09-19) — api 는 관리 포트 9080.
   #    prod job을 추가할 때는 노출 재개가 선행이다 — 아니면 up=0으로 상시 firing이다.
 
   # redis_exporter 멀티타깃 — 프로세스 1개(9121)가 22개 노드를 커버 (§7-11)
@@ -1365,10 +1365,9 @@ curl -s localhost:9090/api/v1/rules      # 로드 확인
 매치되는 `*.yml`이 **0개여도 Prometheus는 정상 기동**한다(별도 인스턴스 cold start로 실증).
 따라서 "배선 먼저, 규칙 나중" 순서로 안전하다.
 
-**Alertmanager는 의도적으로 설치하지 않았다.** 알림 채널(Slack/메일)이 없어서 띄워봐야
-firing을 자기 UI에 다시 보여줄 뿐이고, 그건 Prometheus `/alerts`와 Grafana가 이미 한다.
-로컬 단독 환경에서 **안 만들어서 깨지는 것이 없다.** 채널이 생기면 `prometheus.yml`의
-`alerting` 주석 블록을 해제한다.
+**Alertmanager는 19093에서 돈다**(PR #116, `scripts/setup-alertmanager.sh`). 9093은 Kafka가 쓰고 있어 못 쓴다.
+수신처는 Slack + 로컬 sink(19094) 둘이다 — "규칙이 안 떴나 / 통지가 실패했나"를 가르려고.
+설치 전에는 `alertmanager_notifications_dropped_total`이 1,809까지 쌓여 있었다(보낼 곳이 없었다).
 
 ---
 
@@ -1711,7 +1710,7 @@ WSL2를 새로 설치하거나 환경 완전 재구축 시:
 4. Git 설치 + 프로젝트 clone
    git clone <repo-url> ~/queue-platform
 5. MySQL 설치 + 디렉토리 구성 (위 §5)
-6. Redis 설치 + Sentinel 구성 (위 §6)
+6. Redis Cluster A·B 구성 (위 §6.5) — 앱은 Cluster 만 쓴다. Sentinel(§6)은 학습용 선택 사항
 7. Prometheus + Grafana 설치 (위 §7)
 8. ~/.bashrc 스크립트 설정 (위 §6-6, §7-7)
 9. 기동 + 검증
@@ -1746,9 +1745,10 @@ mysql -u root -p -P 3306 queue_platform < backup_20260515.sql
 
 ```bash
 # 강제 스냅샷
-redis-cli -p 6379 BGSAVE
+# 🔴 앱 데이터는 Cluster A·B 에 있다 — 6379(Sentinel)가 아니다
+for p in 700{1..8} 800{1..8}; do redis-cli -p $p BGSAVE; done   # failover 뒤 master 위치가 바뀌므로 전 노드
 
-# RDB 파일 위치
+# RDB 파일 위치 (Sentinel 예시 — Cluster 는 노드별 data 디렉터리)
 ls -lh ~/queue-platform-infra/redis/master/data/dump.rdb
 
 # 다른 곳에 백업
@@ -1861,7 +1861,7 @@ Hash Tag·이중 라우팅은 로컬 2 Cluster로 구현·검증이 끝났다(§
 ### Phase 6 (모니터링): AlertManager + 알림
 
 ```bash
-# AlertManager (9093) 추가
+# ✅ AlertManager (19093) 추가 완료 — PR #116
 # Slack/Discord Webhook 통합
 # Alert Rules: 임계치 기반 자동 알림
 ```

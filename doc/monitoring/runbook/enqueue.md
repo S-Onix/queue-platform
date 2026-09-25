@@ -96,19 +96,19 @@ HTTP 요청
 
 ### [증상] enqueue 지연이 계속 늘어난다 (p99가 10초, 30초로 밀린다)
 
-- **먼저 의심할 것**: 유입이 `MAX_DRAIN=5000/초`를 넘어 in-memory `globalQueue`에 적체되고 있다. 이 큐는 무한이라 OOM 전까지 조용히 쌓인다.
-- **1분 안에 확인**: **globalQueue 깊이를 노출하는 지표가 없다(미노출 — 지표 추가 필요).** 간접 확인:
+- **먼저 의심할 것**: 드레인이 유입을 못 따라가 in-memory `globalQueue`에 적체되고 있다(`MAX_DRAIN=5000`은 **틱당** 값, 틱 20ms). 이 큐는 무한이라 OOM 전까지 조용히 쌓인다.
+- **1분 안에 확인**: `queue_pending_size` 가 0으로 돌아오지 않고 오르면 적체다. `queue_drain_duration_seconds` p95 가 20ms를 넘으면 틱이 밀리는 중이다. 보조 확인:
   ```bash
   # 초당 요청 수(유입)
   curl -s 'http://localhost:9090/api/v1/query?query=sum(rate(http_server_requests_seconds_count{uri="/api/v1/queues/{queueId}/tokens",method="POST"}[1m]))' | jq -r '.data.result[0].value[1]'
   # 초당 실제 적재(처리) — Redis seq 증가율
   redis-cli -c -p 7001 get 'queue:{q_xxx}:seq'; sleep 10; redis-cli -c -p 7001 get 'queue:{q_xxx}:seq'
   ```
-  **유입 RPS > 5000이면 확정 적체.** seq 증가분이 10초에 50,000 미만이면 처리가 유입을 못 따라간다.
-- **정상 범위**: 유입 RPS ≤ 5000 (WAS 1대 기준. WAS N대면 각 JVM이 독립 `globalQueue`+독립 스케줄러라 총 처리 상한은 5000×N).
+  **판정은 `queue_pending_size` 로 한다** — 아래 seq 증가분은 보조다.
+- **정상 범위**: `queue_pending_size` = 0 근처(AWS 10차 정상판 0). 이론 상한은 WAS당 5,000건/20ms = 초당 25만이라 사실상 도달하지 않는다 — 먼저 막히는 건 Redis Lua·Kafka ack다.
 - **원인별 분기**:
-  - 유입 RPS > 5000 → 처리 상한 초과. 진짜 과부하.
-  - 유입 RPS < 5000인데 지연 증가 → Redis Lua가 느린 것. `[Redis master가 느리다]` 항목으로.
+  - `queue_stage_duration_seconds{stage="redis"}` 가 크다 → Redis Lua가 느린 것. `[Redis master가 느리다]` 항목으로.
+  - `{stage="kafka"}` 가 크다 → 발행 ack 대기. Kafka 항목으로.
   - JVM heap 사용률이 함께 오르면 → `globalQueue` 적체가 힙을 먹는 중. 30초 후 `Future` 타임아웃이 터지며 503이 쏟아진다.
 - **조치**:
   1. WAS를 늘린다(처리 상한이 대수에 비례). Stateless 전제이므로 인스턴스 추가만으로 됨.
@@ -181,7 +181,7 @@ HTTP 요청
   curl -s 'http://localhost:9090/api/v1/query?query=hikaricp_connections_pending' | jq -r '.data.result[]|"\(.metric.pool) \(.value[1])"'
   curl -s 'http://localhost:9090/api/v1/query?query=hikaricp_connections_active' | jq -r '.data.result[]|"\(.metric.pool) \(.value[1])"'
   ```
-  **`pending > 0`이 지속되면 커넥션 고갈. `active`가 pool size(local 10 / prod master 50)에 붙어 있으면 확정.**
+  **`pending > 0`이 지속되면 커넥션 고갈. `active`가 pool size(local 10 / prod master 20)에 붙어 있으면 확정.**
 - **정상 범위**: `hikaricp_connections_pending` = 0. `active` < pool size × 0.8.
 - **원인별 분기**:
   - `pending > 0` → 커넥션 고갈. `open-in-view: false`는 이미 적용됨(`application.yml`)이므로 원인은 다른 긴 트랜잭션이다.
@@ -225,7 +225,7 @@ HTTP 요청
 - **하면 안 되는 것**:
   - `KEYS *` — 단일 스레드를 통째로 막는다. 이미 CPU 100%인 상황에서 실행하면 전면 장애.
   - `DEBUG SLEEP` — 진단 목적으로도 금지.
-  - master에 조회 명령 날리기. 읽기는 **replica 6380/6381**로.
+  - master에 조회 명령 날리기. 읽기는 해당 클러스터의 **replica 노드**로(`cluster nodes`에서 slave 확인. 6380/6381은 Sentinel이라 큐 키가 없다).
 
 ---
 
@@ -289,13 +289,13 @@ HTTP 요청
 
 | 관측 대상 | 현재 상태 |
 |---|---|
-| `globalQueue` 깊이 | **미노출.** `RedisQueueEngine.getGlobalQueue()`는 있으나 Gauge 미등록 |
-| 배치 사이클 소요 시간 / drain 건수 | **미노출.** `BatchProcessor`에 Timer/Counter 없음 |
+| `globalQueue` 깊이 | ✅ `queue_pending_size` (`QueueMetricsConfig`) |
+| 배치 사이클 소요 시간 / drain 건수 | ✅ `queue_drain_duration_seconds` · `queue_drain_batch_size` · `queue_stage_duration_seconds{stage}` (`BatchProcessor`) |
 | 청크 실패 건수 | 로그만 (`Failed to process chunk`). 메트릭 없음 |
 | enqueue 결과 분포(OK/EXISTS/FULL) | **미노출.** `MONITORING_DESIGN.md` 4-2의 `queue_token_enqueue_total`은 **미구현** |
 | `queue_waiting_count` Gauge | **미구현.** ZCARD를 직접 조회하는 수밖에 없음 |
 
-✏️ **구 서술 "`MeterRegistry` 사용처 0건"은 거짓이다**(2026-08-26 정정). **5종이 등록돼 있다** — `queue_waiting_orphans`(`TokenReclaimJob:122`) · `queue_reconcile_ghosts`/`queue_reconcile_stale`(`ReconcileJob:99-100`) · `queue_billing_snapshot_total{result=success|failure}` · `queue_billing_mismatch`(`BillingSnapshotJob`).
+✏️ **구 서술 "`MeterRegistry` 사용처 0건"은 거짓이다**(2026-08-26 정정). **batch 에만 5종이 등록돼 있다**(전체 코드 등록 메트릭은 17종) — `queue_waiting_orphans`(`TokenReclaimJob:122`) · `queue_reconcile_ghosts`/`queue_reconcile_stale`(`ReconcileJob:99-100`) · `queue_billing_snapshot_total{result=success|failure}` · `queue_billing_mismatch`(`BillingSnapshotJob`).
 
 🔑 `queue_billing_mismatch`는 **0이어야 하고, `-1`은 "대사 자체가 실패"다**(§86). 0으로 두면 조회가 깨진 순간 지표가 가장 건강해 보이므로 값으로 구분한다. N대가 각자 보고하므로 `max`로 본다.
 

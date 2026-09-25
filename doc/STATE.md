@@ -1,96 +1,60 @@
 # 📊 Queue Platform — 상태 흐름도
 
-> FRS v1.14 기준 | 전이 가드는 DECISIONS §80
+> 코드 대조 2026-09-25 (dev `890b536`) | 전이 가드는 DECISIONS §80·§91
 
 ---
 
 ## Token 상태 머신
 
+값: `0 WAITING` · `1 ADMIT_ISSUED` · `2 COMPLETED` · `4 EXPIRED` (**3은 결번** — Cancel API를 만들지 않았다, §82)
+
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING : POST /tokens\nEnqueue (Tenant 서버)\nHSETNX tokens[identifier]\nscore = INCR queue:{queueId}:seq
-
-    WAITING --> ADMIT_ISSUED : POST /admit\nTenant 서버 — N명 입장토큰 발급\nZPOPMIN + admitToken TTL 60초\nKafka ADMITTED 발행 (key=tokenId)
-
-    ADMIT_ISSUED --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nTenant 서버 — 입장 완료 통보\nDB COMPLETED + Redis ZREM\n(Kafka 발행 없음 — DB가 이미 확정. Redis 폴백일 때만 발행)
-
-    WAITING --> COMPLETED : POST /queues/:queueId/tokens/:tokenId/complete\nDB 적재 지연으로 아직 status=0인 경우\ncomplete 술어가 status IN (0,1)로 관대하다 (§80)
-
-    ADMIT_ISSUED --> [*] : admitToken TTL 60초 초과\nadmitted ZSet claim (queue-batch)\nHDEL tokens (중복 게이트 해제)\n복귀하지 않는다 (§36)\n⚠️ DB status는 1로 남는다\n재접속 → 재-enqueue → 맨 뒤
-
-    WAITING --> EXPIRED : Batch 10초 주기\nwaitingTtl / inactiveTtl 초과\nZREM waiting + HDEL tokens\nKafka token-lifecycle 발행 (key=tokenId)
-
+    direction LR
+    [*] --> WAITING : T1 enqueue
+    WAITING --> ADMIT_ISSUED : T2 admit
+    ADMIT_ISSUED --> COMPLETED : T3~T5 complete · verify
+    WAITING --> COMPLETED : T3~T5 적재 지연 중 완료
+    WAITING --> EXPIRED : T6 이탈 · T7 대기 초과 · T9 결함
+    ADMIT_ISSUED --> EXPIRED : T10 대사 배치 (300초)
     COMPLETED --> [*]
     EXPIRED --> [*]
 ```
 
-> 🔴 **`CANCELLED(3)`으로 가는 전이는 없다 (DECISIONS §82).** `DELETE /tokens/:tokenId`를
-> 만들지 않기로 확정했다. 유저가 취소 버튼을 누르든 탭을 닫든 신호는 **"폴링이 멈춘다"** 하나이고,
-> `inactiveTtl` 판정 배치가 그것을 잡아 **EXPIRED(4)** 로 보낸다. `status = 3`은 **결번**이다 — `TokenStatus.CANCELED` 상수도 삭제했다(재사용 금지, `schema.sql` 주석).
+`2`와 `4`는 **종착**이다 — 모든 가드가 두 값을 배제한다. 재-enqueue는 전이가 아니다: `tokens` Hash에
+같은 identifier가 남아 있으면 **같은 tokenId·seq를 돌려주고**(자리 유지), 지워졌으면 새 토큰(T1)이다.
+
+| # | 전이 | 누가 | 가드 (어긋나면 조용히 무시) | 코드 |
+|---|---|---|---|---|
+| T1 | ∅ → 0 | `POST /tokens` → 20ms 드레인 | Redis `HSETNX tokens[identifier]` · DB는 `ODKU token_id=token_id` | `enqueue_bulk.lua`, `TokenJpaAdapter.ENQUEUE_INSERT` |
+| T2 | 0 → 1 | `POST /admit` | Redis `ZPOPMIN`(원자) · DB `IF(status=0, 1, …)` · `admitted_at` = MySQL 시각(§90) | `admit.lua`, `TokenJpaAdapter` ADMITTED |
+| T3 | 0·1 → 2 | `complete` **DB 경로** — 이벤트 없음 | `status IN (0,1)` · `admitted_at > UTC-300초` | `TokenJpaRepository.markCompleted` |
+| T4 | 0·1 → 2 | `complete` **Redis 폴백** (DB가 아직 모를 때) | 컨슈머 `IF(status IN (0,1), 2, …)` | `QueueEngineService.complete` |
+| T5 | 0·1 → 2 | `verify` — 응답 시점에 완료 확정 | T4와 같은 컨슈머 가드 | `QueueEngineService.verify` |
+| T6 | 0 → 4 | 회수 배치(10초) — 폴링이 `inactiveTtl` 동안 끊김 | 컨슈머 `IF(status=0, 4, …)` · 사유 3 | `inactive_expire.lua` |
+| T7 | 0 → 4 | 회수 배치 — `waitingTtl`(기본 2시간) 초과 | 같음 · 사유 4 | `waiting_expire.lua` |
+| T8 | 1 → (1) | 회수 배치 — 입장권 60초 만료 | Redis만 정리. DB는 **1에 머문다**(의도 — 늦은 complete를 살린다, §36) | `admit_expire.lua` |
+| T9 | 0 → 4 | T8인데 DB에 ADMITTED가 아직 없을 때 | 가드가 DB 값 0을 봐서 적용 · 사유 1 · 🔴 **결함**(실측 259건) | 같음 |
+| T10 | 1 → 4 | 대사 배치(5분) — complete 창 300초 경과 | **직접 UPDATE** `status=1 AND admitted_at < UTC-300초` · 사유 2 | `ReconcileJob` |
+
+> 🔑 **완료 전이가 셋(T3~T5)이고 출발이 `0`도 허용되는 이유** — 입장권은 Redis에 즉시 보이지만 DB 적재는
+> 비동기라, 사용자가 적재보다 먼저 완료할 수 있다. `= 1`로 좁히면 그 완료가 원장에서 사라진다(§91, 실측 1.43%).
 >
-> **`inactiveTtl`은 유예 창이다.** 배치가 `HDEL tokens`를 하기 전에 같은 identifier로 재-enqueue하면
-> `enqueue_bulk.lua`의 `HSETNX` 게이트가 `EXISTS`를 돌려주어 **기존 `tokenId`·`seq`·`rank`가 복원**된다.
-> 창을 넘기면 신규로 판정되어 맨 뒤에 선다.
->
-> ⚠️ 다만 **재-enqueue 자체는 생존 신호가 아니다** — `enqueue_bulk.lua`는 `last-active`를 갱신하지
-> 않는다. 창을 되살리는 것은 **개인 폴링 재개**뿐이다 (`ka` 여부 무관 — §82 F안).
-
-### 🔴 전이를 실제로 강제하는 것 = Kafka 소비 측 가드 (DECISIONS §80)
-
-위 다이어그램은 그림이고, **강제는 이 표가 한다.** 모든 이벤트는 같은 토픽 `token-lifecycle`,
-key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어 조용히 무시**된다.
-
-| 이벤트 | 허용 출발 | SQL |
-|---|---|---|
-| `ENQUEUED` | (신규) | `ON DUPLICATE KEY UPDATE token_id = token_id` (no-op) |
-| `ADMITTED` | 0 WAITING | `IF(status = 0, 1, status)` |
-| `COMPLETED` | **0 WAITING · 1 ADMIT_ISSUED** | `IF(status IN (0,1), 2, status)` + `admit_token`·`admitted_at`·`completed_at` 보정 (§91) |
-| `EXPIRED` | 0 WAITING | `IF(status = 0, 4, status)` |
-
-> 🔴 **`admitToken` TTL 만료는 `4`에 도달하지 않는다.** 그 사람은 `status = 1`이고 가드가 `0`만
-> 받으므로 **no-op**이다. **의도된 동작이다** — `complete`의 술어가 `status IN (0, 1)`이고 유효 창이
-> 300초라, admitToken TTL(60초)이 지난 뒤 도착하는 **늦은 입장이 정상 경로로 실재**한다(§36).
-> 가드를 `IN (0, 1)`로 넓히면 그 경로가 죽는다. **넓히지 마라.**
-> 🔴 **`4`에 도달하는 경로는 셋이다 — 이 줄은 예전에 하나라고 적고 있었고 거짓이었다.**
-> ① `waitingTtl`·`inactiveTtl` 만료(출발 `0`, 컨슈머 가드)  ② **`ReconcileJob`의 직접 UPDATE**
-> (`status=1 → 4`, 사유 `ADMIT_STALE`) — 실측 30,071건  ③ 🔴 **랙 구간의 `ADMIT_TTL`**(실측 259건,
-> 아래 사유 표 참조). ③은 결함이고 ①②는 설계다.
-
-> **왜 파티션 순서에 기대지 않는가**: 프로듀서가 여러 WAS라 브로커 도착 순서가 뒤집힐 수 있다.
-> 특히 `ZADD`(enqueue Lua)가 Kafka 발행보다 먼저라 **`ENQUEUED`보다 `ADMITTED`가 먼저 도착**하는
-> 창이 실재한다. `ENQUEUED`의 no-op upsert가 그 역전을 흡수한다.
->
-> 🔧 **§91에서 뒤집혔다. 예전 서술을 지운다.**
-> 여기엔 *"`COMPLETED` 가드가 `1`만 허용하는데 complete API가 `IN (0,1)`인 것은 모순이 아니다 —
-> 이 가드는 되살아남만 막는 안전장치이고 **상태를 만드는 주체가 아니다**"* 라고 적혀 있었다.
-> **그 전제가 거짓이었다.** complete가 Redis 폴백으로 200을 주는 경로에서는 동기 UPDATE가 0행이라
-> 행이 아직 `0`이고, 그때 이 가드가 **유일한 기록자**가 된다. 그런데 `= 1`이라 no-op이 되어
-> 행이 `status=1 / completed_at=NULL`로 고착됐다 — 폴백 complete의 **1.43%**가 원장을 잃었다
-> (Kafka 오프셋 전수 실측: COMPLETED가 ADMITTED보다 먼저 도착한다).
-> **지금 이 가드는 상태를 만드는 주체가 맞다.** 그래서 `admit_token`·`admitted_at`도 함께 채운다 —
-> 안 채우면 원장 유실이 과금 누락으로 모양만 바뀐다.
-> ⚠️ **`2`와 `4`는 여전히 배제된다** — `2`를 넣으면 이미 돌려준 `completedAt`이 덮이고,
-> `4`를 넣으면 확정된 만료를 완료로 뒤집는다.
->
-> ⚠️ **알려진 구멍**: `0 → 1 → (TTL 만료) → 0` 왕복 뒤 **옛 `ADMITTED`가 재전달**되면 낡은 토큰으로
-> 다시 1이 된다. 가드는 `status`만 보고 **세대를 모르기 때문**이다. 60초를 넘긴 재전달이라 희박해
-> 지금은 막지 않는다(막으려면 버전 컬럼 — §80에 기록만).
+> 🔑 **파티션 순서에 기대지 않는다** — 같은 key(tokenId)라도 프로듀서가 여러 WAS라 도착 순서가 뒤집힌다.
+> 가드가 순서와 무관하게 같은 결과를 내도록 짜여 있다. 남은 구멍 하나: `0→1→(만료)` 뒤 옛 `ADMITTED`가
+> 재전달되면 다시 1이 된다(가드가 세대를 모른다, 60초 넘은 재전달이라 희박 — §80).
 
 ### 핵심 설계 결정
 
 | 항목 | 내용 |
 |------|------|
-| ADMIT_ISSUED | 입장토큰 발급됨. 유저가 Polling으로 admitToken 수신 대기 |
-| verify | **verify가 완료를 확정한다**(응답 시점에 `COMPLETED` 발행, PR #48). DB **직접** 쓰기는 0회 — 이벤트만 낸다. Redis는 회차 키 넷을 정리하되 `admit-by-admit`만 남긴다(§92) — 그래서 완료 뒤 재-enqueue는 **신규·맨 뒤**이고, 같은 admitToken의 재-verify는 60초 안 통과한다. ~~상태 변경 없음~~ ~~Redis 쓰기 0회~~ |
-| complete | Tenant가 입장 완료 후 명시적 통보 → COMPLETED + ZREM |
-| admitToken 만료 | **복귀하지 않는다 (§36).** `HDEL tokens`로 게이트만 풀고 끝. 재접속 → 재-enqueue → 맨 뒤. ⚠️ **DB `status`는 `1`로 남는다** — `EXPIRED` 가드가 `status = 0` 전용이라 no-op이고, 그것이 `complete`의 300초 창을 살린다 |
-| 이탈 | **전용 API 없음 (§82).** 폴링 중단 → `inactiveTtl` 판정 배치 → EXPIRED(4). `QE_006_INVALID_STATUS`(409)는 큐 상태 전이 위반에 쓰인다(`QueueService`) — 토큰 이탈과는 무관하다 |
-| 세션 관리 | Tenant 책임. Platform 관여 안 함 |
-| complete 순서 | DB 먼저 → ZREM 나중 (잔류가 유실보다 안전) |
-| 복구 | **완료 토큰의 ZREM을 재시도하는 코드는 없다.** 잔류분은 `inactiveTtl` 배치가 결국 걷어간다 |
-| seq 저장 | DB `tokens.seq` 컬럼 — **Redis 전손 시 DB 재구성**(§71). ~~복귀 시 score 복원~~은 §36이 폐기 |
-| admit_token 컬럼 | DB 저장 → Redis 미스 시 Fallback용 + verify DB Fallback |
-| Kafka 발행 | 상태 변경을 발행한다 (ENQUEUED/ADMITTED/COMPLETED/EXPIRED). **예외 둘** — complete의 DB 경로는 이미 `status=2`를 커밋해 이벤트가 no-op이라 발행하지 않고(2026-09-24), `expireStaleAdmitted`(1→4)는 직접 UPDATE다. 단일 토픽 `token-lifecycle`, key=`tokenId`. ~~RETURNED~~는 §36이 폐기 |
+| verify | **응답 시점에 완료를 확정한다**(COMPLETED 발행, PR #48). DB 직접 쓰기 0회. Redis는 `admit-by-admit`만 남긴다 — 같은 admitToken 재-verify는 60초 안 통과, 완료 뒤 재-enqueue는 **신규·맨 뒤**(§92) |
+| complete | DB 먼저 → Redis 정리. DB 경로는 이벤트를 내지 않는다(이미 `status=2` 커밋). 🔴 적재가 L초 밀리면 입장 후 **(60초, L)** 구간은 DB도 Redis도 모른다 → `TK002` 404, **적재 뒤 재시도하면 200**(로컬 재현, AWS 14차 30.8만 건) |
+| 입장권 만료 | **복귀하지 않는다(§36).** `HDEL tokens`로 게이트만 푼다. 재접속 → 재-enqueue → 맨 뒤 |
+| 이탈 | **전용 API 없음(§82).** 폴링 중단 → `inactiveTtl` 회수 → EXPIRED(사유 3) |
+| complete 잔류 정리 | Redis 정리가 실패해 남은 `admitted`·`tokens`는 **입장권 만료 회수(`admit_expire.lua`)**가 다음 주기에 걷는다. 발행되는 EXPIRED는 DB가 이미 2라 no-op |
+| seq 저장 | DB `tokens.seq` — Redis 전손 시 DB 재구성용(§71) |
+| Kafka | 토픽 `token-lifecycle` 하나, key=`tokenId`. 예외 둘: complete DB 경로는 발행 안 함 · T10은 직접 UPDATE |
 
 ### expiredReason
 
@@ -117,7 +81,8 @@ key = `tokenId`다. 허용 출발 상태가 아니면 **UPDATE가 0행이 되어
 - `WAITING_TTL` — 🔴 `ZRANGEBYSCORE`가 **아니다.** `waiting`의 score는 seq라 시간축이 아니다.
   앞부분 고정량 `ZRANGE` 스캔 + `tokens` Hash의 `issuedAt` 비교다(`waiting_expire.lua`).
 - `INACTIVE` — `queue:{queueId}:last-active`를 `ZRANGEBYSCORE 0 (now_ms - inactiveTtl_ms)`.
-  **이탈 회수의 유일한 경로다**(§82).
+  🪤 `last-active`에 오르는 것은 **개인 폴링을 부른 사람뿐**이다. JS SDK는 `rank ≤ 0`이 되기 전엔 개인 폴링을
+  부르지 않으므로, **그 전에 이탈한 사람은 이 경로가 아니라 `WAITING_TTL`(기본 2시간)로 회수된다.**
 - `ADMIT_STALE` — Redis를 안 본다. DB만 본다(`TokenJpaRepository:114`).
 
 `expired_reason` 컬럼은 실제로 채워진다 — `TokenJpaAdapter`의 INSERT 컬럼 목록에 있고,

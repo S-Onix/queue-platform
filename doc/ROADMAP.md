@@ -32,10 +32,10 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 
 | Sprint | 인프라 | 가이드 |
 |:-:|------|:-:|
-| 2 | MySQL 8.0 × 2 (Master + Replica) | INFRA_SETUP §1 |
-| 5 | Redis Sentinel (M1 + S2 + Sen3) + Prometheus + Grafana | INFRA_SETUP §2, §7 |
-| 8 | Kafka 3 브로커 (KRaft) | INFRA_SETUP §3 |
-| 10 | k6 + Prometheus + Grafana 통합 | INFRA_SETUP §4, §5 |
+| 2 | MySQL 8.0 × 2 (Master + Replica) | INFRA_SETUP §5 |
+| 5 | Redis Sentinel (M1 + S2 + Sen3) + Prometheus + Grafana | INFRA_SETUP §6, §7 |
+| 8 | Kafka 3 브로커 (KRaft) | (INFRA_SETUP에 설치 절 없음 — 로컬 9092/9094/9096) |
+| 10 | k6 + Prometheus + Grafana 통합 | INFRA_SETUP §7 (k6 설치 절 없음) |
 | **11** | **Docker + AWS (EC2/RDS/ElastiCache/MSK Serverless)** | **AWS_LEARNING_PATH** |
 
 ### 진행 현황
@@ -52,12 +52,12 @@ AWS 배포 + 대용량 실측 (11):       3.0주  (15%)  ← 신규
 ✅ Sprint 6   Token 도메인 + Enqueue + Polling 구현 완료 (Cancel API는 §82로 폐기 — 범위에서 제거)
 ✅ Sprint 7   admit·verify·complete + §79(/status·watermark·pacing) 구현 완료 (dev ba21221, PR #31~38)
               ⚠️ DoD 체크박스는 아직 대조하지 않았다 — 검증된 항목은 DECISIONS §80 "구현 결과 ⑥"에 있다
-              ⬜ 남은 것: 관측 메트릭 3종 · admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
+              ✅ 관측 메트릭 2종 구현(2026-09-09) · 1종 폐기(§36) · ⬜ admit.lua의 로컬 Cluster 실행 검증 (§80 ⑦)
 🔄 Sprint 8   token-lifecycle 적재 경로 + queue-consumer 구현 / ADMITTED·COMPLETED 발행까지 완료 (~~RETURNED~~는 §36이 폐기)
 🔄 Sprint 9   잡 3개 구현(TokenReclaimJob·ReconcileJob·BillingSnapshotJob) + 회수 3경로 완료. RedisSyncJob은 폐기(2026-08-27)
 ⬜ Sprint 10
 ⬜ Sprint 11  ← AWS 배포
-🎯 Cluster 로컬 실습 완료 (2026-07-08, 병행 학습) — 프로덕션 도입은 §75, 시점 미정
+🎯 Cluster 로컬 실습 완료 (2026-07-08, 병행 학습) — ✅ 2 Cluster 구현 완료(2026-08-17, §75)
 ```
 
 **판정 근거 (2026-08-17 실측)** — ⚠️ **아래 표는 §80 구현 전 상태다.** 2026-08-20 재실측은 그 밑 표.
@@ -153,7 +153,7 @@ flowchart TD
 **소요 시간:** 약 3일 (인프라 세팅 포함)
 **카테고리:** MVP
 
-**선행 인프라:** [INFRA_SETUP.md §1](INFRA_SETUP.md) — MySQL Master(3306) + Replica(3307) WSL2 직접 설치 + GTID 복제
+**선행 인프라:** [INFRA_SETUP.md §5](INFRA_SETUP.md) — MySQL Master(3306) + Replica(3307) WSL2 직접 설치 + GTID 복제
 
 **주요 산출물:**
 - WSL2에 MySQL 8.0 × 2 인스턴스 기동 (Master 3306 / Replica 3307, GTID 기반 복제)
@@ -247,7 +247,7 @@ flowchart TD
 **카테고리:** MVP
 **진행률:** 약 75% (5-A/5-B/5-C/5-D 완료, 5-E 진입)
 
-**선행 인프라:** [INFRA_SETUP.md §2](INFRA_SETUP.md) — Redis Master(6379) + Slave(6380, 6381) + Sentinel(26379, 26380, 26381) WSL2 직접 설치
+**선행 인프라:** [INFRA_SETUP.md §6](INFRA_SETUP.md) — Redis Master(6379) + Slave(6380, 6381) + Sentinel(26379, 26380, 26381) WSL2 직접 설치
 
 ### 진행 현황
 
@@ -256,7 +256,7 @@ flowchart TD
 | 5-A | Redis Sentinel 인프라 | ✅ |
 | 5-B | 모니터링 시스템 (Prometheus + Grafana) | ✅ |
 | 5-C | Rate Limiter (Token Bucket + Fixed Window) | ✅ |
-| 5-D | Redis 캐시 (API Key + Refresh Token) | ✅ |
+| 5-D | Redis 캐시 (API Key) | ✅ — Refresh Token은 캐시하지 않는다(DB 조회) |
 | 5-E | Queue Engine Lua Scripts (Sprint 6 준비) | 🔄 |
 | 5-F | Sprint 5 마무리 (문서 갱신) | 🔄 |
 
@@ -285,7 +285,7 @@ flowchart TD
 | 용도 | 알고리즘 | 키 패턴 | 인터페이스 |
 |------|---------|--------|-----------|
 | Tenant SLA (인증 후) | Token Bucket | `rl:tenant:{tenantId}` | `RateLimiter` |
-| 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip:{ip}` | `FixedWindowRateLimiter` |
+| 인증 전 (signup/login/refresh) | Fixed Window | `rl:{action}:ip{ip}:{windowNo}` | `FixedWindowRateLimiter` |
 
 **구성:**
 - ✅ `RateLimiter` / `FixedWindowRateLimiter` 도메인 포트 (queue-domain)
@@ -527,7 +527,7 @@ flowchart TD
 - [ ] TTL 만료 후 verify → **404**
 - [ ] complete가 `status = 0`(복귀 후)에도 성공한다 — 유효 창 안이면
 - [ ] 중복 complete 요청 → 1번만 성공 (조건부 UPDATE가 0행)
-- [ ] **`queue-batch`의 `/actuator/prometheus`가 200 (**local·dev 프로필 한정** — prod는 노출하지 않는다, 2026-09-02)** (claim-Lua 계측의 전제)
+- [ ] **`queue-batch`의 `/actuator/prometheus`가 200 (✅ prod 도 노출 — 2026-09-19 `82f9ae5`)** (claim-Lua 계측의 전제)
 - [ ] Rich Domain 상태 전환 메서드로 비즈니스 로직 검증
 
 **착수 전 검증 2건 (§80):**
@@ -541,7 +541,7 @@ flowchart TD
       근거·전제는 `DECISIONS.md` §80 / `schema.sql` tokens 주석
 
 **착수 전 결정할 것 — 남은 미판정 0건 (전부 닫힘):**
-- ~~`count` 상한값~~ → **100으로 확정** (§80 ⑦). 실측은 **올릴 근거로만** 쓰고,
+- ~~`count` 상한값~~ → ~~100~~ → **300** (`0082a01`, 2026-09-22 · §80 ⑦). 실측은 **올릴 근거로만** 쓰고,
   그때는 admit 단독 지연이 아니라 **폴링 부하를 함께 건 상태의 폴링 p99 증가분**을 잰다
 - ~~"pop 성공 + admitToken SET 실패" 창~~ → **§80이 닫음** (Lua 하나 = 창 없음)
 - ~~`verified-token` 클러스터 소속~~ → **§80이 닫음** (키 폐기)
@@ -567,7 +567,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 > (`scripts/kafka/create-topics.sh`). Enqueue 적재 경로는 **이미 구현·실측 완료**(100만건, §73)이며,
 > 남은 것은 **상태 전이 이벤트**(admit/complete/expire)로 Sprint 7과 함께 온다.
 
-**선행 인프라:** [INFRA_SETUP.md §3](INFRA_SETUP.md) — Kafka 3 브로커 KRaft 모드 (9092/9192/9292) WSL2 직접 설치
+**선행 인프라:** Kafka 3 브로커 KRaft 모드 — 로컬 9092/9094/9096 (AWS 9092/9192/9292). INFRA_SETUP에 설치 절은 없다
 
 **주요 산출물:**
 - WSL2에 Kafka 3 브로커 KRaft 클러스터 기동 (Zookeeper 미사용)
@@ -640,8 +640,8 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
     ② 한 번 실패해도 다음 날이 가져간다(월 1회는 그 한 번이 곧 한 달치 미청구)
     ③ 16만 행 115ms 실측이라 비용이 반박 근거가 못 된다.
     **더 과거는 안 본다** — 파티션이 DROP된 달을 집계하면 남은 행만 세어 이미 청구한 금액을 깎는다
-  - 🔄 **`queue_daily_stats` 집계 · 파티션 DROP/REORGANIZE는 이 잡에서 뺐다.**
-    과금이 아니라 **파티션 운영**이고 DDL이라 성격이 다르다. 별건으로 남는다 (⬜ 미착수)
+  - ✅ **`queue_daily_stats` 집계와 파티션 DROP도 이 잡이 한다**(§86) — DROP은 집계 대사가 맞을 때만.
+    파티션 ADD(REORGANIZE)는 자동화되지 않았다(⬜)
   - ✅ `billing_snapshots` UPSERT — `FROM tokens PARTITION (pYYYY_MM)` 적용(§83 준수, 실측 `partitions: p2026_08` 1개)
   - ✅ `READ COMMITTED` 격리 — 안 걸면 집계가 `tokens` 적재를 막는다(실측: INSERT가 6초 대기 후 `ERROR 1205`, RC에서는 0.033초)
 - 🔄 **ShedLock·`batch-lock`을 쓰지 않는다.** UPSERT가 멱등이라 batch N대가 각자 같은 값을 쓸 뿐이고,
@@ -656,11 +656,11 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 | 1 | **`queue-batch`에 actuator + micrometer-prometheus 추가** | **reconciliation의 선행 조건.** ~~현재 `queue-batch/build.gradle`에는 `starter-web`만 있고 actuator·micrometer가 **없다**~~ → ✅ **둘 다 있다**(`6647ca5`) → 만들어도 유령 토큰 수를 지표로 못 낸다. `queue-consumer`가 같은 이유로 이미 갖고 있다 |
 | 2 | **회수 배치** — `queue:{q}:last-active` ZSet `ZREM` / `queue:{q}:tokens` Hash `HDEL` | 두 명령 모두 **전 프로덕션 코드 0건**이다. 쓰기만 하고 지우지 않아 30만 큐가 한 바퀴 돌 때마다 멤버가 영구 누적된다. 🔴 **§82로 무게가 커졌다** — 누수 정리에 그치지 않고 **이탈 회수의 유일한 경로**다. 상태 전이(EXPIRED)와 Kafka 발행을 빼먹으면 이탈자가 DB에 영원히 WAITING으로 남는다 |
 | 3 | **reconciliation 스위퍼** (Redis엔 있고 DB엔 없는 유령 토큰) | §73이 "Redis-Kafka 사이엔 분산 트랜잭션이 없어 발행 갭은 **영구적**"이라며 필수 후속으로 남겼다. 100만건 실측에서 실제로 835건 발생. **1번 다음에 온다** |
-| 4 | `ApiKeyCache.invalidate` 프로덕션 호출 연결 (revoke 경로) | 구현·포트 선언은 있는데 **호출부가 0건**이라 폐기된 키가 최대 60초 살아 있다. 배치가 아니라 revoke 서비스 쪽 한 줄이지만, 다른 정리 작업과 함께 처리 |
+| 4 | `ApiKeyCache.invalidate` 프로덕션 호출 연결 (revoke 경로) | ✅ 연결됨(`ApiKeyService` revoke 에서 `apiKeyCache.invalidate` 호출) |
 
 **완료 기준 (DoD):**
 - [x] Batch Server 기동 후 `TokenReclaimJob` 10초 주기 실행 로그 확인 — 실측 `회수 admitTokenTTL=1건 inactiveTTL=0건 waitingTTL=4000건`
-- [ ] `queue-batch`의 `/actuator/prometheus`가 200 (**local·dev 프로필 한정** — prod는 노출하지 않는다, 2026-09-02)을 반환 (위 1번 — reconciliation 지표의 전제)
+- [ ] `queue-batch`의 `/actuator/prometheus`가 200 (✅ prod 도 노출 — 2026-09-19 `82f9ae5`)을 반환 (위 1번 — reconciliation 지표의 전제)
 - [x] 회수 후 `waiting`·`tokens`·`last-active` **세 키에서 모두 빠진다** — `InactiveReclaimTest`가 실제 Redis로 단언(§82)
 - [ ] `zcard last-active` ≤ `zcard waiting` **부등식 자체**는 아직 안 잰다 — 위 테스트는 개별 키의 잔존 멤버만 단언한다
 - [ ] **`inactiveTtl` 초과 토큰 → DB `status = 4` 반영** (§82 — 이탈 회수가 실제로 닫혔다는 증거).
@@ -689,7 +689,7 @@ FRS §6.4~6.6, STATE.md 전이 가드 표
 **예상 기간:** 3주
 **카테고리:** 부하 / 운영
 
-**선행 인프라:** [INFRA_SETUP.md §4](INFRA_SETUP.md) — k6 설치 / [§7](INFRA_SETUP.md) — Prometheus + Grafana (Sprint 5에서 이미 구축)
+**선행 인프라:** k6 설치 절은 INFRA_SETUP에 없다 / [§7](INFRA_SETUP.md) — Prometheus + Grafana (Sprint 5에서 이미 구축)
 
 **주요 산출물:**
 
@@ -937,8 +937,8 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 
 ### 주요 인프라 결정 (2026-07-08 세션 반영)
 
-- ~~**Sprint 10**: Sentinel → Cluster 전환 (§66)~~ → **전환 확정, 시점 미정** (§75)
-- ~~**Sprint 12**: 이중 라우팅 (Cluster + Hash Tag) 도입 (§67)~~ → **채택 확정, 시점 미정** (§75 D25·D26)
+- ~~**Sprint 10**: Sentinel → Cluster 전환 (§66)~~ → ✅ **구현 완료**(2026-08-17, §75)
+- ~~**Sprint 12**: 이중 라우팅 (Cluster + Hash Tag) 도입 (§67)~~ → ✅ **큐 단위 라우팅으로 구현 완료**(§75 D25·D26 — shard 태그는 기각)
 - **Sprint 15+**: Master 크기 최적화 → 4 GB (§68) — 확정 여부 미확인
 - **Sprint 15+**: 4 Cluster × 4 Master 극대 분산 (§69) — 확정 여부 미확인
 
@@ -1058,7 +1058,7 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 - [INFRA_SETUP.md](INFRA_SETUP.md) — WSL2 인프라 설치 가이드 (MySQL/Redis Sentinel/Cluster/Kafka/k6/Prometheus/Grafana)
 - `AWS_LEARNING_PATH.md` — **미작성.** Sprint 11 대비 AWS 병렬 학습 경로 (파일 없음, 링크 걸지 말 것)
 - [FRS v1.16](FRS_final.md) — 기능 정의
-- [DECISIONS](DECISIONS.md) — 84개 설계 결정 (기능별 목차는 문서 맨 앞)
+- [DECISIONS](DECISIONS.md) — 95개 설계 결정 (최신 §95) (기능별 목차는 문서 맨 앞)
 - [FLOW](FLOW.md) — 상세 흐름도
 - [STATE](STATE.md) — 상태 머신
 - [CONCURRENCY](CONCURRENCY.md) — 동시성 제어
@@ -1070,5 +1070,5 @@ Sprint 8+ 이후 대규모 확장을 위한 인프라 진화 계획.
 ---
 
 <p align="center">
-  <sub>2026-08-17 구현 대조 · Sprint 5-E 완료 · Sprint 6·8 부분 구현 · 다음 목표: Sprint 7 (Admit + §79)</sub>
+  <sub>2026-09-25 사실 대조(진행 표·mermaid 는 그 이전 기록) · Sprint 5~9 구현 · AWS 500만(14차)·게이트(15차) 실측</sub>
 </p>

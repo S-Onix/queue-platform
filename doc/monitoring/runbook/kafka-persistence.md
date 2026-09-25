@@ -46,7 +46,7 @@ QueueEngineService.enqueue()
 queue-consumer  group-id=db-writer, auto-offset-reset=earliest
   └ @KafkaListener  List<EnqueueEvent> (max-poll-records 500)
       └ TokenPersistService.persist() @Transactional
-          └ saveAllIfAbsent → @SQLInsert ... ON DUPLICATE KEY UPDATE token_id=token_id
+          └ TokenJpaAdapter.ENQUEUE_INSERT (raw JDBC) ... ON DUPLICATE KEY UPDATE token_id=token_id
       └ 제약 위반 시 이분 탐색으로 범인 1건만 token-lifecycle.DLT
 ```
 
@@ -80,12 +80,11 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 
   | 관계 | 정상 여부 |
   |---|---|
-  | `hlen tokens` == `zcard waiting` | **항상 같아야 한다.** 다르면 Lua 파손 또는 부분 삭제 — 즉시 에스컬레이션 |
+  | `hlen tokens` ≥ `zcard waiting` | **같지 않은 게 정상이다** — admit은 `waiting`에서만 빼고 `tokens`는 남긴다 |
   | `get seq` ≥ `zcard waiting` | 정상. 차이 = 중복 identifier(EXISTS) 횟수. INCR한 seq를 버리기 때문(`enqueue_bulk.lua:62,66`) |
-  | DB rows == `hlen tokens` | **정상이면 같다.** DB가 적으면 = **유령 토큰** |
-  | DB rows > `hlen tokens` | 이전 이벤트의 잔여 행이 섞였다. `issued_at` 범위를 좁혀 다시 재라 |
-
-  **`hlen - DB rows` 가 1 이상이면 유령 토큰 확정.**
+  | DB rows ≥ `hlen tokens` | 회수가 `HDEL`해도 DB 행은 남으므로 **DB가 많은 게 정상**이다 |
+  
+  🔴 **이 표로 유령을 판정하지 마라** — 정상 상태에서도 어긋난다. 갭 판정은 `queue_reconcile_ghosts`(ReconcileJob: 정착 5분 지난 구간의 `ZCOUNT waiting` − `COUNT status=0`)로만 한다.
 - **정상 범위**: `hlen tokens - DB rows` = 0. 단, **consumer lag이 0으로 수렴하기 전에는 일시적으로 양수가 정상**이다 — lag을 먼저 확인하고 0인 상태에서 판정하라.
 - **원인별 분기**:
   - lag > 0 → 아직 안 밀린 것. 유령 아님. `[lag이 줄지 않는다]` 항목으로.
@@ -124,7 +123,6 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
   - 특정 파티션만 LAG이 크다 → 그 파티션에 독약 메시지가 있거나, 그 파티션 담당 컨슈머만 느리다.
   - 전 파티션 균등 LAG → 처리량 부족. 컨슈머 인스턴스를 늘린다 (**최대 18대 = 파티션 수**. 그 이상은 놀기만 한다).
   - `rewriteBatchedStatements`가 없다 → 재배포 필요. 즉시 조치 불가.
-  - `max-poll-records`(500) ≠ `hibernate.batch_size`(500) → 배치가 쪼개진다. 두 값이 같은지 확인.
 - **조치**:
   ```bash
   # 컨슈머 증설 (파티션 18개까지). 같은 group-id면 자동 재배분(CooperativeStickyAssignor)
@@ -181,7 +179,7 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
   - 배치 적재가 5분을 넘는다 → DB가 느리다. `hikaricp_connections_pending`, MySQL `processlist` 확인.
   - 이분 탐색이 돌고 있다 → 500건 중 1건 위반이면 log2(500) ≈ 9단계 × 트랜잭션. 여기에 DB가 느리면 5분 초과가 현실화된다.
   - 네트워크/GC → JVM heap, GC pause 확인.
-- **조치**: 중복 처리 자체는 **데이터를 깨지 않는다** — `@SQLInsert`의 `ON DUPLICATE KEY UPDATE token_id = token_id`가 흡수한다(오프셋 5,000 되감기 재소비 테스트로 검증됨: 행 수 불변). 근본 원인(DB 지연)을 잡는다.
+- **조치**: 중복 처리 자체는 **데이터를 깨지 않는다** — `TokenJpaAdapter.ENQUEUE_INSERT`(raw JDBC)의 `ON DUPLICATE KEY UPDATE token_id = token_id`가 흡수한다(오프셋 5,000 되감기 재소비 테스트로 검증됨: 행 수 불변). 근본 원인(DB 지연)을 잡는다.
 - **하면 안 되는 것**: `max.poll.interval.ms`를 무작정 키우는 것. 진짜 죽은 컨슈머의 감지가 그만큼 늦어져 lag이 조용히 쌓인다.
 
 ---
@@ -211,8 +209,8 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 - **먼저 의심할 것**: **엔드포인트가 아니라 수집 쪽이다.** `queue-consumer/build.gradle`에
   `io.micrometer:micrometer-registry-prometheus`가 있고 `application.yml`에
   `exposure.include: health,info,prometheus`도 있으므로 **8082에서 200이 나오는 것이 정상**이다.
-  ⚠️ **단 local·dev 한정이다.** prod 프로필은 `health,info`만 연다(경계가 없는 동안은 열지 않는다,
-  2026-09-02). prod에서 404는 정상이며, 그때 lag은 `kafka-consumer-groups.sh` CLI로 본다.
+  ⚠️ **dev 는 열지 않는다**(`health, info, metrics`). prod 는 2026-09-19부터 연다 — consumer 는 8082,
+  api 는 관리 포트 9080 이다. dev 에서 404는 정상이며, 그때 lag은 `kafka-consumer-groups.sh` CLI로 본다.
   안 뜬다면 실가동 `prometheus.yml`에 consumer job이 등록돼 있는지를 먼저 본다
   (→ [증상] scrape 타깃이 DOWN, 및 `doc/INFRA_SETUP.md`).
 - **1분 안에 확인**:
@@ -239,8 +237,8 @@ queue-consumer  group-id=db-writer, auto-offset-reset=earliest
 | 관측 대상 | 현재 상태 |
 |---|---|
 | 발행 성공/실패 카운터 | **미노출.** 로그만 |
-| 발행 지연(publish latency) | **미노출** |
+| 발행 지연(publish latency) | enqueue 동기 발행은 `queue_stage_duration_seconds{stage="kafka"}`. admit 발행은 미노출 |
 | 적재 건수 / 배치 크기 분포 | **미노출.** `log.debug`만 (`INFO` 레벨에선 안 찍힘) |
 | DLT 유입 카운터 | **미노출.** Kafka 오프셋을 직접 세야 함 |
-| consumer lag (PromQL) | **클라이언트 단위는 가능** — `kafka_consumer_fetch_manager_records_lag`(⚠️ `_lag_max`는 한가할 때 NaN이라 쓰지 마라). `prometheus.yml`의 `queue-consumer` job 등록은 **완료**(실가동 확인). 알람 규칙은 [`alerts/kafka.yml`](../alerts/kafka.yml). **그룹 단위 LAG 합계는 여전히 불가**(kafka_exporter 미설치) — 아래 주의 참조 |
+| consumer lag (PromQL) | **클라이언트 단위는 가능** — `kafka_consumer_fetch_manager_records_lag`(⚠️ `_lag_max`는 한가할 때 NaN이라 쓰지 마라). 컨슈머 job 은 로컬 `queue-consumer` · AWS `queue-worker`(consumer+batch)다. 알람 규칙은 [`alerts/kafka.yml`](../alerts/kafka.yml). **그룹 단위 LAG 합계는 여전히 불가**(kafka_exporter 미설치) — 아래 주의 참조 |
 | 유령 토큰 수(reconciliation) | ✅ **`queue_reconcile_ghosts`** (`ReconcileJob`, 5분). PromQL에서 **`sum`이 아니라 `max`** — batch N대가 같은 값을 각자 보고한다. 짝인 `queue_reconcile_stale`은 반대 방향(DB > Redis = 종료 이벤트 유실) |

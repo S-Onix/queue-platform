@@ -105,7 +105,7 @@ Client (브라우저)
 [queue-api  N대]  ←── Tenant 서버 (X-API-Key: enqueue · admit · verify · complete)
   ├─→ MySQL 8.0 (GTID 복제)
   │   ├─ Master  (3306)   쓰기 · readOnly 아닌 트랜잭션
-  │   └─ Replica (3307)   @Transactional(readOnly = true) 라우팅
+  │   └─ Replica (3307)   DR 전용 — 앱이 replica 를 읽는 경로는 0이다 (2026-09-02)
   │
   ├─→ Redis Cluster A (7001-7008)  ┐ 큐 단위로 둘 중 하나에 배정 (§75)
   ├─→ Redis Cluster B (8001-8008)  ┘ 한 큐의 키 4종은 같은 클러스터 (해시태그는 경계를 못 넘는다)
@@ -180,7 +180,7 @@ Prometheus + Grafana
 - ~~일반 Lua Script + Bulk Lua Script 하이브리드~~ → **Bulk Lua 단독**
 - ~~부하 기반 자동 전환 (Adaptive Batching)~~ → 폐기 (임계값 분기 없음)
 - ~~Enqueue 전용 SlidingWindowCounter~~ → 폐기 (전환할 경로가 없으니 부하 측정 불필요)
-- Hash Tag 필수 (2-key Lua)
+- Hash Tag 필수 (3-key Lua: waiting/seq/tokens)
 
 **구현 요소**:
 
@@ -214,16 +214,13 @@ queue-api/queue/
         ↕
   BatchProcessor @Scheduled drain-interval=20ms
   → drain(최대 5000) → queueId별 groupBy → 500씩 청크
-  → enqueue_bulk.lua 실행 (Hash Tag 2-key)
+  → enqueue_bulk.lua 실행 (Hash Tag 3-key)
   → 위치(index)로 매칭하여 future.complete()
   → CompletableFuture.complete() → 응답 (10-20ms)
 ```
 
-**임계값 결정**:
-- 부하 임계값: 초당 1000 요청
-- 배치 크기: 100
-- 배치 간격: 10ms
-- 타임아웃: 1초
+~~**임계값 결정**: 초당 1000 요청 · 배치 100 · 간격 10ms · 타임아웃 1초~~ — §70 하이브리드 폐기 전 값.
+현행: `drain-interval=20ms` · `MAX_DRAIN=5000` · `CHUNK_SIZE=500` · 타임아웃 30s
 
 ### 3.3 Sprint 6: ApiKey 인증
 
@@ -343,7 +340,7 @@ redis-cli --cluster check 127.0.0.1:7001
 
 **Step 4**: Lua Script Cluster 테스트 (2026-07-15 개정 — §70)
 - ~~enqueue.lua는 단일 key (KEYS[1])만 사용 → CROSSSLOT 에러 없음~~
-- `enqueue_bulk.lua`는 **2-key** (KEYS[1]=waiting, KEYS[2]=seq)
+- `enqueue_bulk.lua`는 **3-key** (KEYS[1]=waiting, KEYS[2]=seq, KEYS[3]=tokens)
   → **Hash Tag 없으면 CROSSSLOT** (slot 7911 vs 11273)
   → `queue/QueueKeys.java`에서 `queue:{queueId}:...`로 감싸 동일 slot 보장
 - 로컬 Cluster A(7001)에서 실제 스크립트 실행 검증 완료
@@ -418,7 +415,7 @@ CaffeineRankCache 조회
 
 ### 4.4 Sprint 10: Production Cluster 도입
 
-> ⚠️ **개정 (§75, 2026-08-11)**: Cluster 전환은 **확정**, **시점은 미정**(아래 "Sprint 10"은 확정 아님).
+> ⚠️ **개정 (§75, 2026-08-11)**: Cluster 전환은 **구현 완료**(2026-08-17, §75). 아래 "Sprint 10"은 계획 시점의 기록이다.
 > 목표 형태도 아래의 **단일 Cluster 3 Master + 3 Replica**가 아니라
 > **독립 2 Cluster + 큐 단위 이중 라우팅**(cluster1 master 50% 초과 시 신규 큐를 cluster2로)이다.
 > 아래 구성·마이그레이션 계획은 **2026-07-08 시점의 검토안**으로 보존한다. → DECISIONS §75
@@ -516,6 +513,8 @@ Prometheus + Grafana (Kafka + SSE 대시보드)
 ```
 
 ### 5.2 Sprint 11-12: Kafka 도입
+
+> ⛔ **이 흐름(Kafka 먼저 → Consumer가 Redis Lua)은 §94에서 기각됐다.** 실제 구현은 Redis Lua가 순번을 정하고 → Kafka 동기 발행 → 200 → DB 적재다.
 
 **목표**: Enqueue 비동기 처리로 요청 폭증 흡수
 
@@ -862,12 +861,14 @@ Region A (Asia)      Region B (US)       Region C (EU)
    - 개발자 부담 X
 
 3. **본인 프로젝트 적합**
-   - Lua Script는 2-key지만 **Hash Tag로 동일 slot 보장** → CROSSSLOT 문제 없음 (§70)
+   - Lua Script는 3-key지만 **Hash Tag로 동일 slot 보장** → CROSSSLOT 문제 없음 (§70)
    - Multi-tenant 자연스러운 분산
 
 **참고**: 통찰 70-71번
 
 ### 7.3 왜 Kafka (즉시 Redis 처리 아님)?
+
+> ⛔ §94에서 기각된 설계의 논증이다 — 현행은 Redis 먼저다.
 
 **결정**: Sprint 11에 Kafka 도입
 
@@ -1091,9 +1092,9 @@ Adaptive Batching을 "경로 분기"로 오독한 것이 최초 설계의 뿌리
 ### 10.1 확정된 결정
 
 - **Sprint 5-E**: Bulk 단독 Enqueue + Hash Tag (§70 — 하이브리드 폐기)
-- **Sprint 5-E 이후 Polling**: 캐싱 우선 (Sprint 9 Caffeine)
+- **Polling**: WAS 캐시 없음 — `/status`가 3키 MGET로 직접 읽는다(§79 D1, Caffeine 은 2026-08-19 제거)
 - **SSE 도입**: Sprint 13-14
-- **Cluster 도입**: Sprint 10 (Tenant 100+ 대응)
+- **Cluster 도입**: ✅ 구현 완료(§75)
 - **WAS**: Tomcat 유지 (WebFlux 미도입)
 - **Virtual Thread 활용**: 전 Sprint 지속
 
@@ -1262,7 +1263,7 @@ QueueService.enqueue()
 RedisQueueEngine (Global Queue Producer)
    ↓ PendingEnqueue.offer() / future.get()
 BatchProcessor (@Scheduled Consumer)
-   └─ enqueue_bulk.lua 단독 (Hash Tag 2-key)
+   └─ enqueue_bulk.lua 단독 (Hash Tag 3-key)
 ```
 
 ---
@@ -1420,7 +1421,7 @@ Fallback 로직 필요
 **Sprint 10**: Redis Cluster 선택
 
 **근거**:
-1. Queue Platform의 Lua Script는 **2-key지만 Hash Tag로 동일 slot 보장** (2026-07-15 개정, §70)
+1. Queue Platform의 Lua Script는 **3-key지만 Hash Tag로 동일 slot 보장** (2026-07-15 개정, §70)
    - `enqueue_bulk.lua`: KEYS[1] = `queue:{queueId}:waiting`, KEYS[2] = `queue:{queueId}:seq`
    - 중괄호가 Hash Tag → 슬롯 계산에 `queueId`만 사용 → 두 키가 항상 같은 slot
    - CROSSSLOT 문제 없음 (Hash Tag 덕분이지, 단일 key라서가 아님)
@@ -2486,6 +2487,8 @@ public ClusterAssignment selectCluster() {
     return new ClusterAssignment(selected, ...);
 }
 ```
+
+> ⛔ **기각(부록 F)** — shard 태그 라우팅은 채택하지 않았다. 아래는 검토 기록이다.
 
 **Shard Router (Layer 2 - Cluster 내 Master 선택)**:
 ```java
