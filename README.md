@@ -275,7 +275,7 @@ flowchart LR
 
 ## 테스트 전략
 
-538건(전체, 벤치마크 4건 skip). 가르는 기준은 모듈이 아니라 `@Tag`다 — 실 MySQL·Redis Cluster·Kafka를
+541건(전체, 벤치마크 4건 skip). 가르는 기준은 모듈이 아니라 `@Tag`다 — 실 MySQL·Redis Cluster·Kafka를
 쓰는 테스트에만 태그를 붙이고, CI 단위 레인은 그것만 제외한다.
 
 - 모듈 단위로 가르다가 384건 중 104건만 돌고 있던 적이 있다. 그래서 태그다

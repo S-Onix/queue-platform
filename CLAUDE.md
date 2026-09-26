@@ -215,7 +215,7 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
 
 **CI 레인이 둘이고 가르는 기준은 모듈이 아니라 `@Tag`다.**
 ```
-./gradlew test              전부 538건 (로컬 기본, skipped 4 = 벤치마크 · 2026-09-25)
+./gradlew test              전부 541건 (로컬 기본, skipped 4 = 벤치마크 · 2026-09-26)
 ./gradlew test -PunitOnly   346건 (CI 단위 레인, 미재측정) — mysql/redis/kafka 태그 제외
 ```
 - 실 MySQL을 쓰면 `@Tag("mysql")`, 실 Redis Cluster를 쓰면 `@Tag("redis")`,
