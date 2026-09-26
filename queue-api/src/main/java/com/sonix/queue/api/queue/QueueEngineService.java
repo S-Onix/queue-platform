@@ -13,6 +13,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
@@ -347,7 +348,9 @@ public class QueueEngineService {
     public LocalDateTime complete(long tenantId, String queueId, String tokenId, String admitToken) {
         findQueueAndVerifyOwner(tenantId, queueId);
 
-        LocalDateTime completedAt = LocalDateTime.now(clock);
+        // 🔴 DB 정밀도(DATETIME(3))로 자른다. 안 자르면 첫 응답은 나노초, 재시도는 DB 에서 읽은 밀리초라
+        //    "재시도해도 같은 completedAt"(API.md complete) 계약이 깨진다 — 실 DB 테스트에서 드러났다
+        LocalDateTime completedAt = LocalDateTime.now(clock).truncatedTo(ChronoUnit.MILLIS);
 
         int updated = tokenRepository.markCompleted(
                 queueId, tenantId, tokenId, admitToken, completedAt, Token.COMPLETE_VALID_WINDOW_SECONDS);

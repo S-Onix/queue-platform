@@ -5,6 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sonix.queue.domain.queue.Queue;
 import com.sonix.queue.domain.queue.QueueRepository;
 import com.sonix.queue.domain.queue.QueueStatus;
+import com.sonix.queue.domain.queue.Token;
+import com.sonix.queue.domain.queue.TokenEventType;
+import com.sonix.queue.domain.queue.TokenRepository;
+import com.sonix.queue.domain.queue.TokenStatus;
 import com.sonix.queue.domain.tenant.TenantRepository;
 import com.sonix.queue.infrastructure.queue.QueueKeys;
 import org.junit.jupiter.api.AfterAll;
@@ -33,10 +37,13 @@ import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.matchesPattern;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
@@ -445,24 +452,6 @@ class QueueLifecycleContractTest {
     @DisplayName("⑤ PAUSED·DELETED 에서 실제로 무엇이 막히나")
     class PausedAndDeletedBehaviour {
 
-        /** ACTIVE 큐 하나를 API로 만들고 API Key 를 발급해 둔다. */
-        private String[] activeQueueWithKey(String label) throws Exception {
-            MvcResult created = mockMvc.perform(post("/api/v1/queues").with(auth())
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .content("""
-                                    {"name":"%s","maxCapacity":1000}
-                                    """.formatted(uniqueName(label))))
-                    .andExpect(status().isOk())
-                    .andReturn();
-            String queueId = json(created).path("data").path("queueId").asText();
-            createdQueueIds.add(queueId);
-
-            MvcResult issued = mockMvc.perform(post("/api/v1/tenants/me/api-keys").with(auth()))
-                    .andExpect(status().isOk())
-                    .andReturn();
-            return new String[]{queueId, json(issued).path("data").path("rawKey").asText()};
-        }
-
         private ResultActions enqueue(String queueId, String rawKey, String identifier) throws Exception {
             return mockMvc.perform(post("/api/v1/queues/" + queueId + "/tokens")
                     .with(FROM_TEST_IP)
@@ -590,6 +579,118 @@ class QueueLifecycleContractTest {
                     status == QueueStatus.DELETED ? LocalDateTime.now() : null));
             createdQueueIds.add(queueId);
         }
+    }
+
+    // ── ⑥ complete DB 경로 — 실 트랜잭션 매니저 · 실 MySQL ────────────────────
+
+    @Nested
+    @DisplayName("⑥ complete 가 실 트랜잭션·실 DB 를 관통한다")
+    class CompleteThroughRealDb {
+
+        // 이유: complete 의 근거가 목 슬라이스(AdmitApiTest)와 어댑터 단독 테스트뿐이었다.
+        // 문제: 어노테이션 두 개(어댑터 markCompleted 의 @Transactional · RC 격리)가 하중을 받는데, 목으로는 안 보인다.
+        // 원인: @Modifying UPDATE 는 트랜잭션이 없으면 런타임에 죽고, 그건 실 트랜잭션 매니저에서만 드러난다.
+        // 해결: HTTP → 서비스 → 어댑터 → MySQL 을 그대로 태운다. 행은 컨슈머와 같은 applyTransition 으로 심는다.
+
+        @Autowired private TokenRepository tokenRepository;
+
+        /** 컨슈머가 ADMITTED 를 적재한 상태를 만든다. admitted_at 은 §90 대로 MySQL 이 찍는다. */
+        private String[] admittedToken(String queueId) {
+            String tokenId = UUID.randomUUID().toString();
+            String admitToken = UUID.randomUUID().toString();
+            LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
+            // 🪤 admittedAt 을 null 로 넘기면 admitted_at 이 NULL 로 적재된다 — 값이 아니라 "있음" 신호다
+            //    (TRANSITION_INSERT 의 IF(? IS NULL, ...)). 그러면 창 판정이 늘 거짓이라 404 테스트가 공짜로 통과한다
+            tokenRepository.applyTransition(TokenEventType.ADMITTED, List.of(Token.transition(
+                    TokenStatus.ADMIT_ISSUED, tokenId, queueId, tenantId, NS + "user_" + tokenId,
+                    1L, now, admitToken, now)));
+            return new String[]{tokenId, admitToken};
+        }
+
+        private ResultActions complete(String[] q, String tokenId, String admitToken) throws Exception {
+            return mockMvc.perform(post("/api/v1/queues/" + q[0] + "/tokens/" + tokenId + "/complete")
+                    .with(FROM_TEST_IP)
+                    .header("X-API-Key", q[1])
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .content("""
+                            {"admitToken":"%s"}
+                            """.formatted(admitToken)));
+        }
+
+        private int statusOf(String queueId, String tokenId) {
+            return tokenRepository.findByTokenId(queueId, tenantId, tokenId).orElseThrow()
+                    .getStatus().getStatusCode();
+        }
+
+        @Test
+        @DisplayName("창 안의 complete 는 200 이고 DB 가 status=2 로 커밋된다 — 재시도도 같은 completedAt")
+        void completeCommitsAndRetryIsIdempotent() throws Exception {
+            String[] q = activeQueueWithKey("complete-ok");
+            String[] t = admittedToken(q[0]);
+
+            MvcResult first = complete(q, t[0], t[1])
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data.status").value("COMPLETED"))
+                    // 소수부 3자리 이하 = DB 정밀도. 아래 재시도 비교만으로는 마이크로초 끝이 000 인 1/1000 이 빠져나간다
+                    .andExpect(jsonPath("$.data.completedAt").value(matchesPattern(".*T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?")))
+                    .andReturn();
+
+            // 응답만 보면 폴백 200 과 구분이 안 된다. 원장에 커밋됐는지를 따로 본다
+            assertThat(statusOf(q[0], t[0])).isEqualTo(TokenStatus.COMPLETED.getStatusCode());
+
+            // 두 번째는 UPDATE 0행 → findCompletedAt(방금 master 에 쓴 행) 으로 같은 값을 돌려준다
+            complete(q, t[0], t[1])
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data.completedAt")
+                            .value(json(first).path("data").path("completedAt").asText()));
+        }
+
+        @Test
+        @DisplayName("300초 창을 넘긴 complete 는 404 TK002 이고 행은 status=1 에 남는다")
+        void completeAfterWindowIs404() throws Exception {
+            String[] q = activeQueueWithKey("complete-stale");
+            String[] t = admittedToken(q[0]);
+            // 창 판정은 MySQL 시계라(§90) 앱에서 시간을 못 돌린다. 행의 admitted_at 을 창 밖으로 민다
+            deleteById("UPDATE tokens SET admitted_at = admitted_at - INTERVAL "
+                    + (Token.COMPLETE_VALID_WINDOW_SECONDS + 1) + " SECOND WHERE queue_id = ?", q[0]);
+
+            complete(q, t[0], t[1])
+                    .andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.errorResponse.code").value("TK002"));
+
+            assertThat(statusOf(q[0], t[0])).isEqualTo(TokenStatus.ADMIT_ISSUED.getStatusCode());
+        }
+
+        @Test
+        @DisplayName("다른 admitToken 으로는 complete 할 수 없다 — 404 TK002, 행은 그대로")
+        void wrongAdmitTokenIs404() throws Exception {
+            String[] q = activeQueueWithKey("complete-wrong");
+            String[] t = admittedToken(q[0]);
+
+            complete(q, t[0], UUID.randomUUID().toString())
+                    .andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.errorResponse.code").value("TK002"));
+
+            assertThat(statusOf(q[0], t[0])).isEqualTo(TokenStatus.ADMIT_ISSUED.getStatusCode());
+        }
+    }
+
+    /** ACTIVE 큐 하나를 API로 만들고 API Key 를 발급해 둔다. */
+    private String[] activeQueueWithKey(String label) throws Exception {
+        MvcResult created = mockMvc.perform(post("/api/v1/queues").with(auth())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"name":"%s","maxCapacity":1000}
+                                """.formatted(uniqueName(label))))
+                .andExpect(status().isOk())
+                .andReturn();
+        String queueId = json(created).path("data").path("queueId").asText();
+        createdQueueIds.add(queueId);
+
+        MvcResult issued = mockMvc.perform(post("/api/v1/tenants/me/api-keys").with(auth()))
+                .andExpect(status().isOk())
+                .andReturn();
+        return new String[]{queueId, json(issued).path("data").path("rawKey").asText()};
     }
 
     // ── 헬퍼 ────────────────────────────────────────────────────────────────
