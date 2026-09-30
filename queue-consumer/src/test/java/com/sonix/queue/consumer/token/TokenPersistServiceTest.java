@@ -31,7 +31,7 @@ import static org.mockito.Mockito.verify;
  * 넘어온 절반(그 목록을 순서대로 돈다)을 여기서 지킨다.
  *
  * <p>순서가 왜 중요한지는 {@code TokenJpaAdapter.saveAllIfAbsent} 주석에 있다 — 뒤집히면
- * {@code completed_at}·{@code admitted_at}이 NULL로 굳어 complete가 영구 404가 되고 과금이 누락된다.
+ * {@code completed_at}·{@code admitted_at}이 NULL로 굳어 complete 재시도가 영구 404가 되고 과금이 누락된다.
  * 실물 DB로 그걸 확인하는 가드는 {@code TokenJpaAdapterIntegrationTest}에 따로 있다(@Tag("mysql")).
  * 여기는 Spring 없이 호출 순서만 본다.
  */

@@ -104,7 +104,7 @@ public class TokenJpaAdapter implements TokenRepository {
      * 이유: 신규 적재(ENQUEUED). 충돌하면 no-op 이다.
      * 문제: 🔴 <b>JPA 가 아니라 JdbcTemplate 인 것은 실행 시점을 맞추기 위해서다</b> — {@code persist} 는
      *       플러시까지 미루고 raw JDBC 는 즉시 실행해 <b>호출 순서와 실행 순서가 갈렸다</b>(2026-09-14).
-     * 원인: COMPLETED 가 먼저 실행되면 <b>completed_at·admitted_at 이 NULL</b> 로 굳는다(영구 404 + 과금 누락).
+     * 원인: COMPLETED 가 먼저 실행되면 <b>completed_at·admitted_at 이 NULL</b> 로 굳는다(complete 재시도가 영구 404 + 과금 누락).
      * 🔑 <b>두 경로를 같은 계층으로 맞추면 함정 자체가 사라진다</b>(플러시 강제는 주석으로 지켜야 한다).
      */
    @Override
