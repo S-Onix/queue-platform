@@ -106,7 +106,8 @@ queue-consumer는 아무도 참조하지 않는다 (최말단)
           🔑 라벨은 `queue_id`다 — §80(DECISIONS:5822)의 `queueId` 표기를 따르지 않는다.
              `queue_admission_wait_seconds`와 철자가 갈리면 `and on(queue_id)` 조인이 깨진다
           🔑 `result=error`는 **ADMITTED 발행 실패**다. admit은 Lua 커밋 뒤라 항상 200이라
-             HTTP 지표로는 절대 안 보이고, 발행이 빠진 토큰은 complete가 영구 404다  (§80 U9)
+             HTTP 지표로는 절대 안 보이고, 발행이 빠진 토큰은 입장 후 60초 안에 호출이 없으면
+             complete가 영구 404다(60초 안이면 Redis 폴백이 COMPLETED로 원장을 채운다)  (§80 U9)
   폐기    RedisSyncJob + redis_sync_needed — 전제가 성립 불가 (2026-08-27, schema.sql 주석)
   구현됨  JS SDK `sdk/js/` — 폴링 전용 + 리더 탭(Web Locks)            (§78 · PR #77·#78)
           🔑 존재 근거는 리더 탭 하나다 — 폴링 버킷 키가 tokenId 하나라 탭 2개면 여유 0.

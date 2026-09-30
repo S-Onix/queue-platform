@@ -516,9 +516,11 @@ Kafka 발행 실패: 200을 준다. Lua가 이미 커밋됐고 되돌릴 수 없
      ✅ `queue_admit_requests_total{queue_id, result=error}` **구현됨**(2026-09-09, §80 U9).
         알람은 `alerts/app.yml`의 QueueAdmitPublishFailing(0건이 유일한 정상값).
         ⚠️ 개별 tokenId는 여전히 로그에만 있다 — 메트릭은 "몇 건인가"까지만 답한다.
-  🔴 대가: 발행이 실패하면 admitted_at이 NULL로 남아 complete가 영구 404다.
+  🔴 대가: 발행이 실패하면 admitted_at이 NULL로 남아 complete의 DB 경로가 통과하지 못한다.
      complete 술어의 admitted_at > UTC_TIMESTAMP(3) - INTERVAL {유효 창} SECOND 가
      NULL을 배제하므로, status IN (0,1)의 관대함이 여기 닿지 못한다 (DECISIONS §80 정정).
+     입장 후 60초 안에 verify·complete가 오면 Redis 폴백이 200을 주고 COMPLETED가 원장을
+     채운다(§91). **60초 안에 호출이 없으면 영구 404다.**
      ADMITTED 소비 전(컨슈머 랙)에도 같은 창이 열린다.
 
 count 상한: **300**. @Max(300) 한 줄로 강제한다 (전용 검증 클래스 만들지 않는다).
